@@ -16,7 +16,7 @@ class MyWrapper(EWrapper):
     def nextValidId(self, orderId:int):
         print("Setting nextValidOrderId: %d", orderId)
         self.nextValidOrderId = orderId
-        #self.start()
+        self.startData("AAPL")
 
     def historicalData(self, reqId:int, bar: BarData):
         #print("HistoricalData. ReqId:", reqId, "BarData.", bar)
@@ -37,7 +37,7 @@ class MyWrapper(EWrapper):
         self.df.to_csv(f,index=False, header=False,lineterminator='\n')
         f.close()
         print("All Historical Data Collected: Live Data Starting Now...")
-        #app.disconnect()
+        app.disconnect()
         #print("Finished")
 
     def historicalDataUpdate(self, reqId: int, bar: BarData): 
@@ -76,6 +76,7 @@ class MyWrapper(EWrapper):
         print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
 
     def startData(self, ticker):
+        print("testy")
         queryTime = (datetime.datetime.today() - datetime.timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
 
         contract = Contract()
@@ -85,6 +86,7 @@ class MyWrapper(EWrapper):
         contract.exchange = "SMART"
 
         app.reqHistoricalData(1, contract, "", "1 D", "1 min", "TRADES", 1, 1, True, [])
+
 
         f = open("./MainStoinker/DataCollection/Test/datalive.csv", "w")
         f.truncate()

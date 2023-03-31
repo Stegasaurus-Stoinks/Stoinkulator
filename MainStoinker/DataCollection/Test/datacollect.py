@@ -28,3 +28,5 @@ print(df['LineTest'][2000])
 f = open('./MainStoinker/DataCollection/Test/data.csv','w+')
 df.to_csv(f,index=False, header=False,lineterminator='\n')
 f.close()
+
+# ib.run()
