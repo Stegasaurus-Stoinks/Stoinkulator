@@ -93,7 +93,22 @@ const displayChart = async () => {
 
   const LineTest = chart.addLineSeries({ color:'green', lineWidth:1});
   const LineData = await getColumn(10);
+  console.log(LineData)
+  const LineDatanozero = removeElementsWithValue(LineData,0)
+  console.log(LineDatanozero)
   LineTest.setData(LineData);
 };
+
+function removeElementsWithValue(arr, val) {
+  var i = arr.length;
+  while (i--) {
+      if (arr[i].value === val) {
+          arr.splice(i, 1);
+      }
+  }
+  return arr;
+}
+
+
 
 displayChart();
