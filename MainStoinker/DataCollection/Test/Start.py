@@ -28,11 +28,11 @@ apple_contract.secType = 'STK'
 apple_contract.exchange = 'SMART'
 apple_contract.currency = 'USD'
 
-tickers = ["AAPL","GME","MSFT"]
+tickers = ["AAPL"]
 
 app.startData(tickers)
 
 
-time.sleep(10) #Sleep interval to allow time for incoming price data
-app.disconnect()
+# time.sleep(20) #Sleep interval to allow time for incoming price data
+# app.disconnect()
 

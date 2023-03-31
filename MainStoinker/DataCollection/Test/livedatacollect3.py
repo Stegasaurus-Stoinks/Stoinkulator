@@ -30,7 +30,7 @@ class IBapi(EWrapper, EClient):
         # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
 
         candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
-        self.dict[reqId] = self.dict[reqId].append([candleData], ignore_index=True)
+        self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
 
     # print(candleData)
     # print(self.test)
@@ -41,45 +41,41 @@ class IBapi(EWrapper, EClient):
 
         # print(self.df)
         f = open("./MainStoinker/DataCollection/Test/liveData_"+self.tickers[reqId]+".csv", "w")
-        self.dict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
+        self.datadict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
         f.close()
         print("All Historical Data Collected: Live Data Starting Now...")
-        self.disconnect()
+        # self.disconnect()
 
     # print("Finished")
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):
-        global lastbar
-        if lastbar != 0:
-            if (bar.average != lastbar.average):
+        if self.lastbardict[reqId] != 0:
+            if (bar.average != self.lastbardict[reqId].average):
                 print("HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
 
                 # Open our existing CSV file in append mode
                 # Create a file object for this file
                 candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
-                with open('./MainStoinker/DataCollection/Test/datalive.csv', 'a') as f_object:
-                    # Pass this file object to csv.writer()
-                    # and get a writer object
-                    writer_object = writer(f_object)
+                tickerdata = self.datadict[reqId]
+                lastindex = tickerdata.tail(1).index
 
-                    # Pass the list as an argument into
-                    # the writerow()
-                    writer_object.writerow(candleData)
+                if(self.lastbardict[reqId].date == bar.date):
+                    tickerdata.drop(lastindex,inplace=True)
 
-                    # Close the file object
-                    f_object.close()
+                tickerdata.loc[lastindex] = candleData
 
-                lastbar = bar
+                self.lastbardict[reqId] = bar
 
         else:
-            lastbar = bar
+            self.lastbardict[reqId] = bar
 
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
 
     def startData(self, tickers):
         i = 0
-        self.dict = {}
+        self.datadict = {}
+        self.lastbardict = {}
         self.tickers = tickers
         for ticker in tickers:
             print("testy")
@@ -97,5 +93,5 @@ class IBapi(EWrapper, EClient):
             f.truncate()
             f.close()
             
-            self.dict[i] = pd.DataFrame()
+            self.datadict[i] = pd.DataFrame()
             i += 1
