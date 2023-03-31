@@ -28,8 +28,10 @@ apple_contract.secType = 'STK'
 apple_contract.exchange = 'SMART'
 apple_contract.currency = 'USD'
 
-#Request Market Data
-app.reqMktData(1, apple_contract, '', False, False, [])
+tickers = ["AAPL","GME","MSFT"]
+
+app.startData(tickers)
+
 
 time.sleep(10) #Sleep interval to allow time for incoming price data
 app.disconnect()

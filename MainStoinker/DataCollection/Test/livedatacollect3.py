@@ -24,13 +24,13 @@ class IBapi(EWrapper, EClient):
     def nextValidId(self, orderId: int):
         print("Setting nextValidOrderId: %d", orderId)
         self.nextValidOrderId = orderId
-        self.startData("AAPL")
+        # self.startData("AAPL")
 
     def historicalData(self, reqId: int, bar: BarData):
         # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
 
         candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
-        self.df = self.df.append([candleData], ignore_index=True)
+        self.dict[reqId] = self.dict[reqId].append([candleData], ignore_index=True)
 
     # print(candleData)
     # print(self.test)
@@ -39,9 +39,9 @@ class IBapi(EWrapper, EClient):
     def historicalDataEnd(self, reqId: int, start: str, end: str):
         print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
 
-        print(self.df)
-        f = open('./MainStoinker/DataCollection/Test/datalive.csv', 'w+')
-        self.df.to_csv(f, index=False, header=False, lineterminator='\n')
+        # print(self.df)
+        f = open("./MainStoinker/DataCollection/Test/liveData_"+self.tickers[reqId]+".csv", "w")
+        self.dict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
         f.close()
         print("All Historical Data Collected: Live Data Starting Now...")
         self.disconnect()
@@ -77,22 +77,25 @@ class IBapi(EWrapper, EClient):
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
 
-    def startData(self, ticker):
-        print("testy")
-        queryTime = (datetime.datetime.today() - datetime.timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
+    def startData(self, tickers):
+        i = 0
+        self.dict = {}
+        self.tickers = tickers
+        for ticker in tickers:
+            print("testy")
+            queryTime = (datetime.datetime.today() - datetime.timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
 
-        contract = Contract()
-        contract.secType = "STK"
-        contract.symbol = ticker
-        contract.currency = "USD"
-        contract.exchange = "SMART"
+            contract = Contract()
+            contract.secType = "STK"
+            contract.symbol = ticker
+            contract.currency = "USD"
+            contract.exchange = "SMART"
 
-        self.reqHistoricalData(1, contract, "", "1 D", "1 min", "TRADES", 1, 1, True, [])
+            self.reqHistoricalData(i, contract, "", "1 D", "1 min", "TRADES", 1, 1, True, [])
 
-        f = open("./MainStoinker/DataCollection/Test/datalive.csv", "w")
-        f.truncate()
-        f.close()
-
-        self.df = pd.DataFrame()
-        self.dataArray = np.zeros(0)
-        self.test = 13
+            f = open("./MainStoinker/DataCollection/Test/liveData_"+ticker+".csv", "w")
+            f.truncate()
+            f.close()
+            
+            self.dict[i] = pd.DataFrame()
+            i += 1
