@@ -13,13 +13,10 @@ import pandas as pd
 
 class MyWrapper(EWrapper):
 
-    def __init__(self, ticker):
-        self.ticker = ticker
-
     def nextValidId(self, orderId:int):
         print("Setting nextValidOrderId: %d", orderId)
         self.nextValidOrderId = orderId
-        self.start()
+        #self.start()
 
     def historicalData(self, reqId:int, bar: BarData):
         #print("HistoricalData. ReqId:", reqId, "BarData.", bar)
@@ -43,7 +40,7 @@ class MyWrapper(EWrapper):
         #app.disconnect()
         #print("Finished")
 
-    def historicalDataUpdate(self, reqId: int, bar: BarData):
+    def historicalDataUpdate(self, reqId: int, bar: BarData): 
         global lastbar
         if lastbar != 0:
             if(bar.average != lastbar.average):
@@ -78,12 +75,12 @@ class MyWrapper(EWrapper):
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
 
-    def start(self):
+    def startData(self, ticker):
         queryTime = (datetime.datetime.today() - datetime.timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
 
         contract = Contract()
         contract.secType = "STK"
-        contract.symbol = self.ticker
+        contract.symbol = ticker
         contract.currency = "USD"
         contract.exchange = "SMART"
 
@@ -98,7 +95,7 @@ class MyWrapper(EWrapper):
         self.test = 13
 
 
-app = EClient(MyWrapper())
-app.connect("127.0.0.1", 7497, clientId=1)
-lastbar = 0
-app.run()
+# app = EClient(MyWrapper())
+# app.connect("127.0.0.1", 7497, clientId=1)
+# lastbar = 0
+# app.run()
