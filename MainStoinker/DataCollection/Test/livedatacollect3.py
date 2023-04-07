@@ -2,6 +2,7 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.common import BarData
+from ibapi.common import *
 from csv import writer
 import datetime
 
@@ -46,28 +47,46 @@ class IBapi(EWrapper, EClient):
         print("All Historical Data Collected: Live Data Starting Now...")
         # self.disconnect()
 
-    # print("Finished")
 
-    def historicalDataUpdate(self, reqId: int, bar: BarData):
-        if self.lastbardict[reqId] != 0:
+    def testy(self, reqId, bar):
+        # print(self.lastbardict)
+        if self.lastbardict[reqId]:
             if (bar.average != self.lastbardict[reqId].average):
                 print("HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
-
-                # Open our existing CSV file in append mode
-                # Create a file object for this file
-                candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
-                tickerdata = self.datadict[reqId]
-                lastindex = tickerdata.tail(1).index
-
-                if(self.lastbardict[reqId].date == bar.date):
-                    tickerdata.drop(lastindex,inplace=True)
-
-                tickerdata.loc[lastindex] = candleData
-
-                self.lastbardict[reqId] = bar
-
         else:
+            print("empty :D Probably because its the first loop")
             self.lastbardict[reqId] = bar
+
+
+    def historicalDataUpdate(self, reqId: int, bar: BarData):
+        # if self.lastbardict[reqId] != 0:
+
+        self.testy(reqId,bar)
+        # if (bar.average != self.lastbardict[reqId].average):
+        #     print("HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
+
+        #         # Open our existing CSV file in append mode
+        #         # Create a file object for this file
+        #         candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
+        #         tickerdata = self.datadict[reqId]
+        #         lastindex = tickerdata.tail(1).index
+
+        #         if(self.lastbardict[reqId].date == bar.date):
+        #             tickerdata.drop(lastindex,inplace=True)
+
+        #         tickerdata.loc[lastindex] = candleData
+
+        #         self.lastbardict[reqId] = bar
+
+        # else:
+        #     self.lastbardict[reqId] = bar
+
+
+    # def realtimeBar(self, reqId: TickerId, time:int, open_: float, high: float, low: float, close: float,
+    #                          volume: Decimal, wap: Decimal, count: int):
+    #     super().realtimeBar(reqId, time, open_, high, low, close, volume, wap, count)
+    #     print("RealTimeBar. TickerId:", reqId, RealTimeBar(time, -1, open_, high, low, close, volume, wap, count))
+    
 
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
@@ -94,4 +113,5 @@ class IBapi(EWrapper, EClient):
             f.close()
             
             self.datadict[i] = pd.DataFrame()
+            self.lastbardict[i] = 0
             i += 1
