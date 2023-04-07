@@ -4,7 +4,7 @@ from ibapi.contract import Contract
 from ibapi.common import BarData
 from ibapi.common import *
 from csv import writer
-import datetime
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -29,8 +29,8 @@ class IBapi(EWrapper, EClient):
 
     def historicalData(self, reqId: int, bar: BarData):
         # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
-
-        candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
+        # self.timeformat = datetime.strptime(bar.date, "%Y%b%d %H:%M:%S")
+        candleData = [datetime.fromtimestamp(int(bar.date)), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
         self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
 
     # print(candleData)
@@ -73,7 +73,6 @@ class IBapi(EWrapper, EClient):
         self.lastbardict = {}
         self.tickers = tickers
         for ticker in tickers:
-            queryTime = (datetime.datetime.today() - datetime.timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
 
             contract = Contract()
             contract.secType = "STK"
@@ -81,9 +80,9 @@ class IBapi(EWrapper, EClient):
             contract.currency = "USD"
             contract.exchange = "SMART"
 
-            self.reqHistoricalData(i, contract, "", duration, "1 min", "TRADES", 1, 1, True, [])
+            self.reqHistoricalData(i, contract, "", duration, "1 min", "TRADES", 1, 2, True, [])
 
-            f = open("./MainStoinker/DataCollection/Test/liveData_"+ticker+".csv", "w")
+            f = open("./liveData_"+ticker+".csv", "w")
             f.truncate()
             f.close()
             
