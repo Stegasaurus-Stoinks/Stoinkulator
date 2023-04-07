@@ -1,5 +1,5 @@
 const getColumn = async (columnNum) => {
-  const res =  await fetch('./data.csv');
+  const res =  await fetch('./liveData_AAPL.csv');
   const resp = await res.text();
   //console.log(resp);
 
@@ -22,7 +22,7 @@ const getColumn = async (columnNum) => {
 
 
 const getData = async () => {
-  const res =  await fetch('./data.csv');
+  const res =  await fetch('./liveData_AAPL.csv');
   const resp = await res.text();
   //console.log(resp);
 
@@ -32,7 +32,7 @@ const getData = async () => {
     }
 
     const gooddata = cdata.map((row) => {
-      const[time,open,high,low,close,volume,average,barcount] = row.split(',');
+      const[time,open,high,low,close,volume,average] = row.split(',');
       
       var temptime = Date.parse(time)/1000;
       

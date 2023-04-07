@@ -48,39 +48,15 @@ class IBapi(EWrapper, EClient):
         # self.disconnect()
 
 
-    def testy(self, reqId, bar):
+    def historicalDataUpdate(self, reqId: int, bar: BarData):
+        # if self.lastbardict[reqId] != 0:
         # print(self.lastbardict)
         if self.lastbardict[reqId]:
             if (bar.average != self.lastbardict[reqId].average):
                 print("HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
         else:
-            print("empty :D Probably because its the first loop")
+            print("empty :D Probably becauseu its the first loop")
             self.lastbardict[reqId] = bar
-
-
-    def historicalDataUpdate(self, reqId: int, bar: BarData):
-        # if self.lastbardict[reqId] != 0:
-
-        self.testy(reqId,bar)
-        # if (bar.average != self.lastbardict[reqId].average):
-        #     print("HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
-
-        #         # Open our existing CSV file in append mode
-        #         # Create a file object for this file
-        #         candleData = [bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
-        #         tickerdata = self.datadict[reqId]
-        #         lastindex = tickerdata.tail(1).index
-
-        #         if(self.lastbardict[reqId].date == bar.date):
-        #             tickerdata.drop(lastindex,inplace=True)
-
-        #         tickerdata.loc[lastindex] = candleData
-
-        #         self.lastbardict[reqId] = bar
-
-        # else:
-        #     self.lastbardict[reqId] = bar
-
 
     # def realtimeBar(self, reqId: TickerId, time:int, open_: float, high: float, low: float, close: float,
     #                          volume: Decimal, wap: Decimal, count: int):
@@ -91,13 +67,12 @@ class IBapi(EWrapper, EClient):
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
 
-    def startData(self, tickers):
+    def startData(self, tickers, duration):
         i = 0
         self.datadict = {}
         self.lastbardict = {}
         self.tickers = tickers
         for ticker in tickers:
-            print("testy")
             queryTime = (datetime.datetime.today() - datetime.timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
 
             contract = Contract()
@@ -106,7 +81,7 @@ class IBapi(EWrapper, EClient):
             contract.currency = "USD"
             contract.exchange = "SMART"
 
-            self.reqHistoricalData(i, contract, "", "1 D", "1 min", "TRADES", 1, 1, True, [])
+            self.reqHistoricalData(i, contract, "", duration, "1 min", "TRADES", 1, 1, True, [])
 
             f = open("./MainStoinker/DataCollection/Test/liveData_"+ticker+".csv", "w")
             f.truncate()

@@ -32,9 +32,7 @@ apple_contract.currency = 'USD'
 tickers = ["AAPL","GME","MSFT"]
 # tickers = ["ETH"]
 
-print("test")
-app.startData(tickers)
-print("test")
+app.startData(tickers,"2 D")
 
 
 # time.sleep(20) #Sleep interval to allow time for incoming price data
