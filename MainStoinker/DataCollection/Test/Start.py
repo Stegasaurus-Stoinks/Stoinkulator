@@ -25,8 +25,9 @@ time.sleep(1) #Sleep interval to allow time for connection to server
 
 tickers = ["AAPL"]#,"GME","MSFT"]
 # tickers = ["ETH"]
-
-app.startData(tickers,2,Start_config.LiveData,10)
+# app.startData(ticker_list(list),warmup_period(int days),Live Data Yes/No, Backtesting Duration)
+# app.startData(tickers,2,Start_config.LiveData,10) # Backtesting
+app.startData(tickers,2,True,10) # LiveData
 
 # ^^^ All Code Stuff Goes Above This Line ^^^
 

@@ -105,7 +105,7 @@ class IBapi(EWrapper, EClient):
         if self.lastbardict[reqId]:
             if bar.date == self.lastbardict[reqId].date:
                 if (bar.average != self.lastbardict[reqId].average):
-                    print("HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
+                    print("IntraMinute Update: HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
                     self.datadict[reqId].drop(self.datadict[reqId].tail(1).index,inplace=True)
                     self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
                     # print(self.datadict[reqId])
