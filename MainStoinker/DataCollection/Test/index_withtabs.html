@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+      .container {
+          height: 400px;
+          background-color: green;
+      }
+      
+      h1 {
+        text-align: center;
+      }
+
+      .chart1 {
+          height: 600px;
+          width: 90%;
+          margin-left: auto; 
+          margin-right: auto;
+      }
+    </style>
+    <title>TradingView demo</title>
+    <h1>Freaking Live Data Lets Go</h1>
+    <meta charset="UTF-8" />
+    
+  </head>
+
+  <body>
+    <div class="tab">
+      <button class="tablinks" onclick="openAlgo(event, 'ALGO1')" id="defaultOpen">ALGO1</button>
+      <button class="tablinks" onclick="openAlgo(event, 'ALGO2')">ALGO2</button>
+      <button class="tablinks" onclick="openAlgo(event, 'ALGO3')">ALGO3</button>
+    </div>
+    
+    <!-- Tab content -->
+    <div id="ALGO1" class="tabcontent">
+      <h3>ALGO1</h3>
+      <p>AAPL Ticker Graph Here</p>
+      <div id="tvchart" class="chart1"></div>
+      <p>GME Ticker Graph Here</p>
+      <p>MSFT Ticker Graph Here</p>
+    </div>
+    
+    <div id="ALGO2" class="tabcontent">
+      <h3>ALGO2</h3>
+      <p>AAPL Ticker Graph Here</p>
+      <p>GME Ticker Graph Here</p>
+      <p>MSFT Ticker Graph Here</p>
+    </div>
+    
+    <div id="ALGO3" class="tabcontent">
+      <h3>ALGO3</h3>
+      <p>AAPL Ticker Graph Here</p>
+      <p>GME Ticker Graph Here</p>
+      <p>MSFT Ticker Graph Here</p>
+    </div>
+
+    
+  </body>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="index.js"></script>
+</html>
+
+<script>
+// Get the element with id="defaultOpen" and click on it
+document.getElementById("defaultOpen").click();
+</script> 

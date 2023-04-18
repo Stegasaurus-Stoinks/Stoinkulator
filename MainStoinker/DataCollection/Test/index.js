@@ -1,5 +1,5 @@
 const getColumn = async (columnNum) => {
-  const res =  await fetch('./liveData_AAPL.csv');
+  const res =  await fetch('./Collected_Data/liveData_AAPL.csv.csv');
   const resp = await res.text();
   //console.log(resp);
 
@@ -22,7 +22,7 @@ const getColumn = async (columnNum) => {
 
 
 const getData = async () => {
-  const res =  await fetch('./liveData_AAPL.csv');
+  const res =  await fetch('./Collected_Data/liveData_AAPL.csv');
   const resp = await res.text();
   //console.log(resp);
 
@@ -82,21 +82,21 @@ const displayChart = async () => {
     timeVisible: true,
   })
 
-  const sma20_series = chart.addLineSeries({ color:'red', lineWidth:1});
-  const sma20_data = await getColumn(8);
-  //console.log(sma20_data);
-  sma20_series.setData(sma20_data);
+  // const sma20_series = chart.addLineSeries({ color:'red', lineWidth:1});
+  // const sma20_data = await getColumn(8);
+  // //console.log(sma20_data);
+  // sma20_series.setData(sma20_data);
 
-  const sma50_series = chart.addLineSeries({ color:'green', lineWidth:1});
-  const sma50_data = await getColumn(9);
-  sma50_series.setData(sma50_data);
+  // const sma50_series = chart.addLineSeries({ color:'green', lineWidth:1});
+  // const sma50_data = await getColumn(9);
+  // sma50_series.setData(sma50_data);
 
-  const LineTest = chart.addLineSeries({ color:'green', lineWidth:1});
-  const LineData = await getColumn(10);
-  console.log(LineData)
-  const LineDatanozero = removeElementsWithValue(LineData,0)
-  console.log(LineDatanozero)
-  LineTest.setData(LineData);
+  // const LineTest = chart.addLineSeries({ color:'green', lineWidth:1});
+  // const LineData = await getColumn(10);
+  // console.log(LineData)
+  // const LineDatanozero = removeElementsWithValue(LineData,0)
+  // console.log(LineDatanozero)
+  // LineTest.setData(LineData);
 };
 
 function removeElementsWithValue(arr, val) {
@@ -109,6 +109,27 @@ function removeElementsWithValue(arr, val) {
   return arr;
 }
 
+
+function openAlgo(evt, algoName) {
+  // Declare all variables
+  var i, tabcontent, tablinks;
+
+  // Get all elements with class="tabcontent" and hide them
+  tabcontent = document.getElementsByClassName("tabcontent");
+  for (i = 0; i < tabcontent.length; i++) {
+    tabcontent[i].style.display = "none";
+  }
+
+  // Get all elements with class="tablinks" and remove the class "active"
+  tablinks = document.getElementsByClassName("tablinks");
+  for (i = 0; i < tablinks.length; i++) {
+    tablinks[i].className = tablinks[i].className.replace(" active", "");
+  }
+
+  // Show the current tab, and add an "active" class to the button that opened the tab
+  document.getElementById(algoName).style.display = "block";
+  evt.currentTarget.className += " active";
+} 
 
 
 displayChart();
