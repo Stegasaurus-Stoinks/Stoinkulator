@@ -60,16 +60,16 @@ class IBapi(EWrapper, EClient):
             self.simulatedDatadict[reqId].columns=['Date','Open','High','Low','Close','Volume','Average']
             print("Historical Data Collected for " + self.tickers[reqId])
             self.datacollectednum += 1
-            print(self.simulatedDatadict[reqId])
+            # print(self.simulatedDatadict[reqId])
             # Create datadict data frame here
             # ____________________________________________________________________________________
             firstDate = self.simulatedDatadict[reqId].at[0,'Date']
             startDate = firstDate + timedelta(days=self.warmup)
-            print(firstDate)
-            print(startDate)
+            print("Start Date: " + str(firstDate))
+            print("End Date: " + str(startDate))
             self.datadict[reqId] = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['Date'] < startDate)]
             self.datadict[reqId].columns=['Date','Open','High','Low','Close','Volume','Average']
-            print(self.datadict[reqId])
+            # print(self.datadict[reqId])
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
@@ -133,15 +133,26 @@ class IBapi(EWrapper, EClient):
     def backtestingDataUpdate(self):
         startpoint = self.datadict[0].shape[0]
         numpoints = self.simulatedDatadict[0].shape[0] - startpoint
-        print("running data loop for " + str(numpoints))
+        print("Running data loop for " + str(numpoints) + " number of points")
+        starttime = datetime.now()
         for k in range(numpoints):
             for i in range(len(self.tickers)):
-                print("Looping data for " + self.tickers[i])
+                # print("Looping data for " + self.tickers[i])
                 entry = self.simulatedDatadict[i].iloc[startpoint+k]
-                print(entry)
-                self.datadict[i] = pd.concat([self.datadict[i],entry],ignore_index=True)
-                print(self.datadict[i])
-                time.sleep(2)
+                # print(entry[0])
+
+                self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
+                # print(self.datadict[i])
+                # time.sleep(2)
+
+        endtime = datetime.now()
+        duration = endtime-starttime
+        print("Backtesting "+str(numpoints)+" Points is Done!")
+        print("Duration: " + str(duration))
+        print("___________________________________________________________")
+        print("--------------Press 'CTRL' to Close Program----------------")
+        print("___________________________________________________________")
+
 
         
 
