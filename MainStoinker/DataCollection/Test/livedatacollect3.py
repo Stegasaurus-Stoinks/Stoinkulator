@@ -7,6 +7,8 @@ from csv import writer
 from datetime import datetime
 from datetime import timedelta
 
+import Start_config as config
+
 import numpy as np
 import pandas as pd
 
@@ -139,11 +141,16 @@ class IBapi(EWrapper, EClient):
             for i in range(len(self.tickers)):
                 # print("Looping data for " + self.tickers[i])
                 entry = self.simulatedDatadict[i].iloc[startpoint+k]
-                # print(entry[0])
+                print(entry[0])
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 # print(self.datadict[i])
-                # time.sleep(2)
+                
+                if config.intraMinutePrint:
+                    time.sleep(.1)
+                    f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[i]+".csv", "w")
+                    self.datadict[i].to_csv(f, index=False, header=False, lineterminator='\n')
+                    f.close()
 
         endtime = datetime.now()
         duration = endtime-starttime
