@@ -9,6 +9,8 @@ from datetime import timedelta
 
 import Start_config as config
 
+import EMACrossing_Algo
+
 import numpy as np
 import pandas as pd
 
@@ -81,10 +83,10 @@ class IBapi(EWrapper, EClient):
 
             
 
-
-        f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[reqId]+".csv", "w")
-        self.datadict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
-        f.close()
+        if config.FrontEndDisplay:
+            f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[reqId]+".csv", "w")
+            self.datadict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
+            f.close()
 
 
             
@@ -120,7 +122,7 @@ class IBapi(EWrapper, EClient):
             print("empty :D Probably becauseu its the first loop")
 
         self.lastbardict[reqId] = bar
-        if updatecsv:
+        if updatecsv and config.FrontEndDisplay:
             f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[reqId]+".csv", "w")
             self.datadict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
             f.close()
@@ -146,11 +148,17 @@ class IBapi(EWrapper, EClient):
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 # print(self.datadict[i])
                 
-                if config.intraMinutePrint:
-                    time.sleep(.1)
+                if config.intraMinutePrint and config.FrontEndDisplay:
+                    # time.sleep(.1)
                     f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[i]+".csv", "w")
                     self.datadict[i].to_csv(f, index=False, header=False, lineterminator='\n')
                     f.close()
+
+            # EMACrossing_Algo.update(self.getData())
+                for algo in self.algos:
+                    algo.update(self.getData())
+
+
 
         endtime = datetime.now()
         duration = endtime-starttime
@@ -163,12 +171,13 @@ class IBapi(EWrapper, EClient):
 
         
 
-    def startData(self, tickers, warmup, liveData, duration=10):
+    def startData(self, tickers, algos, warmup, liveData, duration=10):
         i = 0
         self.datadict = {}
         self.simulatedDatadict = {}
         self.lastbardict = {}
         self.tickers = tickers
+        self.algos = algos
         self.liveData = liveData
         self.warmup = warmup
         for ticker in tickers:
@@ -185,12 +194,23 @@ class IBapi(EWrapper, EClient):
                 self.simulatedDatadict[i] = pd.DataFrame()
 
 
-            f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+ticker+".csv", "w")
-            f.truncate()
-            f.close()
+            if config.FrontEndDisplay:
+                f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+ticker+".csv", "w")
+                f.truncate()
+                f.close()
             
             self.datadict[i] = pd.DataFrame()
             self.lastbardict[i] = 0
+            i += 1
+
+    def getData(self):
+        return self.datadict
+    
+    def printStats(self):
+        i = 0
+        for algo in self.algos:
+            print(f"Printing Stats for Algo {i}")
+            algo.printStats()
             i += 1
             
 

@@ -9,6 +9,9 @@ import time
 import keyboard
 import os
 from livedatacollect3 import IBapi
+from EMACrossing_Algo import Algo as EMAAlgo
+
+
 
 def run_loop():
 	app.run()
@@ -24,10 +27,17 @@ api_thread.start()
 time.sleep(1) #Sleep interval to allow time for connection to server
 
 tickers = ["AAPL"]#,"GME","MSFT"]
+
+Algo1EMA = EMAAlgo('AAPL', 20, 50, printInfo = True)
+
+Algos = [Algo1EMA]
+
 # tickers = ["ETH"]
 # app.startData(ticker_list(list),warmup_period(int days),Live Data Yes/No, Backtesting Duration)
-app.startData(tickers,2,Start_config.LiveData,10) # Backtesting
+app.startData(tickers,Algos,2,Start_config.LiveData,2) # Backtesting
 # app.startData(tickers,2,True,10) # LiveData
+
+
 
 # ^^^ All Code Stuff Goes Above This Line ^^^
 
@@ -40,7 +50,7 @@ keyboard.wait('Ctrl')
 print("___________________________________________________________")
 print("------------------Closing Program...-----------------------")
 print("___________________________________________________________")
-
+app.printStats()
 app.disconnect()
 mydir = os.path.join(os.path.dirname(__file__), './Collected_Data/')
 for f in os.listdir(mydir):
