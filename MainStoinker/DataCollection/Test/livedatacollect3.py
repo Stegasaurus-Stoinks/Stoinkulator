@@ -69,8 +69,8 @@ class IBapi(EWrapper, EClient):
             # ____________________________________________________________________________________
             firstDate = self.simulatedDatadict[reqId].at[0,'Date']
             startDate = firstDate + timedelta(days=self.warmup)
-            print("Start Date: " + str(firstDate))
-            print("End Date: " + str(startDate))
+            print("Warmup Start Date: " + str(firstDate))
+            print("Warmup End Date: " + str(startDate))
             self.datadict[reqId] = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['Date'] < startDate)]
             self.datadict[reqId].columns=['Date','Open','High','Low','Close','Volume','Average']
             # print(self.datadict[reqId])
@@ -137,13 +137,13 @@ class IBapi(EWrapper, EClient):
     def backtestingDataUpdate(self):
         startpoint = self.datadict[0].shape[0]
         numpoints = self.simulatedDatadict[0].shape[0] - startpoint
-        print("Running data loop for " + str(numpoints) + " number of points")
+        print("Running data loop for " + str(numpoints) + " points of data")
         starttime = datetime.now()
         for k in range(numpoints):
             for i in range(len(self.tickers)):
                 # print("Looping data for " + self.tickers[i])
                 entry = self.simulatedDatadict[i].iloc[startpoint+k]
-                print(entry[0])
+                #print(entry[0])
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 # print(self.datadict[i])
@@ -171,7 +171,7 @@ class IBapi(EWrapper, EClient):
 
         
 
-    def startData(self, tickers, algos, warmup, liveData, duration=10):
+    def startData(self, tickers, algos, warmup, liveData, duration=1):
         i = 0
         self.datadict = {}
         self.simulatedDatadict = {}
@@ -206,11 +206,11 @@ class IBapi(EWrapper, EClient):
     def getData(self):
         return self.datadict
     
-    def printStats(self):
+    def printAlgoStats(self, FullPrint = True):
         i = 0
         for algo in self.algos:
             print(f"Printing Stats for Algo {i}")
-            algo.printStats()
+            algo.printStats(FullPrint)
             i += 1
             
 

@@ -6,3 +6,4 @@ yfinance
 ib_insync
 tzdata
 ibapi
+websocket

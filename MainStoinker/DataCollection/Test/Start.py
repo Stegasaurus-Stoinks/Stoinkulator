@@ -12,6 +12,53 @@ from livedatacollect3 import IBapi
 from EMACrossing_Algo import Algo as EMAAlgo
 
 
+import socketio
+import threading
+from time import sleep
+
+count = 0
+
+def test():
+    global count
+    count +=1
+    print(count)
+
+
+# asyncio
+sio = socketio.Client()
+
+@sio.on('message')
+def on_message(data):
+    # print('I received a message!')
+    print(data)
+    sio.emit('data_send', {'foo': 'bar'})
+    # print("Emitted Data :D")
+    test()
+
+@sio.on('*')
+async def catch_all(event, data):
+   pass
+
+@sio.event
+def connect():
+    print("I'm connected!")
+
+@sio.event
+def connect_error(data):
+    print("The connection failed!")
+
+@sio.event
+def disconnect():
+    print("I'm disconnected!")
+
+def connectwebsocket():
+    sio.connect('http://192.168.1.39:3000')
+
+wst = threading.Thread(target=connectwebsocket)
+wst.daemon = True
+wst.start()
+
+
 
 def run_loop():
 	app.run()
@@ -28,14 +75,12 @@ time.sleep(1) #Sleep interval to allow time for connection to server
 
 tickers = ["AAPL"]#,"GME","MSFT"]
 
-Algo1EMA = EMAAlgo('AAPL', 20, 50, printInfo = True)
+Algo1EMA = EMAAlgo('AAPL', 20, 50, printInfo = False)
 
 Algos = [Algo1EMA]
 
-# tickers = ["ETH"]
 # app.startData(ticker_list(list),warmup_period(int days),Live Data Yes/No, Backtesting Duration)
-app.startData(tickers,Algos,2,Start_config.LiveData,2) # Backtesting
-# app.startData(tickers,2,True,10) # LiveData
+app.startData(tickers,Algos,1,Start_config.LiveData,1) # Backtesting
 
 
 
@@ -50,8 +95,9 @@ keyboard.wait('Ctrl')
 print("___________________________________________________________")
 print("------------------Closing Program...-----------------------")
 print("___________________________________________________________")
-app.printStats()
+# app.printAlgoStats(False)
 app.disconnect()
+print(count)
 mydir = os.path.join(os.path.dirname(__file__), './Collected_Data/')
 for f in os.listdir(mydir):
     os.remove(os.path.join(mydir, f))

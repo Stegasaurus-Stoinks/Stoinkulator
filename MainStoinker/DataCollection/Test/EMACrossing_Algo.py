@@ -62,29 +62,33 @@ class Algo:
                 enterTime = curpoint['Date']
                 enterPrice = curpoint['Close']
                 #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss)
-                self.trade = Trade("AAPL", 10, 1, enterPrice, enterTime, trend, config.LiveTrading, 0.20)
+                self.trade = Trade("AAPL", 10, 1, enterPrice, enterTime, trend, config.LiveTrading, 0.20,printInfo=False)
                 self.trades.append(self.trade)
 
 
             else:
                 self.printStuff("Crossing Down!")
 
-            # self.inTrade = True
-            # enterTime = curpoint['Date']
-            # enterPrice = curpoint['Close']
-            # #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss)
-            # self.trade = Trade("AAPL", 10, 1, enterPrice, enterTime, trend, config.LiveTrading, 0.20)
-           
-
             time.sleep(1)
 
         if self.inTrade:
-            print("In a trade")
-            if not self.trade.check(curpoint['Close']):
-                self.trade.closePosition(curpoint['Close'],curpoint['Date'])
+            self.printStuff("In a trade")
+            if not self.trade.check(curpoint):
+                # if self.trade.stopPrice < curpoint['Close']:
+                #     self.trade.closePosition(curpoint['Close'],curpoint['Date'])
+                # else:
+                self.trade.closePosition(self.trade.stopPrice,curpoint['Date'])
                 self.printStuff("Closing position based on stoploss")
                 self.inTrade = False
-            time.sleep(.1)
+            # time.sleep(1)
+
+
+            #End of day trade closing
+            endofDay = curpoint['Date'].replace(hour=12, minute=55, second=0, microsecond=0)
+            if curpoint['Date'] > endofDay:
+                self.trade.closePosition(curpoint['Close'],curpoint['Date'])
+                self.printStuff("Closing position based on end of day")
+                self.inTrade = False
 
 
 
@@ -93,7 +97,32 @@ class Algo:
         if self.printInfo:
             print(stuff)
 
-    def printStats(self):
+    def printStats(self,FullPrint):
+        totalProfit = 0
+        winningTrades = 0
+        avgWin = 0
+        avgLoss = 0
+        print("Total Trades Placed: ", len(self.trades))
         for trade in self.trades:
-            trade.getStats()
+            trade.getStats(FullPrint)
+            tempProfit = trade.getProfit()
+            totalProfit += tempProfit
+            if tempProfit > 0:
+                winningTrades += 1
+                avgWin += tempProfit
+
+            else:
+                avgLoss += tempProfit
+            
+        avgWin = avgWin/winningTrades
+        avgLoss = avgLoss/(len(self.trades)-winningTrades)
+        winRate = winningTrades/len(self.trades) * 100
+        
+        print("Total Profit: $", round(totalProfit, 3))
+        print("Number of Trades: ",len(self.trades))
+        print("Win Rate: ",int(winRate),"%")
+        print("Average Win: ",round(avgWin, 2))
+        print("Average Loss: ",round(avgLoss, 2))
+
+
 
