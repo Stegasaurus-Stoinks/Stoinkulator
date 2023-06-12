@@ -17,6 +17,8 @@ import pandas as pd
 import threading
 import time
 
+import json
+
 def createStockContact(ticker: str):
     contract = Contract()
     contract.secType = "STK"
@@ -43,7 +45,7 @@ class IBapi(EWrapper, EClient):
 
     def historicalData(self, reqId: int, bar: BarData):
         # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
-        candleData = [datetime.fromtimestamp(int(bar.date)), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
+        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
         if(self.liveData):
             self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
@@ -56,23 +58,25 @@ class IBapi(EWrapper, EClient):
         
         
         if(self.liveData):
-            self.datadict[reqId].columns=['Date','Open','High','Low','Close','Volume','Average']
+            self.datadict[reqId].columns=['date','time','open','high','low','close','volume','average']
+            print(self.datadict[reqId])
             print("All Historical Data Collected: Live Data Starting Now...")
+            # print(self.getDataJson())
                 # nothing else is needed here because historical data was set to keep live data
                    
         else:
-            self.simulatedDatadict[reqId].columns=['Date','Open','High','Low','Close','Volume','Average']
+            self.simulatedDatadict[reqId].columns=['date','time','open','high','low','close','volume','average']
             print("Historical Data Collected for " + self.tickers[reqId])
             self.datacollectednum += 1
             # print(self.simulatedDatadict[reqId])
             # Create datadict data frame here
             # ____________________________________________________________________________________
-            firstDate = self.simulatedDatadict[reqId].at[0,'Date']
+            firstDate = self.simulatedDatadict[reqId].at[0,'date']
             startDate = firstDate + timedelta(days=self.warmup)
             print("Warmup Start Date: " + str(firstDate))
             print("Warmup End Date: " + str(startDate))
-            self.datadict[reqId] = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['Date'] < startDate)]
-            self.datadict[reqId].columns=['Date','Open','High','Low','Close','Volume','Average']
+            self.datadict[reqId] = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
+            self.datadict[reqId].columns=['date','time', 'open','high','low','close','volume','average']
             # print(self.datadict[reqId])
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
@@ -81,29 +85,19 @@ class IBapi(EWrapper, EClient):
 
             self.backtestingDataUpdate()
 
-            
-
-        # if config.FrontEndDisplay:
-        #     f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[reqId]+".csv", "w")
-        #     self.datadict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
-        #     f.close()
-
-
-            
-        
-
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):
         # if self.lastbardict[reqId] != 0:
         # print(self.lastbardict)
         updatecsv = False
-        data = {'Date':[datetime.fromtimestamp(int(bar.date))],
-                'Open':[bar.open],
-                'High':[bar.high],
-                'Low':[bar.low],
-                'Close':[bar.close],
-                'Volume':[bar.volume],
-                'Average':[bar.average]}
+        data = {'date':[datetime.fromtimestamp(int(bar.date))],
+                'time':[int(bar.date)],
+                'open':[bar.open],
+                'high':[bar.high],
+                'low':[bar.low],
+                'close':[bar.close],
+                'volume':[bar.volume],
+                'average':[bar.average]}
         newdata = pd.DataFrame(data)
         #candleData = [datetime.fromtimestamp(int(bar.date)), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
         if self.lastbardict[reqId]:
@@ -122,41 +116,38 @@ class IBapi(EWrapper, EClient):
             print("empty :D Probably becauseu its the first loop")
 
         self.lastbardict[reqId] = bar
-        # if updatecsv and config.FrontEndDisplay:
-        #     f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[reqId]+".csv", "w")
-        #     self.datadict[reqId].to_csv(f, index=False, header=False, lineterminator='\n')
-        #     f.close()
-
-        
-
     
+
 
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
+
 
     def backtestingDataUpdate(self):
         startpoint = self.datadict[0].shape[0]
         numpoints = self.simulatedDatadict[0].shape[0] - startpoint
         print("Running data loop for " + str(numpoints) + " points of data")
+        Fulldata = self.getDataJson(index = 0)
+        self.socket.emit('data_send', Fulldata)
+
+
         starttime = datetime.now()
         for k in range(numpoints):
             for i in range(len(self.tickers)):
                 # print("Looping data for " + self.tickers[i])
                 entry = self.simulatedDatadict[i].iloc[startpoint+k]
-                #print(entry[0])
+                print(entry[0])
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
-                # print(self.datadict[i])
-                
-                # if config.intraMinutePrint and config.FrontEndDisplay:
-                #     # time.sleep(.1)
-                #     f = open("./MainStoinker/DataCollection/Test/Collected_Data/liveData_"+self.tickers[i]+".csv", "w")
-                #     self.datadict[i].to_csv(f, index=False, header=False, lineterminator='\n')
-                #     f.close()
 
-            # EMACrossing_Algo.update(self.getData())
-                for algo in self.algos:
-                    algo.update(self.getData())
+                # time.sleep(.1)
+                
+                sendData = { "time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                # print(sendData)
+                self.socket.emit('update_send',sendData)
+                # algo update  stuffs
+                # for algo in self.algos:
+                #     algo.update(self.getData())
 
 
 
@@ -169,9 +160,9 @@ class IBapi(EWrapper, EClient):
         print("___________________________________________________________")
 
 
-        
+    
 
-    def startData(self, tickers, algos, warmup, liveData, duration=1):
+    def startData(self,socket, tickers, algos, warmup, liveData, duration=1,):
         i = 0
         self.datadict = {}
         self.simulatedDatadict = {}
@@ -180,6 +171,7 @@ class IBapi(EWrapper, EClient):
         self.algos = algos
         self.liveData = liveData
         self.warmup = warmup
+        self.socket = socket
         for ticker in tickers:
 
             contract = createStockContact(ticker)
@@ -205,8 +197,12 @@ class IBapi(EWrapper, EClient):
             self.lastbardict[i] = 0
             i += 1
 
+
     def getData(self):
         return self.datadict
+    
+    def get1DataPoint(self,index):
+        return self.datadict[0].iloc[index]
     
     def printAlgoStats(self, FullPrint = True):
         i = 0
@@ -214,6 +210,11 @@ class IBapi(EWrapper, EClient):
             print(f"Printing Stats for Algo {i}")
             algo.printStats(FullPrint)
             i += 1
-            
+
+    def getDataJson(self,index):
+        result = self.datadict[index].to_json(orient="records")
+        return(result)     
+        parsed = json.loads(result)
+        return(json.dumps(parsed, indent=4))
 
             

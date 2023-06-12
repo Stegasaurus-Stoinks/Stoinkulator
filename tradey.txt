@@ -8162,3 +8162,133 @@ Duration: 0 days 00:11:00
 
 
 
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+
+---------Trade Stats---------
+Open Price: 179.91
+Close Price: 179.87
+P/L: -0.03999999999999204
+
+Open Time: 2023-06-01 11:58:00
+Close Time: 2023-06-01 12:11:00
+Direction: 1
+
+Duration: 0 days 00:13:00
+
+
+

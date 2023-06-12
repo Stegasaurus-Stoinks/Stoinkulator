@@ -34,6 +34,7 @@ class Algo:
 
         curpoint = AAPLdata.iloc[-1]
         lastpoint = AAPLdata.iloc[-2]
+        print("|",end="")
 
         if lastpoint['MA20'] > lastpoint['MA50']:
             prevtrend = 1
