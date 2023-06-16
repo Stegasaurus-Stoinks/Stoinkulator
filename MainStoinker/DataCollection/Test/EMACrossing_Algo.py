@@ -124,6 +124,3 @@ class Algo:
         print("Win Rate: ",int(winRate),"%")
         print("Average Win: ",round(avgWin, 2))
         print("Average Loss: ",round(avgLoss, 2))
-
-
-
