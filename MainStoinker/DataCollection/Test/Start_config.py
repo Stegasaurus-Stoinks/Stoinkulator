@@ -1,6 +1,7 @@
 import datetime
 from dateutil.relativedelta import *
 
+tickers = ["AAPL","GME","MSFT"]
 LiveData = False
 LiveTrading = False
 #once trade excecution is figured out we should be able to get rid of one of these variables
@@ -16,4 +17,4 @@ intraMinuteDisplay = True
 #BackTesting Variables
 StartDate = datetime.datetime.now() - relativedelta(month=0,weeks=0,day=2)
 Duration = 2
-TimeDelayPerPoint = 1 #seconds between backtested points
+TimeDelayPerPoint = .1 #seconds between backtested points

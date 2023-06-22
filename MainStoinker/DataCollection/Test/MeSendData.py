@@ -16,7 +16,7 @@ import Start_config as config
 
 from SocketIO_Client import FrontEndClient
 
-tickers = ["AAPL"]#,"GME","MSFT"]
+tickers = config.tickers
 count = 0
 
 

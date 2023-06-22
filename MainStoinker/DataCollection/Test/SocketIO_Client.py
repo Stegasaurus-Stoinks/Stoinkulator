@@ -35,11 +35,12 @@ class FrontEndClient:
 
         @self.sio.on('req_data')
         def on_message(data):
-            Fulldata = self.app.getDataJson(index = 0)
-            # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
-            # print(Fulldata)
-            print("data requested, sending Fulldata")
-            self.sio.emit('data_send', Fulldata)
+            for i in range(len(config.tickers)):
+                Fulldata = self.app.getDataJson(index = i)
+                # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
+                # print(Fulldata)
+                print("data requested, sending Fulldata")
+                self.sio.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
 
         @self.sio.event
         def connect():

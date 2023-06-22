@@ -64,7 +64,9 @@ class IBapi(EWrapper, EClient):
             # nothing else is needed here because historical data was set to keep live data
             if config.FrontEndDisplay:
                 Fulldata = self.getDataJson(index = 0)
-                self.socket.emit('data_send', Fulldata)
+                # self.socket.emit('data_send', 'AAPL', Fulldata)
+                self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
+                
                    
         else:
             self.simulatedDatadict[reqId].columns=['date','time','open','high','low','close','volume','average']
@@ -84,8 +86,7 @@ class IBapi(EWrapper, EClient):
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
                 print("---Simulated Live Data Starting Now...---")
-
-            self.backtestingDataUpdate()
+                self.backtestingDataUpdate()
 
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):
@@ -137,22 +138,27 @@ class IBapi(EWrapper, EClient):
 
 
     def backtestingDataUpdate(self):
-        startpoint = self.datadict[0].shape[0]
-        numpoints = self.simulatedDatadict[0].shape[0] - startpoint
-        print("Running data loop for " + str(numpoints) + " points of data")
+        startpoints = {}
+        numpoints = {}
 
-        if config.FrontEndDisplay:
-            Fulldata = self.getDataJson(index = 0)
-            self.socket.emit('data_send', Fulldata)
+        for i in range(len(config.tickers)):
+            print(i)
+            startpoints[i] = self.datadict[i].shape[0]
+            numpoints[i] = self.simulatedDatadict[i].shape[0] - startpoints[i]
+            print("Running data loop for " + str(numpoints[i]) + " points of data for ticker " + str(config.tickers[i]) )
+
+            if config.FrontEndDisplay:
+                Fulldata = self.getDataJson(index = i)
+                self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
 
 
         starttime = datetime.now()
-        for k in range(numpoints):
+        for k in range(numpoints[0]):
             for i in range(len(self.tickers)):
                 while(not config.updating):
                     time.sleep(1)
                 # print("Looping data for " + self.tickers[i])
-                entry = self.simulatedDatadict[i].iloc[startpoint+k]
+                entry = self.simulatedDatadict[i].iloc[startpoints[i]+k]
                 print(entry[0])
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
@@ -160,16 +166,14 @@ class IBapi(EWrapper, EClient):
                 time.sleep(config.TimeDelayPerPoint)
                 
                 if config.FrontEndDisplay:
-                    sendData = { "time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                    sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                     # print(sendData)
-                    try: self.socket.emit('update_send',sendData)
+                    try: self.socket.emit('update_send',{'ticker': self.tickers[i], 'data':sendData})
                     except Exception as e: print(e)
 
                 # algo update  stuffs
                 # for algo in self.algos:
                 #     algo.update(self.getData())
-
-
 
         endtime = datetime.now()
         duration = endtime-starttime
@@ -179,8 +183,6 @@ class IBapi(EWrapper, EClient):
         print("--------------Press 'CTRL' to Close Program----------------")
         print("___________________________________________________________")
 
-
-    
 
     def startData(self,socket, tickers, algos, warmup, duration=1,):
         i = 0
@@ -203,6 +205,7 @@ class IBapi(EWrapper, EClient):
                 self.datacollectednum = 0 #variable to track completed historical data pulls
                 self.reqHistoricalData(i, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
                 self.simulatedDatadict[i] = pd.DataFrame()
+                self.datacollectednum = 0
 
             
             self.datadict[i] = pd.DataFrame()
@@ -225,6 +228,7 @@ class IBapi(EWrapper, EClient):
 
     def getDataJson(self,index):
         result = self.datadict[index].to_json(orient="records")
+        print(result)
         return(result)     
 
             
