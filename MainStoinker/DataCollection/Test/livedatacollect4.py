@@ -162,8 +162,6 @@ class IBapi(EWrapper, EClient):
                 print(entry[0])
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
-
-                time.sleep(config.TimeDelayPerPoint)
                 
                 if config.FrontEndDisplay:
                     sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
@@ -174,6 +172,8 @@ class IBapi(EWrapper, EClient):
                 # algo update  stuffs
                 # for algo in self.algos:
                 #     algo.update(self.getData())
+
+            time.sleep(config.TimeDelayPerPoint)
 
         endtime = datetime.now()
         duration = endtime-starttime

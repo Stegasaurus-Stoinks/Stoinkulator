@@ -1,5 +1,6 @@
 import socketio
 import Start_config as config
+import json
 
 class FrontEndClient:
 
@@ -31,6 +32,22 @@ class FrontEndClient:
         @self.sio.on('stop_update')
         def on_message(data):
             config.updating = 0
+        
+        @self.sio.on('req_config')
+        def on_message(data):
+            file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
+
+            tickerlist = []
+            algolist = []
+            algoObjectList = []
+            try:
+                parsed_json = json.load(file)
+            except Exception as e:
+                print("Got the following exception: " + str(e))
+
+            file.close()
+            print(parsed_json)
+            self.sio.emit('config_send', parsed_json[0])
             
 
         @self.sio.on('req_data')

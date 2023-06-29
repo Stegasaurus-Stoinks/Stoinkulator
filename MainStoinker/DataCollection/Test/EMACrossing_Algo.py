@@ -17,13 +17,18 @@ inTrade = False
 enterTime = 0
 
 class Algo:
-    def __init__(self, ticker, EMA1, EMA2, printInfo):
-        self.ticker = ticker
-        self.EMA1 = EMA1
-        self.EMA2 = EMA2
+    def __init__(self, data):
+
+        print("Starting Algo with " + str(data))
+        self.ticker = data['ticker']
+        self.EMA1 = data['short']
+        self.EMA2 = data['long']
         self.inTrade = False
-        self.printInfo = printInfo
+        self.printInfo = False
         self.trades = []
+
+        print("Algo Initialized")
+        
 
     def update(self, data):
         AAPLdata = data[0]
@@ -124,3 +129,6 @@ class Algo:
         print("Win Rate: ",int(winRate),"%")
         print("Average Win: ",round(avgWin, 2))
         print("Average Loss: ",round(avgLoss, 2))
+
+    def getTickers(self):
+        return self.ticker

@@ -8,6 +8,11 @@ from livedatacollect4 import IBapi
 
 from datetime import datetime
 
+from enum import Enum
+
+from algotesty import AlgoConfigParse
+from EMACrossing_Algo import Algo as EMAAlgo
+
 import threading
 import time
 import keyboard
@@ -19,6 +24,8 @@ from SocketIO_Client import FrontEndClient
 tickers = config.tickers
 count = 0
 
+AlgoList = AlgoConfigParse()
+print(AlgoList)
 
 def run_loop():
 	app.run()
@@ -26,29 +33,25 @@ def run_loop():
 app = IBapi()
 
 websock = FrontEndClient(app)
-wst = threading.Thread(target=websock.connectwebsocket)
-
-# wst = threading.Thread(target=connectwebsocket)
-wst.daemon = True
-wst.start()
-
-
-app.connect('127.0.0.1', 7497, 123)
+if config.FrontEndDisplay:
+    wst = threading.Thread(target=websock.connectwebsocket,daemon=True)
+    wst.start()
 
 time.sleep(1)
-
-#Start the socket in a thread
+app.connect('127.0.0.1', 7497, 123)
 api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
 
-app.startData(websock.sio,tickers,[],1,8) # Backtesting
 
+app.startData(websock.sio,tickers,[],1,config.Duration) # Backtesting
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")
 print("___________________________________________________________")
 
 keyboard.wait('Ctrl')
+
+config.updating = 0
 
 print("___________________________________________________________")
 print("------------------Closing Program...-----------------------")
