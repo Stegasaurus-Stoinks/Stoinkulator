@@ -96,9 +96,9 @@ class Trade:
         #stoploss check + reclaculation if necessary for either direction
         #return 1 if good 0 if bad
         if self.direction: #UP Trade
-            # print(curpoint['Close'])
+            # print(curpoint['close'])
             # print(self.stopPrice)
-            price = curpoint["Close"]
+            price = curpoint["close"]
             if price > self.stopPrice + self.stopLoss:
                 self.stopPrice = price - self.stopLoss
                 return 1

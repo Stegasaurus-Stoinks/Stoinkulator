@@ -6,6 +6,7 @@ from ibapi.common import *
 from csv import writer
 from datetime import datetime
 from datetime import timedelta
+import algotesty
 
 import Start_config as config
 
@@ -141,15 +142,20 @@ class IBapi(EWrapper, EClient):
         startpoints = {}
         numpoints = {}
 
+        if config.FrontEndDisplay:
+            algotesty.ConfigSend(self.socket)
+            for i in range(len(config.tickers)):
+                Fulldata = self.getDataJson(index = i)
+                # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
+                # print(Fulldata)
+                print("data requested, sending Fulldata")
+                self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+
         for i in range(len(config.tickers)):
-            print(i)
             startpoints[i] = self.datadict[i].shape[0]
             numpoints[i] = self.simulatedDatadict[i].shape[0] - startpoints[i]
             print("Running data loop for " + str(numpoints[i]) + " points of data for ticker " + str(config.tickers[i]) )
 
-            if config.FrontEndDisplay:
-                Fulldata = self.getDataJson(index = i)
-                self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
 
 
         starttime = datetime.now()
@@ -157,23 +163,31 @@ class IBapi(EWrapper, EClient):
             for i in range(len(self.tickers)):
                 while(not config.updating):
                     time.sleep(1)
-                # print("Looping data for " + self.tickers[i])
                 entry = self.simulatedDatadict[i].iloc[startpoints[i]+k]
-                print(entry[0])
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 
                 if config.FrontEndDisplay:
                     sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                     # print(sendData)
-                    try: self.socket.emit('update_send',{'ticker': self.tickers[i], 'data':sendData})
-                    except Exception as e: print(e)
 
-                # algo update  stuffs
-                # for algo in self.algos:
-                #     algo.update(self.getData())
+                    for i in range(len(config.tickers)):
+                        Fulldata = self.getDataJson(index = i)
+                        # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
+                        # print(Fulldata)
+                        print("data requested, sending Fulldata")
+                        self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+
+
+                    # try: self.socket.emit('update_send',{'ticker': self.tickers[i], 'data':sendData})
+                    # except Exception as e: print(e)
+
+            # algo update  stuffs
+            for algo in self.algos:
+                algo.update(self.getData())
 
             time.sleep(config.TimeDelayPerPoint)
+            print(entry[0])
 
         endtime = datetime.now()
         duration = endtime-starttime
@@ -228,7 +242,7 @@ class IBapi(EWrapper, EClient):
 
     def getDataJson(self,index):
         result = self.datadict[index].to_json(orient="records")
-        print(result)
+        # print(result)
         return(result)     
 
             

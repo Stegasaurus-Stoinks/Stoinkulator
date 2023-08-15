@@ -47,7 +47,21 @@ def AlgoStarter(algo, data):
     print("Opening " + filename)
     AlgoClass = getattr(importlib.import_module(filename),'Algo')
     return AlgoClass(data)
+
+
+def ConfigSend(socket):
+    file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
+
+    try:
+        parsed_json = json.load(file)
+    except Exception as e:
+        print("Got the following exception: " + str(e))
+
+    file.close()
+    print("Sending Algo Config")
+    print(parsed_json)
+    socket.emit('config_send', parsed_json)
     
 
 
-AlgoConfigParse()
+# AlgoConfigParse()

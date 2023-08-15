@@ -43,11 +43,12 @@ api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
 
 
-app.startData(websock.sio,tickers,[],1,config.Duration) # Backtesting
+app.startData(websock.sio,tickers,AlgoList,2,config.Duration) # Backtesting
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")
 print("___________________________________________________________")
+print("")
 
 keyboard.wait('Ctrl')
 

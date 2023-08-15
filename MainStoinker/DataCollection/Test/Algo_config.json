@@ -5,16 +5,6 @@
         "ticker": "msft",
         "short": "20",
         "long": "50"
-      },
-      {
-        "ticker": "gme",
-        "short": "20",
-        "long": "50"
-      },
-      {
-        "ticker": "spy",
-        "short": "20",
-        "long": "50"
       }
     ]
   }

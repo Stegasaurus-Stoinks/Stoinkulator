@@ -1,6 +1,7 @@
 import socketio
 import Start_config as config
 import json
+import algotesty
 
 class FrontEndClient:
 
@@ -35,21 +36,8 @@ class FrontEndClient:
         
         @self.sio.on('req_config')
         def on_message(data):
-            file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
-
-            tickerlist = []
-            algolist = []
-            algoObjectList = []
-            try:
-                parsed_json = json.load(file)
-            except Exception as e:
-                print("Got the following exception: " + str(e))
-
-            file.close()
-            print(parsed_json)
-            self.sio.emit('config_send', parsed_json[0])
+            algotesty.ConfigSend(self.sio)
             
-
         @self.sio.on('req_data')
         def on_message(data):
             for i in range(len(config.tickers)):
@@ -59,6 +47,7 @@ class FrontEndClient:
                 print("data requested, sending Fulldata")
                 self.sio.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
 
+        
         @self.sio.event
         def connect():
             print("I'm connected!")
