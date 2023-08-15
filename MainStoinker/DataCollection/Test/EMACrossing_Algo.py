@@ -11,47 +11,59 @@ import pandas as pd
 
 from trade import Trade
 
-AlgoData = pd.DataFrame()
 
 inTrade = False
 enterTime = 0
 
 class Algo:
     def __init__(self, data):
+        #print("Starting EMA Crossing Algo with " + str(data))
 
-        print("Starting EMA Crossing Algo with " + str(data))
+        #Initialize Algo with data from Algo Config
+        self.name = data['idname']
         self.ticker = data['ticker']
         self.EMA1 = data['short']
         self.EMA2 = data['long']
+
+        #Data frame to store data for Algo, (Stoploss, Analysis, Stuff to send to the front end)  
+        self.DataColumns = ['StopPrice','TestColumn']
+        self.AlgoData = pd.DataFrame(columns=self.DataColumns)
+        print(self.AlgoData.shape)
+
+        #Other inits/variables
         self.inTrade = False
         self.printInfo = True
         self.trades = []
 
-        self.DataColumns = {'StopPrice','TestColumn'}
-
-        self.AlgoData = pd.DataFrame(columns= self.DataColumns)
-
-
-        print("Algo Initialized")
+        print("Algo " + self.name + " Initialized")
         
 
     def update(self, data):
-        AAPLdata = data[0]
+        StockData = data[0]
+        if(self.AlgoData.shape[0] == 0):
+            self.AlgoData = pd.concat([self.AlgoData, StockData], axis=0, ignore_index=True)
+        
+            print(self.AlgoData)
 
         # Adds line to Algo Data so the Algo Data and Stock Data are the same size
-        if AAPLdata.shape[0] != self.AlgoData.shape[0]:
-            diff = AAPLdata.shape[0] - self.AlgoData.shape[0]
-            new_row = pd.DataFrame(columns = self.DataColumns, index=np.empty(diff))
+
+        #check if they are the same size, probably dont need this since they should only be called when theres a line added
+        # if AAPLdata.shape[0] != self.AlgoData.shape[0]:
+        #     diff = AAPLdata.shape[0] - self.AlgoData.shape[0]
+        else:
+            temp = StockData.iloc[-1]
+            temp1 = {'date':[temp['date']], 'time':[temp['time']], 'open':[temp['open']], 'high':[temp['high']], 'low':[temp['low']], 'close':[temp['close']], 'volume':[temp['volume']], 'average':[temp['average']]}
+            new_row = pd.DataFrame.from_dict(temp1,orient='columns')
             self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
             
-        # print(AAPLdata)
-        AAPLdata['MA20'] = ta.SMA(AAPLdata['close'],timeperiod=20)
-        AAPLdata['MA50'] = ta.SMA(AAPLdata['close'],timeperiod=50)
-        # print(AAPLdata)
+        
+        self.AlgoData['MA20'] = ta.EMA(self.AlgoData['close'],timeperiod=20)
+        self.AlgoData['MA50'] = ta.EMA(self.AlgoData['close'],timeperiod=50)
+
         # print(self.AlgoData)
 
-        curpoint = AAPLdata.iloc[-1]
-        lastpoint = AAPLdata.iloc[-2]
+        curpoint = self.AlgoData.iloc[-1]
+        lastpoint = self.AlgoData.iloc[-2]
         print("|",end="")
 
         if lastpoint['MA20'] > lastpoint['MA50']:
@@ -111,6 +123,7 @@ class Algo:
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
+        print(self.AlgoData)
 
 
 
@@ -144,6 +157,3 @@ class Algo:
         print("Win Rate: ",int(winRate),"%")
         print("Average Win: ",round(avgWin, 2))
         print("Average Loss: ",round(avgLoss, 2))
-
-    def getTickers(self):
-        return self.ticker

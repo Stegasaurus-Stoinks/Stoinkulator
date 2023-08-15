@@ -2,6 +2,7 @@
   {
     "EMACrossing": [
       {
+        "idname": "MSFT-20/50EMA",
         "ticker": "msft",
         "short": "20",
         "long": "50"

@@ -10,8 +10,6 @@ import algotesty
 
 import Start_config as config
 
-import EMACrossing_Algo
-
 import numpy as np
 import pandas as pd
 
@@ -51,7 +49,7 @@ class IBapi(EWrapper, EClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -188,7 +186,8 @@ class IBapi(EWrapper, EClient):
 
             time.sleep(config.TimeDelayPerPoint)
             print(entry[0])
-
+   
+        self.printAlgoStats()
         endtime = datetime.now()
         duration = endtime-starttime
         print("Backtesting "+str(numpoints)+" Points is Done!")
@@ -198,7 +197,7 @@ class IBapi(EWrapper, EClient):
         print("___________________________________________________________")
 
 
-    def startData(self,socket, tickers, algos, warmup, duration=1,):
+    def startData(self,socket, tickers, algos, warmup, duration=1):
         i = 0
         self.datadict = {}
         self.simulatedDatadict = {}
