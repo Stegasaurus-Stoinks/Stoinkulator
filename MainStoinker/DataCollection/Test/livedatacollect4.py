@@ -166,7 +166,7 @@ class IBapi(EWrapper, EClient):
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 
                 if config.FrontEndDisplay:
-                    sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                    
                     # print(sendData)
 
                     for i in range(len(config.tickers)):
@@ -183,6 +183,11 @@ class IBapi(EWrapper, EClient):
             # algo update  stuffs
             for algo in self.algos:
                 algo.update(self.getData())
+
+            # algo send front end stuffs
+            for algo in self.algos:
+                if config.FrontEndDisplay:
+                    algo.updatefrontend(self.socket)
 
             time.sleep(config.TimeDelayPerPoint)
             print(entry[0])

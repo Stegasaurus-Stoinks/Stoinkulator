@@ -30,9 +30,13 @@ class Algo:
         self.AlgoData = pd.DataFrame(columns=self.DataColumns)
         print(self.AlgoData.shape)
 
+        #Data to send to the frontend
+        self.FrontEndDataStruct = ['MA20','MA50','StopPrice']
+        self.FrontEndDataType = ['line','line','segment']
+
         #Other inits/variables
         self.inTrade = False
-        self.printInfo = True
+        self.printInfo = False
         self.trades = []
 
         print("Algo " + self.name + " Initialized")
@@ -40,10 +44,11 @@ class Algo:
 
     def update(self, data):
         StockData = data[0]
+
+        #On first loop, append all warmup data to the AlgoData
         if(self.AlgoData.shape[0] == 0):
             self.AlgoData = pd.concat([self.AlgoData, StockData], axis=0, ignore_index=True)
-        
-            print(self.AlgoData)
+            #print(self.AlgoData)
 
         # Adds line to Algo Data so the Algo Data and Stock Data are the same size
 
@@ -64,7 +69,7 @@ class Algo:
 
         curpoint = self.AlgoData.iloc[-1]
         lastpoint = self.AlgoData.iloc[-2]
-        print("|",end="")
+        #print("|",end="")
 
         if lastpoint['MA20'] > lastpoint['MA50']:
             prevtrend = 1
@@ -123,9 +128,20 @@ class Algo:
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
-        # print(self.AlgoData)
 
+    def updatefrontend(self, socket):
+        print("sending update to frontend")
+        # sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+        # my_dict = {"username": "XYZ", "email": "xyz@gmail.com", "location":"Mumbai"}
+        # my_dict['name']='Nick'
+        # print(my_dict)
 
+        dataToSend = {}
+        for x in range(0,len(self.FrontEndDataStruct)):
+            dataToSend[self.FrontEndDataStruct[x]] = {'data':self.AlgoData.tail(1)[self.FrontEndDataStruct[x]], 'type':self.AlgoData.tail(1)[self.FrontEndDataType[x]]}
+        print(dataToSend)
+        
+        #Make pair of data and type under the name of the variable? check discord todolist
 
     def printStuff(self,stuff):
         if self.printInfo:
