@@ -141,9 +141,10 @@ class Trade:
             print(" ")
             print("Open Time: ",self.openTime)
             print("Close Time: ",self.closeTime)
-            print("Direction: ",self.direction)
-            print(" ")
             print("Duration: ",duration)
+            print(" ")
+            print("Direction: ",self.direction)
+            print("-----------------------------")
 
         
         else:

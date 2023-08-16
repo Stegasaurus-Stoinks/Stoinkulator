@@ -21,7 +21,7 @@ import Start_config as config
 
 from SocketIO_Client import FrontEndClient
 
-tickers = config.tickers
+
 count = 0
 
 AlgoList = AlgoConfigParse()
@@ -43,7 +43,7 @@ api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
 
 
-app.startData(websock.sio,tickers,AlgoList,2,config.Duration) # Backtesting
+app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")

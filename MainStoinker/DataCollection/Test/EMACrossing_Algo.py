@@ -93,7 +93,7 @@ class Algo:
                 enterTime = curpoint['date']
                 enterPrice = curpoint['close']
                 #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss)
-                self.trade = Trade("AAPL", 10, 1, enterPrice, enterTime, trend, config.LiveTrading, 0.20,printInfo=False)
+                self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20,printInfo=False)
                 self.trades.append(self.trade)
 
 
@@ -123,7 +123,7 @@ class Algo:
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
-        print(self.AlgoData)
+        # print(self.AlgoData)
 
 
 
@@ -149,7 +149,12 @@ class Algo:
                 avgLoss += tempProfit
             
         avgWin = avgWin/winningTrades
-        avgLoss = avgLoss/(len(self.trades)-winningTrades)
+        try:
+            avgLoss = avgLoss/(len(self.trades)-winningTrades)
+
+        except:
+            avgLoss = 0
+
         winRate = winningTrades/len(self.trades) * 100
         
         print("Total Profit: $", round(totalProfit, 3))

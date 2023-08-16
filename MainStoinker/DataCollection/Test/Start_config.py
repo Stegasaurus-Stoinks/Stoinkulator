@@ -1,7 +1,7 @@
 import datetime
 from dateutil.relativedelta import *
 
-tickers = ["MSFT"]
+tickers = []
 LiveData = False
 LiveTrading = False
 #once trade excecution is figured out we should be able to get rid of one of these variables
