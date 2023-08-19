@@ -166,19 +166,10 @@ class IBapi(EWrapper, EClient):
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 
                 if config.FrontEndDisplay:
-                    
+                    sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                     # print(sendData)
-
-                    for i in range(len(config.tickers)):
-                        Fulldata = self.getDataJson(index = i)
-                        # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
-                        # print(Fulldata)
-                        print("data requested, sending Fulldata")
-                        self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
-
-
-                    # try: self.socket.emit('update_send',{'ticker': self.tickers[i], 'data':sendData})
-                    # except Exception as e: print(e)
+                    try: self.socket.emit('update_send',{'ticker': self.tickers[i], 'data':sendData})
+                    except Exception as e: print(e)
 
             # algo update  stuffs
             for algo in self.algos:
