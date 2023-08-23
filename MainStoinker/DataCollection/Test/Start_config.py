@@ -17,7 +17,7 @@ intraMinuteDisplay = True
 #BackTesting Variables
 StartDate = datetime.datetime.now() - relativedelta(month=0,weeks=0,day=1)
 Duration = 2
-TimeDelayPerPoint = 0 #seconds between backtested points
+TimeDelayPerPoint = 1 #seconds between backtested points
 
 timedelaytesty = 0
 

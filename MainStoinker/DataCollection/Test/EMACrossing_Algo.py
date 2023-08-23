@@ -129,19 +129,12 @@ class Algo:
                 self.inTrade = False
 
 
-    def updatefrontend(self, socket):
-        print("sending update to frontend")
-        # sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-        # my_dict = {"username": "XYZ", "email": "xyz@gmail.com", "location":"Mumbai"}
-        # my_dict['name']='Nick'
-        # print(my_dict)
-
-        dataToSend = {}
+    def updatefrontend(self):
+        dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
-            dataToSend[self.FrontEndDataStruct[x]] = {'data':self.AlgoData.tail(1)[self.FrontEndDataStruct[x]], 'type':self.AlgoData.tail(1)[self.FrontEndDataType[x]]}
-        print(dataToSend)
-        
-        #Make pair of data and type under the name of the variable? check discord todolist
+            dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.AlgoData.iloc[-1][self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
+        return({'idname':self.name, 'data':dataToSend})
+
 
     def printStuff(self,stuff):
         if self.printInfo:

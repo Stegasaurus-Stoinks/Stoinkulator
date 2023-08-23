@@ -158,6 +158,8 @@ class IBapi(EWrapper, EClient):
 
         starttime = datetime.now()
         for k in range(numpoints[0]):
+            tickerdata = []
+            algodata = []
             for i in range(len(self.tickers)):
                 while(not config.updating):
                     time.sleep(1)
@@ -165,20 +167,20 @@ class IBapi(EWrapper, EClient):
 
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 
-                if config.FrontEndDisplay:
-                    sendData = {"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                    # print(sendData)
-                    try: self.socket.emit('update_send',{'ticker': self.tickers[i], 'data':sendData})
-                    except Exception as e: print(e)
+                # if config.FrontEndDisplay:
+                sendData = {"ticker":self.tickers[i],"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                tickerdata.append(sendData) 
 
             # algo update  stuffs
             for algo in self.algos:
                 algo.update(self.getData())
+                sendData = algo.updatefrontend()
+                algodata.append(sendData)
 
-            # algo send front end stuffs
-            for algo in self.algos:
-                if config.FrontEndDisplay:
-                    algo.updatefrontend(self.socket)
+            #  send front end stuffs
+            print([tickerdata,algodata])
+            try: self.socket.emit('update_send',[tickerdata,algodata])
+            except Exception as e: print(e)
 
             time.sleep(config.TimeDelayPerPoint)
             print(entry[0])

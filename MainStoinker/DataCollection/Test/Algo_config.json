@@ -3,9 +3,15 @@
     "EMACrossing": [
       {
         "idname": "TSAT-20/50EMA",
-        "ticker": "NVTS",
+        "ticker": "TSAT",
         "short": "20",
         "long": "50"
+      },
+      {
+        "idname": "NVTS-20/50EMA",
+        "ticker": "NVTS",
+        "short": "30",
+        "long": "40"
       }
     ]
   }
