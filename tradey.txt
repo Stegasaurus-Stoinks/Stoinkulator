@@ -9852,3 +9852,861 @@ Duration: 0 days 01:05:00
 
 
 
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.54
+Close Price: 8.6
+P/L: 0.0600000000000005
+
+Open Time: 2023-08-23 06:51:00
+Close Time: 2023-08-23 08:33:00
+Direction: 1
+
+Duration: 0 days 01:42:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.57
+Close Price: 8.58
+P/L: 0.009999999999999787
+
+Open Time: 2023-08-23 10:26:00
+Close Time: 2023-08-23 11:22:00
+Direction: 1
+
+Duration: 0 days 00:56:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.62
+Close Price: 8.58
+P/L: -0.03999999999999915
+
+Open Time: 2023-08-23 11:53:00
+Close Time: 2023-08-23 12:02:00
+Direction: 1
+
+Duration: 0 days 00:09:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.61
+Close Price: 8.61
+P/L: 0.0
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:56:00
+Direction: 1
+
+Duration: 0 days 00:53:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.13
+Close Price: 8.29
+P/L: 0.15999999999999837
+
+Open Time: 2023-08-24 08:49:00
+Close Time: 2023-08-24 10:31:00
+Direction: 1
+
+Duration: 0 days 01:42:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.54
+Close Price: 8.6
+P/L: 0.0600000000000005
+
+Open Time: 2023-08-23 06:51:00
+Close Time: 2023-08-23 08:33:00
+Direction: 1
+
+Duration: 0 days 01:42:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.57
+Close Price: 8.58
+P/L: 0.009999999999999787
+
+Open Time: 2023-08-23 10:26:00
+Close Time: 2023-08-23 11:22:00
+Direction: 1
+
+Duration: 0 days 00:56:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.62
+Close Price: 8.58
+P/L: -0.03999999999999915
+
+Open Time: 2023-08-23 11:53:00
+Close Time: 2023-08-23 12:02:00
+Direction: 1
+
+Duration: 0 days 00:09:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.61
+Close Price: 8.61
+P/L: 0.0
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:56:00
+Direction: 1
+
+Duration: 0 days 00:53:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.82
+Close Price: 8.620000000000001
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 06:30:00
+Close Time: 2023-08-24 06:34:00
+Direction: 1
+
+Duration: 0 days 00:04:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.13
+Close Price: 8.29
+P/L: 0.15999999999999837
+
+Open Time: 2023-08-24 08:49:00
+Close Time: 2023-08-24 10:31:00
+Direction: 1
+
+Duration: 0 days 01:42:00
+
+
+
+---------Trade Stats---------
+Open Price: 8.35
+Close Price: 8.440000000000001
+P/L: 0.09000000000000163
+
+Open Time: 2023-08-24 11:00:00
+Close Time: 2023-08-24 11:51:00
+Direction: 1
+
+Duration: 0 days 00:51:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+
+---------Trade Stats---------
+Open Price: 20.99
+Close Price: 21.63
+P/L: 0.6400000000000006
+
+Open Time: 2023-08-23 09:28:00
+Close Time: 2023-08-23 11:56:00
+Direction: 1
+
+Duration: 0 days 02:28:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.69
+Close Price: 21.6
+P/L: -0.08999999999999986
+
+Open Time: 2023-08-23 11:57:00
+Close Time: 2023-08-23 12:00:00
+Direction: 1
+
+Duration: 0 days 00:03:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.72
+Close Price: 21.900000000000002
+P/L: 0.18000000000000327
+
+Open Time: 2023-08-23 12:03:00
+Close Time: 2023-08-23 12:32:00
+Direction: 1
+
+Duration: 0 days 00:29:00
+
+
+
+---------Trade Stats---------
+Open Price: 21.64
+Close Price: 21.44
+P/L: -0.1999999999999993
+
+Open Time: 2023-08-24 08:19:00
+Close Time: 2023-08-24 08:24:00
+Direction: 1
+
+Duration: 0 days 00:05:00
+
+
+

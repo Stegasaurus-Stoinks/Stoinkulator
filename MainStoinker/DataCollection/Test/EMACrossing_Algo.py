@@ -43,40 +43,44 @@ class Algo:
         
 
     def update(self, data):
-        StockData = data[0]
-
+        StockData = data
+        # print(StockData)
         #On first loop, append all warmup data to the AlgoData
-        if(self.AlgoData.shape[0] == 0):
-            self.AlgoData = pd.concat([self.AlgoData, StockData], axis=0, ignore_index=True)
+        # if(self.AlgoData.shape[0] == 0):
+        #     self.AlgoData = pd.concat([self.AlgoData, StockData], axis=0, ignore_index=True)
             #print(self.AlgoData)
 
         # Adds line to Algo Data so the Algo Data and Stock Data are the same size
 
-        #check if they are the same size, probably dont need this since they should only be called when theres a line added
-        # if AAPLdata.shape[0] != self.AlgoData.shape[0]:
-        #     diff = AAPLdata.shape[0] - self.AlgoData.shape[0]
-        else:
-            temp = StockData.iloc[-1]
-            temp1 = {'date':[temp['date']], 'time':[temp['time']], 'open':[temp['open']], 'high':[temp['high']], 'low':[temp['low']], 'close':[temp['close']], 'volume':[temp['volume']], 'average':[temp['average']]}
-            new_row = pd.DataFrame.from_dict(temp1,orient='columns')
+        # check if they are the same size, probably dont need this since they should only be called when theres a line added
+        if StockData.shape[0] != self.AlgoData.shape[0]:
+            diff = StockData.shape[0] - self.AlgoData.shape[0]
+            new_row = pd.DataFrame(index=range(diff),columns=self.DataColumns)
             self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
+
+        # else:
+        # temp = StockData.iloc[-1]
+        # temp1 = {'date':[temp['date']], 'time':[temp['time']], 'open':[temp['open']], 'high':[temp['high']], 'low':[temp['low']], 'close':[temp['close']], 'volume':[temp['volume']], 'average':[temp['average']]}
+        # new_row = pd.DataFrame.from_dict(temp1,orient='columns')
+        # self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
             
         
-        self.AlgoData['MA20'] = ta.EMA(self.AlgoData['close'],timeperiod=20)
-        self.AlgoData['MA50'] = ta.EMA(self.AlgoData['close'],timeperiod=50)
+        self.AlgoData['MA20'] = ta.EMA(StockData['close'],timeperiod=20)
+        self.AlgoData['MA50'] = ta.EMA(StockData['close'],timeperiod=50)
 
         # print(self.AlgoData)
 
-        curpoint = self.AlgoData.iloc[-1]
-        lastpoint = self.AlgoData.iloc[-2]
-        #print("|",end="")
+        #Variables to store most recent 2 stock data and algo data 
+        self.curStockData = StockData.iloc[-1]
+        self.curAlgoData = self.AlgoData.iloc[-1]
+        self.lastAlgoData = self.AlgoData.iloc[-2]
 
-        if lastpoint['MA20'] > lastpoint['MA50']:
+        if self.lastAlgoData['MA20'] > self.lastAlgoData['MA50']:
             prevtrend = 1
         else:
             prevtrend = 0
 
-        if curpoint['MA20'] > curpoint['MA50']:
+        if self.curAlgoData['MA20'] > self.curAlgoData['MA50']:
             trend = 1
         else:
             trend = 0
@@ -86,8 +90,8 @@ class Algo:
                 #close trade because we want to open one in a different direction
                 self.printStuff("Closing trade due to opposing signal detected")
                 self.inTrade = False
-                closeTime = curpoint['date']
-                closePrice = curpoint['close']
+                closeTime = self.curStockData['date']
+                closePrice = self.curStockData['close']
                 self.trade.closePosition(closePrice,closeTime)
                 self.trade.getStats()
 
@@ -95,8 +99,8 @@ class Algo:
             if trend:
                 self.printStuff("Crossing Up!")
                 self.inTrade = True
-                enterTime = curpoint['date']
-                enterPrice = curpoint['close']
+                enterTime = self.curStockData['date']
+                enterPrice = self.curStockData['close']
                 #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss)
                 self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20,printInfo=False)
                 self.trades.append(self.trade)
@@ -109,11 +113,8 @@ class Algo:
 
         if self.inTrade:
             self.printStuff("In a trade")
-            if not self.trade.check(curpoint):
-                # if self.trade.stopPrice < curpoint['Close']:
-                #     self.trade.closePosition(curpoint['Close'],curpoint['Date'])
-                # else:
-                self.trade.closePosition(self.trade.stopPrice,curpoint['date'])
+            if not self.trade.check(self.curStockData):
+                self.trade.closePosition(self.trade.stopPrice,self.curStockData['date'])
                 self.printStuff("Closing position based on stoploss")
                 self.inTrade = False
             # time.sleep(1)
@@ -122,9 +123,9 @@ class Algo:
             self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
 
             #End of day trade closing
-            endofDay = curpoint['date'].replace(hour=12, minute=55, second=0, microsecond=0)
-            if curpoint['date'] > endofDay:
-                self.trade.closePosition(curpoint['close'],curpoint['date'])
+            endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
+            if self.curStockData['date'] > endofDay:
+                self.trade.closePosition(self.curStockData['close'],self.curStockData['date'])
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
@@ -132,7 +133,7 @@ class Algo:
     def updatefrontend(self):
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
-            dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.AlgoData.iloc[-1][self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
+            dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.curAlgoData[self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
         return({'idname':self.name, 'data':dataToSend})
 
 

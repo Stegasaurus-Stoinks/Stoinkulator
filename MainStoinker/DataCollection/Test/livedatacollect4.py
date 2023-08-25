@@ -172,13 +172,15 @@ class IBapi(EWrapper, EClient):
                     tickerdata.append(sendData) 
 
             
-            if config.FrontEndDisplay:
-                # algo update stuffs (assemble the algo data array)
-                for algo in self.algos:
-                    algo.update(self.getData())
+            # algo update stuffs (assemble the algo data array)
+            for algo in self.algos:
+                # finds the right data for the algo ticker
+                algo.update(self.datadict[self.tickers.index(algo.ticker)])
+                if config.FrontEndDisplay:
                     sendData = algo.updatefrontend()
                     algodata.append(sendData)
 
+            if config.FrontEndDisplay:
                 # send front end stuffs
                 # print([tickerdata,algodata])
                 try: self.socket.emit('update_send',[tickerdata,algodata])
@@ -226,8 +228,8 @@ class IBapi(EWrapper, EClient):
             i += 1
 
 
-    def getData(self):
-        return self.datadict
+    def getData(self,index):
+        return self.datadict[index]
     
     def get1DataPoint(self,index):
         return self.datadict[0].iloc[index]
@@ -235,6 +237,7 @@ class IBapi(EWrapper, EClient):
     def printAlgoStats(self, FullPrint = True):
         i = 0
         for algo in self.algos:
+            print("________________________________________________")
             print(f"Printing Stats for Algo {i}")
             algo.printStats(FullPrint)
             i += 1

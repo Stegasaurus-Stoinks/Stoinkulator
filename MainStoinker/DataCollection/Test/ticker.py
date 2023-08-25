@@ -4,9 +4,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 
-class Ticker:
+class TickerData:
 
-    def __init__(self, symbol, type, Database, dataSize = 100, startDate = 0, endDate = 0):
+    def __init__(self, symbol, type, startDate = 0, endDate = 0):
         self.symbol = symbol
         self.type = type
         self.status = "Not Initialized"
@@ -33,9 +33,6 @@ class Ticker:
         self.EMA20 = 0
         self.EMA50 = 0
         self.EMA200 = 0
-
-        #This object will be the only one communicating with the database
-        self.DataBase = Database
 
         self.tradeList = pd.DataFrame()
 
