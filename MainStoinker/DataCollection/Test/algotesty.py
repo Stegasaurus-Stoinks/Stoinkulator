@@ -60,8 +60,10 @@ def ConfigSend(socket):
     file.close()
     print("Sending Algo Config")
     print(parsed_json)
-    socket.emit('config_send', parsed_json)
-    
+    try:
+        socket.emit('config_send', parsed_json)
+    except:
+        print("Cant send Config, /Not connected to front end")
 
 
 # AlgoConfigParse()

@@ -8,6 +8,7 @@ import time
 import Start_config as config
 import numpy as np
 import pandas as pd
+import math
 
 from trade import Trade
 
@@ -31,8 +32,12 @@ class Algo:
         print(self.AlgoData.shape)
 
         #Data to send to the frontend
+       
         self.FrontEndDataStruct = ['MA20','MA50','StopPrice']
         self.FrontEndDataType = ['line','line','segment']
+
+        # self.FrontEndDataStruct = ['MA20','MA50']
+        # self.FrontEndDataType = ['line','line']
 
         #Other inits/variables
         self.inTrade = False
@@ -133,6 +138,9 @@ class Algo:
     def updatefrontend(self):
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
+            data = self.curAlgoData[self.FrontEndDataStruct[x]]
+            if math.isnan(data):
+                data = None
             dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.curAlgoData[self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
         return({'idname':self.name, 'data':dataToSend})
 
