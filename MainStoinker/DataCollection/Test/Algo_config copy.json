@@ -1,7 +1,6 @@
 [
   {
-    "ID":"EMACrossing",
-    "data":[
+    "EMACrossing": [
       {
         "idname": "TSAT-20/30EMA",
         "ticker": "TSAT",

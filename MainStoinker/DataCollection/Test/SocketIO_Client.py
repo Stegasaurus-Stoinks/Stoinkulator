@@ -15,6 +15,7 @@ class FrontEndClient:
             self.call_backs()
             self.sio.connect('http://'+config.FrontEndPort)
 
+
         except:
             print("Connecting to Front End (Socketio) failed")
 
