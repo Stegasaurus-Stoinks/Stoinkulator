@@ -147,7 +147,10 @@ class IBapi(EWrapper, EClient):
                 # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
                 # print(Fulldata)
                 print("data requested, sending Fulldata")
-                self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+                try:
+                    self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+                except Exception as e: 
+                    print(e)
 
         for i in range(len(config.tickers)):
             startpoints[i] = self.datadict[i].shape[0]

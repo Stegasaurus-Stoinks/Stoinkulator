@@ -18,16 +18,18 @@ def AlgoConfigParse():
     file.close()
 
     algoCount = 0
-
-    for algos in parsed_json:
-        # print(algos)
-        algoName = list(algos.keys())[0]
+    # print(parsed_json)
+    for algo in parsed_json:
+        # print(algo)
+        algoName = algo['ID']
+        # print(algoName)
         algolist.append(algoName)
-        for algoConfigData in algos[algoName]:
-            print(algoConfigData['ticker'])
+        for algoConfigData in algo['data']:
+            # print(algoConfigData['ticker'])
             algoObjectList.append(AlgoStarter(algoName,algoConfigData))
             if algoConfigData['ticker'] in tickerlist:
-                print("ticker already in tickerlist")
+                # print("ticker already in tickerlist")
+                continue
 
             else:
                 tickerlist.append(algoConfigData['ticker'])
