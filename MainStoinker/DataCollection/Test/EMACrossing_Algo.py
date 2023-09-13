@@ -142,7 +142,7 @@ class Algo:
             if math.isnan(data):
                 data = None
             dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.curAlgoData[self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
-        return({'idname':self.name, 'time':self.curStockData['time'], 'data':dataToSend})
+        return({'idname':self.name, 'time':float(self.curStockData['time']), 'data':dataToSend})
 
 
     def printStuff(self,stuff):

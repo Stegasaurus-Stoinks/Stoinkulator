@@ -7,7 +7,7 @@ LiveTrading = False
 #once trade excecution is figured out we should be able to get rid of one of these variables
 
 #Frontend Variables
-FrontEndDisplay = False
+FrontEndDisplay = True
 FrontEndPort = '24.56.52.6:3000'
 updating = 1
 

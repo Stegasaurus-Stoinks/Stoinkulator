@@ -193,7 +193,7 @@ class IBapi(EWrapper, EClient):
                     # self.socket.emit('update_send',{)
                     payload = {"tickerdata":tickerdata,"algodata":algodata}
                     payload = simplejson.dumps(payload, ignore_nan=True)
-                    # print(payload)
+                    print(payload)
                     self.socket.emit('update_send',payload)
                 except Exception as e: 
                     print(e)
