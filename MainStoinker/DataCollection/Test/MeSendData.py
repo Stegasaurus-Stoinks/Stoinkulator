@@ -9,7 +9,7 @@ from livedatacollect4 import IBapi
 from datetime import datetime
 
 from enum import Enum
-
+ 
 from algotesty import AlgoConfigParse
 from EMACrossing_Algo import Algo as EMAAlgo
 

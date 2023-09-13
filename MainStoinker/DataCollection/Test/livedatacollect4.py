@@ -7,6 +7,7 @@ from csv import writer
 from datetime import datetime
 from datetime import timedelta
 import algotesty
+import simplejson
 
 import Start_config as config
 
@@ -49,7 +50,7 @@ class IBapi(EWrapper, EClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -190,7 +191,10 @@ class IBapi(EWrapper, EClient):
                 # print({"ticker":algodata})
                 try: 
                     # self.socket.emit('update_send',{)
-                    self.socket.emit('update_send',[tickerdata,algodata])
+                    payload = {"tickerdata":tickerdata,"algodata":algodata}
+                    payload = simplejson.dumps(payload, ignore_nan=True)
+                    # print(payload)
+                    self.socket.emit('update_send',payload)
                 except Exception as e: 
                     print(e)
 
