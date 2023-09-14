@@ -50,7 +50,7 @@ class IBapi(EWrapper, EClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -112,7 +112,7 @@ class IBapi(EWrapper, EClient):
 
                     if config.FrontEndDisplay and config.intraMinuteDisplay:
                         entry = self.datadict[reqId].tail(1)
-                        sendData = { "time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                        sendData = { "time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                         try: self.socket.emit('update_send',sendData)
                         except Exception as e: print(e)
 
@@ -121,7 +121,7 @@ class IBapi(EWrapper, EClient):
 
                 if config.FrontEndDisplay:
                     entry = self.datadict[reqId].tail(1)
-                    sendData = { "time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                    sendData = { "time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                     try: self.socket.emit('update_send',sendData)
                     except Exception as e: print(e)
 
@@ -172,7 +172,7 @@ class IBapi(EWrapper, EClient):
                 self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
                 
                 if config.FrontEndDisplay:
-                    sendData = {"ticker":self.tickers[i],"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                    sendData = {"ticker":self.tickers[i],"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                     tickerdata.append(sendData) 
 
             
@@ -193,13 +193,13 @@ class IBapi(EWrapper, EClient):
                     # self.socket.emit('update_send',{)
                     payload = {"tickerdata":tickerdata,"algodata":algodata}
                     payload = simplejson.dumps(payload, ignore_nan=True)
-                    print(payload)
+                    # print(payload)
                     self.socket.emit('update_send',payload)
                 except Exception as e: 
                     print(e)
 
             time.sleep(config.TimeDelayPerPoint)
-            print(entry[0])
+            # print(entry[0])
    
         self.printAlgoStats()
         endtime = datetime.now()

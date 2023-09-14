@@ -36,9 +36,6 @@ class Algo:
         self.FrontEndDataStruct = ['MA20','MA50','StopPrice']
         self.FrontEndDataType = ['line','line','segment']
 
-        # self.FrontEndDataStruct = ['MA20','MA50']
-        # self.FrontEndDataType = ['line','line']
-
         #Other inits/variables
         self.inTrade = False
         self.printInfo = False
@@ -49,14 +46,7 @@ class Algo:
 
     def update(self, data):
         StockData = data
-        # print(StockData)
-        #On first loop, append all warmup data to the AlgoData
-        # if(self.AlgoData.shape[0] == 0):
-        #     self.AlgoData = pd.concat([self.AlgoData, StockData], axis=0, ignore_index=True)
-            #print(self.AlgoData)
-
-        # Adds line to Algo Data so the Algo Data and Stock Data are the same size
-
+        
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:
             diff = StockData.shape[0] - self.AlgoData.shape[0]
@@ -109,12 +99,13 @@ class Algo:
                 #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss)
                 self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20,printInfo=False)
                 self.trades.append(self.trade)
+                time.sleep(1)
 
 
             else:
                 self.printStuff("Crossing Down!")
 
-            time.sleep(1)
+            
 
         if self.inTrade:
             self.printStuff("In a trade")
@@ -134,6 +125,8 @@ class Algo:
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
+        self.curAlgoData = self.AlgoData.iloc[-1]
+
 
     def updatefrontend(self):
         dataToSend = []
@@ -141,8 +134,10 @@ class Algo:
             data = self.curAlgoData[self.FrontEndDataStruct[x]]
             if math.isnan(data):
                 data = None
-            dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.curAlgoData[self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
-        return({'idname':self.name, 'time':float(self.curStockData['time']), 'data':dataToSend})
+            else:
+                dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.curAlgoData[self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
+            
+        return({'idname':self.name, 'time':int(self.curStockData['time']), 'data':dataToSend})
 
 
     def printStuff(self,stuff):
