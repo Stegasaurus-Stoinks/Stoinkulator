@@ -65,7 +65,7 @@ class IBapi(EWrapper, EClient):
             if config.FrontEndDisplay:
                 Fulldata = self.getDataJson(index = 0)
                 # self.socket.emit('data_send', 'AAPL', Fulldata)
-                self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
+                # self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
                 
                    
         else:
@@ -89,10 +89,12 @@ class IBapi(EWrapper, EClient):
                 self.backtestingDataUpdate()
 
 
-    def historicalDataUpdate(self, reqId: int, bar: BarData):
-        # if self.lastbardict[reqId] != 0:
-        # print(self.lastbardict)
-        updatecsv = False
+
+
+    def historicalDataUpdate(self, reqId: int, bar: BarData):           # Live Data Updates
+        tickerdata = []
+        algodata = []
+
         data = {'date':[datetime.fromtimestamp(int(bar.date))],
                 'time':[int(bar.date)],
                 'open':[bar.open],
@@ -106,31 +108,53 @@ class IBapi(EWrapper, EClient):
         if self.lastbardict[reqId]:
             if bar.date == self.lastbardict[reqId].date:
                 if (bar.average != self.lastbardict[reqId].average):
-                    print("IntraMinute Update: HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
+                    # print("IntraMinute Update: HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
                     self.datadict[reqId].drop(self.datadict[reqId].tail(1).index,inplace=True)
                     self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
 
                     if config.FrontEndDisplay and config.intraMinuteDisplay:
                         entry = self.datadict[reqId].tail(1)
                         sendData = { "time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                        try: self.socket.emit('update_send',sendData)
-                        except Exception as e: print(e)
+                        # try: self.socket.emit('update_send',sendData)
+                        # except Exception as e: print(e)
 
             else:
                 self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
-
+                print("got data for " +self.tickers[reqId])
                 if config.FrontEndDisplay:
                     entry = self.datadict[reqId].tail(1)
                     sendData = { "time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                    try: self.socket.emit('update_send',sendData)
-                    except Exception as e: print(e)
+                    self.livetickerdata.append(sendData)
 
+                    #TODO Add catch for if not all the data comes in 
+                    #(dont know if itll ever happen but would rather be safe than sorry)
+                    #Maybe use a timmer from time of first minute received?
+                  
+                    if (len(self.livetickerdata) == len(self.tickers)): #All ticker data collected
+                        print("Got All ticker data, sending data now :)")
+                        for algo in self.algos:
+                            # finds the right data for the algo ticker
+                            algo.update(self.datadict[self.tickers.index(algo.ticker)])
+                            if config.FrontEndDisplay:
+                                sendData = algo.updatefrontend()
+                                algodata.append(sendData)
 
-        else:
-            print("empty :D Probably because its the first loop")
+                        try: 
+                            # self.socket.emit('update_send',{)
+                            payload = {"tickerdata":self.livetickerdata,"algodata":algodata}
+                            payload = simplejson.dumps(payload, ignore_nan=True)
+                            print(payload)
+                            self.socket.emit('update_send',payload)
+                        except Exception as e: 
+                            print(e)
+
+                        #reset livetickerdata so its ready to collect data for next minute
+                        self.livetickerdata = []
 
         self.lastbardict[reqId] = bar
     
+
+
 
 
     def error(self, reqId, errorCode, errorString):
@@ -145,9 +169,7 @@ class IBapi(EWrapper, EClient):
             algotesty.ConfigSend(self.socket)
             for i in range(len(config.tickers)):
                 Fulldata = self.getDataJson(index = i)
-                # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
-                # print(Fulldata)
-                print("data requested, sending Fulldata")
+                print("Sending Fulldata")
                 try:
                     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
                 except Exception as e: 
@@ -185,10 +207,6 @@ class IBapi(EWrapper, EClient):
                     algodata.append(sendData)
 
             if config.FrontEndDisplay:
-                # send front end stuffs
-                # print(tickerdata)
-                # print(algodata)
-                # print({"ticker":algodata})
                 try: 
                     # self.socket.emit('update_send',{)
                     payload = {"tickerdata":tickerdata,"algodata":algodata}
@@ -215,6 +233,7 @@ class IBapi(EWrapper, EClient):
         i = 0
         self.datadict = {}
         self.simulatedDatadict = {}
+        self.livetickerdata = []
         self.lastbardict = {}
         self.tickers = tickers
         self.algos = algos
