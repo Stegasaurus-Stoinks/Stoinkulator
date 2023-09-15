@@ -48,7 +48,7 @@ class IBapi(EWrapper, EClient):
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
         if(config.LiveData):
-            self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
+            self.datadict[reqId] = self.datadict[reqId]._append([candleData], ignore_index=True)
         else:
             self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
@@ -113,17 +113,30 @@ class IBapi(EWrapper, EClient):
                     self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
 
                     if config.FrontEndDisplay and config.intraMinuteDisplay:
-                        entry = self.datadict[reqId].tail(1)
-                        sendData = { "time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                        # try: self.socket.emit('update_send',sendData)
-                        # except Exception as e: print(e)
+                        entry = self.datadict[reqId].iloc[-1]
+                        sendData = {"ticker":self.tickers[reqId],"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                        
+                        self.liveintraminutedata.append(sendData)
+
+                        if len(self.liveintraminutedata) >= len(self.tickers):
+                            print("Got full intraminute data package")
+                        
+                            try: 
+                                payload = {"tickerdata":self.liveintraminutedata}
+                                payload = simplejson.dumps(payload, ignore_nan=True)
+                                print("Intraminute Update: " + payload)
+                                self.socket.emit('update_send',payload)
+                            except Exception as e: 
+                                print(e)
+                            
+                            self.liveintraminutedata = []
 
             else:
                 self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
                 print("got data for " +self.tickers[reqId])
                 if config.FrontEndDisplay:
-                    entry = self.datadict[reqId].tail(1)
-                    sendData = { "time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
+                    entry = self.datadict[reqId].iloc[-1]
+                    sendData = {"ticker":self.tickers[reqId],"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
                     self.livetickerdata.append(sendData)
 
                     #TODO Add catch for if not all the data comes in 
@@ -234,6 +247,7 @@ class IBapi(EWrapper, EClient):
         self.datadict = {}
         self.simulatedDatadict = {}
         self.livetickerdata = []
+        self.liveintraminutedata = []
         self.lastbardict = {}
         self.tickers = tickers
         self.algos = algos

@@ -12,7 +12,7 @@ FrontEndPort = '192.168.0.212:3000'
 updating = 1
 
 #LiveData Variables
-intraMinuteDisplay = False
+intraMinuteDisplay = True
 
 #BackTesting Variables
 StartDate = datetime.datetime.now() - relativedelta(month=0,weeks=0,day=1)
