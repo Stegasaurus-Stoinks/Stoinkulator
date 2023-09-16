@@ -39,11 +39,15 @@ if config.FrontEndDisplay:
 
 time.sleep(1)
 app.connect('127.0.0.1', 7497, 123)
+while(not app.isConnected):
+    time.sleep(.5)
+print("TWS Connected")
 api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
 
 
-app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+# app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+app.testingtrading()
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")
@@ -62,4 +66,4 @@ app.disconnect()
 
 time.sleep(2)
 
-print("Data Collection Closed")
+print("TWS Collection Closed")

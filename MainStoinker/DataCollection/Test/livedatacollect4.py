@@ -1,6 +1,7 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
+from ibapi.order import Order
 from ibapi.common import BarData
 from ibapi.common import *
 from csv import writer
@@ -290,6 +291,24 @@ class IBapi(EWrapper, EClient):
     def getDataJson(self,index):
         result = self.datadict[index].to_json(orient="records")
         # print(result)
-        return(result)     
+        return(result)
+    
+    def testingtrading(self):
+        contract = Contract()
+        contract.symbol = "TSLA"
+        contract.secType = 'STK'
+        contract.exchange = 'SMART'
+        contract.currency = "USD"
+        contract.primaryExchange = "SMART"
 
+        order = Order()
+        order.action = "Buy"
+        order.totalQuantity = 1 
+        order.orderType =  "MKT"
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+
+        print("done")
+        print(self.reqIds(-1))
+        # self.placeOrder(,contract,order)
             

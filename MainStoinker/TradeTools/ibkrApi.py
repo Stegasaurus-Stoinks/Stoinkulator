@@ -8,8 +8,6 @@ class ibkrApi(IB):
     pass
     #unique id so find trades that have been placed by this algo
 
-    ibkrApi
-
 
     def orderfilled(trade, fill):
         print("------------------order has been filled")
