@@ -33,16 +33,13 @@ def createStockContact(ticker: str):
 class IBapi(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
-        
+
+        self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
+        self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
                 
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
             print('The current ask price is: ', price)
-
-    def nextValidId(self, orderId: int):
-        print("Setting nextValidOrderId: %d", orderId)
-        self.nextValidOrderId = orderId
-        # self.startData("AAPL")
 
     def historicalData(self, reqId: int, bar: BarData):
         # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
@@ -301,14 +298,85 @@ class IBapi(EWrapper, EClient):
         contract.currency = "USD"
         contract.primaryExchange = "SMART"
 
-        order = Order()
-        order.action = "Buy"
-        order.totalQuantity = 1 
-        order.orderType =  "MKT"
-        order.eTradeOnly = False
-        order.firmQuoteOnly = False
+        buyorder = Order()
+        buyorder.action = "Buy"
+        buyorder.totalQuantity = 1 
+        buyorder.orderType =  "MKT"
+        buyorder.eTradeOnly = False
+        buyorder.firmQuoteOnly = False
 
-        print("done")
-        print(self.reqIds(-1))
-        # self.placeOrder(,contract,order)
+        sellorder = Order()
+        sellorder.action = "Sell"
+        sellorder.totalQuantity = 2 
+        sellorder.orderType =  "MKT"
+        sellorder.eTradeOnly = False
+        sellorder.firmQuoteOnly = False
+
+        time.sleep(5)
+
+        self.placeOrder(self.nextValidOrderId,contract,buyorder)
+        print("order1 placed")
+        print("orderid = " + str(self.nextValidOrderId))
+        self.getNextOrderID()
+        self.placeOrder(self.nextValidOrderId,contract,buyorder)
+        print("order2 placed")
+        print("orderid = " + str(self.nextValidOrderId))
+        print(self.readPositions())
+        time.sleep(5)
+        self.getNextOrderID()
+        self.placeOrder(self.nextValidOrderId,contract,sellorder)
+        print("order3 placed")
+        print("orderid = " + str(self.nextValidOrderId))
+        print(self.readPositions())
+
+    def getNextOrderID(self):
+        self.event_obj = threading.Event()
+        self.reqIds(-1)
+        if config.Debug:
+            print("waiting for getNextOrderID thread")
+        timeout = 10
+        flag = self.event_obj.wait(timeout)
+        if flag:
+            if config.Debug:
+                print("getNextOrderID Event Triggered, This means it worked")
+            return 1
+        else:
+            if config.Debug:
+                print("Time out occured, getNextOrderID event internal flag still false. Executing thread without waiting for event")
+            return 0
+
+    def nextValidId(self, orderId: int, event_obj = None):
+        super().nextValidId(orderId)
+
+        self.nextValidOrderId = orderId
+        if config.Debug:
+            print("NextValidId:", orderId)
+        try:
+            self.event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("tried to set event object for getNextOrderID")
+
+    #Generate new list of positions, returns Pandas DataFrame
+    def readPositions(self):
+        self.reqPositions() # associated callback: position
+        print("Waiting for IB's API response for accounts positions requests...")
+        time.sleep(3)
+        current_positions = self.all_positions # associated callback: position
+        # dont know why i cant shift the index of the array, adding line below breaks stuff :(
+        # current_positions.set_index('Account',inplace=True,drop=True) #set all_positions DataFrame index to "Account"
+        return current_positions
+    
+    def position(self, account, contract, pos, avgCost):
+        index = str(account)+str(contract.symbol)
+        if config.Debug:
+            print("In CallBack for Postions")
+            print(account, contract.symbol, pos, avgCost, contract.secType)
+        self.all_positions.loc[index]= {'Account':account, 'Symbol':contract.symbol, 'Quantity':pos, 'Average Cost':avgCost, 'Sec Type':contract.secType}
             
+    def positionEnd(self):
+        super().positionEnd()
+        print("PositionEnd")
+
+        #TODO use this call back instead of delay function
