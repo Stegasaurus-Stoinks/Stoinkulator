@@ -10,6 +10,8 @@ from datetime import timedelta
 import algotesty
 import simplejson
 
+import queue
+# from NeatTools.decorators import singleton
 import Start_config as config
 
 import numpy as np
@@ -29,13 +31,28 @@ def createStockContact(ticker: str):
 
     return contract
 
-
+# @singleton
 class IBapi(EWrapper, EClient):
+    # _instance = None
+    # _lock = threading.Lock()
+
+    # def __new__(cls):
+    #     if cls._instance is None: 
+    #         with cls._lock:
+    #             # Another thread could have created the instance
+    #             # before we acquired the lock. So check that the
+    #             # instance is still nonexistent.
+    #             if not cls._instance:
+    #                 print("making new instance")
+    #                 cls._instance = super().__new__(cls)
+    #     return cls._instance
+    
     def __init__(self):
         EClient.__init__(self, self)
-
+        print("initializing new object")
         self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
         self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
+        self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'Order Type', 'Quantity', 'Action', 'Order State', 'Sec Type'])
                 
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
@@ -48,7 +65,7 @@ class IBapi(EWrapper, EClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId]._append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -291,43 +308,48 @@ class IBapi(EWrapper, EClient):
         return(result)
     
     def testingtrading(self):
-        contract = Contract()
-        contract.symbol = "TSLA"
-        contract.secType = 'STK'
-        contract.exchange = 'SMART'
-        contract.currency = "USD"
-        contract.primaryExchange = "SMART"
-
-        buyorder = Order()
-        buyorder.action = "Buy"
-        buyorder.totalQuantity = 1 
-        buyorder.orderType =  "MKT"
-        buyorder.eTradeOnly = False
-        buyorder.firmQuoteOnly = False
-
-        sellorder = Order()
-        sellorder.action = "Sell"
-        sellorder.totalQuantity = 2 
-        sellorder.orderType =  "MKT"
-        sellorder.eTradeOnly = False
-        sellorder.firmQuoteOnly = False
-
+        contract = makeStockContract("MSFT")
         time.sleep(5)
 
-        self.placeOrder(self.nextValidOrderId,contract,buyorder)
+        parentorder = buyOrderObject(1)
+        parentId = self.nextValidOrderId
+        self.placeOrder(parentId,contract,parentorder)
+        self.readOrders()
         print("order1 placed")
-        print("orderid = " + str(self.nextValidOrderId))
-        self.getNextOrderID()
-        self.placeOrder(self.nextValidOrderId,contract,buyorder)
-        print("order2 placed")
-        print("orderid = " + str(self.nextValidOrderId))
+        print("orderid = " + str(parentId))
+        stoplossId = self.addStoploss(parentorder, parentId, contract, 100)
+        # # self.getNextOrderID()
+        # # self.placeOrder(self.nextValidOrderId,contract,buyOrderObject(2))
+        # # print("order2 placed")
+        # # print("orderid = " + str(self.nextValidOrderId))
+        
+        # time.sleep(1)
+
+        print("Current Positions:")
         print(self.readPositions())
+        # print(self.readPositions("TSLA"))
+
+        # time.sleep(10)
+        # print("changing stoploss")
+        # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId)
+
+        # time.sleep(5)
+        # # Changing StopLoss to Market Order To Close both orders
+        # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId, OrderType="MKT")
+
+        self.readOrders()
+
+        # testsingleton()
+    
         time.sleep(5)
-        self.getNextOrderID()
-        self.placeOrder(self.nextValidOrderId,contract,sellorder)
-        print("order3 placed")
-        print("orderid = " + str(self.nextValidOrderId))
-        print(self.readPositions())
+        self.readOrders()
+        time.sleep(20)
+        self.readOrders()
+        # self.getNextOrderID()
+        # self.placeOrder(self.nextValidOrderId,contract,sellorder)
+        # print("order3 placed")
+        # print("orderid = " + str(self.nextValidOrderId))
+        # print(self.readPositions())
 
     def getNextOrderID(self):
         self.event_obj = threading.Event()
@@ -345,7 +367,7 @@ class IBapi(EWrapper, EClient):
                 print("Time out occured, getNextOrderID event internal flag still false. Executing thread without waiting for event")
             return 0
 
-    def nextValidId(self, orderId: int, event_obj = None):
+    def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
 
         self.nextValidOrderId = orderId
@@ -359,24 +381,155 @@ class IBapi(EWrapper, EClient):
                 print("tried to set event object for getNextOrderID")
 
     #Generate new list of positions, returns Pandas DataFrame
-    def readPositions(self):
+    def readPositions(self,tickerSymbol:str = None):
+        self.positions_event_obj = threading.Event()
         self.reqPositions() # associated callback: position
-        print("Waiting for IB's API response for accounts positions requests...")
-        time.sleep(3)
-        current_positions = self.all_positions # associated callback: position
-        # dont know why i cant shift the index of the array, adding line below breaks stuff :(
-        # current_positions.set_index('Account',inplace=True,drop=True) #set all_positions DataFrame index to "Account"
-        return current_positions
+        # self.reqPositionsMulti()
+        if config.Debug:
+            print("Waiting for IB's API response for accounts positions requests...")
+        # time.sleep(3)
+        timeout = 10
+        flag = self.positions_event_obj.wait(timeout)
+        if flag:
+            current_positions = self.all_positions # associated callback: position
+            # dont know why i cant shift the index of the array, adding line below breaks stuff :(
+            # current_positions.set_index('Account',inplace=True,drop=True) #set all_positions DataFrame index to "Account"
+            if tickerSymbol:
+                return current_positions.loc[current_positions['Symbol'] == tickerSymbol]
+            return current_positions
+        else:
+            print("error with callback for positions")
     
     def position(self, account, contract, pos, avgCost):
         index = str(account)+str(contract.symbol)
         if config.Debug:
-            print("In CallBack for Postions")
+            print("In CallBack for Postions: Position Data Received")
             print(account, contract.symbol, pos, avgCost, contract.secType)
         self.all_positions.loc[index]= {'Account':account, 'Symbol':contract.symbol, 'Quantity':pos, 'Average Cost':avgCost, 'Sec Type':contract.secType}
             
-    def positionEnd(self):
-        super().positionEnd()
-        print("PositionEnd")
+    def positionEnd(self, event_obj = None):
+        # super().positionEnd()
+        if config.Debug:
+            print("PositionEnd CallBack")
+        try:
+            self.positions_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for readPositions")
 
-        #TODO use this call back instead of delay function
+    def readOrders(self):
+        self.orders_event_obj = threading.Event()
+        self.reqAllOpenOrders()
+        if config.Debug:
+            print("Waiting for IB's API response for accounts positions requests...")
+        # time.sleep(3)
+        timeout = 10
+        flag = self.orders_event_obj.wait(timeout)
+        if flag:
+            print(self.all_openorders)
+        else:
+            print("error with callback for positions")
+
+    def openOrder(self,orderId,contract,order,orderState):
+        self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'Order Type':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'Order State':orderState.status,'Sec Type':contract.secType}
+
+    def openOrderEnd(self):
+        if config.Debug:
+            print("openOrderEnd CallBack")
+        try:
+            self.orders_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for readOrders")
+
+    
+    def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice, StopId = None, OrderType = None):
+        #StopId being set means you are updating a stoploss thats already been created
+
+        parentAction = parentOrder.action
+        quantity = parentOrder.totalQuantity
+        parentOrderId = parentOrder.orderId
+        if StopId == None:
+            self.getNextOrderID()
+            OrderId = self.nextValidOrderId
+        else:
+            OrderId = StopId
+            if config.Debug:
+                print("Editing Stoploss Price/Quantity")
+
+        stopLoss = Order()
+        stopLoss.orderId = OrderId
+        if parentAction == "Buy":
+            stopLoss.action = "SELL"  
+        else: 
+            stopLoss.action = "BUY"
+
+        if OrderType == None:
+            stopLoss.orderType = "STP"
+        else: 
+            stopLoss.orderType = OrderType
+            if config.Debug:
+                print("Editing Stoploss Order Type to " + str(OrderType))
+        #Stop trigger price
+        stopLoss.auxPrice = stopPrice
+        stopLoss.totalQuantity = quantity
+        stopLoss.parentId = parentOrderId
+        stopLoss.eTradeOnly = False
+        stopLoss.firmQuoteOnly = False
+
+        self.placeOrder(OrderId, contract, stopLoss)
+
+        return OrderId
+
+        
+
+def buyOrderObject(quantity, limitPrice = None):
+    order = Order()
+    order.action = "Buy"
+    order.totalQuantity = quantity
+    if limitPrice == None:
+        order.orderType =  "MKT"
+    else:
+        order.orderType = "LMT"
+        order.lmtPrice = limitPrice
+    order.eTradeOnly = False
+    order.firmQuoteOnly = False
+    # order.adjustedStopLimitPrice = stopPrice
+
+    return order
+
+def sellOrderObject(quantity, limitPrice = None):
+    order = Order()
+    order.action = "Sell"
+    order.totalQuantity = quantity
+    if limitPrice == None:
+        order.orderType =  "MKT"
+    else:
+        order.orderType = "LMT"
+        order.lmtPrice = limitPrice
+    order.eTradeOnly = False
+    order.firmQuoteOnly = False
+
+    return order
+
+def makeStockContract(tickerSymbol: str):
+    contract = Contract()
+    contract.symbol = tickerSymbol
+    contract.secType = 'STK'
+    contract.exchange = 'SMART'
+    contract.currency = "USD"
+    contract.primaryExchange = "SMART"
+
+    return contract
+
+def testsingleton():
+    app = IBapi()
+    # app.connect('127.0.0.1', 7497, 123)
+    while(not app.isConnected):
+        time.sleep(.5)
+    print("TWS Connected")
+    print(app.readPositions("TSLA"))
+
+# TODO: Singleton not working yet... dont know why, its not connecting...

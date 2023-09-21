@@ -3,9 +3,11 @@ class Trade:
     #unique id so find trades that have been placed by this algo
 
     def __init__(self, symbol, volume, ID, openPrice, openTime, direction, live, stoploss, printInfo = False):
+        self.ibkrApi = API
         self.symbol = symbol
         self.volume = volume
-        self.ID = ID
+        self.tradeID = ID
+        self.stopLossID = 0
         self.openPrice = openPrice
         self.openTime = openTime
         self.direction = direction
@@ -26,6 +28,7 @@ class Trade:
 
     def openPosition(self):
         #call funtion to open order through api
+        # TODO: Open stoploss position here too
 
         #check if short or long position
         if self.volume > 0:
@@ -49,7 +52,8 @@ class Trade:
         self.closeTime = closeTime
 
         #call funtion to close order through api
-        
+        # TODO: close stoploss position here too
+
         if self.live:
             if self.volume > 0:
                 self.ibkrApi.SimpleBuy(self.symbol, self.volume)
@@ -72,18 +76,6 @@ class Trade:
                 print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.ID))
 
 
-    def fakeOpen(self):
-
-        self.position = True
-        self.status = "Open"
-
-        #print to console trade placement info if asked for it
-        if self.printInfo:
-            print("______________________________________________________________________")
-            print("Opened a fake Postion! Bought " + str(self.volume) + " of " + self.symbol + " at time: " + str(self.openTime) + " | Trade ID: " + str(self.ID))
-            print("______________________________________________________________________")
-
-
 
     #return true or false whether we are in position or not
     def inPosition(self):
@@ -96,23 +88,24 @@ class Trade:
         #stoploss check + reclaculation if necessary for either direction
         #return 1 if good 0 if bad
         if self.direction: #UP Trade
-            # print(curpoint['close'])
-            # print(self.stopPrice)
+
             price = curpoint["close"]
             if price > self.stopPrice + self.stopLoss:
                 self.stopPrice = price - self.stopLoss
-                return 1
+
             if price < self.stopPrice:
                 return 0
             else:
                 return 1
 
-        # else: #DOWN Trade
-        #     if price < self.stopPrice - self.stopLoss:
-        #         self.stopPrice = price + self.stopLoss
-        #         return 1
-        #     if price > self.stopLoss:
-        #         return 0
+        else: #DOWN Trade
+            if price < self.stopPrice - self.stopLoss:
+                self.stopPrice = price + self.stopLoss
+
+            if price > self.stopLoss:
+                return 0
+            else:
+                return 1
 
     def getStats(self, Fulldisplay = True):
 
