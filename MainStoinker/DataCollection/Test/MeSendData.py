@@ -45,6 +45,9 @@ print("TWS Connected")
 
 api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
+# print("before run")
+# app.run()
+# print("after run")
 
 #verify connection has read/write capabilities
 if not app.getNextOrderID():
@@ -55,8 +58,10 @@ if not app.getNextOrderID():
     time.sleep(1)
     exit()
 
-# app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
-app.testingtrading()
+print(app.readPositions())
+
+app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+# app.testingtrading()
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")

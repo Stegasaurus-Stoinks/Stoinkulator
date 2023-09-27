@@ -10,6 +10,8 @@ from datetime import timedelta
 import algotesty
 import simplejson
 
+from IBKRHelper import *
+
 import queue
 # from NeatTools.decorators import singleton
 import Start_config as config
@@ -162,7 +164,7 @@ class IBapi(EWrapper, EClient):
                         print("Got All ticker data, sending data now :)")
                         for algo in self.algos:
                             # finds the right data for the algo ticker
-                            algo.update(self.datadict[self.tickers.index(algo.ticker)])
+                            algo.update(self, self.datadict[self.tickers.index(algo.ticker)])
                             if config.FrontEndDisplay:
                                 sendData = algo.updatefrontend()
                                 algodata.append(sendData)
@@ -229,7 +231,10 @@ class IBapi(EWrapper, EClient):
             # algo update stuffs (assemble the algo data array)
             for algo in self.algos:
                 # finds the right data for the algo ticker
-                algo.update(self.datadict[self.tickers.index(algo.ticker)])
+                algo.update(API = self, data = self.datadict[self.tickers.index(algo.ticker)])
+
+                # print(self)
+
                 if config.FrontEndDisplay:
                     sendData = algo.updatefrontend()
                     algodata.append(sendData)
@@ -245,7 +250,7 @@ class IBapi(EWrapper, EClient):
                     print(e)
 
             time.sleep(config.TimeDelayPerPoint)
-            # print(entry[0])
+            print(entry[0])
    
         self.printAlgoStats()
         endtime = datetime.now()
@@ -361,11 +366,11 @@ class IBapi(EWrapper, EClient):
         if flag:
             if config.Debug:
                 print("getNextOrderID Event Triggered, This means it worked")
-            return 1
+            return self.nextValidOrderId
         else:
             if config.Debug:
                 print("Time out occured, getNextOrderID event internal flag still false. Executing thread without waiting for event")
-            return 0
+            return None
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -383,12 +388,12 @@ class IBapi(EWrapper, EClient):
     #Generate new list of positions, returns Pandas DataFrame
     def readPositions(self,tickerSymbol:str = None):
         self.positions_event_obj = threading.Event()
-        self.reqPositions() # associated callback: position
+        self.temp = self.reqPositions() # associated callback: position
         # self.reqPositionsMulti()
         if config.Debug:
             print("Waiting for IB's API response for accounts positions requests...")
         # time.sleep(3)
-        timeout = 10
+        timeout = 4
         flag = self.positions_event_obj.wait(timeout)
         if flag:
             current_positions = self.all_positions # associated callback: position
@@ -482,47 +487,15 @@ class IBapi(EWrapper, EClient):
         self.placeOrder(OrderId, contract, stopLoss)
 
         return OrderId
+    
+    # def readPositionsTest(self,tickerSymbol:str = None):
+    #     self.readPositions(self)
 
+    def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):
+        if reqId > -1:
+            print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
         
 
-def buyOrderObject(quantity, limitPrice = None):
-    order = Order()
-    order.action = "Buy"
-    order.totalQuantity = quantity
-    if limitPrice == None:
-        order.orderType =  "MKT"
-    else:
-        order.orderType = "LMT"
-        order.lmtPrice = limitPrice
-    order.eTradeOnly = False
-    order.firmQuoteOnly = False
-    # order.adjustedStopLimitPrice = stopPrice
-
-    return order
-
-def sellOrderObject(quantity, limitPrice = None):
-    order = Order()
-    order.action = "Sell"
-    order.totalQuantity = quantity
-    if limitPrice == None:
-        order.orderType =  "MKT"
-    else:
-        order.orderType = "LMT"
-        order.lmtPrice = limitPrice
-    order.eTradeOnly = False
-    order.firmQuoteOnly = False
-
-    return order
-
-def makeStockContract(tickerSymbol: str):
-    contract = Contract()
-    contract.symbol = tickerSymbol
-    contract.secType = 'STK'
-    contract.exchange = 'SMART'
-    contract.currency = "USD"
-    contract.primaryExchange = "SMART"
-
-    return contract
 
 def testsingleton():
     app = IBapi()

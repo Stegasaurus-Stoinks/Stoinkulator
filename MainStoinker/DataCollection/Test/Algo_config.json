@@ -3,22 +3,10 @@
     "ID":"EMACrossing",
     "data":[
       {
-        "idname": "TSAT-20/30EMA",
+        "idname": "MSFT-20/30EMA",
         "ticker": "MSFT",
         "short": "20",
-        "long": "30"
-      },
-      {
-        "idname": "t-20/30EMA",
-        "ticker": "TSLA",
-        "short": "20",
-        "long": "30"
-      },
-      {
-        "idname": "h-20/30EMA",
-        "ticker": "AAPL",
-        "short": "20",
-        "long": "30"
+        "long": "50"
       }
     ]
   }

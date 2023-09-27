@@ -38,13 +38,15 @@ class Algo:
 
         #Other inits/variables
         self.inTrade = False
-        self.printInfo = False
+        self.printInfo = True
         self.trades = []
 
         print("Algo " + self.name + " Initialized")
         
 
-    def update(self, data):
+    def update(self, API, data):
+        self.ibkrApi = API
+        
         StockData = data
         
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
@@ -96,8 +98,18 @@ class Algo:
                 self.inTrade = True
                 enterTime = self.curStockData['date']
                 enterPrice = self.curStockData['close']
-                #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss)
-                self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20,printInfo=False)
+                #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, printinfo)
+                self.trade = 0
+
+                # print(self.ibkrApi)
+                print("trying reqPositions")
+                API.reqPositions()
+                time.sleep(3)
+                print("trying to read positions from algo object")
+                print(API.readPositions())
+                print("done trying to read positions from algo object")
+
+                self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20, self.ibkrApi, printInfo=False)
                 self.trades.append(self.trade)
                 time.sleep(1)
 
