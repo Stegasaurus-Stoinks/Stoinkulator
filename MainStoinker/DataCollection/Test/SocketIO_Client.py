@@ -1,7 +1,9 @@
 import socketio
 import Start_config as config
 import json
+import simplejson
 import algotesty
+
 
 class FrontEndClient:
 
@@ -41,13 +43,27 @@ class FrontEndClient:
             
         @self.sio.on('req_data')
         def on_message(data):
-            for i in range(len(config.tickers)):
-                Fulldata = self.app.getDataJson(index = i)
-                # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
-                # print(Fulldata)
-                print("data requested, sending Fulldata")
-                self.sio.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+            tickerfulldata = []
+            algofulldata = []
 
+            for i in range(len(config.algos)):
+                print("bleh")
+            for i in range(len(config.tickers)):
+                Fulldata = self.getDataJson(index = i)
+                tickerfulldata.append({'ticker': config.tickers[i], 'data':Fulldata})
+                # try:
+                #     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+                # except Exception as e: 
+                #     print(e)
+            print("Sending Fulldata")
+            try: 
+                # self.socket.emit('update_send',{)
+                payload = {"tickerdata":tickerfulldata, "algodata":algofulldata}
+                payload = simplejson.dumps(payload, ignore_nan=True)
+                # print(payload)
+                self.socket.emit('data_send',payload)
+            except Exception as e: 
+                print(e)
         
         @self.sio.event
         def connect():
@@ -62,5 +78,6 @@ class FrontEndClient:
         @self.sio.event
         def disconnect():
             print("I'm disconnected!")
+
 
     

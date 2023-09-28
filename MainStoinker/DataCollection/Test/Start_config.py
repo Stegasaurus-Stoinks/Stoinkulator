@@ -2,6 +2,7 @@ import datetime
 from dateutil.relativedelta import *
 
 tickers = []
+algos = []
 LiveData = False
 LiveTrading = False
 #once trade excecution is figured out we should be able to get rid of one of these variables
@@ -9,8 +10,8 @@ LiveTrading = False
 Debug = True
 
 #Frontend Variables
-FrontEndDisplay = True
-FrontEndPort = '24.56.52.6:3000'
+FrontEndDisplay = False
+FrontEndPort = '192.168.0.212:3000'
 updating = 1
 
 #LiveData Variables

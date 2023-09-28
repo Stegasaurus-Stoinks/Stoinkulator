@@ -196,14 +196,24 @@ class IBapi(EWrapper, EClient):
         numpoints = {}
 
         if config.FrontEndDisplay:
+            tickerfulldata = []
             algotesty.ConfigSend(self.socket)
             for i in range(len(config.tickers)):
                 Fulldata = self.getDataJson(index = i)
-                print("Sending Fulldata")
-                try:
-                    self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
-                except Exception as e: 
-                    print(e)
+                tickerfulldata.append({'ticker': config.tickers[i], 'data':Fulldata})
+                # try:
+                #     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
+                # except Exception as e: 
+                #     print(e)
+            print("Sending Fulldata")
+            try: 
+                # self.socket.emit('update_send',{)
+                payload = {"tickerdata":tickerfulldata}
+                payload = simplejson.dumps(payload, ignore_nan=True)
+                # print(payload)
+                self.socket.emit('data_send',payload)
+            except Exception as e: 
+                print(e)
 
         for i in range(len(config.tickers)):
             startpoints[i] = self.datadict[i].shape[0]

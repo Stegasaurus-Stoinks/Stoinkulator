@@ -137,6 +137,9 @@ class Algo:
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
+        print(self.AlgoData)
+        print(StockData)
+
         self.curAlgoData = self.AlgoData.iloc[-1]
 
 

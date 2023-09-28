@@ -41,6 +41,8 @@ def AlgoConfigParse():
     # print(tickerlist) # list of all the unique tickers
     # print(parsed_json) # all the data from json file
     Start_config.tickers = tickerlist
+    Start_config.algos = algoObjectList
+
     return algoObjectList
 
 
