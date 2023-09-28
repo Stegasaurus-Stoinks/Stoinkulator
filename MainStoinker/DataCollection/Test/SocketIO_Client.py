@@ -47,21 +47,27 @@ class FrontEndClient:
             algofulldata = []
 
             for i in range(len(config.algos)):
-                print("bleh")
+                Fulldata = config.algos[i].updatefrontendfulldata()
+                algofulldata.append(Fulldata)
+
+            print(algofulldata)
+
             for i in range(len(config.tickers)):
-                Fulldata = self.getDataJson(index = i)
+                Fulldata = self.app.getDataJson(index = i)
                 tickerfulldata.append({'ticker': config.tickers[i], 'data':Fulldata})
                 # try:
                 #     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
                 # except Exception as e: 
                 #     print(e)
+            # print(tickerfulldata)
             print("Sending Fulldata")
             try: 
                 # self.socket.emit('update_send',{)
                 payload = {"tickerdata":tickerfulldata, "algodata":algofulldata}
                 payload = simplejson.dumps(payload, ignore_nan=True)
                 # print(payload)
-                self.socket.emit('data_send',payload)
+                self.sio.emit('data_send',payload)
+                print("full data send")
             except Exception as e: 
                 print(e)
         

@@ -67,7 +67,7 @@ class IBapi(EWrapper, EClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId]._append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -371,7 +371,7 @@ class IBapi(EWrapper, EClient):
         self.reqIds(-1)
         if config.Debug:
             print("waiting for getNextOrderID thread")
-        timeout = 10
+        timeout = 2
         flag = self.event_obj.wait(timeout)
         if flag:
             if config.Debug:
@@ -403,7 +403,7 @@ class IBapi(EWrapper, EClient):
         if config.Debug:
             print("Waiting for IB's API response for accounts positions requests...")
         # time.sleep(3)
-        timeout = 4
+        timeout = 2
         flag = self.positions_event_obj.wait(timeout)
         if flag:
             current_positions = self.all_positions # associated callback: position
@@ -439,7 +439,7 @@ class IBapi(EWrapper, EClient):
         if config.Debug:
             print("Waiting for IB's API response for accounts positions requests...")
         # time.sleep(3)
-        timeout = 10
+        timeout = 2
         flag = self.orders_event_obj.wait(timeout)
         if flag:
             print(self.all_openorders)

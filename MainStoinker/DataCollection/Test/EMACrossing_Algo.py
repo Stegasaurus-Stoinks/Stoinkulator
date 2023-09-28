@@ -3,6 +3,7 @@ from datetime import datetime
 from datetime import timedelta
 import talib as ta
 import time
+import json
 
 
 import Start_config as config
@@ -27,7 +28,7 @@ class Algo:
         self.EMA2 = data['long']
 
         #Data frame to store data for Algo, (Stoploss, Analysis, Stuff to send to the front end)  
-        self.DataColumns = ['StopPrice','TestColumn']
+        self.DataColumns = ['time','StopPrice','MA20','MA50']
         self.AlgoData = pd.DataFrame(columns=self.DataColumns)
         print(self.AlgoData.shape)
 
@@ -137,10 +138,13 @@ class Algo:
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
-        print(self.AlgoData)
-        print(StockData)
+        self.AlgoData['time'] = StockData['time']
 
         self.curAlgoData = self.AlgoData.iloc[-1]
+
+        # print(self.AlgoData)
+        # print(StockData['date'])
+       
 
 
     def updatefrontend(self):
@@ -150,9 +154,20 @@ class Algo:
             if math.isnan(data):
                 data = None
             else:
-                dataToSend.append({'name':self.FrontEndDataStruct[x],'data':self.curAlgoData[self.FrontEndDataStruct[x]], 'type':self.FrontEndDataType[x]})
+                dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
         return({'idname':self.name, 'time':int(self.curStockData['time']), 'data':dataToSend})
+    
+
+    def updatefrontendfulldata(self):
+        dataToSend = []
+        for x in range(0,len(self.FrontEndDataStruct)):
+            data = self.AlgoData[['time',self.FrontEndDataStruct[x]]]
+            data.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
+            data = data.to_json(orient="records")
+            dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
+            
+        return({'idname':self.name, 'data':dataToSend})
 
 
     def printStuff(self,stuff):
