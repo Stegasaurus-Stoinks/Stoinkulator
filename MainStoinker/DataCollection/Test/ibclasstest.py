@@ -21,6 +21,8 @@ import Start_config as config
 
 from SocketIO_Client import FrontEndClient
 
+from testyclass import testibkr
+
 
 count = 0
 
@@ -45,8 +47,6 @@ print("TWS Connected")
 
 api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
-setattr(app, "_thread", api_thread)
-
 # print("before run")
 # app.run()
 # print("after run")
@@ -60,10 +60,15 @@ if not app.getNextOrderID():
     time.sleep(1)
     exit()
 
-print("startup read positions")
+print("Read positions in ibclasstest:")
 print(app.readPositions())
 
-app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+# app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+app.testingtrading(AlgoList)
+
+
+
+
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")

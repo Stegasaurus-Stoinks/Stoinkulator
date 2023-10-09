@@ -42,12 +42,16 @@ class Algo:
         self.printInfo = True
         self.trades = []
 
+        self.ibkrApi = None
+
         print("Algo " + self.name + " Initialized")
         
 
-    def update(self, API, data):
-        self.ibkrApi = API
-        
+    def update(self, api, data):
+        self.ibape = api
+        print("algo update readPositions")
+        print(self.ibape.readPositions())
+
         StockData = data
         
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
@@ -103,12 +107,13 @@ class Algo:
                 self.trade = 0
 
                 # print(self.ibkrApi)
-                print("trying reqPositions")
-                API.reqPositions()
-                time.sleep(3)
+                # print("trying reqPositions")
+                # API.reqPositions()
+                # time.sleep(3)
                 print("trying to read positions from algo object")
-                print(API.readPositions())
-                print("done trying to read positions from algo object")
+                # print(API.readPositions())
+                # print("done trying to read positions from algo object")
+                
 
                 self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20, self.ibkrApi, printInfo=False)
                 self.trades.append(self.trade)
@@ -205,3 +210,12 @@ class Algo:
         print("Win Rate: ",int(winRate),"%")
         print("Average Win: ",round(avgWin, 2))
         print("Average Loss: ",round(avgLoss, 2))
+
+    def testpositions(self, api, data):
+        self.api2 = api
+        self.fuckingshitfuck = data
+        print("testpositions:")
+        print(self.fuckingshitfuck)
+        print(self.api2.readPositions())
+
+        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, False, 0.20, self.api2, printInfo=False) 

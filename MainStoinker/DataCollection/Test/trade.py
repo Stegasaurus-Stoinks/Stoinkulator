@@ -23,11 +23,14 @@ class Trade:
 
         self.printInfo = True
 
+        print("Read positions in trade class")
+        print(self.ibkrApi.readPositions())
+
         self.stopLoss = stoploss
-        if live:
-            self.openPosition()
-        else:
-            self.fakeOpen()
+        # if live:
+        #     self.openPosition()
+        # else:
+        #     self.fakeOpen()
 
         
 

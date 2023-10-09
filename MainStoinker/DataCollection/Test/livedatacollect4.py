@@ -24,6 +24,11 @@ import time
 
 import json
 
+from testyclass import testibkr
+from trade import Trade
+from EMACrossing_Algo import Algo
+
+
 def createStockContact(ticker: str):
     contract = Contract()
     contract.secType = "STK"
@@ -34,7 +39,15 @@ def createStockContact(ticker: str):
     return contract
 
 # @singleton
-class IBapi(EWrapper, EClient):
+class TestWrapper(EWrapper):
+    def __init__(self):
+        pass
+
+class TestClient(EClient):
+    def __init__(self, wrapper):
+        EClient.__init__(self, wrapper)
+
+class IBapi(TestWrapper, TestClient):
     # _instance = None
     # _lock = threading.Lock()
 
@@ -50,12 +63,16 @@ class IBapi(EWrapper, EClient):
     #     return cls._instance
     
     def __init__(self):
-        EClient.__init__(self, self)
+        # EWrapper.__init__(self)
+        # EClient.__init__(self, wrapper=self)
+        TestWrapper.__init__(self)
+        TestClient.__init__(self, wrapper=self)
         print("initializing new object")
         self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
         self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
         self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'Order Type', 'Quantity', 'Action', 'Order State', 'Sec Type'])
-                
+        
+
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
             print('The current ask price is: ', price)
@@ -67,12 +84,11 @@ class IBapi(EWrapper, EClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId]._append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
-        # print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
-        
+        print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
         
         if(config.LiveData):
             self.datadict[reqId].columns=['date','time','open','high','low','close','volume','average']
@@ -103,7 +119,13 @@ class IBapi(EWrapper, EClient):
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
                 print("---Simulated Live Data Starting Now...---")
-                self.backtestingDataUpdate()
+
+                print("historical data end read positions:")
+                print(self.readPositions())
+
+                # threadtest = threading.Thread(target=self.backtestingDataUpdate(),daemon=True)
+                # threadtest.start()
+                # self.backtestingDataUpdate()
 
 
 
@@ -164,7 +186,8 @@ class IBapi(EWrapper, EClient):
                         print("Got All ticker data, sending data now :)")
                         for algo in self.algos:
                             # finds the right data for the algo ticker
-                            algo.update(self, self.datadict[self.tickers.index(algo.ticker)])
+                            tempdata = self.datadict[self.tickers.index(algo.ticker)]
+                            algo.update(self, tempdata)
                             if config.FrontEndDisplay:
                                 sendData = algo.updatefrontend()
                                 algodata.append(sendData)
@@ -241,7 +264,10 @@ class IBapi(EWrapper, EClient):
             # algo update stuffs (assemble the algo data array)
             for algo in self.algos:
                 # finds the right data for the algo ticker
-                algo.update(API = self, data = self.datadict[self.tickers.index(algo.ticker)])
+                print(self.readPositions())
+                # self.testingtrading(self.algos)
+                algo.testpositions(self, 42069)
+                algo.update(self, self.datadict[self.tickers.index(algo.ticker)])
 
                 # print(self)
 
@@ -302,6 +328,9 @@ class IBapi(EWrapper, EClient):
             self.lastbardict[i] = 0
             i += 1
 
+        print("startData read positions")
+        print(self.readPositions())
+
 
     def getData(self,index):
         return self.datadict[index]
@@ -322,17 +351,18 @@ class IBapi(EWrapper, EClient):
         # print(result)
         return(result)
     
-    def testingtrading(self):
-        contract = makeStockContract("MSFT")
-        time.sleep(5)
+    def testingtrading(self,algos):
+        # contract = makeStockContract("MSFT")
+        time.sleep(2)
 
-        parentorder = buyOrderObject(1)
-        parentId = self.nextValidOrderId
-        self.placeOrder(parentId,contract,parentorder)
-        self.readOrders()
-        print("order1 placed")
-        print("orderid = " + str(parentId))
-        stoplossId = self.addStoploss(parentorder, parentId, contract, 100)
+        # parentorder = buyOrderObject(1)
+        # parentId = self.nextValidOrderId
+        # self.placeOrder(parentId,contract,parentorder)
+        # self.readOrders()
+        # print("order1 placed")
+        # print("orderid = " + str(parentId))
+        # stoplossId = self.addStoploss(parentorder, parentId, contract, 100)
+
         # # self.getNextOrderID()
         # # self.placeOrder(self.nextValidOrderId,contract,buyOrderObject(2))
         # # print("order2 placed")
@@ -340,8 +370,20 @@ class IBapi(EWrapper, EClient):
         
         # time.sleep(1)
 
-        print("Current Positions:")
+        print("Read positions in livedatacollect:")
         print(self.readPositions())
+        time.sleep(2)
+        temp = testibkr(self)
+        time.sleep(2)
+        temp.testpositions(self)
+        time.sleep(2)
+        
+        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, config.LiveTrading, 0.20, self, printInfo=False)
+
+        print("here")
+        for algo in algos:
+            algo.testpositions(self, 42069)
+
         # print(self.readPositions("TSLA"))
 
         # time.sleep(10)
@@ -352,14 +394,15 @@ class IBapi(EWrapper, EClient):
         # # Changing StopLoss to Market Order To Close both orders
         # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId, OrderType="MKT")
 
-        self.readOrders()
+        # self.readOrders()
 
         # testsingleton()
     
-        time.sleep(5)
-        self.readOrders()
-        time.sleep(20)
-        self.readOrders()
+        # time.sleep(5)
+        # self.readOrders()
+        # time.sleep(20)
+        # self.readOrders()
+
         # self.getNextOrderID()
         # self.placeOrder(self.nextValidOrderId,contract,sellorder)
         # print("order3 placed")
