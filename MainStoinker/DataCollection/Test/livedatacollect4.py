@@ -82,9 +82,9 @@ class IBapi(TestWrapper, TestClient):
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
         if(config.LiveData):
-            self.datadict[reqId] = self.datadict[reqId]._append([candleData], ignore_index=True)
+            self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -126,6 +126,7 @@ class IBapi(TestWrapper, TestClient):
                 # threadtest = threading.Thread(target=self.backtestingDataUpdate(),daemon=True)
                 # threadtest.start()
                 # self.backtestingDataUpdate()
+                return self.testingtrading(config.algos)
 
 
 

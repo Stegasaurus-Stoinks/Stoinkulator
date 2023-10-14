@@ -32,6 +32,8 @@ def run_loop():
 
 app = IBapi()
 
+app2 = IBapi()
+
 websock = FrontEndClient(app)
 if config.FrontEndDisplay:
     wst = threading.Thread(target=websock.connectwebsocket,daemon=True)
@@ -39,13 +41,23 @@ if config.FrontEndDisplay:
 
 time.sleep(1)
 app.connect('127.0.0.1', 7497, 123)
+app2.connect('127.0.0.1', 7497, 124)
+
 while(not app.isConnected):
     time.sleep(.5)
 print("TWS Connected")
 
+while(not app2.isConnected):
+    time.sleep(.5)
+print("TWS 2 Connected")
+
 api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
 setattr(app, "_thread", api_thread)
+
+api2_thread = threading.Thread(target=app2.run,daemon=True)
+api2_thread.start()
+setattr(app, "_thread", api2_thread)
 
 # print("before run")
 # app.run()
@@ -65,6 +77,10 @@ print(app.readPositions())
 
 app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
 
+time.sleep(10)
+
+app2.testingtrading(config.algos)
+
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")
 print("___________________________________________________________")
@@ -79,6 +95,7 @@ print("------------------Closing Program...-----------------------")
 print("___________________________________________________________")
 
 app.disconnect()
+app2.disconnect()
 
 time.sleep(2)
 
