@@ -3,6 +3,7 @@ import threading
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
+from MainStoinker.NeatTools.decorators import singleton
 
 from livedatacollect4 import IBapi
 
