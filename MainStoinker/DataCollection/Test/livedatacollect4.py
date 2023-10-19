@@ -10,6 +10,8 @@ from datetime import timedelta
 import algotesty
 import simplejson
 
+from MainStoinker.TradeTools.ibkrApi import ibkrApi
+
 from IBKRHelper import *
 
 import queue
@@ -84,7 +86,7 @@ class IBapi(TestWrapper, TestClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -125,8 +127,8 @@ class IBapi(TestWrapper, TestClient):
 
                 # threadtest = threading.Thread(target=self.backtestingDataUpdate(),daemon=True)
                 # threadtest.start()
-                # self.backtestingDataUpdate()
-                return self.testingtrading(config.algos)
+                self.backtestingDataUpdate()
+                # return self.testingtrading(config.algos)
 
 
 
@@ -355,7 +357,7 @@ class IBapi(TestWrapper, TestClient):
     def testingtrading(self,algos):
         # contract = makeStockContract("MSFT")
         time.sleep(2)
-
+       
         # parentorder = buyOrderObject(1)
         # parentId = self.nextValidOrderId
         # self.placeOrder(parentId,contract,parentorder)

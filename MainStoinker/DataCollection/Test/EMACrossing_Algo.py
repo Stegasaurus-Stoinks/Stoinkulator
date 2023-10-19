@@ -5,11 +5,14 @@ import talib as ta
 import time
 import json
 
+from MainStoinker.TradeTools.ibkrApi import ibkrApi
 
 import Start_config as config
 import numpy as np
 import pandas as pd
 import math
+
+import asyncio
 
 from trade import Trade
 
@@ -54,6 +57,18 @@ class Algo:
 
         StockData = data
         
+        print("shit will work here :)")
+        ib = ibkrApi()
+        # loop = asyncio.get_event_loop() # event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        future = asyncio.ensure_future(print(ib.reqPositions())) # tasks to do
+        loop.run_until_complete(future) # loop until done
+
+        
+        # hi = ib.reqPositions()
+        # print(hi)
+
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:
             diff = StockData.shape[0] - self.AlgoData.shape[0]
