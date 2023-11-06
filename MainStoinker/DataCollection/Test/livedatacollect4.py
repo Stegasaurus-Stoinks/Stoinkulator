@@ -15,7 +15,7 @@ from MainStoinker.TradeTools.ibkrApi import ibkrApi
 from IBKRHelper import *
 
 import queue
-# from NeatTools.decorators import singleton
+from NeatTools.decorators import singleton
 import Start_config as config
 
 import numpy as np
@@ -40,7 +40,7 @@ def createStockContact(ticker: str):
 
     return contract
 
-# @singleton
+
 class TestWrapper(EWrapper):
     def __init__(self):
         pass
@@ -49,20 +49,8 @@ class TestClient(EClient):
     def __init__(self, wrapper):
         EClient.__init__(self, wrapper)
 
+@singleton
 class IBapi(TestWrapper, TestClient):
-    # _instance = None
-    # _lock = threading.Lock()
-
-    # def __new__(cls):
-    #     if cls._instance is None: 
-    #         with cls._lock:
-    #             # Another thread could have created the instance
-    #             # before we acquired the lock. So check that the
-    #             # instance is still nonexistent.
-    #             if not cls._instance:
-    #                 print("making new instance")
-    #                 cls._instance = super().__new__(cls)
-    #     return cls._instance
     
     def __init__(self):
         # EWrapper.__init__(self)
@@ -86,7 +74,7 @@ class IBapi(TestWrapper, TestClient):
         if(config.LiveData):
             self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -127,8 +115,9 @@ class IBapi(TestWrapper, TestClient):
 
                 # threadtest = threading.Thread(target=self.backtestingDataUpdate(),daemon=True)
                 # threadtest.start()
-                self.backtestingDataUpdate()
+                # self.backtestingDataUpdate()
                 # return self.testingtrading(config.algos)
+                self.data_collected_obj.set()
 
 
 
@@ -301,7 +290,8 @@ class IBapi(TestWrapper, TestClient):
         print("___________________________________________________________")
 
 
-    def startData(self,socket, tickers, algos, warmup, duration=1):
+    def startData(self,socket, tickers, algos, warmup, data_collected_obj, duration=1):
+        self.data_collected_obj = data_collected_obj
         i = 0
         self.datadict = {}
         self.simulatedDatadict = {}
