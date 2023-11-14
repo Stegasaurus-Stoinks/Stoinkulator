@@ -5,7 +5,7 @@ import talib as ta
 import time
 import json
 
-from MainStoinker.TradeTools.ibkrApi import ibkrApi
+from livedatacollect4 import IBapi
 
 import Start_config as config
 import numpy as np
@@ -21,14 +21,16 @@ inTrade = False
 enterTime = 0
 
 class Algo:
-    def __init__(self, data):
+    def __init__(self, algoConfigData):
         #print("Starting EMA Crossing Algo with " + str(data))
 
         #Initialize Algo with data from Algo Config
-        self.name = data['idname']
-        self.ticker = data['ticker']
-        self.EMA1 = data['short']
-        self.EMA2 = data['long']
+        self.name = algoConfigData['idname']
+        self.ticker = algoConfigData['ticker']
+        self.EMA1 = algoConfigData['short']
+        self.EMA2 = algoConfigData['long']
+
+        self.ibape = IBapi()
 
         #Data frame to store data for Algo, (Stoploss, Analysis, Stuff to send to the front end)  
         self.DataColumns = ['time','StopPrice','MA20','MA50']
@@ -50,24 +52,10 @@ class Algo:
         print("Algo " + self.name + " Initialized")
         
 
-    def update(self, api, data):
-        self.ibape = api
-        print("algo update readPositions")
-        print(self.ibape.readPositions())
-
-        StockData = data
+    def update(self, StockData):
+        # print("algo update readPositions")
+        # print(self.ibape.readPositions())
         
-        print("shit will work here :)")
-        ib = ibkrApi()
-        # loop = asyncio.get_event_loop() # event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        future = asyncio.ensure_future(print(ib.reqPositions())) # tasks to do
-        loop.run_until_complete(future) # loop until done
-
-        
-        # hi = ib.reqPositions()
-        # print(hi)
 
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:
@@ -125,7 +113,7 @@ class Algo:
                 # print("trying reqPositions")
                 # API.reqPositions()
                 # time.sleep(3)
-                print("trying to read positions from algo object")
+                # print("trying to read positions from algo object")
                 # print(API.readPositions())
                 # print("done trying to read positions from algo object")
                 
@@ -225,12 +213,3 @@ class Algo:
         print("Win Rate: ",int(winRate),"%")
         print("Average Win: ",round(avgWin, 2))
         print("Average Loss: ",round(avgLoss, 2))
-
-    def testpositions(self, api, data):
-        self.api2 = api
-        self.fuckingshitfuck = data
-        print("testpositions:")
-        print(self.fuckingshitfuck)
-        print(self.api2.readPositions())
-
-        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, False, 0.20, self.api2, printInfo=False) 

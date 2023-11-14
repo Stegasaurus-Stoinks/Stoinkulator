@@ -10,12 +10,10 @@ from datetime import timedelta
 import algotesty
 import simplejson
 
-from MainStoinker.TradeTools.ibkrApi import ibkrApi
-
 from IBKRHelper import *
 
 import queue
-from NeatTools.decorators import singleton
+from MainStoinker.NeatTools.decorators import singleton
 import Start_config as config
 
 import numpy as np
@@ -28,7 +26,6 @@ import json
 
 from testyclass import testibkr
 from trade import Trade
-from EMACrossing_Algo import Algo
 
 
 def createStockContact(ticker: str):
@@ -93,7 +90,7 @@ class IBapi(TestWrapper, TestClient):
                    
         else:
             self.simulatedDatadict[reqId].columns=['date','time','open','high','low','close','volume','average']
-            print("Historical Data Collected for " + self.tickers[reqId])
+            print("Historical Data Collected for " + self.tickers[reqId].name)
             self.datacollectednum += 1
             # print(self.simulatedDatadict[reqId])
             # Create datadict data frame here
@@ -102,22 +99,13 @@ class IBapi(TestWrapper, TestClient):
             startDate = firstDate + timedelta(days=self.warmup)
             print("Warmup Start Date: " + str(firstDate))
             print("Warmup End Date: " + str(startDate))
-            self.datadict[reqId] = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
-            self.datadict[reqId].columns=['date','time', 'open','high','low','close','volume','average']
-            # print(self.datadict[reqId])
+
+            self.tickers[reqId].data = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
+            self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume','average']
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
-                print("---Simulated Live Data Starting Now...---")
-
-                print("historical data end read positions:")
-                print(self.readPositions())
-
-                # threadtest = threading.Thread(target=self.backtestingDataUpdate(),daemon=True)
-                # threadtest.start()
-                # self.backtestingDataUpdate()
-                # return self.testingtrading(config.algos)
-                self.data_collected_obj.set()
+                self.eventDict[0].set()            
 
 
 
@@ -206,93 +194,9 @@ class IBapi(TestWrapper, TestClient):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
 
 
-    def backtestingDataUpdate(self):
-        startpoints = {}
-        numpoints = {}
 
-        if config.FrontEndDisplay:
-            tickerfulldata = []
-            algotesty.ConfigSend(self.socket)
-            for i in range(len(config.tickers)):
-                Fulldata = self.getDataJson(index = i)
-                tickerfulldata.append({'ticker': config.tickers[i], 'data':Fulldata})
-                # try:
-                #     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
-                # except Exception as e: 
-                #     print(e)
-            print("Sending Fulldata")
-            try: 
-                # self.socket.emit('update_send',{)
-                payload = {"tickerdata":tickerfulldata}
-                payload = simplejson.dumps(payload, ignore_nan=True)
-                # print(payload)
-                self.socket.emit('data_send',payload)
-            except Exception as e: 
-                print(e)
-
-        for i in range(len(config.tickers)):
-            startpoints[i] = self.datadict[i].shape[0]
-            numpoints[i] = self.simulatedDatadict[i].shape[0] - startpoints[i]
-            print("Running data loop for " + str(numpoints[i]) + " points of data for ticker " + str(config.tickers[i]) )
-
-
-
-        starttime = datetime.now()
-        for k in range(numpoints[0]):
-            tickerdata = []
-            algodata = []
-            for i in range(len(self.tickers)):
-                while(not config.updating):
-                    time.sleep(1)
-                entry = self.simulatedDatadict[i].iloc[startpoints[i]+k]
-
-                self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
-                
-                if config.FrontEndDisplay:
-                    sendData = {"ticker":self.tickers[i],"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                    tickerdata.append(sendData) 
-
-            
-            # algo update stuffs (assemble the algo data array)
-            for algo in self.algos:
-                # finds the right data for the algo ticker
-                print(self.readPositions())
-                # self.testingtrading(self.algos)
-                algo.testpositions(self, 42069)
-                algo.update(self, self.datadict[self.tickers.index(algo.ticker)])
-
-                # print(self)
-
-                if config.FrontEndDisplay:
-                    sendData = algo.updatefrontend()
-                    algodata.append(sendData)
-
-            if config.FrontEndDisplay:
-                try: 
-                    # self.socket.emit('update_send',{)
-                    payload = {"tickerdata":tickerdata,"algodata":algodata}
-                    payload = simplejson.dumps(payload, ignore_nan=True)
-                    # print(payload)
-                    self.socket.emit('update_send',payload)
-                except Exception as e: 
-                    print(e)
-
-            time.sleep(config.TimeDelayPerPoint)
-            print(entry[0])
-   
-        self.printAlgoStats()
-        endtime = datetime.now()
-        duration = endtime-starttime
-        print("Backtesting "+str(numpoints)+" Points is Done!")
-        print("Duration: " + str(duration))
-        print("___________________________________________________________")
-        print("--------------Press 'CTRL' to Close Program----------------")
-        print("___________________________________________________________")
-
-
-    def startData(self,socket, tickers, algos, warmup, data_collected_obj, duration=1):
-        self.data_collected_obj = data_collected_obj
-        i = 0
+    def startData(self,socket, tickers, algos, warmup, eventDict, duration=1):
+        self.eventDict = eventDict
         self.datadict = {}
         self.simulatedDatadict = {}
         self.livetickerdata = []
@@ -302,24 +206,23 @@ class IBapi(TestWrapper, TestClient):
         self.algos = algos
         self.warmup = warmup
         self.socket = socket
-        for ticker in tickers:
+        for ticker in tickers.values():
 
-            contract = createStockContact(ticker)
+            contract = createStockContact(ticker.name)
 
             if(config.LiveData):
-                self.reqHistoricalData(i, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])
+                self.reqHistoricalData(ticker.index, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])
                 
 
             else:
                 self.datacollectednum = 0 #variable to track completed historical data pulls
-                self.reqHistoricalData(i, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
-                self.simulatedDatadict[i] = pd.DataFrame()
+                self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
+                self.simulatedDatadict[ticker.index] = pd.DataFrame()
                 self.datacollectednum = 0
 
             
-            self.datadict[i] = pd.DataFrame()
-            self.lastbardict[i] = 0
-            i += 1
+            self.datadict[ticker.index] = pd.DataFrame()
+            self.lastbardict[ticker.index] = 0
 
         print("startData read positions")
         print(self.readPositions())
@@ -339,10 +242,7 @@ class IBapi(TestWrapper, TestClient):
             algo.printStats(FullPrint)
             i += 1
 
-    def getDataJson(self,index):
-        result = self.datadict[index].to_json(orient="records")
-        # print(result)
-        return(result)
+
     
     def testingtrading(self,algos):
         # contract = makeStockContract("MSFT")
@@ -494,6 +394,8 @@ class IBapi(TestWrapper, TestClient):
             if config.Debug:
                 print(e)
                 print("failed to set event object for readOrders")
+    
+
 
     
     def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice, StopId = None, OrderType = None):

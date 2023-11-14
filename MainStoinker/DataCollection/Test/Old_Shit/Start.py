@@ -1,4 +1,4 @@
-import Start_config
+import Start_config as config
 
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -83,7 +83,7 @@ Algo1EMA = EMAAlgo('AAPL', 20, 50, printInfo = False)
 Algos = [Algo1EMA]
 
 # app.startData(ticker_list(list),warmup_period(int days),Live Data Yes/No, Backtesting Duration)
-app.startData(tickers,Algos,1,Start_config.LiveData,8) # Backtesting
+app.startData(tickers,Algos,1,config.LiveData,8) # Backtesting
 
 
 

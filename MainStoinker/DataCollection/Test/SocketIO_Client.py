@@ -3,14 +3,16 @@ import Start_config as config
 import json
 import simplejson
 import algotesty
+from MainStoinker.NeatTools.decorators import singleton
 
-
+@singleton
 class FrontEndClient:
 
-    sio = socketio.Client()
+    
 
-    def __init__(self, IBapp):
-        self.app = IBapp
+    def __init__(self):
+        print("initializing socket connection")
+        self.sio = socketio.Client()
         
     def connectwebsocket(self):
         try:
@@ -53,8 +55,8 @@ class FrontEndClient:
             print(algofulldata)
 
             for i in range(len(config.tickers)):
-                Fulldata = self.app.getDataJson(index = i)
-                tickerfulldata.append({'ticker': config.tickers[i], 'data':Fulldata})
+                Fulldata = self.getDataJson(i)
+                tickerfulldata.append({'ticker': config.tickers[i].name, 'data':Fulldata})
                 # try:
                 #     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
                 # except Exception as e: 
@@ -85,5 +87,23 @@ class FrontEndClient:
         def disconnect():
             print("I'm disconnected!")
 
+        
 
-    
+
+    #EMITS BEING USED:
+    # data_send
+    # update_send
+    # config_send
+    def emit_data(self, message, payload):
+        try: 
+            payload = simplejson.dumps(payload, ignore_nan=True)
+            self.sio.emit(message, payload)  
+        except Exception as e: 
+            print(e)
+
+
+
+    def getDataJson(self, index):
+        result = config.tickers[index].data.to_json(orient="records")
+        # print(result)
+        return(result)

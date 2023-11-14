@@ -1,10 +1,14 @@
 import json
 import os
 import importlib
-import Start_config
+import Start_config as config
+from ticker import Ticker
 # print(os.getcwd())
 
 def AlgoConfigParse():
+    tickerDict = {}
+    configTickerDict = {}
+
     file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
 
     tickerlist = []
@@ -25,14 +29,22 @@ def AlgoConfigParse():
         # print(algoName)
         algolist.append(algoName)
         for algoConfigData in algo['data']:
+            tickerName = algoConfigData['ticker']
             # print(algoConfigData['ticker'])
-            algoObjectList.append(AlgoStarter(algoName,algoConfigData))
-            if algoConfigData['ticker'] in tickerlist:
-                # print("ticker already in tickerlist")
-                continue
 
-            else:
-                tickerlist.append(algoConfigData['ticker'])
+            ticker = tickerDict.get(tickerName) 
+            
+            if ticker is None:
+                # create ticker object
+                ticker = Ticker(tickerName, config.tickerIndex)
+                tickerDict[tickerName] = ticker
+                config.tickerIndex += config.tickerIndex 
+                configTickerDict[ticker.index] = ticker
+            
+            
+            algo = AlgoStarter(algoName,algoConfigData)
+            ticker.register_algo(algo)
+            algoObjectList.append(algo)
 
             algoCount += 1
 
@@ -40,8 +52,8 @@ def AlgoConfigParse():
     # print(algolist) # list of all the unique algos
     # print(tickerlist) # list of all the unique tickers
     # print(parsed_json) # all the data from json file
-    Start_config.tickers = tickerlist
-    Start_config.algos = algoObjectList
+    config.tickers = configTickerDict
+    config.algos = algoObjectList
 
     return algoObjectList
 
