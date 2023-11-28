@@ -2,7 +2,6 @@ import socketio
 import Start_config as config
 import json
 import simplejson
-import algotesty
 from MainStoinker.NeatTools.decorators import singleton
 
 @singleton
@@ -41,7 +40,7 @@ class FrontEndClient:
         
         @self.sio.on('req_config')
         def on_message(data):
-            algotesty.ConfigSend(self.sio)
+            self.ConfigSend()
             
         @self.sio.on('req_data')
         def on_message(data):
@@ -57,21 +56,12 @@ class FrontEndClient:
             for i in range(len(config.tickers)):
                 Fulldata = self.getDataJson(i)
                 tickerfulldata.append({'ticker': config.tickers[i].name, 'data':Fulldata})
-                # try:
-                #     self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
-                # except Exception as e: 
-                #     print(e)
-            # print(tickerfulldata)
+
             print("Sending Fulldata")
-            try: 
-                # self.socket.emit('update_send',{)
-                payload = {"tickerdata":tickerfulldata, "algodata":algofulldata}
-                payload = simplejson.dumps(payload, ignore_nan=True)
-                # print(payload)
-                self.sio.emit('data_send',payload)
-                print("full data send")
-            except Exception as e: 
-                print(e)
+
+            payload = {"tickerdata":tickerfulldata, "algodata":algofulldata}
+            self.emit_data("data_send", payload)
+            print("full data send")
         
         @self.sio.event
         def connect():
@@ -94,7 +84,7 @@ class FrontEndClient:
     # data_send
     # update_send
     # config_send
-    def emit_data(self, message, payload):
+    def emit_data(self, message:str, payload):
         try: 
             payload = simplejson.dumps(payload, ignore_nan=True)
             self.sio.emit(message, payload)  
@@ -103,7 +93,36 @@ class FrontEndClient:
 
 
 
-    def getDataJson(self, index):
+    def getDataJson(self, index:int):
         result = config.tickers[index].data.to_json(orient="records")
         # print(result)
         return(result)
+    
+
+
+    def send_full_data(self, index:int):
+        data = self.getDataJson(index)
+        payload = {"tickerdata":data}
+        self.emit_data("data_send", payload)
+    
+    def updateData(self, index:int):
+        data = self.getDataJson(index)
+        payload = {"tickerdata":data}
+        self.emit_data("data_send", payload)
+
+    
+    def ConfigSend(self):
+        file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
+
+        try:
+            parsed_json = json.load(file)
+        except Exception as e:
+            print("Got the following exception: " + str(e))
+
+        file.close()
+        print("Sending Algo Config")
+        print(parsed_json)
+        try:
+            self.sio.emit('config_send', parsed_json)
+        except:
+            print("Cant send Config, /Not connected to front end")

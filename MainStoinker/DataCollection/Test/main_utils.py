@@ -12,7 +12,7 @@ def event_loop(event, index):
     while(not event.is_set()):
         event.wait()
         print("Event called for " + config.tickers[index].name)
-        config.tickers[index].updateAlgos()
+        config.tickers[index].update_algos()
         event.clear()
 
 

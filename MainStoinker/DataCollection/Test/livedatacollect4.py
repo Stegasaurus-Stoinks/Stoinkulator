@@ -7,22 +7,19 @@ from ibapi.common import *
 from csv import writer
 from datetime import datetime
 from datetime import timedelta
-import algotesty
 import simplejson
 
 from IBKRHelper import *
 
-import queue
 from MainStoinker.NeatTools.decorators import singleton
 import Start_config as config
+from SocketIO_Client import FrontEndClient as Sio
 
 import numpy as np
 import pandas as pd
 
 import threading
 import time
-
-import json
 
 from testyclass import testibkr
 from trade import Trade
@@ -52,6 +49,7 @@ class IBapi(TestWrapper, TestClient):
     def __init__(self):
         # EWrapper.__init__(self)
         # EClient.__init__(self, wrapper=self)
+        self.socket = Sio()
         TestWrapper.__init__(self)
         TestClient.__init__(self, wrapper=self)
         print("initializing new object")
@@ -64,28 +62,27 @@ class IBapi(TestWrapper, TestClient):
         if tickType == 2 and reqId == 1:
             print('The current ask price is: ', price)
 
+    # collecting backtesting/warmup data
     def historicalData(self, reqId: int, bar: BarData):
-        # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
+        
+        # TODO: maybe make this a method (1)
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
         if(config.LiveData):
-            self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
+            config.tickers[reqId].append([candleData])
         else:
             self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
-
+    # terminal callback from reqHistoricalData
     def historicalDataEnd(self, reqId: int, start: str, end: str):
+        # TODO: add a warmup function for algos to analyze historical data
         print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
         
         if(config.LiveData):
-            self.datadict[reqId].columns=['date','time','open','high','low','close','volume','average']
             print(self.datadict[reqId])
             print("All Historical Data Collected: Live Data Starting Now...")
             # nothing else is needed here because historical data was set to keep live data
-            if config.FrontEndDisplay:
-                Fulldata = self.getDataJson(index = 0)
-                # self.socket.emit('data_send', 'AAPL', Fulldata)
-                # self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
+            
                 
                    
         else:
@@ -105,87 +102,33 @@ class IBapi(TestWrapper, TestClient):
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
-                self.eventDict[0].set()            
+                self.eventDict[0].set() 
+        
+        if config.FrontEndDisplay:
+            self.socket.send_full_data(reqId)
 
 
 
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):           # Live Data Updates
-        tickerdata = []
-        algodata = []
+        ticker = config.tickers[reqId]
+        # TODO: maybe make this a method (2)
+        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
-        data = {'date':[datetime.fromtimestamp(int(bar.date))],
-                'time':[int(bar.date)],
-                'open':[bar.open],
-                'high':[bar.high],
-                'low':[bar.low],
-                'close':[bar.close],
-                'volume':[bar.volume],
-                'average':[bar.average]}
-        newdata = pd.DataFrame(data)
-        
         if self.lastbardict[reqId]:
+            # is it intraminute?
             if bar.date == self.lastbardict[reqId].date:
+                # did anything change?
                 if (bar.average != self.lastbardict[reqId].average):
-                    # print("IntraMinute Update: HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
-                    self.datadict[reqId].drop(self.datadict[reqId].tail(1).index,inplace=True)
-                    self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
-
-                    if config.FrontEndDisplay and config.intraMinuteDisplay:
-                        entry = self.datadict[reqId].iloc[-1]
-                        sendData = {"ticker":self.tickers[reqId],"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                        
-                        self.liveintraminutedata.append(sendData)
-
-                        if len(self.liveintraminutedata) >= len(self.tickers):
-                            print("Got full intraminute data package")
-                        
-                            try: 
-                                payload = {"tickerdata":self.liveintraminutedata}
-                                payload = simplejson.dumps(payload, ignore_nan=True)
-                                print("Intraminute Update: " + payload)
-                                self.socket.emit('update_send',payload)
-                            except Exception as e: 
-                                print(e)
-                            
-                            self.liveintraminutedata = []
-
+                    ticker.replace([candleData])
+            #it is not intraminute
             else:
-                self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
-                print("got data for " +self.tickers[reqId])
-                if config.FrontEndDisplay:
-                    entry = self.datadict[reqId].iloc[-1]
-                    sendData = {"ticker":self.tickers[reqId],"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                    self.livetickerdata.append(sendData)
-
-                    #TODO Add catch for if not all the data comes in 
-                    #(dont know if itll ever happen but would rather be safe than sorry)
-                    #Maybe use a timmer from time of first minute received?
-                  
-                    if (len(self.livetickerdata) == len(self.tickers)): #All ticker data collected
-                        print("Got All ticker data, sending data now :)")
-                        for algo in self.algos:
-                            # finds the right data for the algo ticker
-                            tempdata = self.datadict[self.tickers.index(algo.ticker)]
-                            algo.update(self, tempdata)
-                            if config.FrontEndDisplay:
-                                sendData = algo.updatefrontend()
-                                algodata.append(sendData)
-
-                        try: 
-                            # self.socket.emit('update_send',{)
-                            payload = {"tickerdata":self.livetickerdata,"algodata":algodata}
-                            payload = simplejson.dumps(payload, ignore_nan=True)
-                            print(payload)
-                            self.socket.emit('update_send',payload)
-                        except Exception as e: 
-                            print(e)
-
-                        #reset livetickerdata so its ready to collect data for next minute
-                        self.livetickerdata = []
+                ticker.append([candleData])
+                self.eventDict[reqId].set()              
+        else:
+            ticker.append([candleData])
 
         self.lastbardict[reqId] = bar
-    
 
 
 

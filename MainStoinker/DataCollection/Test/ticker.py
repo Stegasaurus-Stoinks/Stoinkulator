@@ -31,8 +31,11 @@ class Ticker():
         
         # update all associated algos
         for algo in self.registeredAlgos:
-            algo.update(self.data)
-
+            if config.LiveData:
+                algo.update(self.data.drop(self.data.tail(1).index,inplace=True))
+            else:
+                algo.update(self.data)
+                
             if config.FrontEndDisplay:
                 sendData = algo.updatefrontend()
                 algodata.append(sendData)
@@ -45,5 +48,9 @@ class Ticker():
             self.socket.emit_data("update_send", payload)
 
 
-    def append(self, entry):
+    def append(self, entry:list):
         self.data = pd.concat([self.data,pd.DataFrame.from_records([entry])],ignore_index=True)
+
+    def replace(self, entry:list, pointNum = 1):
+        self.data.drop(self.data.tail(pointNum).index,inplace=True)
+        self.append(entry)

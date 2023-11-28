@@ -3,7 +3,6 @@ from datetime import datetime
 from datetime import timedelta
 import talib as ta
 import time
-import json
 
 from livedatacollect4 import IBapi
 
@@ -11,8 +10,6 @@ import Start_config as config
 import numpy as np
 import pandas as pd
 import math
-
-import asyncio
 
 from trade import Trade
 

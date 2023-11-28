@@ -38,7 +38,7 @@ def AlgoConfigParse():
                 # create ticker object
                 ticker = Ticker(tickerName, config.tickerIndex)
                 tickerDict[tickerName] = ticker
-                config.tickerIndex += config.tickerIndex 
+                config.tickerIndex += 1
                 configTickerDict[ticker.index] = ticker
             
             
@@ -49,6 +49,7 @@ def AlgoConfigParse():
             algoCount += 1
 
     print("Total Algos: " + str(algoCount))
+    print(configTickerDict)
     # print(algolist) # list of all the unique algos
     # print(tickerlist) # list of all the unique tickers
     # print(parsed_json) # all the data from json file
@@ -65,21 +66,6 @@ def AlgoStarter(algo, data):
     return AlgoClass(data)
 
 
-def ConfigSend(socket):
-    file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
-
-    try:
-        parsed_json = json.load(file)
-    except Exception as e:
-        print("Got the following exception: " + str(e))
-
-    file.close()
-    print("Sending Algo Config")
-    print(parsed_json)
-    try:
-        socket.emit('config_send', parsed_json)
-    except:
-        print("Cant send Config, /Not connected to front end")
 
 
 # AlgoConfigParse()

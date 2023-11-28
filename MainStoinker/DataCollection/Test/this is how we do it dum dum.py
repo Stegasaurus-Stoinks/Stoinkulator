@@ -57,7 +57,7 @@ if config.LiveData:
         eventDict[ticker.index] = threading.Event()
 
     for index, event in eventDict.items():
-        event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True)
+        event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True, name=config.tickers[index].name)
         event_thread.start()
 else:
     eventDict[0] = threading.Event()
