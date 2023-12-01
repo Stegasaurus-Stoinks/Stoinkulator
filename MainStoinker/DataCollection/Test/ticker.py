@@ -32,9 +32,9 @@ class Ticker():
         # update all associated algos
         for algo in self.registeredAlgos:
             if config.LiveData:
-                print(self.data)
-                df = self.data.drop(self.data.tail(1).index, inplace=True)
-                algo.update(df)
+                # print(self.data)
+                # print(self.data.head(-1))
+                algo.update(self.data.head(-1))
             else:
                 algo.update(self.data)
                 
