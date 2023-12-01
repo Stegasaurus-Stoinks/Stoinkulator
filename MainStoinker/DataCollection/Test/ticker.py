@@ -32,7 +32,9 @@ class Ticker():
         # update all associated algos
         for algo in self.registeredAlgos:
             if config.LiveData:
-                algo.update(self.data.drop(self.data.tail(1).index,inplace=True))
+                print(self.data)
+                df = self.data.drop(self.data.tail(1).index, inplace=True)
+                algo.update(df)
             else:
                 algo.update(self.data)
                 
@@ -49,7 +51,9 @@ class Ticker():
 
 
     def append(self, entry:list):
-        self.data = pd.concat([self.data,pd.DataFrame.from_records([entry])],ignore_index=True)
+        df = pd.DataFrame(entry)
+        df.columns=['date','time','open','high','low','close','volume','average']
+        self.data = pd.concat([self.data,df],ignore_index=True)
 
     def replace(self, entry:list, pointNum = 1):
         self.data.drop(self.data.tail(pointNum).index,inplace=True)

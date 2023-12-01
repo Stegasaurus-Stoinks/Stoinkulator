@@ -79,7 +79,7 @@ class IBapi(TestWrapper, TestClient):
         print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
         
         if(config.LiveData):
-            print(self.datadict[reqId])
+            print(config.tickers[reqId].data)
             print("All Historical Data Collected: Live Data Starting Now...")
             # nothing else is needed here because historical data was set to keep live data
             
@@ -115,22 +115,17 @@ class IBapi(TestWrapper, TestClient):
         # TODO: maybe make this a method (2)
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
-        if self.lastbardict[reqId]:
             # is it intraminute?
-            if bar.date == self.lastbardict[reqId].date:
-                # did anything change?
-                if (bar.average != self.lastbardict[reqId].average):
-                    ticker.replace([candleData])
-            #it is not intraminute
-            else:
-                ticker.append([candleData])
-                self.eventDict[reqId].set()              
+        self.lastbar = ticker.data.iloc[-1]
+        lastbartime = self.lastbar["date"].to_pydatetime()
+        if candleData[0] == lastbartime:
+            # did anything change?
+            if (bar.average != self.lastbar["average"]):
+                ticker.replace([candleData])
+        #it is not intraminute
         else:
             ticker.append([candleData])
-
-        self.lastbardict[reqId] = bar
-
-
+            self.eventDict[reqId].set()              
 
 
     def error(self, reqId, errorCode, errorString):

@@ -52,7 +52,8 @@ class Algo:
     def update(self, StockData):
         # print("algo update readPositions")
         # print(self.ibape.readPositions())
-        
+        print("Stock DAta in Ticker")
+        print(StockData)
 
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:

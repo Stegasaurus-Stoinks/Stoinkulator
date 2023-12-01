@@ -91,7 +91,6 @@ print("___________________________________________________________")
 print("")
 
 keyboard.wait('Ctrl')
-print(app.readpositions())
 
 config.updating = 0
 

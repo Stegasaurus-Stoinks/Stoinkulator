@@ -15000,3 +15000,16 @@ Duration: 0 days 00:04:00
 
 
 
+---------Trade Stats---------
+Open Price: 372.27
+Close Price: 372.39
+P/L: 0.12000000000000455
+
+Open Time: 2023-12-01 09:41:00
+Close Time: 2023-12-01 09:42:00
+Direction: 1
+
+Duration: 0 days 00:01:00
+
+
+
