@@ -138,7 +138,7 @@ class IBapi(TestWrapper, TestClient):
 
 
 
-    def startData(self,socket, tickers, algos, warmup, eventDict, duration=1):
+    def startData(self, tickers, algos, warmup, eventDict, duration=1):
         self.eventDict = eventDict
         self.datadict = {}
         self.simulatedDatadict = {}
@@ -148,7 +148,6 @@ class IBapi(TestWrapper, TestClient):
         self.tickers = tickers
         self.algos = algos
         self.warmup = warmup
-        self.socket = socket
         for ticker in tickers.values():
 
             contract = createStockContact(ticker.name)

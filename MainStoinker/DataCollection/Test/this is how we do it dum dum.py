@@ -35,7 +35,7 @@ app = IBapi()
 
 
 
-websock = FrontEndClient(app)
+websock = FrontEndClient()
 if config.FrontEndDisplay:
     wst = threading.Thread(target=websock.connectwebsocket,daemon=True)
     wst.start()
@@ -75,7 +75,7 @@ if not app.getNextOrderID():
 print("startup read positions")
 print(app.readPositions())
 
-app.startData(websock.sio,config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
+app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
 if not config.LiveData:
     eventDict[0].wait()
@@ -91,7 +91,7 @@ print("___________________________________________________________")
 print("")
 
 keyboard.wait('Ctrl')
-print(app.readpositions)
+print(app.readpositions())
 
 config.updating = 0
 

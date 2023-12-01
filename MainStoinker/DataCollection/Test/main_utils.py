@@ -1,5 +1,4 @@
 import Start_config as config
-import algotesty
 from SocketIO_Client import FrontEndClient as sio
 import simplejson
 from livedatacollect4 import IBapi
@@ -28,7 +27,7 @@ def backtesting_data_blast():
     #MOVE FRONT END STUFF SOMEWHERE ELSE
     if config.FrontEndDisplay:
         tickerfulldata = []
-        algotesty.ConfigSend(socket)
+        socket.ConfigSend()
         for i in range(len(config.tickers)):
             Fulldata = getDataJson(index = i)
             tickerfulldata.append({'ticker': config.tickers[i].name, 'data':Fulldata})
