@@ -1,14 +1,19 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
+from ibapi.order import Order
 from ibapi.common import BarData
 from ibapi.common import *
 from csv import writer
 from datetime import datetime
 from datetime import timedelta
-import algotesty
+import simplejson
 
+from IBKRHelper import *
+
+from MainStoinker.NeatTools.decorators import singleton
 import Start_config as config
+from SocketIO_Client import FrontEndClient as Sio
 
 import numpy as np
 import pandas as pd
@@ -16,7 +21,9 @@ import pandas as pd
 import threading
 import time
 
-import json
+from testyclass import testibkr
+from trade import Trade
+
 
 def createStockContact(ticker: str):
     contract = Contract()
@@ -28,48 +35,59 @@ def createStockContact(ticker: str):
     return contract
 
 
-class IBapi(EWrapper, EClient):
+class TestWrapper(EWrapper):
     def __init__(self):
-        EClient.__init__(self, self)
+        pass
+
+class TestClient(EClient):
+    def __init__(self, wrapper):
+        EClient.__init__(self, wrapper)
+
+@singleton
+class IBapi(TestWrapper, TestClient):
+    
+    def __init__(self):
+        # EWrapper.__init__(self)
+        # EClient.__init__(self, wrapper=self)
+        self.socket = Sio()
+        TestWrapper.__init__(self)
+        TestClient.__init__(self, wrapper=self)
+        print("initializing new object")
+        self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
+        self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
+        self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'Order Type', 'Quantity', 'Action', 'Order State', 'Sec Type'])
         
-                
+
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
             print('The current ask price is: ', price)
 
-    def nextValidId(self, orderId: int):
-        print("Setting nextValidOrderId: %d", orderId)
-        self.nextValidOrderId = orderId
-        # self.startData("AAPL")
-
+    # collecting backtesting/warmup data
     def historicalData(self, reqId: int, bar: BarData):
-        # print("HistoricalData. ReqId:", reqId, "BarData.", bar)
+        
+        # TODO: maybe make this a method (1)
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
 
         if(config.LiveData):
-            self.datadict[reqId] = self.datadict[reqId].append([candleData], ignore_index=True)
+            config.tickers[reqId].append([candleData])
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
-
+    # terminal callback from reqHistoricalData
     def historicalDataEnd(self, reqId: int, start: str, end: str):
-        # print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
-        
+        # TODO: add a warmup function for algos to analyze historical data
+        print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
         
         if(config.LiveData):
-            self.datadict[reqId].columns=['date','time','open','high','low','close','volume','average']
-            print(self.datadict[reqId])
+            print(config.tickers[reqId].data)
             print("All Historical Data Collected: Live Data Starting Now...")
             # nothing else is needed here because historical data was set to keep live data
-            if config.FrontEndDisplay:
-                Fulldata = self.getDataJson(index = 0)
-                # self.socket.emit('data_send', 'AAPL', Fulldata)
-                self.socket.emit('data_send', {'ticker': 'AAPL', 'data':Fulldata})
+            
                 
                    
         else:
             self.simulatedDatadict[reqId].columns=['date','time','open','high','low','close','volume','average']
-            print("Historical Data Collected for " + self.tickers[reqId])
+            print("Historical Data Collected for " + self.tickers[reqId].name)
             self.datacollectednum += 1
             # print(self.simulatedDatadict[reqId])
             # Create datadict data frame here
@@ -78,156 +96,77 @@ class IBapi(EWrapper, EClient):
             startDate = firstDate + timedelta(days=self.warmup)
             print("Warmup Start Date: " + str(firstDate))
             print("Warmup End Date: " + str(startDate))
-            self.datadict[reqId] = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
-            self.datadict[reqId].columns=['date','time', 'open','high','low','close','volume','average']
-            # print(self.datadict[reqId])
+
+            self.tickers[reqId].data = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
+            self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume','average']
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
-                print("---Simulated Live Data Starting Now...---")
-                self.backtestingDataUpdate()
-
-
-    def historicalDataUpdate(self, reqId: int, bar: BarData):
-        # if self.lastbardict[reqId] != 0:
-        # print(self.lastbardict)
-        updatecsv = False
-        data = {'date':[datetime.fromtimestamp(int(bar.date))],
-                'time':[int(bar.date)],
-                'open':[bar.open],
-                'high':[bar.high],
-                'low':[bar.low],
-                'close':[bar.close],
-                'volume':[bar.volume],
-                'average':[bar.average]}
-        newdata = pd.DataFrame(data)
+                self.eventDict[0].set() 
         
-        if self.lastbardict[reqId]:
-            if bar.date == self.lastbardict[reqId].date:
-                if (bar.average != self.lastbardict[reqId].average):
-                    print("IntraMinute Update: HistoricalDataUpdate. ReqId:", reqId, "BarData.", bar)
-                    self.datadict[reqId].drop(self.datadict[reqId].tail(1).index,inplace=True)
-                    self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
-
-                    if config.FrontEndDisplay and config.intraMinuteDisplay:
-                        entry = self.datadict[reqId].tail(1)
-                        sendData = { "time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                        try: self.socket.emit('update_send',sendData)
-                        except Exception as e: print(e)
-
-            else:
-                self.datadict[reqId] = pd.concat([self.datadict[reqId],newdata],ignore_index=True)
-
-                if config.FrontEndDisplay:
-                    entry = self.datadict[reqId].tail(1)
-                    sendData = { "time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                    try: self.socket.emit('update_send',sendData)
-                    except Exception as e: print(e)
+        if config.FrontEndDisplay:
+            self.socket.send_full_data(reqId)
 
 
+
+
+    def historicalDataUpdate(self, reqId: int, bar: BarData):           # Live Data Updates
+        ticker = config.tickers[reqId]
+        # TODO: maybe make this a method (2)
+        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
+
+            # is it intraminute?
+        self.lastbar = ticker.data.iloc[-1]
+        lastbartime = self.lastbar["date"].to_pydatetime()
+        if candleData[0] == lastbartime:
+            # did anything change?
+            if (bar.average != self.lastbar["average"]):
+                ticker.replace([candleData])
+        #it is not intraminute
         else:
-            print("empty :D Probably because its the first loop")
-
-        self.lastbardict[reqId] = bar
-    
+            ticker.append([candleData])
+            self.eventDict[reqId].set()              
 
 
     def error(self, reqId, errorCode, errorString):
         print("Error. Id: ", reqId, " Code: ", errorCode, " Msg: ", errorString)
 
 
-    def backtestingDataUpdate(self):
-        startpoints = {}
-        numpoints = {}
 
-        if config.FrontEndDisplay:
-            algotesty.ConfigSend(self.socket)
-            for i in range(len(config.tickers)):
-                Fulldata = self.getDataJson(index = i)
-                # sendData = { "Date":str(dataPoint['Date']), "Open":str(dataPoint['Open']),"High":str(dataPoint['High']),"Low":str(dataPoint['Low']),"Close":str(dataPoint['Close']),"Volume":str(dataPoint['Volume'])}
-                # print(Fulldata)
-                print("data requested, sending Fulldata")
-                self.socket.emit('data_send', {'ticker': config.tickers[i], 'data':Fulldata})
-
-        for i in range(len(config.tickers)):
-            startpoints[i] = self.datadict[i].shape[0]
-            numpoints[i] = self.simulatedDatadict[i].shape[0] - startpoints[i]
-            print("Running data loop for " + str(numpoints[i]) + " points of data for ticker " + str(config.tickers[i]) )
-
-
-
-        starttime = datetime.now()
-        for k in range(numpoints[0]):
-            tickerdata = []
-            algodata = []
-            for i in range(len(self.tickers)):
-                while(not config.updating):
-                    time.sleep(1)
-                entry = self.simulatedDatadict[i].iloc[startpoints[i]+k]
-
-                self.datadict[i] = pd.concat([self.datadict[i],pd.DataFrame.from_records([entry])],ignore_index=True)
-                
-                if config.FrontEndDisplay:
-                    sendData = {"ticker":self.tickers[i],"time":float(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}
-                    tickerdata.append(sendData) 
-
-            
-            if config.FrontEndDisplay:
-                # algo update stuffs (assemble the algo data array)
-                for algo in self.algos:
-                    algo.update(self.getData())
-                    sendData = algo.updatefrontend()
-                    algodata.append(sendData)
-
-                # send front end stuffs
-                # print([tickerdata,algodata])
-                try: self.socket.emit('update_send',[tickerdata,algodata])
-                except Exception as e: print(e)
-
-            time.sleep(config.TimeDelayPerPoint)
-            print(entry[0])
-   
-        self.printAlgoStats()
-        endtime = datetime.now()
-        duration = endtime-starttime
-        print("Backtesting "+str(numpoints)+" Points is Done!")
-        print("Duration: " + str(duration))
-        print("___________________________________________________________")
-        print("--------------Press 'CTRL' to Close Program----------------")
-        print("___________________________________________________________")
-
-
-    def startData(self,socket, tickers, algos, warmup, duration=1):
-        i = 0
+    def startData(self, tickers, algos, warmup, eventDict, duration=1):
+        self.eventDict = eventDict
         self.datadict = {}
         self.simulatedDatadict = {}
+        self.livetickerdata = []
+        self.liveintraminutedata = []
         self.lastbardict = {}
         self.tickers = tickers
         self.algos = algos
         self.warmup = warmup
-        self.socket = socket
-        for ticker in tickers:
+        for ticker in tickers.values():
 
-            contract = createStockContact(ticker)
+            contract = createStockContact(ticker.name)
 
             if(config.LiveData):
-                self.reqHistoricalData(i, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])
+                self.reqHistoricalData(ticker.index, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])
                 
 
             else:
                 self.datacollectednum = 0 #variable to track completed historical data pulls
-                self.reqHistoricalData(i, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
-                self.simulatedDatadict[i] = pd.DataFrame()
+                self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
+                self.simulatedDatadict[ticker.index] = pd.DataFrame()
                 self.datacollectednum = 0
 
             
-            self.datadict[i] = pd.DataFrame()
-            self.lastbardict[i] = 0
-            i += 1
+            self.datadict[ticker.index] = pd.DataFrame()
+            self.lastbardict[ticker.index] = 0
+
+        print("startData read positions")
+        print(self.readPositions())
 
 
-    def getData(self):
-        return self.datadict
+    def getData(self,index):
+        return self.datadict[index]
     
     def get1DataPoint(self,index):
         return self.datadict[0].iloc[index]
@@ -235,13 +174,220 @@ class IBapi(EWrapper, EClient):
     def printAlgoStats(self, FullPrint = True):
         i = 0
         for algo in self.algos:
+            print("________________________________________________")
             print(f"Printing Stats for Algo {i}")
             algo.printStats(FullPrint)
             i += 1
 
-    def getDataJson(self,index):
-        result = self.datadict[index].to_json(orient="records")
-        # print(result)
-        return(result)     
 
+    
+    def testingtrading(self,algos):
+        # contract = makeStockContract("MSFT")
+        time.sleep(2)
+       
+        # parentorder = buyOrderObject(1)
+        # parentId = self.nextValidOrderId
+        # self.placeOrder(parentId,contract,parentorder)
+        # self.readOrders()
+        # print("order1 placed")
+        # print("orderid = " + str(parentId))
+        # stoplossId = self.addStoploss(parentorder, parentId, contract, 100)
+
+        # # self.getNextOrderID()
+        # # self.placeOrder(self.nextValidOrderId,contract,buyOrderObject(2))
+        # # print("order2 placed")
+        # # print("orderid = " + str(self.nextValidOrderId))
+        
+        # time.sleep(1)
+
+        print("Read positions in livedatacollect:")
+        print(self.readPositions())
+        time.sleep(2)
+        temp = testibkr(self)
+        time.sleep(2)
+        temp.testpositions(self)
+        time.sleep(2)
+        
+        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, config.LiveTrading, 0.20, self, printInfo=False)
+
+        print("here")
+        for algo in algos:
+            algo.testpositions(self, 42069)
+
+        # print(self.readPositions("TSLA"))
+
+        # time.sleep(10)
+        # print("changing stoploss")
+        # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId)
+
+        # time.sleep(5)
+        # # Changing StopLoss to Market Order To Close both orders
+        # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId, OrderType="MKT")
+
+        # self.readOrders()
+
+        # testsingleton()
+    
+        # time.sleep(5)
+        # self.readOrders()
+        # time.sleep(20)
+        # self.readOrders()
+
+        # self.getNextOrderID()
+        # self.placeOrder(self.nextValidOrderId,contract,sellorder)
+        # print("order3 placed")
+        # print("orderid = " + str(self.nextValidOrderId))
+        # print(self.readPositions())
+
+    def getNextOrderID(self):
+        self.event_obj = threading.Event()
+        self.reqIds(-1)
+        if config.Debug:
+            print("waiting for getNextOrderID thread")
+        timeout = 2
+        flag = self.event_obj.wait(timeout)
+        if flag:
+            if config.Debug:
+                print("getNextOrderID Event Triggered, This means it worked")
+            return self.nextValidOrderId
+        else:
+            if config.Debug:
+                print("Time out occured, getNextOrderID event internal flag still false. Executing thread without waiting for event")
+            return None
+
+    def nextValidId(self, orderId: int):
+        super().nextValidId(orderId)
+
+        self.nextValidOrderId = orderId
+        if config.Debug:
+            print("NextValidId:", orderId)
+        try:
+            self.event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("tried to set event object for getNextOrderID")
+
+    #Generate new list of positions, returns Pandas DataFrame
+    def readPositions(self,tickerSymbol:str = None):
+        self.positions_event_obj = threading.Event()
+        self.temp = self.reqPositions() # associated callback: position
+        # self.reqPositionsMulti()
+        if config.Debug:
+            print("Waiting for IB's API response for accounts positions requests...")
+        # time.sleep(3)
+        timeout = 2
+        flag = self.positions_event_obj.wait(timeout)
+        if flag:
+            current_positions = self.all_positions # associated callback: position
+            # dont know why i cant shift the index of the array, adding line below breaks stuff :(
+            # current_positions.set_index('Account',inplace=True,drop=True) #set all_positions DataFrame index to "Account"
+            if tickerSymbol:
+                return current_positions.loc[current_positions['Symbol'] == tickerSymbol]
+            return current_positions
+        else:
+            print("error with callback for positions")
+    
+    def position(self, account, contract, pos, avgCost):
+        index = str(account)+str(contract.symbol)
+        if config.Debug:
+            print("In CallBack for Postions: Position Data Received")
+            print(account, contract.symbol, pos, avgCost, contract.secType)
+        self.all_positions.loc[index]= {'Account':account, 'Symbol':contract.symbol, 'Quantity':pos, 'Average Cost':avgCost, 'Sec Type':contract.secType}
             
+    def positionEnd(self, event_obj = None):
+        # super().positionEnd()
+        if config.Debug:
+            print("PositionEnd CallBack")
+        try:
+            self.positions_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for readPositions")
+
+    def readOrders(self):
+        self.orders_event_obj = threading.Event()
+        self.reqAllOpenOrders()
+        if config.Debug:
+            print("Waiting for IB's API response for accounts positions requests...")
+        # time.sleep(3)
+        timeout = 2
+        flag = self.orders_event_obj.wait(timeout)
+        if flag:
+            print(self.all_openorders)
+        else:
+            print("error with callback for positions")
+
+    def openOrder(self,orderId,contract,order,orderState):
+        self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'Order Type':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'Order State':orderState.status,'Sec Type':contract.secType}
+
+    def openOrderEnd(self):
+        if config.Debug:
+            print("openOrderEnd CallBack")
+        try:
+            self.orders_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for readOrders")
+    
+
+
+    
+    def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice, StopId = None, OrderType = None):
+        #StopId being set means you are updating a stoploss thats already been created
+
+        parentAction = parentOrder.action
+        quantity = parentOrder.totalQuantity
+        parentOrderId = parentOrder.orderId
+        if StopId == None:
+            self.getNextOrderID()
+            OrderId = self.nextValidOrderId
+        else:
+            OrderId = StopId
+            if config.Debug:
+                print("Editing Stoploss Price/Quantity")
+
+        stopLoss = Order()
+        stopLoss.orderId = OrderId
+        if parentAction == "Buy":
+            stopLoss.action = "SELL"  
+        else: 
+            stopLoss.action = "BUY"
+
+        if OrderType == None:
+            stopLoss.orderType = "STP"
+        else: 
+            stopLoss.orderType = OrderType
+            if config.Debug:
+                print("Editing Stoploss Order Type to " + str(OrderType))
+        #Stop trigger price
+        stopLoss.auxPrice = stopPrice
+        stopLoss.totalQuantity = quantity
+        stopLoss.parentId = parentOrderId
+        stopLoss.eTradeOnly = False
+        stopLoss.firmQuoteOnly = False
+
+        self.placeOrder(OrderId, contract, stopLoss)
+
+        return OrderId
+    
+    # def readPositionsTest(self,tickerSymbol:str = None):
+    #     self.readPositions(self)
+
+    def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):
+        if reqId > -1:
+            print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
+        
+
+
+def testsingleton():
+    app = IBapi()
+    # app.connect('127.0.0.1', 7497, 123)
+    while(not app.isConnected):
+        time.sleep(.5)
+    print("TWS Connected")
+    print(app.readPositions("TSLA"))
+
+# TODO: Singleton not working yet... dont know why, its not connecting...

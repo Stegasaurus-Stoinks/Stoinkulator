@@ -3,7 +3,6 @@ import threading
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from MainStoinker.NeatTools.decorators import singleton
 
 from livedatacollect4 import IBapi
 
@@ -22,11 +21,8 @@ import Start_config as config
 
 from SocketIO_Client import FrontEndClient
 
-from MainStoinker.TradeTools.ibkrApi import ibkrApi
+from testyclass import testibkr
 
-ib = ibkrApi()
-
-print(ib.reqPositions())
 
 count = 0
 
@@ -38,8 +34,6 @@ def run_loop():
 
 app = IBapi()
 
-
-
 websock = FrontEndClient(app)
 if config.FrontEndDisplay:
     wst = threading.Thread(target=websock.connectwebsocket,daemon=True)
@@ -47,16 +41,12 @@ if config.FrontEndDisplay:
 
 time.sleep(1)
 app.connect('127.0.0.1', 7497, 123)
-
-
 while(not app.isConnected):
     time.sleep(.5)
 print("TWS Connected")
 
 api_thread = threading.Thread(target=app.run,daemon=True)
 api_thread.start()
-setattr(app, "_thread", api_thread)
-
 # print("before run")
 # app.run()
 # print("after run")
@@ -70,12 +60,15 @@ if not app.getNextOrderID():
     time.sleep(1)
     exit()
 
-print("startup read positions")
+print("Read positions in ibclasstest:")
 print(app.readPositions())
 
-app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+# app.startData(websock.sio,config.tickers,AlgoList,2,config.Duration) # Backtesting
+app.testingtrading(AlgoList)
 
-time.sleep(10)
+
+
+
 
 print("___________________________________________________________")
 print("--------------Press 'CTRL' to Close Program----------------")

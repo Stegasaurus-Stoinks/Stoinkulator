@@ -1,38 +1,71 @@
+from IBKRHelper import *
+
 class Trade:
     
     #unique id so find trades that have been placed by this algo
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, live, stoploss, printInfo = False):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, limitOrder = False, printInfo = False):
+        self.ibkrApi = API
         self.symbol = symbol
         self.volume = volume
-        self.ID = ID
+        self.tradeID = ID
+        self.stopLossID = 0
         self.openPrice = openPrice
         self.openTime = openTime
         self.direction = direction
         self.printInfo = printInfo
         self.live = live
+        self.limitOrder = limitOrder
         if self.direction:
             self.stopPrice = openPrice - stoploss
         else:
             self.stopPrice = openPrice + stoploss
 
+        self.printInfo = True
+
+        print("Read positions in trade class")
+        # print(self.ibkrApi.readPositions())
+
         self.stopLoss = stoploss
-        if live:
-            self.openPosition()
-        else:
-            self.fakeOpen()
+        # if live:
+        #     self.openPosition()
+        # else:
+        #     self.fakeOpen()
+
         
 
 
+        
+    def fakeOpen(self):
+        print("Open Fake Trade")
+
     def openPosition(self):
         #call funtion to open order through api
+        # TODO: Open stoploss position here too
+
+        self.contract = makeStockContract(self.symbol)
 
         #check if short or long position
-        if self.volume > 0:
-            self.ibkrApi.SimpleBuy(self.symbol, self.volume)
+        if self.direction:
+            if self.limitOrder:
+                self.parentOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
+            else:
+                self.parentOrder = buyOrderObject(self.volume)
+                print("buy order created")
 
-        if self.volume < 0:
-            self.ibkrApi.SimpleSell(self.symbol, self.volume)
+        else:
+            if self.limitOrder:
+                self.parentOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
+            else:
+                self.parentOrder = sellOrderObject(self.volume)
+        
+        print(self.ibkrApi.readPositions())
+        self.ibkrApi.getNextOrderID()
+        self.parentId = self.ibkrApi.nextValidOrderId
+        print("open order id")
+        print(self.parentId)
+        self.ibkrApi.placeOrder(self.parentId,self.contract,self.parentOrder)
+        self.stoplossId = self.ibkrApi.addStoploss(self.parentOrder, self.parentId, self.contract, self.stopPrice)
 
         self.position = True
         self.status = "Open"
@@ -40,7 +73,7 @@ class Trade:
         #print to console trade placement info if asked for it
         if self.printInfo:
             print("______________________________________________________________________")
-            print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.ID))
+            print("Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
             print("______________________________________________________________________")
 
 
@@ -49,19 +82,33 @@ class Trade:
         self.closeTime = closeTime
 
         #call funtion to close order through api
-        
-        if self.live:
-            if self.volume > 0:
-                self.ibkrApi.SimpleBuy(self.symbol, self.volume)
+        # TODO: close stoploss position here too
 
-            if self.volume < 0:
-                self.ibkrApi.SimpleSell(self.symbol, self.volume)
+        if self.live:
+            if self.direction:
+                if self.limitOrder:
+                    self.parentCloseOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
+                else:
+                    self.parentCloseOrder = sellOrderObject(self.volume)
+                    print("sell order created")
+
+            else:
+                if self.limitOrder:
+                    self.parentCloseOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
+                else:
+                    self.parentCloseOrder = buyOrderObject(self.volume)
+
+            
+            self.ParentCloseId = self.ibkrApi.getNextOrderID()
+            print("close order id")
+            print(self.ParentCloseId)
+            self.ibkrApi.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
 
             self.position = False
             self.status = "Closed"
 
             if self.printInfo:
-                print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.ID))
+                print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
 
         else:
             #Fake Trade for backtesting
@@ -69,19 +116,7 @@ class Trade:
             self.status = "Closed"
 
             if self.printInfo:
-                print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.ID))
-
-
-    def fakeOpen(self):
-
-        self.position = True
-        self.status = "Open"
-
-        #print to console trade placement info if asked for it
-        if self.printInfo:
-            print("______________________________________________________________________")
-            print("Opened a fake Postion! Bought " + str(self.volume) + " of " + self.symbol + " at time: " + str(self.openTime) + " | Trade ID: " + str(self.ID))
-            print("______________________________________________________________________")
+                print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
 
 
 
@@ -96,23 +131,24 @@ class Trade:
         #stoploss check + reclaculation if necessary for either direction
         #return 1 if good 0 if bad
         if self.direction: #UP Trade
-            # print(curpoint['close'])
-            # print(self.stopPrice)
+
             price = curpoint["close"]
             if price > self.stopPrice + self.stopLoss:
                 self.stopPrice = price - self.stopLoss
-                return 1
+
             if price < self.stopPrice:
                 return 0
             else:
                 return 1
 
-        # else: #DOWN Trade
-        #     if price < self.stopPrice - self.stopLoss:
-        #         self.stopPrice = price + self.stopLoss
-        #         return 1
-        #     if price > self.stopLoss:
-        #         return 0
+        else: #DOWN Trade
+            if price < self.stopPrice - self.stopLoss:
+                self.stopPrice = price + self.stopLoss
+
+            if price > self.stopLoss:
+                return 0
+            else:
+                return 1
 
     def getStats(self, Fulldisplay = True):
 
@@ -134,7 +170,7 @@ class Trade:
         
         if(Fulldisplay):
             print("---------Trade Stats---------")
-            print("ID: ",self.ID)
+            print("ID: ",self.tradeID)
             print("Open Price: ",self.openPrice)
             print("Close Price: ",self.closePrice)
             print("P/L: ",PL)

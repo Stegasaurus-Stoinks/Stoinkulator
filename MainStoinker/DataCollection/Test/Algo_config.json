@@ -1,17 +1,12 @@
 [
   {
-    "EMACrossing": [
+    "ID":"EMACrossing",
+    "data":[
       {
-        "idname": "TSAT-20/50EMA",
-        "ticker": "TSAT",
+        "idname": "MSFT-20/30EMA",
+        "ticker": "MSFT",
         "short": "20",
         "long": "50"
-      },
-      {
-        "idname": "NVTS-20/50EMA",
-        "ticker": "NVTS",
-        "short": "30",
-        "long": "40"
       }
     ]
   }

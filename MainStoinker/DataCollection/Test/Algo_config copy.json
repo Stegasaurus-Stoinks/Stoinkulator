@@ -1,0 +1,18 @@
+[
+  {
+    "EMACrossing": [
+      {
+        "idname": "TSAT-20/30EMA",
+        "ticker": "TSAT",
+        "short": "20",
+        "long": "30"
+      },
+      {
+        "idname": "AAPL-20/70EMA",
+        "ticker": "AAPL",
+        "short": "20",
+        "long": "70"
+      }
+    ]
+  }
+]

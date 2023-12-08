@@ -2,13 +2,22 @@ from ib_insync import *
 import time
 import pandas as pd
 import numpy as np
+from MainStoinker.NeatTools.decorators import singleton
 
-
+@singleton
 class ibkrApi(IB):
     pass
     #unique id so find trades that have been placed by this algo
+    def __init__(self):
+        super().__init__()
+        self.connect('127.0.0.1', 7497, clientId=124)
+        print("Connecting ib_insync")
+        time.sleep(5)
+        if(not self.isConnected()):
+            exit()
+            
 
-    ibkrApi
+    
 
 
     def orderfilled(trade, fill):
