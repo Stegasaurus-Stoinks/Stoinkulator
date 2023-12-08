@@ -51,9 +51,13 @@ class Ticker():
 
 
     def append(self, entry:list):
-        df = pd.DataFrame(entry)
-        df.columns=['date','time','open','high','low','close','volume','average']
-        self.data = pd.concat([self.data,df],ignore_index=True)
+        if not config.LiveData:
+            self.data = pd.concat([self.data,pd.DataFrame.from_records([entry])],ignore_index=True)
+        else:
+            df = pd.DataFrame(entry)
+            df.columns=['date','time','open','high','low','close','volume','average']
+            self.data = pd.concat([self.data,df],ignore_index=True)
+        
 
     def replace(self, entry:list, pointNum = 1):
         self.data.drop(self.data.tail(pointNum).index,inplace=True)
