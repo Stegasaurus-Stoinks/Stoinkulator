@@ -1,34 +1,71 @@
+from MainStoinker.Util.IBKRHelper import *
+
 class Trade:
     
     #unique id so find trades that have been placed by this algo
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, ibkrApi, live, backTest):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, limitOrder = False, printInfo = False):
+        self.ibkrApi = API
         self.symbol = symbol
         self.volume = volume
-        self.ID = ID
+        self.tradeID = ID
+        self.stopLossID = 0
         self.openPrice = openPrice
         self.openTime = openTime
         self.direction = direction
-        self.ibkrApi = ibkrApi
-        self.printInfo = True
+        self.printInfo = printInfo
         self.live = live
-        self.backTest = backTest
-        if live:
-            self.openPosition()
+        self.limitOrder = limitOrder
+        if self.direction:
+            self.stopPrice = openPrice - stoploss
         else:
-            self.fakeOpen()
+            self.stopPrice = openPrice + stoploss
+
+        self.printInfo = True
+
+        print("Read positions in trade class")
+        # print(self.ibkrApi.readPositions())
+
+        self.stopLoss = stoploss
+        # if live:
+        #     self.openPosition()
+        # else:
+        #     self.fakeOpen()
+
         
 
 
-    def openPosition(self):
+        
+    def fake_open(self):
+        print("Open Fake Trade")
+
+    def open_position(self):
         #call funtion to open order through api
+        # TODO: Open stoploss position here too
+
+        self.contract = makeStockContract(self.symbol)
 
         #check if short or long position
-        if self.volume > 0:
-            self.ibkrApi.SimpleBuy(self.symbol, self.volume)
+        if self.direction:
+            if self.limitOrder:
+                self.parentOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
+            else:
+                self.parentOrder = buyOrderObject(self.volume)
+                print("buy order created")
 
-        if self.volume < 0:
-            self.ibkrApi.SimpleSell(self.symbol, self.volume)
+        else:
+            if self.limitOrder:
+                self.parentOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
+            else:
+                self.parentOrder = sellOrderObject(self.volume)
+        
+        print(self.ibkrApi.readPositions())
+        self.ibkrApi.getNextOrderID()
+        self.parentId = self.ibkrApi.nextValidOrderId
+        print("open order id")
+        print(self.parentId)
+        self.ibkrApi.placeOrder(self.parentId,self.contract,self.parentOrder)
+        self.stoplossId = self.ibkrApi.addStoploss(self.parentOrder, self.parentId, self.contract, self.stopPrice)
 
         self.position = True
         self.status = "Open"
@@ -36,91 +73,119 @@ class Trade:
         #print to console trade placement info if asked for it
         if self.printInfo:
             print("______________________________________________________________________")
-            print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + self.ID)
+            print("Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
             print("______________________________________________________________________")
 
 
-    def closePosition(self, closePrice, closeTime):
+    def close_position(self, closePrice, closeTime):
         self.closePrice = closePrice
         self.closeTime = closeTime
 
         #call funtion to close order through api
-        
-        if self.volume > 0:
-            self.ibkrApi.SimpleBuy(self.symbol, self.volume)
+        # TODO: close stoploss position here too
 
-        if self.volume < 0:
-            self.ibkrApi.SimpleSell(self.symbol, self.volume)
+        if self.live:
+            if self.direction:
+                if self.limitOrder:
+                    self.parentCloseOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
+                else:
+                    self.parentCloseOrder = sellOrderObject(self.volume)
+                    print("sell order created")
 
-        self.position = False
-        self.status = "Closed"
+            else:
+                if self.limitOrder:
+                    self.parentCloseOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
+                else:
+                    self.parentCloseOrder = buyOrderObject(self.volume)
 
-        if self.printInfo:
-            print("______________________________________________________________________")
-            print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + self.ID)
-            print("______________________________________________________________________")
+            
+            self.ParentCloseId = self.ibkrApi.getNextOrderID()
+            print("close order id")
+            print(self.ParentCloseId)
+            self.ibkrApi.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
 
-    def fakeOpen(self):
+            self.position = False
+            self.status = "Closed"
 
-        self.position = True
-        self.status = "Open"
+            if self.printInfo:
+                print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
 
-        #print to console trade placement info if asked for it
-        if self.printInfo:
-            print("______________________________________________________________________")
-            print("Opened a fake Postion! Bought " + str(self.volume) + " of " + self.symbol + " at time: " + str(self.openTime) + " | Trade ID: " + self.ID)
-            print("______________________________________________________________________")
+        else:
+            #Fake Trade for backtesting
+            self.position = False
+            self.status = "Closed"
 
+            if self.printInfo:
+                print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
 
-    def fakeClose(self, closePrice, closeTime):
-        self.closePrice = closePrice
-        self.closeTime = closeTime
-
-        self.position = False
-        self.status = "Closed"
-
-        if self.printInfo:
-            print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + self.ID)
 
 
     #return true or false whether we are in position or not
-    def inPosition(self):
+    def in_position(self):
         return(self.position)
 
-    def getStatus(self):
+    def get_status(self):
         return(self.status)
+    
+    def check(self, curpoint):
+        #stoploss check + reclaculation if necessary for either direction
+        #return 1 if good 0 if bad
+        if self.direction: #UP Trade
 
-    def getStats(self, display = False):
+            price = curpoint["close"]
+            if price > self.stopPrice + self.stopLoss:
+                self.stopPrice = price - self.stopLoss
+
+            if price < self.stopPrice:
+                return 0
+            else:
+                return 1
+
+        else: #DOWN Trade
+            if price < self.stopPrice - self.stopLoss:
+                self.stopPrice = price + self.stopLoss
+
+            if price > self.stopLoss:
+                return 0
+            else:
+                return 1
+
+    def get_stats(self, Fulldisplay = True):
 
         PL = self.closePrice - self.openPrice
         if self.direction == "DOWN":
             PL = PL*(-1)
         duration = self.closeTime - self.openTime
         
-        if(display):
-            if not self.backTest:
-                f = open("live_tradey.txt", "a")
-            else:
-                f = open("test_tradey.txt", "a")
-            f.write("---------Trade Stats---------\n")
-            f.write(str("Open Price: "+str(self.openPrice)+"\n"))
-            f.write(str("Close Price: "+str(self.closePrice)+"\n"))
-            f.write(str("P/L: "+str(PL)+"\n\n"))
-            f.write(str("Open Time: "+str(self.openTime)+"\n"))
-            f.write(str("Close Time: "+str(self.closeTime)+"\n"))
-            f.write(str("Direction: "+str(self.direction)+"\n\n"))
-            f.write(str("Duration: "+str(duration)+"\n\n\n\n"))
-            f.close()
+        f = open("tradey.txt", "a")
+        f.write("---------Trade Stats---------\n")
+        f.write(str("Open Price: "+str(self.openPrice)+"\n"))
+        f.write(str("Close Price: "+str(self.closePrice)+"\n"))
+        f.write(str("P/L: "+str(PL)+"\n\n"))
+        f.write(str("Open Time: "+str(self.openTime)+"\n"))
+        f.write(str("Close Time: "+str(self.closeTime)+"\n"))
+        f.write(str("Direction: "+str(self.direction)+"\n\n"))
+        f.write(str("Duration: "+str(duration)+"\n\n\n\n"))
+        f.close()
+        
+        if(Fulldisplay):
             print("---------Trade Stats---------")
+            print("ID: ",self.tradeID)
             print("Open Price: ",self.openPrice)
             print("Close Price: ",self.closePrice)
             print("P/L: ",PL)
             print(" ")
             print("Open Time: ",self.openTime)
             print("Close Time: ",self.closeTime)
-            print("Direction: ",self.direction)
-            print(" ")
             print("Duration: ",duration)
+            print(" ")
+            print("Direction: ",self.direction)
+            print("-----------------------------")
+
+        
+        else:
+            print("Trade ", self.ID)
+            print("Profit: ",PL)
 
         d = dict(); 
         d['openPrice'] = self.openPrice
@@ -131,6 +196,14 @@ class Trade:
         d['duration']   = duration
 
         return(d)
+
+
+    def get_profit(self):
+        PL = self.closePrice - self.openPrice
+        if self.direction == "DOWN":
+            PL = PL*(-1)
+        return PL
+
 
 
     #returns a dictionary object of all data needed to recreate the trade object

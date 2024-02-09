@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import Enum
  
 from algotesty import AlgoConfigParse
-from EMACrossing_Algo import Algo as EMAAlgo
+from MainStoinker.DataCollection.Test.EMACrosssing_Algo import Algo as EMAAlgo
 
 import threading
 import time

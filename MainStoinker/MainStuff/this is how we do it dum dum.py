@@ -5,12 +5,9 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from MainStoinker.NeatTools.decorators import singleton
 
-from livedatacollect4 import IBapi
+from MainStoinker.DataCollection.apiApi import IBapi
 from datetime import datetime
 from enum import Enum
- 
-from algotesty import AlgoConfigParse
-from MainStoinker.DataCollection.Test.EMACrosssing_Algo import Algo as EMAAlgo
 
 import threading
 import time
@@ -19,14 +16,14 @@ import os
 import Start_config as config
 import main_utils as utils
 
-from SocketIO_Client import FrontEndClient
+from MainStoinker.Util.SocketIO_Client import FrontEndClient
 
 eventDict = {}
 
 
 count = 0
 
-AlgoList = AlgoConfigParse()
+AlgoList = utils.algo_config_parse()
 print(AlgoList)
 
 
@@ -37,7 +34,7 @@ app = IBapi()
 
 websock = FrontEndClient()
 if config.FrontEndDisplay:
-    wst = threading.Thread(target=websock.connectwebsocket,daemon=True)
+    wst = threading.Thread(target=websock.connect_websocket,daemon=True)
     wst.start()
 
 time.sleep(1)

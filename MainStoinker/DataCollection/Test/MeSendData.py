@@ -12,7 +12,7 @@ from datetime import datetime
 from enum import Enum
  
 from algotesty import AlgoConfigParse
-from EMACrossing_Algo import Algo as EMAAlgo
+from MainStoinker.DataCollection.Test.EMACrosssing_Algo import Algo as EMAAlgo
 
 import threading
 import time
@@ -22,7 +22,7 @@ import Start_config as config
 
 from SocketIO_Client import FrontEndClient
 
-from MainStoinker.TradeTools.ibkrApi import ibkrApi
+from MainStoinker.DataCollection.ibkrApi import ibkrApi
 
 ib = ibkrApi()
 

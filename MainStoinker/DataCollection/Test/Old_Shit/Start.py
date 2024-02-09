@@ -9,7 +9,7 @@ import time
 import keyboard
 import os
 from livedatacollect3 import IBapi
-from EMACrossing_Algo import Algo as EMAAlgo
+from MainStoinker.DataCollection.Test.EMACrosssing_Algo import Algo as EMAAlgo
 
 
 import socketio

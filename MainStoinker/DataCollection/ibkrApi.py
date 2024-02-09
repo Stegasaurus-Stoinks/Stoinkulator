@@ -25,7 +25,7 @@ class ibkrApi(IB):
         print(trade)
         print(fill)
 
-    def closePosition(self, position, price = 0, percent=1.00):
+    def close_position(self, position, price = 0, percent=1.00):
         position.contract.exchange = 'SMART'
         numShares = round(percent * position.position)
         if numShares == 0:
@@ -40,7 +40,7 @@ class ibkrApi(IB):
         print(sell)
         sell.fillEvent += self.orderfilled
 
-    def openPosition(self, ticker, strike, date, direction, quantity, price = 0):
+    def open_position(self, ticker, strike, date, direction, quantity, price = 0):
         #ticker: 'AAPL'
         #strike: int
         #date: '20210430' = 'YYYYMMDD'
@@ -59,7 +59,7 @@ class ibkrApi(IB):
         trade = self.placeOrder(call_option,buyOrder)
 
     #stock version of openPosition
-    def SimpleBuy(self, ticker, quantity, price = 0):
+    def simple_buy(self, ticker, quantity, price = 0):
         #ticker: 'AAPL'
         #strike: int
         #date: '20210430' = 'YYYYMMDD'
@@ -79,7 +79,7 @@ class ibkrApi(IB):
         print("PLACED BUY ORDER!")
         return trade
 
-    def simpleSell(self, position, price = 0, percent=1.00):
+    def simple_sell(self, position, price = 0, percent=1.00):
         position.contract.exchange = 'SMART'
         numShares = round(percent * position.position)
         if numShares == 0:

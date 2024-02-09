@@ -9,7 +9,7 @@ from datetime import timedelta
 
 import Start_config as config
 
-import EMACrossing_Algo
+import MainStoinker.DataCollection.Test.EMACrosssing_Algo as EMACrosssing_Algo
 
 import numpy as np
 import pandas as pd
