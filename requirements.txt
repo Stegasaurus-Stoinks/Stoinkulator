@@ -7,3 +7,7 @@ ib_insync
 tzdata
 ibapi
 python-socketio
+simplejson
+keyboard
+
+# pip install -e .
