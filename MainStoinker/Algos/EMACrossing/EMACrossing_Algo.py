@@ -4,14 +4,14 @@ from datetime import timedelta
 import talib as ta
 import time
 
-from livedatacollect4 import IBapi
+from MainStoinker.DataCollection.apiApi import IBapi
 
-import Start_config as config
+import MainStoinker.MainStuff.Start_config as config
 import numpy as np
 import pandas as pd
 import math
 
-from trade import Trade
+from MainStoinker.TradeTools.trade import Trade
 
 
 inTrade = False
@@ -129,7 +129,7 @@ class Algo:
         if self.inTrade:
             self.printStuff("In a trade")
             if not self.trade.check(self.curStockData):
-                self.trade.closePosition(self.trade.stopPrice,self.curStockData['date'])
+                self.trade.close_Position(self.trade.stopPrice,self.curStockData['date'])
                 self.printStuff("Closing position based on stoploss")
                 self.inTrade = False
             # time.sleep(1)
@@ -140,7 +140,7 @@ class Algo:
             #End of day trade closing
             endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
             if self.curStockData['date'] > endofDay:
-                self.trade.closePosition(self.curStockData['close'],self.curStockData['date'])
+                self.trade.close_Position(self.curStockData['close'],self.curStockData['date'])
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 

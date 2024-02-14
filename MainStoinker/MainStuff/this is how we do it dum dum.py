@@ -13,7 +13,7 @@ import threading
 import time
 import keyboard
 import os
-import Start_config as config
+import MainStoinker.MainStuff.Start_config as config
 import main_utils as utils
 
 from MainStoinker.Util.SocketIO_Client import FrontEndClient

@@ -48,7 +48,7 @@ class FrontEndClient:
             algofulldata = []
 
             for i in range(len(config.algos)):
-                Fulldata = config.algos[i].updatefrontendfulldata()
+                Fulldata = config.algos[i].update_frontend_fulldata()
                 algofulldata.append(Fulldata)
 
             print(algofulldata)

@@ -39,7 +39,7 @@ class Ticker():
                 algo.update(self.data)
                 
             if config.FrontEndDisplay:
-                sendData = algo.updatefrontend()
+                sendData = algo.update_frontend()
                 algodata.append(sendData)
         
         # send data to front end

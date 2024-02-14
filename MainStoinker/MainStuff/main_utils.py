@@ -1,4 +1,4 @@
-import Start_config as config
+import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.Util.SocketIO_Client import FrontEndClient as sio
 import simplejson
 from MainStoinker.DataCollection.apiApi import IBapi
@@ -73,9 +73,9 @@ def algo_config_parse():
 
 
 def algo_starter(algo, data):
-    filename = str(algo) + "_Algo"
+    filename = "." + str(algo) + "_Algo"
     print("Opening " + filename)
-    AlgoClass = getattr(importlib.import_module(filename),'Algo')
+    AlgoClass = getattr(importlib.import_module(filename,"MainStoinker.Algos.EMACrossing"),'Algo')
     return AlgoClass(data)
 
 
