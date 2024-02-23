@@ -1,11 +1,13 @@
 from MainStoinker.Util.IBKRHelper import *
+import MainStoinker.MainStuff.Start_config as config
+from MainStoinker.DataCollection.apiApi import IBapi
 
 class Trade:
     
     #unique id so find trades that have been placed by this algo
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, limitOrder = False, printInfo = False):
-        self.ibkrApi = API
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, stoploss, limitOrder = False, printInfo = False):
+        self.ibape = IBapi()
         self.symbol = symbol
         self.volume = volume
         self.tradeID = ID
@@ -14,7 +16,7 @@ class Trade:
         self.openTime = openTime
         self.direction = direction
         self.printInfo = printInfo
-        self.live = live
+        self.live = config.LiveTrading
         self.limitOrder = limitOrder
         if self.direction:
             self.stopPrice = openPrice - stoploss
@@ -23,14 +25,14 @@ class Trade:
 
         self.printInfo = True
 
-        print("Read positions in trade class")
-        # print(self.ibkrApi.readPositions())
+        # print("Read positions in trade class")
+        # print(self.ibape.readPositions())
 
         self.stopLoss = stoploss
-        # if live:
-        #     self.openPosition()
-        # else:
-        #     self.fakeOpen()
+        if self.live:
+            self.open_position()
+        else:
+            self.fake_open()
 
         
 
@@ -59,13 +61,13 @@ class Trade:
             else:
                 self.parentOrder = sellOrderObject(self.volume)
         
-        print(self.ibkrApi.readPositions())
-        self.ibkrApi.getNextOrderID()
-        self.parentId = self.ibkrApi.nextValidOrderId
+        print(self.ibape.readPositions())
+        self.ibape.getNextOrderID()
+        self.parentId = self.ibape.nextValidOrderId
         print("open order id")
         print(self.parentId)
-        self.ibkrApi.placeOrder(self.parentId,self.contract,self.parentOrder)
-        self.stoplossId = self.ibkrApi.addStoploss(self.parentOrder, self.parentId, self.contract, self.stopPrice)
+        self.ibape.placeOrder(self.parentId,self.contract,self.parentOrder)
+        self.stoplossId = self.ibape.addStoploss(self.parentOrder, self.parentId, self.contract, self.stopPrice)
 
         self.position = True
         self.status = "Open"
@@ -99,10 +101,10 @@ class Trade:
                     self.parentCloseOrder = buyOrderObject(self.volume)
 
             
-            self.ParentCloseId = self.ibkrApi.getNextOrderID()
+            self.ParentCloseId = self.ibape.getNextOrderID()
             print("close order id")
             print(self.ParentCloseId)
-            self.ibkrApi.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
+            self.ibape.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
 
             self.position = False
             self.status = "Closed"

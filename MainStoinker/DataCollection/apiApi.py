@@ -21,9 +21,6 @@ import pandas as pd
 import threading
 import time
 
-from MainStoinker.Util.testyclass import testibkr
-from MainStoinker.TradeTools.trade import Trade
-
 
 def createStockContact(ticker: str):
     contract = Contract()
@@ -121,10 +118,14 @@ class IBapi(TestWrapper, TestClient):
         if candleData[0] == lastbartime:
             # did anything change?
             if (bar.average != self.lastbar["average"]):
+                print("intraminute update")
                 ticker.replace([candleData])
+                if config.intraMinuteDisplay:
+                    ticker.intraminute_update()
         #it is not intraminute
         else:
             ticker.append([candleData])
+            print(ticker.data)
             self.eventDict[reqId].set()              
 
 

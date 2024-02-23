@@ -44,8 +44,6 @@ class Algo:
         self.printInfo = True
         self.trades = []
 
-        self.ibkrApi = None
-
         print("Algo " + self.name + " Initialized")
         
 
@@ -96,7 +94,7 @@ class Algo:
                 closeTime = self.curStockData['date']
                 closePrice = self.curStockData['close']
                 self.trade.close_position(closePrice,closeTime)
-                self.trade.getStats()
+                self.trade.get_stats()
 
             
             if trend:
@@ -116,7 +114,7 @@ class Algo:
                 # print("done trying to read positions from algo object")
                 
 
-                self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20, self.ibkrApi, printInfo=False)
+                self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, 0.20, printInfo=False)
                 self.trades.append(self.trade)
                 time.sleep(1)
 

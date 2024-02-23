@@ -112,7 +112,7 @@ class FrontEndClient:
 
     
     def Config_send(self):
-        file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
+        file = open('./MainStoinker/MainStuff/Algo_config.json')
 
         try:
             parsed_json = json.load(file)

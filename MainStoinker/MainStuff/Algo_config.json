@@ -3,8 +3,8 @@
     "ID":"EMACrossing",
     "data":[
       {
-        "idname": "MSFT-20/30EMA",
-        "ticker": "MSFT",
+        "idname": "HUT8-20/30EMA",
+        "ticker": "HUT",
         "short": "20",
         "long": "50"
       }
