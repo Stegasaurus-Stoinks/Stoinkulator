@@ -15,10 +15,6 @@ class ibkrApi(IB):
         time.sleep(5)
         if(not self.isConnected()):
             exit()
-            
-
-    
-
 
     def orderfilled(trade, fill):
         print("------------------order has been filled")

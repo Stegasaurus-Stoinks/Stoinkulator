@@ -52,8 +52,8 @@ class Algo:
     def update(self, StockData):
         # print("algo update readPositions")
         # print(self.ibape.readPositions())
-        print("Stock DAta in Ticker")
-        print(StockData)
+        # print("Stock DAta in Ticker")
+        # print(StockData)
 
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:
@@ -95,7 +95,7 @@ class Algo:
                 self.inTrade = False
                 closeTime = self.curStockData['date']
                 closePrice = self.curStockData['close']
-                self.trade.closePosition(closePrice,closeTime)
+                self.trade.close_position(closePrice,closeTime)
                 self.trade.getStats()
 
             
@@ -129,7 +129,7 @@ class Algo:
         if self.inTrade:
             self.printStuff("In a trade")
             if not self.trade.check(self.curStockData):
-                self.trade.close_Position(self.trade.stopPrice,self.curStockData['date'])
+                self.trade.close_position(self.trade.stopPrice,self.curStockData['date'])
                 self.printStuff("Closing position based on stoploss")
                 self.inTrade = False
             # time.sleep(1)
@@ -140,7 +140,7 @@ class Algo:
             #End of day trade closing
             endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
             if self.curStockData['date'] > endofDay:
-                self.trade.close_Position(self.curStockData['close'],self.curStockData['date'])
+                self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 

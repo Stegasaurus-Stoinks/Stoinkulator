@@ -71,7 +71,7 @@ class IBapi(TestWrapper, TestClient):
         if(config.LiveData):
             config.tickers[reqId].append([candleData])
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
 
     # terminal callback from reqHistoricalData
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -179,65 +179,6 @@ class IBapi(TestWrapper, TestClient):
             algo.printStats(FullPrint)
             i += 1
 
-
-    
-    def testingtrading(self,algos):
-        # contract = makeStockContract("MSFT")
-        time.sleep(2)
-       
-        # parentorder = buyOrderObject(1)
-        # parentId = self.nextValidOrderId
-        # self.placeOrder(parentId,contract,parentorder)
-        # self.readOrders()
-        # print("order1 placed")
-        # print("orderid = " + str(parentId))
-        # stoplossId = self.addStoploss(parentorder, parentId, contract, 100)
-
-        # # self.getNextOrderID()
-        # # self.placeOrder(self.nextValidOrderId,contract,buyOrderObject(2))
-        # # print("order2 placed")
-        # # print("orderid = " + str(self.nextValidOrderId))
-        
-        # time.sleep(1)
-
-        print("Read positions in livedatacollect:")
-        print(self.readPositions())
-        time.sleep(2)
-        temp = testibkr(self)
-        time.sleep(2)
-        temp.testpositions(self)
-        time.sleep(2)
-        
-        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, config.LiveTrading, 0.20, self, printInfo=False)
-
-        print("here")
-        for algo in algos:
-            algo.testpositions(self, 42069)
-
-        # print(self.readPositions("TSLA"))
-
-        # time.sleep(10)
-        # print("changing stoploss")
-        # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId)
-
-        # time.sleep(5)
-        # # Changing StopLoss to Market Order To Close both orders
-        # self.addStoploss(parentorder, parentId, contract, stopPrice=150, StopId = stoplossId, OrderType="MKT")
-
-        # self.readOrders()
-
-        # testsingleton()
-    
-        # time.sleep(5)
-        # self.readOrders()
-        # time.sleep(20)
-        # self.readOrders()
-
-        # self.getNextOrderID()
-        # self.placeOrder(self.nextValidOrderId,contract,sellorder)
-        # print("order3 placed")
-        # print("orderid = " + str(self.nextValidOrderId))
-        # print(self.readPositions())
 
     def getNextOrderID(self):
         self.event_obj = threading.Event()
@@ -380,14 +321,3 @@ class IBapi(TestWrapper, TestClient):
         if reqId > -1:
             print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
         
-
-
-def testsingleton():
-    app = IBapi()
-    # app.connect('127.0.0.1', 7497, 123)
-    while(not app.isConnected):
-        time.sleep(.5)
-    print("TWS Connected")
-    print(app.readPositions("TSLA"))
-
-# TODO: Singleton not working yet... dont know why, its not connecting...

@@ -51,7 +51,7 @@ class FrontEndClient:
                 Fulldata = config.algos[i].update_frontend_fulldata()
                 algofulldata.append(Fulldata)
 
-            print(algofulldata)
+            # print(algofulldata)
 
             for i in range(len(config.tickers)):
                 Fulldata = self.get_data_json(i)
