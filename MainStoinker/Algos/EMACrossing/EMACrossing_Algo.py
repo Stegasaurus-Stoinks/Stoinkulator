@@ -24,8 +24,8 @@ class Algo:
         #Initialize Algo with data from Algo Config
         self.name = algoConfigData['idname']
         self.ticker = algoConfigData['ticker']
-        self.EMA1 = algoConfigData['short']
-        self.EMA2 = algoConfigData['long']
+        self.short = int(algoConfigData['short'])
+        self.long = int(algoConfigData['long'])
 
         self.ibape = IBapi()
 
@@ -66,8 +66,8 @@ class Algo:
         # self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
             
         
-        self.AlgoData['MA20'] = ta.EMA(StockData['close'],timeperiod=20)
-        self.AlgoData['MA50'] = ta.EMA(StockData['close'],timeperiod=50)
+        self.AlgoData['MA20'] = ta.EMA(StockData['close'],timeperiod=self.short)
+        self.AlgoData['MA50'] = ta.EMA(StockData['close'],timeperiod=self.long)
 
         # print(self.AlgoData)
 

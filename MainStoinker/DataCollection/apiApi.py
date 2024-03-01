@@ -102,6 +102,7 @@ class IBapi(TestWrapper, TestClient):
                 self.eventDict[0].set() 
         
         if config.FrontEndDisplay:
+            # TODO: Move this into ticker
             self.socket.send_full_data(reqId)
 
 
