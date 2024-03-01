@@ -1,7 +1,7 @@
 import pandas as pd
 import time
-import Start_config as config
-from SocketIO_Client import FrontEndClient as sio
+import MainStoinker.MainStuff.Start_config as config
+from MainStoinker.Util.SocketIO_Client import FrontEndClient as sio
 
 
 
@@ -39,15 +39,22 @@ class Ticker():
                 algo.update(self.data)
                 
             if config.FrontEndDisplay:
-                sendData = algo.updatefrontend()
+                sendData = algo.update_frontend()
                 algodata.append(sendData)
         
         # send data to front end
         if config.FrontEndDisplay:
-            entry = self.data.tail(1)
+            entry = self.data.tail(2).head(1)
             tickerdata = [{"ticker":self.name,"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}]
             payload = {"tickerdata":tickerdata,"algodata":algodata}
             self.socket.emit_data("update_send", payload)
+
+
+    def intraminute_update(self):
+        entry = self.data.tail(1)
+        tickerdata = [{"ticker":self.name,"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}]
+        payload = {"tickerdata":tickerdata}
+        self.socket.emit_data("update_send", payload)
 
 
     def append(self, entry:list):

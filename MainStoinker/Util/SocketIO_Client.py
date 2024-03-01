@@ -1,5 +1,5 @@
 import socketio
-import Start_config as config
+import MainStoinker.MainStuff.Start_config as config
 import json
 import simplejson
 from MainStoinker.NeatTools.decorators import singleton
@@ -13,7 +13,7 @@ class FrontEndClient:
         print("initializing socket connection")
         self.sio = socketio.Client()
         
-    def connectwebsocket(self):
+    def connect_websocket(self):
         try:
             self.call_backs()
             self.sio.connect('http://'+config.FrontEndPort)
@@ -40,7 +40,7 @@ class FrontEndClient:
         
         @self.sio.on('req_config')
         def on_message(data):
-            self.ConfigSend()
+            self.Config_send()
             
         @self.sio.on('req_data')
         def on_message(data):
@@ -48,13 +48,13 @@ class FrontEndClient:
             algofulldata = []
 
             for i in range(len(config.algos)):
-                Fulldata = config.algos[i].updatefrontendfulldata()
+                Fulldata = config.algos[i].update_frontend_fulldata()
                 algofulldata.append(Fulldata)
 
-            print(algofulldata)
+            # print(algofulldata)
 
             for i in range(len(config.tickers)):
-                Fulldata = self.getDataJson(i)
+                Fulldata = self.get_data_json(i)
                 tickerfulldata.append({'ticker': config.tickers[i].name, 'data':Fulldata})
 
             print("Sending Fulldata")
@@ -93,7 +93,7 @@ class FrontEndClient:
 
 
 
-    def getDataJson(self, index:int):
+    def get_data_json(self, index:int):
         result = config.tickers[index].data.to_json(orient="records")
         # print(result)
         return(result)
@@ -101,18 +101,18 @@ class FrontEndClient:
 
 
     def send_full_data(self, index:int):
-        data = self.getDataJson(index)
+        data = self.get_data_json(index)
         payload = {"tickerdata":data}
         self.emit_data("data_send", payload)
     
-    def updateData(self, index:int):
-        data = self.getDataJson(index)
+    def update_data(self, index:int):
+        data = self.get_data_json(index)
         payload = {"tickerdata":data}
         self.emit_data("data_send", payload)
 
     
-    def ConfigSend(self):
-        file = open('./MainStoinker/DataCollection/Test/Algo_config.json')
+    def Config_send(self):
+        file = open('./MainStoinker/MainStuff/Algo_config.json')
 
         try:
             parsed_json = json.load(file)

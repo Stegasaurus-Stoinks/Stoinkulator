@@ -4,14 +4,14 @@ from datetime import timedelta
 import talib as ta
 import time
 
-from livedatacollect4 import IBapi
+from MainStoinker.DataCollection.apiApi import IBapi
 
-import Start_config as config
+import MainStoinker.MainStuff.Start_config as config
 import numpy as np
 import pandas as pd
 import math
 
-from trade import Trade
+from MainStoinker.TradeTools.trade import Trade
 
 
 inTrade = False
@@ -24,8 +24,8 @@ class Algo:
         #Initialize Algo with data from Algo Config
         self.name = algoConfigData['idname']
         self.ticker = algoConfigData['ticker']
-        self.EMA1 = algoConfigData['short']
-        self.EMA2 = algoConfigData['long']
+        self.short = int(algoConfigData['short'])
+        self.long = int(algoConfigData['long'])
 
         self.ibape = IBapi()
 
@@ -44,16 +44,14 @@ class Algo:
         self.printInfo = True
         self.trades = []
 
-        self.ibkrApi = None
-
         print("Algo " + self.name + " Initialized")
         
 
     def update(self, StockData):
         # print("algo update readPositions")
         # print(self.ibape.readPositions())
-        print("Stock DAta in Ticker")
-        print(StockData)
+        # print("Stock DAta in Ticker")
+        # print(StockData)
 
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:
@@ -68,8 +66,8 @@ class Algo:
         # self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
             
         
-        self.AlgoData['MA20'] = ta.EMA(StockData['close'],timeperiod=20)
-        self.AlgoData['MA50'] = ta.EMA(StockData['close'],timeperiod=50)
+        self.AlgoData['MA20'] = ta.EMA(StockData['close'],timeperiod=self.short)
+        self.AlgoData['MA50'] = ta.EMA(StockData['close'],timeperiod=self.long)
 
         # print(self.AlgoData)
 
@@ -95,8 +93,8 @@ class Algo:
                 self.inTrade = False
                 closeTime = self.curStockData['date']
                 closePrice = self.curStockData['close']
-                self.trade.closePosition(closePrice,closeTime)
-                self.trade.getStats()
+                self.trade.close_position(closePrice,closeTime)
+                self.trade.get_stats()
 
             
             if trend:
@@ -116,7 +114,7 @@ class Algo:
                 # print("done trying to read positions from algo object")
                 
 
-                self.trade = Trade("AAPL", 10, len(self.trades), enterPrice, enterTime, trend, config.LiveTrading, 0.20, self.ibkrApi, printInfo=False)
+                self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, 0.20, printInfo=False)
                 self.trades.append(self.trade)
                 time.sleep(1)
 
@@ -129,7 +127,7 @@ class Algo:
         if self.inTrade:
             self.printStuff("In a trade")
             if not self.trade.check(self.curStockData):
-                self.trade.closePosition(self.trade.stopPrice,self.curStockData['date'])
+                self.trade.close_position(self.trade.stopPrice,self.curStockData['date'])
                 self.printStuff("Closing position based on stoploss")
                 self.inTrade = False
             # time.sleep(1)
@@ -140,7 +138,7 @@ class Algo:
             #End of day trade closing
             endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
             if self.curStockData['date'] > endofDay:
-                self.trade.closePosition(self.curStockData['close'],self.curStockData['date'])
+                self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
                 self.printStuff("Closing position based on end of day")
                 self.inTrade = False
 
@@ -153,7 +151,7 @@ class Algo:
        
 
 
-    def updatefrontend(self):
+    def update_frontend(self):
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
             data = self.curAlgoData[self.FrontEndDataStruct[x]]
@@ -165,7 +163,7 @@ class Algo:
         return({'idname':self.name, 'time':int(self.curStockData['time']), 'data':dataToSend})
     
 
-    def updatefrontendfulldata(self):
+    def update_frontend_fulldata(self):
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
             data = self.AlgoData[['time',self.FrontEndDataStruct[x]]]

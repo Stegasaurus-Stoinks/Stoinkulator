@@ -1,4 +1,4 @@
-from trade import Trade
+from MainStoinker.TradeTools.trade import Trade
 
 class testibkr():
     def __init__(self, api):
