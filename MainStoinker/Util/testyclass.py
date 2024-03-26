@@ -13,5 +13,5 @@ class testibkr():
         print("Read positions in external class function:")
         print(self.api2.readPositions())
 
-        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, False, 0.20, self.api2, printInfo=False)
+        trade = Trade("AAPL", 10, 5, 3.00, 5555, 5, False, 0.01, self.api2, printInfo=False)
 

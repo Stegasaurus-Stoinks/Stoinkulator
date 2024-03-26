@@ -114,7 +114,7 @@ class Algo:
                 # print("done trying to read positions from algo object")
                 
 
-                self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, 0.20, printInfo=False)
+                self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, 1, printInfo=False)
                 self.trades.append(self.trade)
                 time.sleep(1)
 
@@ -126,14 +126,17 @@ class Algo:
 
         if self.inTrade:
             self.printStuff("In a trade")
-            if not self.trade.check(self.curStockData):
-                self.trade.close_position(self.trade.stopPrice,self.curStockData['date'])
-                self.printStuff("Closing position based on stoploss")
-                self.inTrade = False
+            ## old logic for manual stoploss
+            # if not self.trade.check(self.curStockData):
+            #     self.trade.close_position(self.trade.stopPrice,self.curStockData['date'])
+            #     self.printStuff("Closing position based on stoploss")
+            #     self.inTrade = False
             # time.sleep(1)
 
             # Update AlgoData with newest StopPrice Data
-            self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+
+            # self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = 2
+            self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.get_stopPrice(self.curStockData)
 
             #End of day trade closing
             endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)

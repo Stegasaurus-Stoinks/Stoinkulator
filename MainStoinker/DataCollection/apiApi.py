@@ -31,6 +31,14 @@ def createStockContact(ticker: str):
 
     return contract
 
+def createCryptoContact(ticker: str):
+    contract = Contract()
+    contract.secType = "CRYPTO"
+    contract.symbol = ticker
+    contract.currency = "USD"
+    contract.exchange = "PAXOS"
+
+    return contract
 
 class TestWrapper(EWrapper):
     def __init__(self):
@@ -52,7 +60,7 @@ class IBapi(TestWrapper, TestClient):
         print("initializing new object")
         self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
         self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
-        self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'Order Type', 'Quantity', 'Action', 'Order State', 'Sec Type'])
+        self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
         
 
     def tickPrice(self, reqId, tickType, price, attrib):
@@ -62,8 +70,7 @@ class IBapi(TestWrapper, TestClient):
     # collecting backtesting/warmup data
     def historicalData(self, reqId: int, bar: BarData):
         
-        # TODO: maybe make this a method (1)
-        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
+        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume]
 
         if(config.LiveData):
             config.tickers[reqId].append([candleData])
@@ -83,7 +90,7 @@ class IBapi(TestWrapper, TestClient):
                 
                    
         else:
-            self.simulatedDatadict[reqId].columns=['date','time','open','high','low','close','volume','average']
+            self.simulatedDatadict[reqId].columns=['date','time','open','high','low','close','volume']
             print("Historical Data Collected for " + self.tickers[reqId].name)
             self.datacollectednum += 1
             # print(self.simulatedDatadict[reqId])
@@ -95,14 +102,13 @@ class IBapi(TestWrapper, TestClient):
             print("Warmup End Date: " + str(startDate))
 
             self.tickers[reqId].data = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
-            self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume','average']
+            self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume']
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
                 self.eventDict[0].set() 
         
         if config.FrontEndDisplay:
-            # TODO: Move this into ticker
             self.socket.send_full_data(reqId)
 
 
@@ -111,14 +117,14 @@ class IBapi(TestWrapper, TestClient):
     def historicalDataUpdate(self, reqId: int, bar: BarData):           # Live Data Updates
         ticker = config.tickers[reqId]
         # TODO: maybe make this a method (2)
-        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.average]
+        candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume]
 
             # is it intraminute?
         self.lastbar = ticker.data.iloc[-1]
         lastbartime = self.lastbar["date"].to_pydatetime()
         if candleData[0] == lastbartime:
             # did anything change?
-            if (bar.average != self.lastbar["average"]):
+            if (bar.volume != self.lastbar["volume"]):
                 print("intraminute update")
                 ticker.replace([candleData])
                 if config.intraMinuteDisplay:
@@ -146,8 +152,12 @@ class IBapi(TestWrapper, TestClient):
         self.algos = algos
         self.warmup = warmup
         for ticker in tickers.values():
+            
+            if ticker.name == "ETH" or ticker.name == "BTC":
+                contract = createCryptoContact(ticker.name)
 
-            contract = createStockContact(ticker.name)
+            else:
+                contract = createStockContact(ticker.name)
 
             if(config.LiveData):
                 self.reqHistoricalData(ticker.index, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])
@@ -165,6 +175,8 @@ class IBapi(TestWrapper, TestClient):
 
         print("startData read positions")
         print(self.readPositions())
+
+        print(self.readOrders())
 
 
     def getData(self,index):
@@ -263,7 +275,14 @@ class IBapi(TestWrapper, TestClient):
             print("error with callback for positions")
 
     def openOrder(self,orderId,contract,order,orderState):
-        self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'Order Type':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'Order State':orderState.status,'Sec Type':contract.secType}
+        # super().openOrder(orderId, contract, order, orderState)
+        # print("OpenOrder. PermId:", (order.permId), "ClientId:", (order.clientId), "OrderId:", (orderId), 
+        #     "Account:", order.account, "Symbol:", contract.symbol, "SecType:", contract.secType,
+        #     "Exchange:", contract.exchange, "Action:", order.action, "OrderType:", order.orderType,
+        #     "TotalQty:", (order.totalQuantity), "CashQty:", (order.cashQty), 
+        #     "LmtPrice:", (order.lmtPrice), "AuxPrice:", (order.auxPrice), "Status:", orderState.status,
+        #     "MinCompeteSize:", (order.minCompeteSize))
+        self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'OrderType':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'OrderState':orderState.status,'SecType':contract.secType, 'AuxPrice:': float(order.auxPrice),'LmtPrice': float(order.lmtPrice)}
 
     def openOrderEnd(self):
         if config.Debug:
@@ -278,19 +297,16 @@ class IBapi(TestWrapper, TestClient):
 
 
     
-    def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice, StopId = None, OrderType = None):
+    def addStoploss(self, parentOrder, parentOrderID, contract, trailingPercent):
         #StopId being set means you are updating a stoploss thats already been created
 
         parentAction = parentOrder.action
         quantity = parentOrder.totalQuantity
         parentOrderId = parentOrder.orderId
-        if StopId == None:
-            self.getNextOrderID()
-            OrderId = self.nextValidOrderId
-        else:
-            OrderId = StopId
-            if config.Debug:
-                print("Editing Stoploss Price/Quantity")
+        
+        self.getNextOrderID()
+        OrderId = self.nextValidOrderId
+        print(OrderId)
 
         stopLoss = Order()
         stopLoss.orderId = OrderId
@@ -299,14 +315,11 @@ class IBapi(TestWrapper, TestClient):
         else: 
             stopLoss.action = "BUY"
 
-        if OrderType == None:
-            stopLoss.orderType = "STP"
-        else: 
-            stopLoss.orderType = OrderType
-            if config.Debug:
-                print("Editing Stoploss Order Type to " + str(OrderType))
+        stopLoss.orderType = "TRAIL"
+        
         #Stop trigger price
-        stopLoss.auxPrice = stopPrice
+        stopLoss.trailStopPrice = trailingPercent
+        stopLoss.auxPrice = trailingPercent
         stopLoss.totalQuantity = quantity
         stopLoss.parentId = parentOrderId
         stopLoss.eTradeOnly = False
@@ -316,8 +329,6 @@ class IBapi(TestWrapper, TestClient):
 
         return OrderId
     
-    # def readPositionsTest(self,tickerSymbol:str = None):
-    #     self.readPositions(self)
 
     def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):
         if reqId > -1:

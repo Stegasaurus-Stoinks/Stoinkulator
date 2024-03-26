@@ -41,7 +41,8 @@ time.sleep(1)
 app.connect('127.0.0.1', 7497, 123)
 
 
-while(not app.isConnected):
+while(not app.isConnected()):
+    print("Order Status: " + app.isConnected())
     time.sleep(.5)
 print("TWS Connected")
 
@@ -71,6 +72,8 @@ if not app.getNextOrderID():
 
 print("startup read positions")
 print(app.readPositions())
+
+print(app.readOrders())
 
 app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 

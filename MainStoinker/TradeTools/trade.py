@@ -11,7 +11,7 @@ class Trade:
         self.symbol = symbol
         self.volume = volume
         self.tradeID = ID
-        self.stopLossID = 0
+        self.stoplossId = 0
         self.openPrice = openPrice
         self.openTime = openTime
         self.direction = direction
@@ -19,23 +19,15 @@ class Trade:
         self.live = config.LiveTrading
         self.limitOrder = limitOrder
         if self.direction:
-            self.stopPrice = openPrice - stoploss
+            self.trailingPercent = stoploss
         else:
-            self.stopPrice = openPrice + stoploss
-
+            self.trailingPercent = stoploss
         self.printInfo = True
 
-        # print("Read positions in trade class")
-        # print(self.ibape.readPositions())
-
-        self.stopLoss = stoploss
         if self.live:
             self.open_position()
         else:
             self.fake_open()
-
-        
-
 
         
     def fake_open(self):
@@ -67,7 +59,7 @@ class Trade:
         print("open order id")
         print(self.parentId)
         self.ibape.placeOrder(self.parentId,self.contract,self.parentOrder)
-        self.stoplossId = self.ibape.addStoploss(self.parentOrder, self.parentId, self.contract, self.stopPrice)
+        self.stoplossId = self.ibape.addStoploss(self.parentOrder, self.parentId, self.contract, self.trailingPercent)
 
         self.position = True
         self.status = "Open"
@@ -92,6 +84,7 @@ class Trade:
                     self.parentCloseOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
                 else:
                     self.parentCloseOrder = sellOrderObject(self.volume)
+
                     print("sell order created")
 
             else:
@@ -99,7 +92,7 @@ class Trade:
                     self.parentCloseOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
                 else:
                     self.parentCloseOrder = buyOrderObject(self.volume)
-
+            self.ibape.cancelOrder(self.stoplossId)
             
             self.ParentCloseId = self.ibape.getNextOrderID()
             print("close order id")
@@ -129,28 +122,37 @@ class Trade:
     def get_status(self):
         return(self.status)
     
-    def check(self, curpoint):
-        #stoploss check + reclaculation if necessary for either direction
-        #return 1 if good 0 if bad
-        if self.direction: #UP Trade
+    ## old method for manual stoploss check. returns true if trade is still good
+    # def check(self, curpoint):
+    #     #stoploss check + reclaculation if necessary for either direction
+    #     #return 1 if good 0 if bad
+    #     if self.direction: #UP Trade
 
-            price = curpoint["close"]
-            if price > self.stopPrice + self.stopLoss:
-                self.stopPrice = price - self.stopLoss
+    #         price = curpoint["close"]
+    #         if price > self.stopPrice + self.stopLoss:
+    #             self.stopPrice = price - self.stopLoss
 
-            if price < self.stopPrice:
-                return 0
-            else:
-                return 1
+    #         if price < self.stopPrice:
+    #             return 0
+    #         else:
+    #             return 1
 
-        else: #DOWN Trade
-            if price < self.stopPrice - self.stopLoss:
-                self.stopPrice = price + self.stopLoss
+    #     else: #DOWN Trade
+    #         if price < self.stopPrice - self.stopLoss:
+    #             self.stopPrice = price + self.stopLoss
 
-            if price > self.stopLoss:
-                return 0
-            else:
-                return 1
+    #         if price > self.stopLoss:
+    #             return 0
+    #         else:
+    #             return 1
+
+    def get_stopPrice(self,curpoint):
+        self.ibape.readOrders()
+        print(self.ibape.all_openorders)
+        stopOrder = self.ibape.all_openorders.loc[[self.stoplossId]]
+        print(stopOrder)
+        price = float(curpoint["close"])-float(stopOrder["LmtPrice"])
+        return price
 
     def get_stats(self, Fulldisplay = True):
 
@@ -205,7 +207,6 @@ class Trade:
         if self.direction == "DOWN":
             PL = PL*(-1)
         return PL
-
 
 
     #returns a dictionary object of all data needed to recreate the trade object
