@@ -36,22 +36,25 @@ class Trade:
     def open_position(self):
         #call funtion to open order through api
         # TODO: Open stoploss position here too
+        if self.symbol == "ETH" or self.symbol == "BTC":
+            self.contract = create_stock_contract(self.symbol)
+        else:
+            self.contract = create_stock_contract(self.symbol)
 
-        self.contract = makeStockContract(self.symbol)
 
         #check if short or long position
         if self.direction:
             if self.limitOrder:
-                self.parentOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
+                self.parentOrder = buy_order_object(self.volume, limitPrice=self.openPrice)
             else:
-                self.parentOrder = buyOrderObject(self.volume)
+                self.parentOrder = buy_order_object(self.volume)
                 print("buy order created")
 
         else:
             if self.limitOrder:
-                self.parentOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
+                self.parentOrder = sell_order_object(self.volume, limitPrice=self.openPrice)
             else:
-                self.parentOrder = sellOrderObject(self.volume)
+                self.parentOrder = sell_order_object(self.volume)
         
         print(self.ibape.readPositions())
         self.ibape.getNextOrderID()
@@ -81,17 +84,17 @@ class Trade:
         if self.live:
             if self.direction:
                 if self.limitOrder:
-                    self.parentCloseOrder = sellOrderObject(self.volume, limitPrice=self.openPrice)
+                    self.parentCloseOrder = sell_order_object(self.volume, limitPrice=self.openPrice)
                 else:
-                    self.parentCloseOrder = sellOrderObject(self.volume)
+                    self.parentCloseOrder = sell_order_object(self.volume)
 
                     print("sell order created")
 
             else:
                 if self.limitOrder:
-                    self.parentCloseOrder = buyOrderObject(self.volume, limitPrice=self.openPrice)
+                    self.parentCloseOrder = buy_order_object(self.volume, limitPrice=self.openPrice)
                 else:
-                    self.parentCloseOrder = buyOrderObject(self.volume)
+                    self.parentCloseOrder = buy_order_object(self.volume)
             self.ibape.cancelOrder(self.stoplossId)
             
             self.ParentCloseId = self.ibape.getNextOrderID()

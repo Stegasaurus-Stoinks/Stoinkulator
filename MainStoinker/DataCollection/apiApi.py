@@ -21,25 +21,6 @@ import pandas as pd
 import threading
 import time
 
-
-def createStockContact(ticker: str):
-    contract = Contract()
-    contract.secType = "STK"
-    contract.symbol = ticker
-    contract.currency = "USD"
-    contract.exchange = "SMART"
-
-    return contract
-
-def createCryptoContact(ticker: str):
-    contract = Contract()
-    contract.secType = "CRYPTO"
-    contract.symbol = ticker
-    contract.currency = "USD"
-    contract.exchange = "PAXOS"
-
-    return contract
-
 class TestWrapper(EWrapper):
     def __init__(self):
         pass
@@ -154,10 +135,10 @@ class IBapi(TestWrapper, TestClient):
         for ticker in tickers.values():
             
             if ticker.name == "ETH" or ticker.name == "BTC":
-                contract = createCryptoContact(ticker.name)
+                contract = create_crypto_contract(ticker.name)
 
             else:
-                contract = createStockContact(ticker.name)
+                contract = create_stock_contract(ticker.name)
 
             if(config.LiveData):
                 self.reqHistoricalData(ticker.index, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])

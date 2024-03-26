@@ -3,7 +3,7 @@ from dateutil.relativedelta import *
 
 tickers = {}
 algos = []
-LiveData = True
+LiveData = False
 LiveTrading = True
 #once trade excecution is figured out we should be able to get rid of one of these variables
 
