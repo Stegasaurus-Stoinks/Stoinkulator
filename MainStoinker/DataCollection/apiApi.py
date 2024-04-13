@@ -4,6 +4,7 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.common import BarData
 from ibapi.common import *
+from ibapi.execution import *
 from csv import writer
 from datetime import datetime
 from datetime import timedelta
@@ -42,7 +43,7 @@ class IBapi(TestWrapper, TestClient):
         self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
         self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
         self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
-        
+        self.all_executions = pd.DataFrame([], columns = ['reqId', 'Price'])
 
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
@@ -274,8 +275,40 @@ class IBapi(TestWrapper, TestClient):
                 print(e)
                 print("failed to set event object for readOrders")
 
+
+
+
+    #Generate new list of positions, returns Pandas DataFrame
+    def readExecutions(self,tickerSymbol:str = None):
+        self.executions_event_obj = threading.Event()
+        self.temp = self.reqExecutions(10001, ExecutionFilter())
+        # self.reqPositionsMulti()
+        if config.Debug:
+            print("Waiting for IB's API response for accounts positions requests...")
+        # time.sleep(3)
+        timeout = 15
+        flag = self.executions_event_obj.wait(timeout)
+        if flag:
+            print(self.all_executions)
+        else:
+            print("error with callback for positions")
     
-    def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice):
+    def execDetails(self, reqId: int, contract: Contract, execution: Execution):
+        print("ExecDetails. ReqId:", reqId, "Symbol:", contract.symbol, "SecType:", contract.secType, "Currency:", contract.currency, execution)
+        self.all_executions.loc[orderId]= {'reqId':reqId, 'Price':execution.price}
+    def execDetailsEnd(self, reqId: int):
+        print("ExecDetailsEnd. ReqId:", reqId)
+        try:
+            self.executions_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for readOrders")
+    
+
+
+    
+    def addStoploss(self, parentOrder, parentOrderID, contract, trailingPercent):
         #StopId being set means you are updating a stoploss thats already been created
 
         parentAction = parentOrder.action
