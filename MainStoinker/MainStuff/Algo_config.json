@@ -3,10 +3,11 @@
     "ID":"EMACrossing",
     "data":[
       {
-        "idname": "ETH-10/20EMA",
-        "ticker": "ETH",
-        "short": "10",
-        "long": "20"
+        "idname": "AAPL-10/20EMA",
+        "ticker": "AAPL",
+        "short": "20",
+        "long": "40",
+        "stoplossPercent": ".1"
       }
     ]
   }

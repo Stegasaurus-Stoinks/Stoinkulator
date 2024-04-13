@@ -48,6 +48,6 @@ def create_crypto_contract(ticker: str):
     contract.secType = "CRYPTO"
     contract.symbol = ticker
     contract.currency = "USD"
-    contract.exchange = "PAXOS"
-    contract.primaryExchange = "PAXOS"
+    contract.exchange = "ZEROHASH"
+    contract.primaryExchange = "ZEROHASH"
     return contract

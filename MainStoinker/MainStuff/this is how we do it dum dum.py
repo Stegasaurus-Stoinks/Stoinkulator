@@ -73,6 +73,7 @@ if not app.getNextOrderID():
 print("startup read positions")
 print(app.readPositions())
 
+print("startup read orders")
 print(app.readOrders())
 
 app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting

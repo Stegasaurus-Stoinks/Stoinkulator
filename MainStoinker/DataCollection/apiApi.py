@@ -97,7 +97,6 @@ class IBapi(TestWrapper, TestClient):
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):           # Live Data Updates
         ticker = config.tickers[reqId]
-        # TODO: maybe make this a method (2)
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume]
 
             # is it intraminute?
@@ -263,7 +262,7 @@ class IBapi(TestWrapper, TestClient):
         #     "TotalQty:", (order.totalQuantity), "CashQty:", (order.cashQty), 
         #     "LmtPrice:", (order.lmtPrice), "AuxPrice:", (order.auxPrice), "Status:", orderState.status,
         #     "MinCompeteSize:", (order.minCompeteSize))
-        self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'OrderType':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'OrderState':orderState.status,'SecType':contract.secType, 'AuxPrice:': float(order.auxPrice),'LmtPrice': float(order.lmtPrice)}
+        self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'OrderType':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'OrderState':orderState.status,'SecType':contract.secType, 'AuxPrice': float(order.auxPrice),'LmtPrice': float(order.lmtPrice)}
 
     def openOrderEnd(self):
         if config.Debug:
@@ -274,11 +273,9 @@ class IBapi(TestWrapper, TestClient):
             if config.Debug:
                 print(e)
                 print("failed to set event object for readOrders")
-    
-
 
     
-    def addStoploss(self, parentOrder, parentOrderID, contract, trailingPercent):
+    def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice):
         #StopId being set means you are updating a stoploss thats already been created
 
         parentAction = parentOrder.action
@@ -296,11 +293,10 @@ class IBapi(TestWrapper, TestClient):
         else: 
             stopLoss.action = "BUY"
 
-        stopLoss.orderType = "TRAIL"
+        stopLoss.orderType = "STP"
         
         #Stop trigger price
-        stopLoss.trailStopPrice = trailingPercent
-        stopLoss.auxPrice = trailingPercent
+        stopLoss.auxPrice = stopPrice
         stopLoss.totalQuantity = quantity
         stopLoss.parentId = parentOrderId
         stopLoss.eTradeOnly = False
@@ -308,7 +304,7 @@ class IBapi(TestWrapper, TestClient):
 
         self.placeOrder(OrderId, contract, stopLoss)
 
-        return OrderId
+        return stopLoss
     
 
     def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):
