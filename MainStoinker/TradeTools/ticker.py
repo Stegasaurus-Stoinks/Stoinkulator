@@ -10,8 +10,8 @@ class Ticker():
     def __init__(self, name, index):
         self.name = name
         self.index = index
-        self.data = pd.DataFrame([], columns = ['date','time','open','high','low','close','volume','average'])
-        # self.data.columns = ['date','time','open','high','low','close','volume','average']
+        self.data = pd.DataFrame([], columns = ['date','time','open','high','low','close','volume'])
+        # self.data.columns = ['date','time','open','high','low','close','volume']
         self.registeredAlgos = []
         self.socket = sio()
 
@@ -62,7 +62,7 @@ class Ticker():
             self.data = pd.concat([self.data,pd.DataFrame.from_records([entry])],ignore_index=True)
         else:
             df = pd.DataFrame(entry)
-            df.columns=['date','time','open','high','low','close','volume','average']
+            df.columns=['date','time','open','high','low','close','volume']
             self.data = pd.concat([self.data,df],ignore_index=True)
         
 
