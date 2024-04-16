@@ -11,12 +11,14 @@ class FrontEndClient:
 
     def __init__(self):
         print("initializing socket connection")
+        # self.sio = socketio.Client(logger=True, engineio_logger=True)
         self.sio = socketio.Client()
         
     def connect_websocket(self):
         try:
             self.call_backs()
             self.sio.connect('http://'+config.FrontEndPort)
+            self.sio.wait()
 
 
         except:

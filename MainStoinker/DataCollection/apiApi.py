@@ -308,7 +308,7 @@ class IBapi(TestWrapper, TestClient):
 
 
     
-    def addStoploss(self, parentOrder, parentOrderID, contract, trailingPercent):
+    def addStoploss(self, parentOrder, parentOrderID, contract, stopPrice):
         #StopId being set means you are updating a stoploss thats already been created
 
         parentAction = parentOrder.action

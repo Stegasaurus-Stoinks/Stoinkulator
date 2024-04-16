@@ -162,9 +162,10 @@ class Trade:
 
             if price > self.stopPrice + self.stopLoss:
                 self.stopPrice = price - self.stopLoss
-                self.stopOrder.auxPrice = self.stopPrice
-                print("This is now auxPrice: " + str(self.stopOrder.auxPrice))
-                if config.LiveTrading: self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
+                if config.LiveTrading: 
+                    stopOrder.auxPrice = self.stopPrice
+                    print("This is now auxPrice: " + str(self.stopOrder.auxPrice))
+                    self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
             elif price < self.stopPrice:
                 self.close_position(self.stopPrice,curpoint['date'])
