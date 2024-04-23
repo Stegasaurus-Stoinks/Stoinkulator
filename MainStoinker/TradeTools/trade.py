@@ -70,7 +70,7 @@ class Trade:
         self.parentId = self.ibape.nextValidOrderId
         # "20200923 15:13:20 EST"
         print(self.openTime)
-        temptime = self.openTime + pd.Timedelta(1,"min")
+        temptime = self.openTime + pd.Timedelta(2,"min")
         temptime = temptime.strftime('%X')
         print(temptime)
         self.parentOrder.tif = "GTD"
@@ -152,8 +152,8 @@ class Trade:
         if config.LiveTrading:
             print("printing open orders:")
             print(self.ibape.all_openorders)
-            if self.stopLossId in self.ibape.all_openorders.index:
-                stopOrder = self.ibape.all_openorders.iloc[[self.stoplossId]]
+            if self.stoplossId in self.ibape.all_openorders.index:
+                stopOrder = self.ibape.all_openorders.loc[[self.stoplossId]]
             else:
                 return 0
         #stoploss check + reclaculation if necessary for either direction
@@ -162,10 +162,13 @@ class Trade:
 
             if price > self.stopPrice + self.stopLoss:
                 self.stopPrice = price - self.stopLoss
-                self.stopOrder.auxPrice = self.stopPrice
-                print("This is now auxPrice: " + str(self.stopOrder.auxPrice))
-                if config.LiveTrading: self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
+                
+                if config.LiveTrading: 
+                    self.stopOrder.auxPrice = self.stopPrice
+                    print("This is now auxPrice: " + str(self.stopOrder.auxPrice))
+                    self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
+
             elif price < self.stopPrice:
                 self.close_position(self.stopPrice,curpoint['date'])
                 result = 0    
@@ -173,9 +176,12 @@ class Trade:
         else: #DOWN Trade
             if price < self.stopPrice - self.stopLoss:
                 self.stopPrice = price + self.stopLoss
-                self.stopOrder.auxPrice = self.stopPrice
-                if config.LiveTrading: self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
+                
+                if config.LiveTrading: 
+                    self.stopOrder.auxPrice = self.stopPrice
+                    self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
+
             elif price > self.stopLoss:
                 self.close_position(self.stopPrice,curpoint['date'])                
                 result = 0
@@ -248,13 +254,23 @@ class Trade:
 
 
     #returns a dictionary object of all data needed to recreate the trade object
-    def toJson(self):
+    def to_json(self):
+        duration = self.closeTime - self.openTime
+        profit = self.closePrice - self.openPrice
         data = {
             'symbol' : self.symbol,
+            'ID' : self.tradeID,
+            'stoplossID' : self.stoplossId,
             'volume' : self.volume,
-            'ID' : self.ID,
             'openPrice' : self.openPrice,
             'openTime' : self.openTime,
-            'direction' : self.direction
+            'direction' : self.direction,
+            'stoploss' : self.stopLoss,
+            'status' : self.status,
+            'closePrice' : self.closePrice,
+            'closeTime' : self.closeTime,
+            'duration' : duration,
+            'profit' : profit
             }
         return data
+    

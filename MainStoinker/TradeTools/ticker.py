@@ -50,11 +50,20 @@ class Ticker():
             self.socket.emit_data("update_send", payload)
 
 
+    def save_algos(self):
+        temparray = []
+        for algo in self.registeredAlgos:
+            temparray.append(algo.save_trades())
+
+        return(pd.concat(temparray))
+
+
     def intraminute_update(self):
         entry = self.data.tail(1)
         tickerdata = [{"ticker":self.name,"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}]
         payload = {"tickerdata":tickerdata}
-        self.socket.emit_data("update_send", payload)
+        if config.FrontEndDisplay:
+            self.socket.emit_data("update_send", payload)
 
 
     def append(self, entry:list):

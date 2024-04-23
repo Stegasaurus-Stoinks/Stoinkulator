@@ -80,7 +80,7 @@ app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
 if not config.LiveData:
     eventDict[0].wait()
-    print("Event called for backtesty")
+    # rint("Event called for backtesty")
     utils.backtesting_data_blast()
     eventDict[0].clear()
 
@@ -91,7 +91,7 @@ print("--------------Press 'CTRL' to Close Program----------------")
 print("___________________________________________________________")
 print("")
 
-keyboard.wait('Ctrl')
+keyboard.wait('Delete')
 
 config.updating = 0
 

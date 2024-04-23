@@ -5,6 +5,7 @@ from MainStoinker.DataCollection.apiApi import IBapi
 from datetime import datetime
 import time
 import importlib
+import pandas as pd
 import json
 from MainStoinker.TradeTools.ticker import Ticker
 
@@ -13,7 +14,7 @@ from MainStoinker.TradeTools.ticker import Ticker
 def event_loop(event, index):
     while(not event.is_set()):
         event.wait()
-        print("Event called for " + config.tickers[index].name)
+        # print("Event called for " + config.tickers[index].name)
         config.tickers[index].update_algos()
         event.clear()
 
@@ -129,10 +130,13 @@ def backtesting_data_blast():
         for ticker in config.tickers.values():
             ticker.update_algos()
 
+
         time.sleep(config.TimeDelayPerPoint)
         print(entry[0])
 
-    # self.printAlgoStats()
+    # Done with the Backtesting loop here
+    get_algo_data()
+
     endtime = datetime.now()
     duration = endtime-starttime
     print("Backtesting "+str(numpoints)+" Points is Done!")
@@ -145,3 +149,9 @@ def get_data_json(index):
     result = config.tickers[index].data.to_json(orient="records")
     # print(result)
     return(result)
+
+def get_algo_data():
+    temparray = []
+    for ticker in config.tickers.values():
+            temparray.append(ticker.save_algos())
+            pd.concat(temparray).to_csv('algo.csv')
