@@ -33,7 +33,7 @@ class Algo:
         #Data frame to store data for Algo, (Stoploss, Analysis, Stuff to send to the front end)  
         self.DataColumns = ['time','StopPrice','MA20','MA50']
         self.AlgoData = pd.DataFrame(columns=self.DataColumns)
-        print(self.AlgoData.shape)
+        # print(self.AlgoData.shape)
 
         #Data to send to the frontend
        
@@ -53,6 +53,7 @@ class Algo:
         # print(self.ibape.readPositions())
         # print("Stock DAta in Ticker")
         # print(StockData)
+
 
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
         if StockData.shape[0] != self.AlgoData.shape[0]:
@@ -76,6 +77,9 @@ class Algo:
         self.curStockData = StockData.iloc[-1]
         self.curAlgoData = self.AlgoData.iloc[-1]
         self.lastAlgoData = self.AlgoData.iloc[-2]
+
+        # datapoint print for current minute
+        # print(str(self.ticker) + " : " + str(self.curStockData['close']))
 
         if self.lastAlgoData['MA20'] > self.lastAlgoData['MA50']:
             prevtrend = 1
@@ -105,19 +109,11 @@ class Algo:
                 enterPrice = self.curStockData['close']
                 #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, printinfo)
                 self.trade = 0
-
-                # print(self.ibkrApi)
-                # print("trying reqPositions")
-                # API.reqPositions()
-                # time.sleep(3)
-                # print("trying to read positions from algo object")
-                # print(API.readPositions())
-                # print("done trying to read positions from algo object")
                 
 
                 self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, (self.stoplossPercent/100), printInfo=False)
                 self.trades.append(self.trade)
-                time.sleep(1)
+                # ime.sleep(1)
 
 
             else:
@@ -132,24 +128,22 @@ class Algo:
             if not self.trade.check_stoploss(self.curStockData):
                 self.printStuff("Closing position based on stoploss")
                 self.inTrade = False
-            time.sleep(.1)
 
-            # Update AlgoData with newest StopPrice Data
-            self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+            else:
+                # Update AlgoData with newest StopPrice Data
+                self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
 
-            #End of day trade closing
-            endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
-            if self.curStockData['date'] > endofDay:
-                self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
-                self.printStuff("Closing position based on end of day")
-                self.inTrade = False
+                #End of day trade closing
+                endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
+                if self.curStockData['date'] > endofDay:
+                    self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
+                    self.printStuff("Closing position based on end of day")
+                    self.inTrade = False
 
         self.AlgoData['time'] = StockData['time']
 
         self.curAlgoData = self.AlgoData.iloc[-1]
 
-        # print(self.AlgoData)
-        # print(StockData['date'])
        
 
 
@@ -174,6 +168,9 @@ class Algo:
             dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
         return({'idname':self.name, 'data':dataToSend})
+    
+    def printtrades(self):
+        print(self.trades)
 
 
     def printStuff(self,stuff):
@@ -211,3 +208,7 @@ class Algo:
         print("Win Rate: ",int(winRate),"%")
         print("Average Win: ",round(avgWin, 2))
         print("Average Loss: ",round(avgLoss, 2))
+
+    def save_trades(self):
+        tradeDataframe = pd.DataFrame.from_records([trade.to_json() for trade in self.trades])
+        return tradeDataframe
