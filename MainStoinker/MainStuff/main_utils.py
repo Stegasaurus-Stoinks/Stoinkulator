@@ -8,6 +8,7 @@ import importlib
 import pandas as pd
 import json
 from MainStoinker.TradeTools.ticker import Ticker
+import logging
 
 
 
@@ -155,3 +156,30 @@ def get_algo_data():
     for ticker in config.tickers.values():
             temparray.append(ticker.save_algos())
             pd.concat(temparray).to_csv('algo.csv')
+
+
+
+
+
+def create_logger(name):
+    # create logger
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    # create console handler and set level to debug
+    fh = logging.FileHandler('loggy.log')
+    fh.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+
+    # create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    # add formatter to ch
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    # add ch to logger
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    return logger

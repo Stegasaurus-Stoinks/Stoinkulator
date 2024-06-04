@@ -15,16 +15,17 @@ import keyboard
 import os
 import MainStoinker.MainStuff.Start_config as config
 import main_utils as utils
+import logging
 
 from MainStoinker.Util.SocketIO_Client import FrontEndClient
 
 eventDict = {}
 
-
+logger = utils.create_logger("dum_dum")
 count = 0
 
 AlgoList = utils.algo_config_parse()
-print(AlgoList)
+print(AlgoList) 
 
 
 app = IBapi()
@@ -42,7 +43,7 @@ app.connect('127.0.0.1', 7497, 123)
 
 
 while(not app.isConnected()):
-    print("Order Status: " + app.isConnected())
+    print("Order Status: " + str(app.isConnected()))
     time.sleep(.5)
 print("TWS Connected")
 
@@ -86,18 +87,17 @@ if not config.LiveData:
 
 
 
-print("___________________________________________________________")
-print("--------------Press 'CTRL' to Close Program----------------")
-print("___________________________________________________________")
-print("")
+logger.info("___________________________________________________________")
+logger.info("--------------Press 'DEL' to Close Program----------------")
+logger.info("___________________________________________________________\n")
 
 keyboard.wait('Delete')
 
 config.updating = 0
 
-print("___________________________________________________________")
-print("------------------Closing Program...-----------------------")
-print("___________________________________________________________")
+logger.info("___________________________________________________________")
+logger.info("------------------Closing Program...-----------------------")
+logger.info("___________________________________________________________\n")
 
 app.disconnect()
 

@@ -2,12 +2,13 @@ from MainStoinker.Util.IBKRHelper import *
 import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.DataCollection.apiApi import IBapi
 import pandas as pd
+import MainStoinker.MainStuff.main_utils as utils
 
 class Trade:
     
     #unique id so find trades that have been placed by this algo
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, stoploss, limitOrder = False, printInfo = False):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, stoploss, limitOrder = False, printInfo = True):
         self.ibape = IBapi()
         self.symbol = symbol
         self.volume = volume
@@ -21,6 +22,8 @@ class Trade:
         self.live = config.LiveTrading
         self.limitOrder = limitOrder
 
+        self.logger = utils.create_logger("trade:"+symbol)
+
         # set trailingPercent to be the exact amount above or below 1 for equations
         if self.direction:
             self.trailingPercent = 1 - stoploss
@@ -30,7 +33,6 @@ class Trade:
         
         self.stopPrice = round(self.openPrice * (self.trailingPercent), 2)
         self.stopLoss = abs(openPrice - self.stopPrice)
-        self.printInfo = True
         
 
         if self.live:
@@ -89,9 +91,9 @@ class Trade:
 
         #print to console trade placement info if asked for it
         if self.printInfo:
-            print("______________________________________________________________________")
-            print("Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
-            print("______________________________________________________________________")
+            self.logger.info("______________________________________________________________________")
+            self.logger.info("Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
+            self.logger.info("______________________________________________________________________")
 
 
     def close_position(self, closePrice, closeTime):
@@ -126,7 +128,7 @@ class Trade:
             self.status = "Closed"
 
             if self.printInfo:
-                print("Closed a Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
+                self.logger.info("Closed a Position! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID) +"\n")
 
         else:
             #Fake Trade for backtesting
@@ -152,9 +154,7 @@ class Trade:
         if config.LiveTrading:
             print("printing open orders:")
             print(self.ibape.all_openorders)
-            if self.stoplossId in self.ibape.all_openorders.index:
-                stopOrder = self.ibape.all_openorders.loc[[self.stoplossId]]
-            else:
+            if self.stoplossId not in self.ibape.all_openorders.index:
                 return 0
         #stoploss check + reclaculation if necessary for either direction
         #return 1 if good 0 if bad
@@ -165,11 +165,12 @@ class Trade:
                 
                 if config.LiveTrading: 
                     self.stopOrder.auxPrice = self.stopPrice
-                    print("This is now auxPrice: " + str(self.stopOrder.auxPrice))
+                    self.logger.info("updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
                     self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
 
             elif price < self.stopPrice:
+                self.logger.info("***manual stoploss close position***")
                 self.close_position(self.stopPrice,curpoint['date'])
                 result = 0    
 

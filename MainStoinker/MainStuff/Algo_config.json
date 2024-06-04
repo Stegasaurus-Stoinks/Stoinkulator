@@ -5,35 +5,30 @@
       {
         "idname": "AAPL-20/40EMA",
         "ticker": "AAPL",
-        "short": "20",
-        "long": "40",
-        "stoplossPercent": ".2"
-      }
-    ]
-  },
-
-  {
-    "ID":"EMACrossing",
-    "data":[
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
+      },
       {
         "idname": "MSFT-20/40EMA",
         "ticker": "MSFT",
-        "short": "20",
-        "long": "40",
-        "stoplossPercent": ".2"
-      }
-    ]
-  },
-
-  {
-    "ID":"EMACrossing",
-    "data":[
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
+      },
       {
-        "idname": "TSLA-20/40EMA",
-        "ticker": "TSLA",
-        "short": "20",
-        "long": "40",
-        "stoplossPercent": ".2"
+        "idname": "GME-20/40EMA",
+        "ticker": "GME",
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
+      },
+      {
+        "idname": "HUT8-20/40EMA",
+        "ticker": "HUT",
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
       }
     ]
   }

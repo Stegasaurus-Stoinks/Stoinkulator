@@ -5,8 +5,7 @@ import talib as ta
 import time
 
 from MainStoinker.DataCollection.apiApi import IBapi
-
-import MainStoinker.MainStuff.Start_config as config
+import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
 import math
@@ -19,7 +18,7 @@ enterTime = 0
 
 class Algo:
     def __init__(self, algoConfigData):
-        #print("Starting EMA Crossing Algo with " + str(data))
+        
 
         #Initialize Algo with data from Algo Config
         self.name = algoConfigData['idname']
@@ -27,6 +26,7 @@ class Algo:
         self.short = int(algoConfigData['short'])
         self.long = int(algoConfigData['long'])
         self.stoplossPercent = float(algoConfigData['stoplossPercent'])
+        self.logger = utils.create_logger("algo:"+self.name+":"+self.ticker)
 
         self.ibape = IBapi()
 
@@ -98,6 +98,7 @@ class Algo:
                 self.inTrade = False
                 closeTime = self.curStockData['date']
                 closePrice = self.curStockData['close']
+                self.logger.info("***trend cross close position***")
                 self.trade.close_position(closePrice,closeTime)
                 self.trade.get_stats()
 
@@ -136,6 +137,7 @@ class Algo:
                 #End of day trade closing
                 endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
                 if self.curStockData['date'] > endofDay:
+                    self.logger.info("***end of day close position***")
                     self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
                     self.printStuff("Closing position based on end of day")
                     self.inTrade = False

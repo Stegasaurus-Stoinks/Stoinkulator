@@ -18,8 +18,7 @@ class FrontEndClient:
         try:
             self.call_backs()
             self.sio.connect('http://'+config.FrontEndPort)
-            self.sio.wait()
-
+            # self.sio.wait()
 
         except:
             print("Connecting to Front End (Socketio) failed")
