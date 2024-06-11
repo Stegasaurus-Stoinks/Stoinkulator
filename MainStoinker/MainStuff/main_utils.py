@@ -168,9 +168,9 @@ def create_logger(name):
 
     # create console handler and set level to debug
     fh = logging.FileHandler('loggy.log')
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(logging.INFO)
     ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.INFO)
 
     # create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')

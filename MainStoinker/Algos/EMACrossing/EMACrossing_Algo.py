@@ -111,7 +111,7 @@ class Algo:
                 #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, printinfo)
                 self.trade = 0
                 
-
+                self.logger.info("***opening trade on cross-up***")
                 self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, (self.stoplossPercent/100), printInfo=False)
                 self.trades.append(self.trade)
                 # ime.sleep(1)
@@ -127,7 +127,7 @@ class Algo:
             
             # logic for manual stoploss
             if not self.trade.check_stoploss(self.curStockData):
-                self.printStuff("Closing position based on stoploss")
+                self.logger.info("***manual stoploss close position***")
                 self.inTrade = False
 
             else:

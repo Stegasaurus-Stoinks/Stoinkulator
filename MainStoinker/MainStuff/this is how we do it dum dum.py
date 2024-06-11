@@ -21,9 +21,14 @@ from MainStoinker.Util.SocketIO_Client import FrontEndClient
 
 eventDict = {}
 
-logger = utils.create_logger("dum_dum")
+for name in config.loggers:
+    utils.create_logger(name)
+logger = logging.getLogger("dum_dum")
 count = 0
 
+logger.info("___________________________________________________________")
+logger.info("---------------------Starting Program----------------------")
+logger.info("___________________________________________________________\n")
 AlgoList = utils.algo_config_parse()
 print(AlgoList) 
 
@@ -45,6 +50,7 @@ app.connect('127.0.0.1', 7497, 123)
 while(not app.isConnected()):
     print("Order Status: " + str(app.isConnected()))
     time.sleep(.5)
+time.sleep(1)
 print("TWS Connected")
 
 api_thread = threading.Thread(target=app.run,daemon=True)

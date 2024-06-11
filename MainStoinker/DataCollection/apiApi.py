@@ -100,9 +100,15 @@ class IBapi(TestWrapper, TestClient):
         ticker = config.tickers[reqId]
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume]
 
-            # is it intraminute?
+        # is it intraminute?
         self.lastbar = ticker.data.iloc[-1]
         lastbartime = self.lastbar["date"].to_pydatetime()
+
+        if lastbartime != self.olddatatime:
+            #first occurance of new data of this minute (needs to be tested to make sure it only gets called once...)
+            self.readOrders()
+            self.olddatatime = lastbartime
+
         if candleData[0] == lastbartime:
             # did anything change?
             if (bar.volume != self.lastbar["volume"]):
@@ -129,6 +135,7 @@ class IBapi(TestWrapper, TestClient):
         self.livetickerdata = []
         self.liveintraminutedata = []
         self.lastbardict = {}
+        self.olddatatime = 0
         self.tickers = tickers
         self.algos = algos
         self.warmup = warmup
@@ -180,7 +187,7 @@ class IBapi(TestWrapper, TestClient):
         self.reqIds(-1)
         if config.Debug:
             print("waiting for getNextOrderID thread")
-        timeout = 2
+        timeout = 5
         flag = self.event_obj.wait(timeout)
         if flag:
             if config.Debug:
@@ -243,6 +250,7 @@ class IBapi(TestWrapper, TestClient):
                 print("failed to set event object for readPositions")
 
     def readOrders(self):
+        self.all_openorders = self.all_openorders.iloc[0:0]
         self.orders_event_obj = threading.Event()
         self.reqAllOpenOrders()
         if config.Debug:

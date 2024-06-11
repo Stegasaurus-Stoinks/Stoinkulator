@@ -3,6 +3,7 @@ import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.DataCollection.apiApi import IBapi
 import pandas as pd
 import MainStoinker.MainStuff.main_utils as utils
+import logging
 
 class Trade:
     
@@ -22,7 +23,7 @@ class Trade:
         self.live = config.LiveTrading
         self.limitOrder = limitOrder
 
-        self.logger = utils.create_logger("trade:"+symbol)
+        self.logger = logging.getLogger("trade")
 
         # set trailingPercent to be the exact amount above or below 1 for equations
         if self.direction:
@@ -170,7 +171,6 @@ class Trade:
                 result = 1
 
             elif price < self.stopPrice:
-                self.logger.info("***manual stoploss close position***")
                 self.close_position(self.stopPrice,curpoint['date'])
                 result = 0    
 
