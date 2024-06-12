@@ -150,6 +150,7 @@ def get_data_json(index):
     # print(result)
     return(result)
 
+# Grabs all algo data from all tickers and makes big ole df and sends it to a file
 def get_algo_data():
     temparray = []
     for ticker in config.tickers.values():

@@ -8,26 +8,14 @@
         "short": "20",
         "long": "40",
         "stoplossPercent": ".2"
-      }
-    ]
-  },
-
-  {
-    "ID":"EMACrossing",
-    "data":[
+      },
       {
         "idname": "MSFT-20/40EMA",
         "ticker": "MSFT",
         "short": "20",
         "long": "40",
         "stoplossPercent": ".2"
-      }
-    ]
-  },
-
-  {
-    "ID":"EMACrossing",
-    "data":[
+      },
       {
         "idname": "TSLA-20/40EMA",
         "ticker": "TSLA",

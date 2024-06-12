@@ -255,8 +255,16 @@ class Trade:
 
     #returns a dictionary object of all data needed to recreate the trade object
     def to_json(self):
-        duration = self.closeTime - self.openTime
-        profit = self.closePrice - self.openPrice
+        if self.status == 'Closed':
+            duration = self.closeTime - self.openTime
+            profit = self.closePrice - self.openPrice
+
+        else:
+            self.closePrice = float('nan')
+            self.closeTime = float('nan')
+            duration = float('nan')
+            profit = float('nan')
+
         data = {
             'symbol' : self.symbol,
             'ID' : self.tradeID,

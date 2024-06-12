@@ -10,7 +10,7 @@ LiveTrading = False
 Debug = False
 
 #Frontend Variables
-FrontEndDisplay = False
+FrontEndDisplay = True
 FrontEndPort = '24.56.52.6:3000'
 updating = 1
 tickerIndex = 0
@@ -20,7 +20,7 @@ intraMinuteDisplay = True
 #BackTesting Variables
 Duration = 2 #days
 StartDate = datetime.datetime.now() - relativedelta(month=0,weeks=0,day=Duration)
-TimeDelayPerPoint = 0 #seconds between backtested points
+TimeDelayPerPoint = .1 #seconds between backtested points
 
 timedelaytesty = 0
 
