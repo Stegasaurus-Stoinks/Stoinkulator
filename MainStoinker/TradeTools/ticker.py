@@ -2,6 +2,7 @@ import pandas as pd
 import time
 import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.Util.SocketIO_Client import FrontEndClient as sio
+from MainStoinker.DataCollection.apiApi import IBapi
 
 
 
@@ -14,6 +15,7 @@ class Ticker():
         # self.data.columns = ['date','time','open','high','low','close','volume']
         self.registeredAlgos = []
         self.socket = sio()
+        self.api = IBapi()
 
     
     def register_algo(self, algo):
@@ -27,6 +29,10 @@ class Ticker():
 
 
     def update_algos(self):
+        if self.api.firstdataofminute == 1: #first time we get a minute of data:
+            self.api.readOrders()
+            self.api.firstdataofminute = 0
+
         algodata = []
         
         # update all associated algos

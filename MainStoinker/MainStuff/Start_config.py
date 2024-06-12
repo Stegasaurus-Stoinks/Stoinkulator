@@ -11,7 +11,7 @@ LiveTrading = True
 Debug = False
 
 #Frontend Variables
-FrontEndDisplay = True
+FrontEndDisplay = False
 FrontEndPort = '24.56.52.6:3000'
 updating = 1
 tickerIndex = 0

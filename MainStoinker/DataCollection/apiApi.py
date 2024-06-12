@@ -105,8 +105,10 @@ class IBapi(TestWrapper, TestClient):
         lastbartime = self.lastbar["date"].to_pydatetime()
 
         if lastbartime != self.olddatatime:
-            #first occurance of new data of this minute (needs to be tested to make sure it only gets called once...)
-            self.readOrders()
+            #first occurance of new data for new minute (needs to be tested to make sure it only gets called once...)
+            self.firstdataofminute = 1
+            print("in loop for ticker: " + str(ticker.name))
+            print("----------" + str(lastbartime) + "----------" + str(datetime.now())) #print time for new minute
             self.olddatatime = lastbartime
 
         if candleData[0] == lastbartime:
@@ -118,7 +120,6 @@ class IBapi(TestWrapper, TestClient):
                     ticker.intraminute_update()
         #it is not intraminute
         else:
-            print("----------" + str(lastbartime) + "----------")
             ticker.append([candleData])
             self.eventDict[reqId].set()              
 
@@ -164,7 +165,10 @@ class IBapi(TestWrapper, TestClient):
         print("startData read positions")
         print(self.readPositions())
 
+        print("startData read orders")
         print(self.readOrders())
+
+        
 
 
     def getData(self,index):
@@ -259,9 +263,10 @@ class IBapi(TestWrapper, TestClient):
         timeout = 2
         flag = self.orders_event_obj.wait(timeout)
         if flag:
-            print(self.all_openorders)
+            # print(self.all_openorders)
+            pass
         else:
-            print("error with callback for positions")
+            print("error with callback for readOrders")
 
     def openOrder(self,orderId,contract,order,orderState):
         # super().openOrder(orderId, contract, order, orderState)
