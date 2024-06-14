@@ -104,7 +104,7 @@ class IBapi(TestWrapper, TestClient):
         self.lastbar = ticker.data.iloc[-1]
         lastbartime = self.lastbar["date"].to_pydatetime()
 
-        if lastbartime != self.olddatatime:
+        if lastbartime > self.olddatatime:
             #first occurance of new data for new minute (needs to be tested to make sure it only gets called once...)
             self.firstdataofminute = 1
             print("in loop for ticker: " + str(ticker.name))
@@ -140,6 +140,7 @@ class IBapi(TestWrapper, TestClient):
         self.tickers = tickers
         self.algos = algos
         self.warmup = warmup
+        self.firstdataofminute = 0
         for ticker in tickers.values():
             
             if ticker.name == "ETH" or ticker.name == "BTC":
