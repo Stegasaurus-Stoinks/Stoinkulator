@@ -85,6 +85,7 @@ print(app.readOrders())
 
 app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
+# backtesting loop
 if not config.LiveData:
     eventDict[0].wait()
     # rint("Event called for backtesty")
@@ -98,6 +99,8 @@ logger.info("--------------Press 'DEL' to Close Program----------------")
 logger.info("___________________________________________________________\n")
 
 keyboard.wait('Delete')
+
+utils.get_algo_data()
 
 config.updating = 0
 
