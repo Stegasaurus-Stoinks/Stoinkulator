@@ -30,15 +30,15 @@ class Algo:
 
         self.ibape = IBapi()
 
-        #Data frame to store data for Algo, (Stoploss, Analysis, Stuff to send to the front end)  
-        self.DataColumns = ['time','StopPrice','MA20','MA50']
-        self.AlgoData = pd.DataFrame(columns=self.DataColumns)
-        # print(self.AlgoData.shape)
-
         #Data to send to the frontend
        
-        self.FrontEndDataStruct = ['MA20','MA50','StopPrice']
-        self.FrontEndDataType = ['line','line','segment']
+        self.FrontEndDataStruct = ['MA20','MA50','StopPrice',"Trade"]
+        self.FrontEndDataType = ['line','line','segment','baseline']
+
+        #Data frame to store data for Algo ( Uses Front End Data Struct to create dataframe, can add whaterver you want also))  
+        self.DataColumns = ['time'] + self.FrontEndDataStruct
+        self.AlgoData = pd.DataFrame(columns=self.DataColumns)
+        # print(self.AlgoData.shape)
 
         #Other inits/variables
         self.inTrade = False
@@ -133,6 +133,19 @@ class Algo:
             else:
                 # Update AlgoData with newest StopPrice Data
                 self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+
+                # Update AlgoData with trade data (midpoint of price data)
+                if self.trade.openTime == self.curStockData['time']: #if this is the first point in the trade
+                    midpoint = self.curStockData['close']
+                else:
+
+                    diff = self.curStockData['close'] - self.curStockData['open']
+                    if diff > 0:
+                        midpoint = self.curStockData['open'] + (diff/2)
+                    else:
+                        midpoint = self.curStockData['close'] - (diff/2)
+
+                self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = midpoint
 
                 #End of day trade closing
                 endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
