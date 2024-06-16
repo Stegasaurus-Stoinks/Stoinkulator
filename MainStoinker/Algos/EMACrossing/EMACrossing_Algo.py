@@ -42,7 +42,6 @@ class Algo:
 
         #Other inits/variables
         self.inTrade = False
-        self.printInfo = True
         self.trades = []
 
         print("Algo " + self.name + " Initialized")
@@ -94,7 +93,7 @@ class Algo:
         if prevtrend != trend: # Check if trend has changed
             if(self.inTrade):
                 #close trade because we want to open one in a different direction
-                self.printStuff("Closing trade due to opposing signal detected")
+                print("Closing trade due to opposing signal detected")
                 self.inTrade = False
                 closeTime = self.curStockData['date']
                 closePrice = self.curStockData['close']
@@ -104,30 +103,30 @@ class Algo:
 
             
             if trend:
-                self.printStuff("Crossing Up!")
+                print("Crossing Up!")
                 self.inTrade = True
                 enterTime = self.curStockData['date']
                 enterPrice = self.curStockData['close']
-                #Trade(symbol, volume, ID, openPrice, openTime, direction, live, stoploss, API, printinfo)
                 self.trade = 0
                 
                 self.logger.info("***opening trade on cross-up***")
-                self.trade = Trade(self.ticker, 10, len(self.trades), enterPrice, enterTime, trend, (self.stoplossPercent/100), printInfo=False)
+                tradeid = str(self.name) + str(len(self.trades))
+                self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, (self.stoplossPercent/100), self.logger)
                 self.trades.append(self.trade)
                 # ime.sleep(1)
 
 
             else:
-                self.printStuff("Crossing Down!")
+                print("Crossing Down!")
 
             
 
         if self.inTrade:
-            self.printStuff("In a trade")
+            print("In a trade")
             
             # logic for manual stoploss
             if not self.trade.check_stoploss(self.curStockData):
-                self.logger.info("***manual stoploss close position***")
+                self.logger.debug("***received false from check_stoploss***")
                 self.inTrade = False
 
             else:
@@ -152,7 +151,7 @@ class Algo:
                 if self.curStockData['date'] > endofDay:
                     self.logger.info("***end of day close position***")
                     self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
-                    self.printStuff("Closing position based on end of day")
+                    print("Closing position based on end of day")
                     self.inTrade = False
 
         self.AlgoData['time'] = StockData['time']
@@ -184,13 +183,10 @@ class Algo:
             
         return({'idname':self.name, 'data':dataToSend})
     
+    
     def printtrades(self):
         print(self.trades)
 
-
-    def printStuff(self,stuff):
-        if self.printInfo:
-            print(stuff)
 
     def printStats(self,FullPrint):
         totalProfit = 0

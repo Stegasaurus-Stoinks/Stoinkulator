@@ -162,16 +162,16 @@ def get_algo_data():
 
 
 
-def create_logger(name):
+def create_logger(name, log_level=config.log_level):
     # create logger
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(log_level)
 
     # create console handler and set level to debug
     fh = logging.FileHandler('loggy.log')
-    fh.setLevel(logging.INFO)
+    fh.setLevel(log_level)
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(log_level)
 
     # create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')

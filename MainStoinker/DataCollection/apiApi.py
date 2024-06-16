@@ -104,12 +104,12 @@ class IBapi(TestWrapper, TestClient):
         self.lastbar = ticker.data.iloc[-1]
         lastbartime = self.lastbar["date"].to_pydatetime()
 
-        if lastbartime > self.olddatatime:
+        if lastbartime > self.olddatetime:
             #first occurance of new data for new minute (needs to be tested to make sure it only gets called once...)
             self.firstdataofminute = 1
             print("in loop for ticker: " + str(ticker.name))
             print("----------" + str(lastbartime) + "----------" + str(datetime.now())) #print time for new minute
-            self.olddatatime = lastbartime
+            self.olddatetime = lastbartime
 
         if candleData[0] == lastbartime:
             # did anything change?
@@ -136,7 +136,7 @@ class IBapi(TestWrapper, TestClient):
         self.livetickerdata = []
         self.liveintraminutedata = []
         self.lastbardict = {}
-        self.olddatatime = 0
+        self.olddatetime = datetime.min
         self.tickers = tickers
         self.algos = algos
         self.warmup = warmup

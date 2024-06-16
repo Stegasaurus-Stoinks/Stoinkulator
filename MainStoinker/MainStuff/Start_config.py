@@ -1,9 +1,12 @@
 import datetime
 from dateutil.relativedelta import *
+import logging
 
+# Backend Variables
 tickers = {}
 algos = []
-loggers = ["dum_dum", "trade"]
+loggers = ["dum_dum"]
+log_level = logging.INFO
 LiveData = True
 LiveTrading = True
 #once trade excecution is figured out we should be able to get rid of one of these variables

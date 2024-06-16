@@ -9,7 +9,7 @@ class Trade:
     
     #unique id so find trades that have been placed by this algo
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, stoploss, limitOrder = False, printInfo = True):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, stoploss, logger, limitOrder = False):
         self.ibape = IBapi()
         self.symbol = symbol
         self.volume = volume
@@ -19,11 +19,10 @@ class Trade:
         
         self.openTime = openTime
         self.direction = direction
-        self.printInfo = printInfo
         self.live = config.LiveTrading
         self.limitOrder = limitOrder
 
-        self.logger = logging.getLogger("trade")
+        self.logger = logger
 
         # set trailingPercent to be the exact amount above or below 1 for equations
         if self.direction:
@@ -91,10 +90,7 @@ class Trade:
         self.status = "Open"
 
         #print to console trade placement info if asked for it
-        if self.printInfo:
-            self.logger.info("______________________________________________________________________")
-            self.logger.info("Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
-            self.logger.info("______________________________________________________________________")
+        self.logger.info(self.tradeID+" - Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.parentId))
 
 
     def close_position(self, closePrice, closeTime):
@@ -128,16 +124,14 @@ class Trade:
             self.position = False
             self.status = "Closed"
 
-            if self.printInfo:
-                self.logger.info("Closed a Position! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID) +"\n")
+            self.logger.info(self.tradeID+" - Closed a Position! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID) +"\n")
 
         else:
             #Fake Trade for backtesting
             self.position = False
             self.status = "Closed"
 
-            if self.printInfo:
-                print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
+            print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
 
 
 
@@ -153,9 +147,15 @@ class Trade:
         result = 1
         price = curpoint["close"]
         if config.LiveTrading:
-            print("printing open orders:")
-            print(self.ibape.all_openorders)
+            self.logger.debug(self.tradeID+" - printing open orders, looking for "+self.stoplossId)
+            self.logger.debug(self.tradeID+" - "+self.ibape.all_openorders)
             if self.stoplossId not in self.ibape.all_openorders.index:
+                self.logger.info(self.tradeID+" - Position has been closed by TWS stoploss: ")
+                #TODO: ask TWS for close price + close time. populate variables in trade. probably use readExecutions
+                    # self.closePrice = closePrice
+                    # self.closeTime = closeTime
+                    # duration
+                    # profit
                 return 0
         #stoploss check + reclaculation if necessary for either direction
         #return 1 if good 0 if bad
@@ -166,12 +166,13 @@ class Trade:
                 
                 if config.LiveTrading: 
                     self.stopOrder.auxPrice = self.stopPrice
-                    self.logger.info("updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
+                    self.logger.info(self.tradeID+" - updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
                     self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
 
             elif price < self.stopPrice:
                 self.close_position(self.stopPrice,curpoint['date'])
+                self.logger.info(self.tradeID+" - Manually closing position based on stoploss: "+self.tradeID)
                 result = 0    
 
         else: #DOWN Trade
@@ -180,11 +181,13 @@ class Trade:
                 
                 if config.LiveTrading: 
                     self.stopOrder.auxPrice = self.stopPrice
+                    self.logger.info(self.tradeID+" - updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
                     self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
 
             elif price > self.stopLoss:
-                self.close_position(self.stopPrice,curpoint['date'])                
+                self.close_position(self.stopPrice,curpoint['date'])       
+                self.logger.info(self.tradeID+" - Manually closing position based on stoploss: "+self.tradeID)         
                 result = 0
         
         return result
