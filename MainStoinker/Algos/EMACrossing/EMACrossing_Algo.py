@@ -170,6 +170,8 @@ class Algo:
             else:
                 dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
+        self.logger.debug(str(self.name) + " - " + str({'idname':self.name, 'time':int(self.curStockData['time']), 'data':dataToSend})) 
+
         return({'idname':self.name, 'time':int(self.curStockData['time']), 'data':dataToSend})
     
 
