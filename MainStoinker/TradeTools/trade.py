@@ -146,8 +146,8 @@ class Trade:
         result = 1
         price = curpoint["close"]
         if config.LiveTrading:
-            self.logger.debug(self.tradeID+" - printing open orders, looking for "+self.stoplossId)
-            self.logger.debug(self.tradeID+" - "+self.ibape.all_openorders)
+            self.logger.debug(self.tradeID+" - printing open orders, looking for "+str(self.stoplossId))
+            self.logger.debug(self.tradeID+" - "+str(self.ibape.all_openorders))
             if self.stoplossId not in self.ibape.all_openorders.index:
                 self.logger.info(self.tradeID+" - Position has been closed by TWS stoploss: ")
                 #TODO: ask TWS for close price + close time. populate variables in trade. probably use readExecutions

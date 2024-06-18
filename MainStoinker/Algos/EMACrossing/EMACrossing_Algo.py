@@ -13,8 +13,6 @@ import math
 from MainStoinker.TradeTools.trade import Trade
 
 
-inTrade = False
-enterTime = 0
 
 class Algo:
     def __init__(self, algoConfigData):
@@ -48,10 +46,6 @@ class Algo:
         
 
     def update(self, StockData):
-        # print("algo update readPositions")
-        # print(self.ibape.readPositions())
-        # print("Stock DAta in Ticker")
-        # print(StockData)
 
 
         # check if they are the same size, probably dont need this since they should only be called when theres a line added
@@ -79,6 +73,41 @@ class Algo:
 
         # datapoint print for current minute
         # print(str(self.ticker) + " : " + str(self.curStockData['close']))
+
+        if self.inTrade:
+            print("In a trade")
+            
+            # logic for manual stoploss
+            if not self.trade.check_stoploss(self.curStockData):
+                self.logger.debug("***received false from check_stoploss***")
+                self.inTrade = False
+
+            else:
+                # Update AlgoData with newest StopPrice Data
+                self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+
+                # Update AlgoData with trade data (midpoint of price data)
+                if self.trade.openTime == self.curStockData['time']: #if this is the first point in the trade
+                    midpoint = self.curStockData['close']
+                else:
+
+                    diff = self.curStockData['close'] - self.curStockData['open']
+                    if diff > 0:
+                        midpoint = self.curStockData['open'] + (diff/2)
+                    else:
+                        midpoint = self.curStockData['close'] - (diff/2)
+
+                self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = midpoint
+
+                #End of day trade closing
+                endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
+                if self.curStockData['date'] > endofDay:
+                    self.logger.info("***end of day close position***")
+                    self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
+                    print("Closing position based on end of day")
+                    self.inTrade = False
+
+
 
         if self.lastAlgoData['MA20'] > self.lastAlgoData['MA50']:
             prevtrend = 1
@@ -121,38 +150,22 @@ class Algo:
 
             
 
-        if self.inTrade:
-            print("In a trade")
-            
-            # logic for manual stoploss
-            if not self.trade.check_stoploss(self.curStockData):
-                self.logger.debug("***received false from check_stoploss***")
-                self.inTrade = False
 
-            else:
-                # Update AlgoData with newest StopPrice Data
-                self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+        
+        
+        # if not self.inTrade:
+        #     trend = 1
+        #     self.logger.info("***opening trade just because***")
+        #     self.inTrade = True
+        #     enterTime = self.curStockData['date']
+        #     enterPrice = self.curStockData['close']
+        #     # self.trade = 0
 
-                # Update AlgoData with trade data (midpoint of price data)
-                if self.trade.openTime == self.curStockData['time']: #if this is the first point in the trade
-                    midpoint = self.curStockData['close']
-                else:
+        #     tradeid = str(self.name) + str(len(self.trades))
+        #     self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, (self.stoplossPercent/100), self.logger)
+        #     self.trades.append(self.trade)
 
-                    diff = self.curStockData['close'] - self.curStockData['open']
-                    if diff > 0:
-                        midpoint = self.curStockData['open'] + (diff/2)
-                    else:
-                        midpoint = self.curStockData['close'] - (diff/2)
 
-                self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = midpoint
-
-                #End of day trade closing
-                endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
-                if self.curStockData['date'] > endofDay:
-                    self.logger.info("***end of day close position***")
-                    self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
-                    print("Closing position based on end of day")
-                    self.inTrade = False
 
         self.AlgoData['time'] = StockData['time']
 
