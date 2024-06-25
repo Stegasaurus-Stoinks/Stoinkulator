@@ -57,7 +57,7 @@ class IBapi(TestWrapper, TestClient):
         if(config.LiveData):
             config.tickers[reqId].append([candleData])
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId]._append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
 
     # terminal callback from reqHistoricalData
     def historicalDataEnd(self, reqId: int, start: str, end: str):
