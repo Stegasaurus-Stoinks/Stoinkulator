@@ -38,6 +38,7 @@ app = IBapi()
 
 
 if not config.offline:
+    
     websock = FrontEndClient()
     if config.FrontEndDisplay:
         wst = threading.Thread(target=websock.connect_websocket,daemon=True)

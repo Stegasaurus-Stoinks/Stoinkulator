@@ -27,5 +27,5 @@ StartDate = datetime.datetime.now() - relativedelta(month=0,weeks=0,day=Duration
 TimeDelayPerPoint = 1.0 #seconds between backtested points
 
 #offline dev
-collectofflinedata = True
+collectofflinedata = False
 offline = False
