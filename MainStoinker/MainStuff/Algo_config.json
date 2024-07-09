@@ -18,4 +18,24 @@
       }
     ]
   }
+  ,
+  {
+    "ID":"TrendLine",
+    "data":[
+      {
+        "idname": "AAPL-10/30trend",
+        "ticker": "AAPL",
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
+      },
+      {
+        "idname": "TSLA-20/40trend",
+        "ticker": "TSLA",
+        "short": "20",
+        "long": "40",
+        "stoplossPercent": ".1"
+      }
+    ]
+  }
 ]

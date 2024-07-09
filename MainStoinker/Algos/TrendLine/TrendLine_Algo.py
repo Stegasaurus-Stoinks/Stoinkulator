@@ -30,7 +30,7 @@ class Algo(ParentAlgo):
 
         #Data to send to the frontend
         self.FrontEndDataStruct = ['mins','maxs','MA20','upperband','middleband','lowerband','StopPrice',"Trade"]
-        self.FrontEndDataType = ['uparrow','downarrow','line','line','line','line','segment','baseline']
+        self.FrontEndDataType = ['uparrow-f','downarrow-f','line','line','line','line','segment','baseline']
 
         #Data frame to store data for Algo ( Uses Front End Data Struct to create dataframe, can add whaterver you want also))  
         self.DataColumns = ['time'] + self.FrontEndDataStruct
@@ -52,8 +52,8 @@ class Algo(ParentAlgo):
 
         n = 5
 
-        self.AlgoData['mins'] = self.AlgoData.iloc[argrelextrema(self.AlgoData.close.values, np.less_equal, order=n)[0]]['close']
-        self.AlgoData['maxs'] = self.AlgoData.iloc[argrelextrema(self.AlgoData.close.values, np.greater_equal, order=n)[0]]['close']
+        self.AlgoData['mins'] = StockData.iloc[argrelextrema(StockData.close.values, np.less_equal, order=n)[0]]['close']
+        self.AlgoData['maxs'] = StockData.iloc[argrelextrema(StockData.close.values, np.greater_equal, order=n)[0]]['close']
         # print(ta.HT_TRENDLINE(StockData['close']))
     
         self.AlgoData['upperband'],self.AlgoData['middleband'],self.AlgoData['lowerband'] = ta.BBANDS(StockData['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0)

@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import math
 
+fulldatatypes = ['uparrow-f','downarrow-f','line-f']
+
 
 
 
@@ -28,6 +30,7 @@ class ParentAlgo:
         self.curStockData = 0
         self.curAlgoData = 0
         self.lastAlgoData = 0
+        self.AlgoData = 0
         self.FrontEndDataStruct = 0
         self.FrontEndDataType = 0
         
@@ -39,7 +42,12 @@ class ParentAlgo:
             if math.isnan(data):
                 data = None
             else:
-                dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
+                if self.FrontEndDataType[x] in fulldatatypes:
+                    data = self.AlgoData[self.FrontEndDataStruct[x]]
+                    df1 = self.AlgoData[['time', self.FrontEndDataStruct[x]]].to_dict('records')
+                    # print(df1)
+                else:
+                    dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
         self.logger.debug(str(self.name) + " - " + str({'idname':self.name, 'time':int(self.curStockData['time']), 'data':dataToSend})) 
 

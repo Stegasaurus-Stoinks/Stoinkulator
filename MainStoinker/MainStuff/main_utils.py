@@ -77,7 +77,7 @@ def algo_config_parse():
 def algo_starter(algo, data):
     filename = "." + str(algo) + "_Algo"
     print("Opening " + filename)
-    AlgoClass = getattr(importlib.import_module(filename,"MainStoinker.Algos.EMACrossing"),'Algo')
+    AlgoClass = getattr(importlib.import_module(filename,"MainStoinker.Algos."+str(algo)),'Algo')
     return AlgoClass(data)
 
 
