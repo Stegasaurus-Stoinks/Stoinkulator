@@ -37,57 +37,77 @@ app = IBapi()
 
 
 
+if not config.offline:
+    
+    websock = FrontEndClient()
+    if config.FrontEndDisplay:
+        wst = threading.Thread(target=websock.connect_websocket,daemon=True)
+        wst.start()
 
-websock = FrontEndClient()
-if config.FrontEndDisplay:
-    wst = threading.Thread(target=websock.connect_websocket,daemon=True)
-    wst.start()
-
-time.sleep(1)
-app.connect('127.0.0.1', 7497, 123)
-
-
-while(not app.isConnected()):
-    print("Order Status: " + str(app.isConnected()))
-    time.sleep(.5)
-time.sleep(1)
-print("TWS Connected")
-
-api_thread = threading.Thread(target=app.run,daemon=True)
-api_thread.start()
-
-
-if config.LiveData:
-    for ticker in config.tickers.values():
-        eventDict[ticker.index] = threading.Event()
-
-    for index, event in eventDict.items():
-        event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True, name=config.tickers[index].name)
-        event_thread.start()
-else:
-    eventDict[0] = threading.Event()
-
-
-#verify connection has read/write capabilities
-if not app.getNextOrderID():
-    print("Something wrong with connection (no response from TWS)")
-    print("Shutting Down...")
     time.sleep(1)
-    app.disconnect
+    app.connect('127.0.0.1', 7497, 123)
+
+
+    while(not app.isConnected()):
+        print("Order Status: " + str(app.isConnected()))
+        time.sleep(.5)
     time.sleep(1)
-    exit()
+    print("TWS Connected")
 
-print("startup read positions")
-print(app.readPositions())
+    api_thread = threading.Thread(target=app.run,daemon=True)
+    api_thread.start()
 
-print("startup read orders")
-print(app.readOrders())
 
-app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
+    if config.LiveData:
+        for ticker in config.tickers.values():
+            eventDict[ticker.index] = threading.Event()
+
+        for index, event in eventDict.items():
+            event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True, name=config.tickers[index].name)
+            event_thread.start()
+    else:
+        eventDict[0] = threading.Event()
+
+
+    #verify connection has read/write capabilities
+    if not app.getNextOrderID():
+        print("Something wrong with connection (no response from TWS)")
+        print("Shutting Down...")
+        time.sleep(1)
+        app.disconnect
+        time.sleep(1)
+        exit()
+
+    print("startup read positions")
+    print(app.readPositions())
+
+    print("startup read orders")
+    print(app.readOrders())
+
+    app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
+
+else: #if offline load offline data
+    # self.datacollectednum = 0 #variable to track completed historical data pulls
+    # self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
+    # self.simulatedDatadict[ticker.index] = pd.DataFrame()
+    # self.datacollectednum = 0
+
+            
+    # self.datadict[ticker.index] = pd.DataFrame()
+    # self.lastbardict[ticker.index] = 0
+    pass
 
 # backtesting loop
 if not config.LiveData:
     eventDict[0].wait()
+
+    # collect offline data
+    if(config.collectofflinedata):
+        print(app.simulatedDatadict)
+        for ticker in config.tickers:
+            tickerdf = app.simulatedDatadict[ticker]
+            tickerdf.to_csv("_" + str(config.tickers[ticker].name) + "_offlinedata_")
+
     # rint("Event called for backtesty")
     utils.backtesting_data_blast()
     eventDict[0].clear()

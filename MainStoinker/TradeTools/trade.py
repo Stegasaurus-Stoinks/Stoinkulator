@@ -149,7 +149,7 @@ class Trade:
             self.logger.debug(self.tradeID+" - printing open orders, looking for "+str(self.stoplossId))
             self.logger.debug(self.tradeID+" - "+str(self.ibape.all_openorders))
             if self.stoplossId in self.ibape.all_openorders.index:
-                if self.ibape.all_openorders.loc(self.stoplossId)['OrderState'] == 'Filled':
+                if self.ibape.all_openorders.loc[self.stoplossId,'OrderState'] == 'Filled':
                     return 0
             else:
                 self.logger.info(self.tradeID+" - Position has been closed by TWS stoploss: ")
