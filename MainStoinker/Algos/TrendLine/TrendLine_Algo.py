@@ -55,8 +55,7 @@ class Algo(ParentAlgo):
         self.AlgoData['mins'] = self.AlgoData.iloc[argrelextrema(self.AlgoData.close.values, np.less_equal, order=n)[0]]['close']
         self.AlgoData['maxs'] = self.AlgoData.iloc[argrelextrema(self.AlgoData.close.values, np.greater_equal, order=n)[0]]['close']
         # print(ta.HT_TRENDLINE(StockData['close']))
-        # print(ta.MACD(StockData['close']))
-        # print(self.AlgoData['MA50'])
+    
         self.AlgoData['upperband'],self.AlgoData['middleband'],self.AlgoData['lowerband'] = ta.BBANDS(StockData['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0)
 
         # print(self.AlgoData)
