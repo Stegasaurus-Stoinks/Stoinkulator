@@ -19,7 +19,6 @@ class Trade:
         
         self.openTime = openTime
         self.direction = direction
-        self.live = config.LiveTrading
         self.limitOrder = limitOrder
 
         self.logger = logger
@@ -35,7 +34,7 @@ class Trade:
         self.stopLoss = abs(openPrice - self.stopPrice)
         
 
-        if self.live:
+        if config.LiveTrading:
             self.open_position()
         else:
             self.fake_open()
@@ -90,7 +89,7 @@ class Trade:
         self.status = "Open"
 
         #print to console trade placement info if asked for it
-        self.logger.info(self.tradeID+" - Opened a Postion! Bought " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.parentId))
+        self.logger.info(self.tradeID+" - Opened a Postion! Bought " + str(self.volume) + " of " + str(self.symbol) + " Trade ID: " + str(self.parentId))
 
 
     def close_position(self, closePrice, closeTime):
@@ -100,7 +99,7 @@ class Trade:
         #call funtion to close order through api
         # TODO: close stoploss position here too
 
-        if self.live:
+        if config.LiveTrading:
             if self.direction:
                 if self.limitOrder:
                     self.parentCloseOrder = sell_order_object(self.volume, limitPrice=self.openPrice)
@@ -124,14 +123,14 @@ class Trade:
             self.position = False
             self.status = "Closed"
 
-            self.logger.info(self.tradeID+" - Closed a Position! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID) +"\n")
+            self.logger.info(self.tradeID+" - Closed a Position! Sold " + str(self.volume) + " of " + str(self.symbol) + " Trade ID: " + str(self.tradeID) +"\n")
 
         else:
             #Fake Trade for backtesting
             self.position = False
             self.status = "Closed"
 
-            print("Closed a fake Postion! Sold " + str(self.volume) + " of " + self.symbol + " Trade ID: " + str(self.tradeID))
+            print("Closed a fake Postion! Sold " + str(self.volume) + " of " + str(self.symbol) + " Trade ID: " + str(self.tradeID))
 
 
 
@@ -147,9 +146,12 @@ class Trade:
         result = 1
         price = curpoint["close"]
         if config.LiveTrading:
-            self.logger.debug(self.tradeID+" - printing open orders, looking for "+self.stoplossId)
-            self.logger.debug(self.tradeID+" - "+self.ibape.all_openorders)
-            if self.stoplossId not in self.ibape.all_openorders.index:
+            self.logger.debug(self.tradeID+" - printing open orders, looking for "+str(self.stoplossId))
+            self.logger.debug(self.tradeID+" - "+str(self.ibape.all_openorders))
+            if self.stoplossId in self.ibape.all_openorders.index:
+                if self.ibape.all_openorders.loc(self.stoplossId)['OrderState'] == 'Filled':
+                    return 0
+            else:
                 self.logger.info(self.tradeID+" - Position has been closed by TWS stoploss: ")
                 #TODO: ask TWS for close price + close time. populate variables in trade. probably use readExecutions
                     # self.closePrice = closePrice
