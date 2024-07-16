@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import math
 
-fulldatatypes = ['uparrow-f','downarrow-f','line-f']
+fulldatatypes = ['marker-up','marker-down','marker-dot','line-f']
 
 
 
@@ -44,8 +44,28 @@ class ParentAlgo:
             else:
                 if self.FrontEndDataType[x] in fulldatatypes:
                     data = self.AlgoData[self.FrontEndDataStruct[x]]
-                    df1 = self.AlgoData[['time', self.FrontEndDataStruct[x]]].to_dict('records')
+                    df1 = self.AlgoData[['time', self.FrontEndDataStruct[x]]]#.to_dict('records')
+                    # print("Dataframe")
                     # print(df1)
+                    df1 = df1.dropna(subset=[self.FrontEndDataStruct[x]])
+                    df1 = df1.reset_index()
+                    df1 = df1[['time',self.FrontEndDataStruct[x]]]
+                    # print("shortened df")
+                    # print(df1)
+                    # print("BLEH")
+                    fuckingshit = df1['time'].tolist()
+                    print(fuckingshit)
+                    # print("list[2]")
+                    # print(df1[self.FrontEndDataStruct[x]].tolist()[2].type())
+                    if "marker-" in self.FrontEndDataType[x]:
+                        markerdata = {'name':self.FrontEndDataStruct[x], 'data':fuckingshit, 'type':self.FrontEndDataType[x]}
+                        dataToSend.append(markerdata)
+
+                    # else:
+                    #     df1.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
+                    #     data = data.to_json(orient="records")
+                    #     dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
+
                 else:
                     dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
@@ -57,10 +77,11 @@ class ParentAlgo:
     def update_frontend_fulldata(self):
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
-            data = self.AlgoData[['time',self.FrontEndDataStruct[x]]]
-            data.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
-            data = data.to_json(orient="records")
-            dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
+            if self.FrontEndDataType[x] not in fulldatatypes:
+                data = self.AlgoData[['time',self.FrontEndDataStruct[x]]]
+                data.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
+                data = data.to_json(orient="records")
+                dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
         return({'idname':self.name, 'data':dataToSend})
     

@@ -46,6 +46,7 @@ class Ticker():
                 
             if config.FrontEndDisplay:
                 sendData = algo.update_frontend()
+                # print("calling update front end")
                 algodata.append(sendData)
         
         # send data to front end

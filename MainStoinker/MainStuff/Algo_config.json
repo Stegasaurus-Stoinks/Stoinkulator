@@ -1,25 +1,5 @@
 [
   {
-    "ID":"EMACrossing",
-    "data":[
-      {
-        "idname": "AAPL-10/30EMA",
-        "ticker": "AAPL",
-        "short": "10",
-        "long": "30",
-        "stoplossPercent": ".1"
-      },
-      {
-        "idname": "TSLA-20/40EMA",
-        "ticker": "TSLA",
-        "short": "20",
-        "long": "40",
-        "stoplossPercent": ".1"
-      }
-    ]
-  }
-  ,
-  {
     "ID":"TrendLine",
     "data":[
       {
@@ -27,13 +7,6 @@
         "ticker": "AAPL",
         "short": "10",
         "long": "30",
-        "stoplossPercent": ".1"
-      },
-      {
-        "idname": "TSLA-20/40trend",
-        "ticker": "TSLA",
-        "short": "20",
-        "long": "40",
         "stoplossPercent": ".1"
       }
     ]

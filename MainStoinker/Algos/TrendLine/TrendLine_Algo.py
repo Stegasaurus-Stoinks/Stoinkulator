@@ -29,8 +29,8 @@ class Algo(ParentAlgo):
         self.ibape = IBapi()
 
         #Data to send to the frontend
-        self.FrontEndDataStruct = ['mins','maxs','MA20','upperband','middleband','lowerband','StopPrice',"Trade"]
-        self.FrontEndDataType = ['uparrow-f','downarrow-f','line','line','line','line','segment','baseline']
+        self.FrontEndDataStruct = ['mins','maxs','MA20','StopPrice',"Trade"]
+        self.FrontEndDataType = ['marker-up','marker-down','line','segment','baseline']
 
         #Data frame to store data for Algo ( Uses Front End Data Struct to create dataframe, can add whaterver you want also))  
         self.DataColumns = ['time'] + self.FrontEndDataStruct
