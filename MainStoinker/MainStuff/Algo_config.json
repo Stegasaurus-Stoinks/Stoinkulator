@@ -8,6 +8,20 @@
         "short": "10",
         "long": "30",
         "stoplossPercent": ".1"
+      },
+      {
+        "idname": "MSFT-10/30trend",
+        "ticker": "MSFT",
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
+      },
+      {
+        "idname": "TSLA-10/30trend",
+        "ticker": "TSLA",
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
       }
     ]
   }

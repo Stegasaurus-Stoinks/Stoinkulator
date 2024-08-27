@@ -161,23 +161,23 @@ class IBapi(TestWrapper, TestClient):
                     self.simulatedDatadict[ticker.index] = pd.DataFrame()
                     self.datacollectednum = 0
 
-            if config.offline:
-                self.datacollectednum = 0 #variable to track completed historical data pulls
-                self.simulatedDatadict[ticker.index] = pd.DataFrame()
-                self.load_offline_data()
+                else:
+                    self.datacollectednum = 0 #variable to track completed historical data pulls
+                    self.simulatedDatadict[ticker.index] = pd.DataFrame()
+                    self.load_offline_data()
+
+            if not config.offline:
+                print("startData read positions")
+                print(self.readPositions())
+
+                print("startData read orders")
+                print(self.readOrders())
 
             
 
             
             self.datadict[ticker.index] = pd.DataFrame()
             self.lastbardict[ticker.index] = 0
-
-        print("startData read positions")
-        print(self.readPositions())
-
-        print("startData read orders")
-        print(self.readOrders())
-
         
 
 
@@ -367,20 +367,17 @@ class IBapi(TestWrapper, TestClient):
         if reqId > -1:
             print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
 
-
     def load_offline_data(self):
         for ticker in config.tickers:
-            tickername = config.tickers[ticker].name
-            print("looking for data for " + tickername)
-            filename = "./OfflineData/_" + tickername + "_offlinedata_.csv"
-            filename2 = "./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_"
+            # print("looking for data for " + tickername)
+            filename = "./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_"
             # pd.read_csv(filename2)
             try:
-                data = pd.read_csv(filename2,usecols=['date','time', 'open','high','low','close','volume'])
-                print("Found data for " + tickername)
+                data = pd.read_csv(filename,usecols=['date','time', 'open','high','low','close','volume'])
+                print("Found data for " + config.tickers[ticker].name)
 
             except:
-                print("file " + filename2 + " cannot be found or does not exist")
+                print("file " + filename + " cannot be found or does not exist")
                 print("not all data cant be collected, shutting down...")
                 # TODO Filter out the algos that use the tickers that dont have data and dont run them?  could be fun
                 quit()
@@ -392,19 +389,12 @@ class IBapi(TestWrapper, TestClient):
             self.simulatedDatadict[reqId]=data
             self.datacollectednum += 1
 
-            # datetime.strptime(self.simulatedDatadict[reqId].at[0,'date'], '%y-%m-%d %H:%M:%S')
-
             firstDate = self.simulatedDatadict[reqId].at[0,'date']
-            print(firstDate)
             startDate = firstDate + timedelta(days=self.warmup)
             config.tickers[reqId].data = data.loc[(data['date'] < startDate)]
-            
-            firstDate = self.simulatedDatadict[reqId].at[0,'date']
-            startDate = firstDate + timedelta(days=self.warmup)
+
             print("Warmup Start Date: " + str(firstDate))
             print("Warmup End Date: " + str(startDate))
-            
-            print(self.simulatedDatadict[reqId])
 
             self.tickers[reqId].data = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
             self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume']

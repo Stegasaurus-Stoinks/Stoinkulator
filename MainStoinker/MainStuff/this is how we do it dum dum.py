@@ -85,33 +85,17 @@ if not config.offline:
         time.sleep(1)
         exit()
 
-    print("startup read positions")
-    print(app.readPositions())
-
-    print("startup read orders")
-    print(app.readOrders())
-
     app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
 else: #if offline load offline data
-    # self.datacollectednum = 0 #variable to track completed historical data pulls
-    # self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
-    # self.simulatedDatadict[ticker.index] = pd.DataFrame()
-    # self.datacollectednum = 0
-
-            
-    # self.datadict[ticker.index] = pd.DataFrame()
-    # self.lastbardict[ticker.index] = 0
     eventDict[0] = threading.Event()
-    time.sleep(1)
-    print("setting up offline thread")
-    print("loading offline data for tickers:")
+    time.sleep(.5)
+    print("____________________________________________")
+    print("Setting up offline thread...")
+    print("Loading offline data for tickers from CSV...")
+    print("")
     app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
-
-
-
-    # pass
 
 # backtesting loop
 if not config.LiveData:
@@ -123,8 +107,7 @@ if not config.LiveData:
         for ticker in config.tickers:
             tickerdf = app.simulatedDatadict[ticker]
             tickerdf.to_csv("./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_")
-
-    print("Event called for backtesty")
+    
     utils.backtesting_data_blast()
     eventDict[0].clear()
 

@@ -48,6 +48,9 @@ def algo_config_parse():
             tickerName = algoConfigData['ticker']
             # print(algoConfigData['ticker'])
 
+            # TODO: replace ticketDict name check with a check that iterates over configTickerDict, and checks for both name and timeFrame
+            # TODO: Add timeframe variable to algo_config.json
+            # TODO: After finishing above, change code to dynamically request data based off timeFrame and remove hardcoded values
             ticker = tickerDict.get(tickerName) 
             
             if ticker is None:

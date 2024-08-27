@@ -121,8 +121,8 @@ class FrontEndClient:
             print("Got the following exception: " + str(e))
 
         file.close()
-        print("Sending Algo Config")
-        print(parsed_json)
+        # print("Sending Algo Config")
+        # print(parsed_json)
         try:
             self.sio.emit('config_send', parsed_json)
         except:

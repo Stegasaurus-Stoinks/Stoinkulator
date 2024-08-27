@@ -50,21 +50,10 @@ class ParentAlgo:
                     df1 = df1.dropna(subset=[self.FrontEndDataStruct[x]])
                     df1 = df1.reset_index()
                     df1 = df1[['time',self.FrontEndDataStruct[x]]]
-                    # print("shortened df")
-                    # print(df1)
-                    # print("BLEH")
                     fuckingshit = df1['time'].tolist()
-                    print(fuckingshit)
-                    # print("list[2]")
-                    # print(df1[self.FrontEndDataStruct[x]].tolist()[2].type())
                     if "marker-" in self.FrontEndDataType[x]:
                         markerdata = {'name':self.FrontEndDataStruct[x], 'data':fuckingshit, 'type':self.FrontEndDataType[x]}
                         dataToSend.append(markerdata)
-
-                    # else:
-                    #     df1.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
-                    #     data = data.to_json(orient="records")
-                    #     dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
 
                 else:
                     dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
