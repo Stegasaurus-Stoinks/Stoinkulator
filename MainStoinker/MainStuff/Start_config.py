@@ -14,7 +14,7 @@ LiveTrading = False
 Debug = False
 
 #Frontend Variables
-FrontEndDisplay = True
+FrontEndDisplay = False
 FrontEndPort = '192.168.68.101:3000' #'24.56.52.6:3000' #
 updating = 1
 tickerIndex = 0
@@ -28,4 +28,4 @@ TimeDelayPerPoint = .5 #seconds between backtested points
 
 #offline dev
 collectofflinedata = False
-offline = False
+offline = True

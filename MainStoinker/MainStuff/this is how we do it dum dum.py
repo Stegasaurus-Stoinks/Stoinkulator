@@ -19,6 +19,9 @@ import logging
 
 from MainStoinker.Util.SocketIO_Client import FrontEndClient
 
+# check for config errors before doing anything else
+utils.check_valid_config()
+
 eventDict = {}
 
 for name in config.loggers:
@@ -30,23 +33,26 @@ logger.info("___________________________________________________________")
 logger.info("---------------------Starting Program----------------------")
 logger.info("___________________________________________________________\n")
 AlgoList = utils.algo_config_parse()
-print(AlgoList) 
+print(AlgoList)
+print(config.algos)
+print(config.tickers) 
 
-
+# if not config.offline:
 app = IBapi()
 
 
 
-if not config.offline:
     
-    websock = FrontEndClient()
-    if config.FrontEndDisplay:
-        wst = threading.Thread(target=websock.connect_websocket,daemon=True)
-        wst.start()
-
+websock = FrontEndClient()
+if config.FrontEndDisplay:
+    wst = threading.Thread(target=websock.connect_websocket,daemon=True)
+    wst.start()
     time.sleep(1)
-    app.connect('127.0.0.1', 7497, 123)
 
+
+if not config.offline:
+
+    app.connect('127.0.0.1', 7497, 123)
 
     while(not app.isConnected()):
         print("Order Status: " + str(app.isConnected()))
@@ -65,6 +71,7 @@ if not config.offline:
         for index, event in eventDict.items():
             event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True, name=config.tickers[index].name)
             event_thread.start()
+
     else:
         eventDict[0] = threading.Event()
 
@@ -95,20 +102,29 @@ else: #if offline load offline data
             
     # self.datadict[ticker.index] = pd.DataFrame()
     # self.lastbardict[ticker.index] = 0
-    pass
+    eventDict[0] = threading.Event()
+    time.sleep(1)
+    print("setting up offline thread")
+    print("loading offline data for tickers:")
+    app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
+
+
+
+
+    # pass
 
 # backtesting loop
 if not config.LiveData:
     eventDict[0].wait()
 
-    # collect offline data
+    # collect offline data if configured to do so
     if(config.collectofflinedata):
         print(app.simulatedDatadict)
         for ticker in config.tickers:
             tickerdf = app.simulatedDatadict[ticker]
-            tickerdf.to_csv("_" + str(config.tickers[ticker].name) + "_offlinedata_")
+            tickerdf.to_csv("./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_")
 
-    # rint("Event called for backtesty")
+    print("Event called for backtesty")
     utils.backtesting_data_blast()
     eventDict[0].clear()
 

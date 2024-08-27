@@ -88,7 +88,7 @@ class IBapi(TestWrapper, TestClient):
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
-                self.eventDict[0].set() 
+                self.eventDict[0].set()
         
         if config.FrontEndDisplay:
             self.socket.send_full_data(reqId)
@@ -154,10 +154,19 @@ class IBapi(TestWrapper, TestClient):
                 
 
             else:
+                # only do the following if Not offline and not using live data:  ie normal backtesting
+                if not config.offline:
+                    self.datacollectednum = 0 #variable to track completed historical data pulls
+                    self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
+                    self.simulatedDatadict[ticker.index] = pd.DataFrame()
+                    self.datacollectednum = 0
+
+            if config.offline:
                 self.datacollectednum = 0 #variable to track completed historical data pulls
-                self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
                 self.simulatedDatadict[ticker.index] = pd.DataFrame()
-                self.datacollectednum = 0
+                self.load_offline_data()
+
+            
 
             
             self.datadict[ticker.index] = pd.DataFrame()
@@ -357,4 +366,53 @@ class IBapi(TestWrapper, TestClient):
     def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):
         if reqId > -1:
             print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
+
+
+    def load_offline_data(self):
+        for ticker in config.tickers:
+            tickername = config.tickers[ticker].name
+            print("looking for data for " + tickername)
+            filename = "./OfflineData/_" + tickername + "_offlinedata_.csv"
+            filename2 = "./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_"
+            # pd.read_csv(filename2)
+            try:
+                data = pd.read_csv(filename2,usecols=['date','time', 'open','high','low','close','volume'])
+                print("Found data for " + tickername)
+
+            except:
+                print("file " + filename2 + " cannot be found or does not exist")
+                print("not all data cant be collected, shutting down...")
+                # TODO Filter out the algos that use the tickers that dont have data and dont run them?  could be fun
+                quit()
+
+            # convert date column to datetime (lost datetime objects when converted to csv)
+            data['date'] = pd.to_datetime(data['date'])
+            reqId = ticker
+
+            self.simulatedDatadict[reqId]=data
+            self.datacollectednum += 1
+
+            # datetime.strptime(self.simulatedDatadict[reqId].at[0,'date'], '%y-%m-%d %H:%M:%S')
+
+            firstDate = self.simulatedDatadict[reqId].at[0,'date']
+            print(firstDate)
+            startDate = firstDate + timedelta(days=self.warmup)
+            config.tickers[reqId].data = data.loc[(data['date'] < startDate)]
+            
+            firstDate = self.simulatedDatadict[reqId].at[0,'date']
+            startDate = firstDate + timedelta(days=self.warmup)
+            print("Warmup Start Date: " + str(firstDate))
+            print("Warmup End Date: " + str(startDate))
+            
+            print(self.simulatedDatadict[reqId])
+
+            self.tickers[reqId].data = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
+            self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume']
+
+
+        if config.FrontEndDisplay:
+            self.socket.send_full_data(reqId)
+
+        print("------All Historical Data Collected------")
+        self.eventDict[0].set()
         
