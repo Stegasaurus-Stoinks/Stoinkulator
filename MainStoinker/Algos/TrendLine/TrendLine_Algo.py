@@ -36,6 +36,8 @@ class Algo(ParentAlgo):
         self.DataColumns = ['time'] + self.FrontEndDataStruct
         self.AlgoData = pd.DataFrame(columns=self.DataColumns)
         # print(self.AlgoData.shape)
+        # test commit changes
+        # nothing to see here
         
 
     def update(self, StockData):
