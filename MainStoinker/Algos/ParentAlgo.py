@@ -43,10 +43,8 @@ class ParentAlgo:
                 data = None
             else:
                 if self.FrontEndDataType[x] in fulldatatypes:
-                    data = self.AlgoData[self.FrontEndDataStruct[x]]
-                    df1 = self.AlgoData[['time', self.FrontEndDataStruct[x]]]#.to_dict('records')
-                    # print("Dataframe")
-                    # print(df1)
+                    #TODO: Modify original object instead of creating new one each time: will help with speed optimization if needed
+                    df1 = self.AlgoData[['time', self.FrontEndDataStruct[x]]]
                     df1 = df1.dropna(subset=[self.FrontEndDataStruct[x]])
                     df1 = df1.reset_index()
                     df1 = df1[['time',self.FrontEndDataStruct[x]]]
@@ -55,6 +53,14 @@ class ParentAlgo:
                         markerdata = {'name':self.FrontEndDataStruct[x], 'data':fuckingshit, 'type':self.FrontEndDataType[x]}
                         dataToSend.append(markerdata)
 
+<<<<<<< HEAD
+=======
+                    else:
+                        df1.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
+                        data = data.to_json(orient="records")
+                        dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
+
+>>>>>>> origin/trendline_algo
                 else:
                     dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             
