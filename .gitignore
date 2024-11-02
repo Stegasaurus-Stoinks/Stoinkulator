@@ -131,4 +131,6 @@ dmypy.json
 # intellij
 .idea/
 
+# stoink stuff
 tradey.txt
+OfflineData/

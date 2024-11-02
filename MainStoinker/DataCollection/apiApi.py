@@ -88,7 +88,7 @@ class IBapi(TestWrapper, TestClient):
 
             if self.datacollectednum >= len(self.tickers): #all historical data collected
                 print("------All Historical Data Collected------")
-                self.eventDict[0].set() 
+                self.eventDict[0].set()
         
         if config.FrontEndDisplay:
             self.socket.send_full_data(reqId)
@@ -154,21 +154,30 @@ class IBapi(TestWrapper, TestClient):
                 
 
             else:
-                self.datacollectednum = 0 #variable to track completed historical data pulls
-                self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
-                self.simulatedDatadict[ticker.index] = pd.DataFrame()
-                self.datacollectednum = 0
+                # only do the following if Not offline and not using live data:  ie normal backtesting
+                if not config.offline:
+                    self.datacollectednum = 0 #variable to track completed historical data pulls
+                    self.reqHistoricalData(ticker.index, contract, "", str(warmup+duration) + " D", "1 min", "TRADES", 1, 2, False, [])
+                    self.simulatedDatadict[ticker.index] = pd.DataFrame()
+                    self.datacollectednum = 0
+
+                else:
+                    self.datacollectednum = 0 #variable to track completed historical data pulls
+                    self.simulatedDatadict[ticker.index] = pd.DataFrame()
+                    self.load_offline_data()
+
+            if not config.offline:
+                print("startData read positions")
+                print(self.readPositions())
+
+                print("startData read orders")
+                print(self.readOrders())
+
+            
 
             
             self.datadict[ticker.index] = pd.DataFrame()
             self.lastbardict[ticker.index] = 0
-
-        print("startData read positions")
-        print(self.readPositions())
-
-        print("startData read orders")
-        print(self.readOrders())
-
         
 
 
@@ -357,4 +366,43 @@ class IBapi(TestWrapper, TestClient):
     def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):
         if reqId > -1:
             print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
+
+    def load_offline_data(self):
+        for ticker in config.tickers:
+            # print("looking for data for " + tickername)
+            filename = "./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_"
+            # pd.read_csv(filename2)
+            try:
+                data = pd.read_csv(filename,usecols=['date','time', 'open','high','low','close','volume'])
+                print("Found data for " + config.tickers[ticker].name)
+
+            except:
+                print("file " + filename + " cannot be found or does not exist")
+                print("not all data cant be collected, shutting down...")
+                # TODO Filter out the algos that use the tickers that dont have data and dont run them?  could be fun
+                quit()
+
+            # convert date column to datetime (lost datetime objects when converted to csv)
+            data['date'] = pd.to_datetime(data['date'])
+            reqId = ticker
+
+            self.simulatedDatadict[reqId]=data
+            self.datacollectednum += 1
+
+            firstDate = self.simulatedDatadict[reqId].at[0,'date']
+            startDate = firstDate + timedelta(days=self.warmup)
+            config.tickers[reqId].data = data.loc[(data['date'] < startDate)]
+
+            print("Warmup Start Date: " + str(firstDate))
+            print("Warmup End Date: " + str(startDate))
+
+            self.tickers[reqId].data = self.simulatedDatadict[reqId].loc[(self.simulatedDatadict[reqId]['date'] < startDate)]
+            self.tickers[reqId].data.columns=['date','time', 'open','high','low','close','volume']
+
+
+        if config.FrontEndDisplay:
+            self.socket.send_full_data(reqId)
+
+        print("------All Historical Data Collected------")
+        self.eventDict[0].set()
         

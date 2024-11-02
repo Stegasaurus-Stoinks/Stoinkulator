@@ -9,6 +9,7 @@ import pandas as pd
 import json
 from MainStoinker.TradeTools.ticker import Ticker
 import logging
+import pandas as pd
 
 
 
@@ -47,6 +48,9 @@ def algo_config_parse():
             tickerName = algoConfigData['ticker']
             # print(algoConfigData['ticker'])
 
+            # TODO: replace ticketDict name check with a check that iterates over configTickerDict, and checks for both name and timeFrame
+            # TODO: Add timeframe variable to algo_config.json
+            # TODO: After finishing above, change code to dynamically request data based off timeFrame and remove hardcoded values
             ticker = tickerDict.get(tickerName) 
             
             if ticker is None:
@@ -184,3 +188,28 @@ def create_logger(name, log_level=config.log_level):
     logger.addHandler(ch)
 
     return logger
+
+
+def check_valid_config():
+    error = ""
+    errordetected = 0
+    if config.offline:
+        if config.collectofflinedata:
+            error = error + " | Cant collect offline data when offline (collectofflinedata = True)"
+            errordetected = 1
+        if config.LiveData:
+            error = error + " | Conflicting Data Types: LiveData = True and Offline = True"
+            errordetected = 1
+        if config.LiveTrading:
+            error = error + " | Cant LiveTrading when offline = True"
+            errordetected = 1
+
+        # to be continued as we find more cases of conflicting config settings
+
+        if errordetected == 1:
+            print("Config Error Detected")
+            print("Canceling Program, Please check config settings")
+            print("Error message: " + error)
+            quit()
+
+
