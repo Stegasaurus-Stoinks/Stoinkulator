@@ -53,14 +53,6 @@ class ParentAlgo:
                         markerdata = {'name':self.FrontEndDataStruct[x], 'data':fuckingshit, 'type':self.FrontEndDataType[x]}
                         dataToSend.append(markerdata)
 
-<<<<<<< HEAD
-=======
-                    else:
-                        df1.rename(columns = {self.FrontEndDataStruct[x]:'value'}, inplace = True)
-                        data = data.to_json(orient="records")
-                        dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
-
->>>>>>> origin/trendline_algo
                 else:
                     dataToSend.append({'name':self.FrontEndDataStruct[x],'data':data, 'type':self.FrontEndDataType[x]})
             

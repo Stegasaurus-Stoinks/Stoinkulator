@@ -3,6 +3,7 @@ from datetime import datetime
 from datetime import timedelta
 import talib as ta
 import time
+from enum import Enum
 
 from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
@@ -16,6 +17,23 @@ from MainStoinker.TradeTools.trade import Trade
 
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 
+'''
+ALGO PLAN/IDEA:
+
+Okokokokokok
+Step 1: Trendline with breaks indication
+        Trying to figure this shit out...
+Step 2: TRAMA indicator (Trend Regularity Adaptive Moving Average)
+        IMPLEMENTATION: https://luxalgo.medium.com/trend-regularity-adaptive-moving-average-b4e05707f739
+Step 3: RSI (over bought: above 70 or over sold indicator: below 70)
+
+Uptrade logic: Price above TRAMA, wait for a downward trendline break to the upside, on break, buy, hold until RSI is overbought
+Downtrade logic: Price below TRAMA, wait for upward trendline break to the downside, on break, short, hold until RSI is oversold
+
+'''
+
+RSIUpperThreshold = 70
+RSILowerThreshold = 30
 
 
 class Algo(ParentAlgo):
@@ -38,6 +56,10 @@ class Algo(ParentAlgo):
         # print(self.AlgoData.shape)
         # test commit changes
         # nothing to see here
+
+        
+
+
         
 
     def update(self, StockData):
@@ -58,10 +80,25 @@ class Algo(ParentAlgo):
         self.AlgoData['maxs'] = StockData.iloc[argrelextrema(StockData.close.values, np.greater_equal, order=n)[0]]['close']
         self.AlgoData['random'] = StockData.iloc[argrelextrema(StockData.close.values, np.less_equal, order=n+2)[0]]['close']
 
-        # print(ta.HT_TRENDLINE(StockData['close']))
-    
-        self.AlgoData['upperband'],self.AlgoData['middleband'],self.AlgoData['lowerband'] = ta.BBANDS(StockData['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0)
+        
+        self.RSI = ta.RSI(StockData['close'],14)
+        # print(type(self.RSI))
+        self.curRSI = self.RSI.iat[-1]
 
+        if self.curRSI > RSIUpperThreshold:
+            self.RSIState = "OVERBOUGHT"
+        elif self.curRSI < RSILowerThreshold:
+            self.RSIState = "OVERSOLD"
+        else:
+             self.RSIState = "NEUTRAL"
+
+        print("RSI: ", self.curRSI ," - ", self.RSIState)
+
+
+
+
+        # print(ta.HT_TRENDLINE(StockData['close']))
+        self.AlgoData['upperband'],self.AlgoData['middleband'],self.AlgoData['lowerband'] = ta.BBANDS(StockData['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0)
         # print(self.AlgoData)
 
         #Variables to store most recent 2 stock data and algo data 
@@ -73,3 +110,4 @@ class Algo(ParentAlgo):
         self.AlgoData['time'] = StockData['time']
 
         self.curAlgoData = self.AlgoData.iloc[-1]
+
