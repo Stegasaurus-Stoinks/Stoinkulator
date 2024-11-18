@@ -40,6 +40,9 @@ class Algo(ParentAlgo):
         #algo_config
         self.RRRatio = float(algoConfigData['RRRatio'])
 
+        #duration we wait for a retest before its become too long and invalid
+        self.retestTimeout = 20
+
         #Data to send to the frontend
         self.FrontEndDataStruct = ['UpperBound','LowerBound','tp','StopPrice',"Trade"]
         self.FrontEndDataType = ['segment','segment','segment','segment','baseline']
@@ -125,6 +128,7 @@ class Algo(ParentAlgo):
 
                     print("breakout direction: ", self.direction)
                     
+                    self.breakout_time = self.curStockData['date']
                     self.TradeState.breakoutconfirmed()
 
         #breakoutState
@@ -137,6 +141,13 @@ class Algo(ParentAlgo):
 
             #check for retest
             print('waitng for retest')
+
+            #check if its been too long since breakout for retest to be valid
+            time_difference = self.curStockData['date'] - self.breakout_time
+            if ((time_difference.total_seconds() / 60) > self.retestTimeout):
+                print("Retest took too long")
+                self.TradeState.retesttimout()
+
             #if down direction, check for retest is high of candle is above lowerbound and close is below range
             wiggleroom = 0.05
             if self.direction == 'down':
@@ -252,6 +263,7 @@ class AlgoLogic(StateMachine):
     # transitions of the state
     firstcandleconfirmed = initState.to(waitingState)
     breakoutconfirmed = waitingState.to(breakoutState)
+    retesttimout = breakoutState.to(doneTradingState)
     retestconfirmed = breakoutState.to(inTradeState)
     retestfailed = breakoutState.to(waitingState)
     closeout = inTradeState.to(doneTradingState)
