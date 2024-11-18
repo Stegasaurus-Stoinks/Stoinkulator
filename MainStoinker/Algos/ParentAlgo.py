@@ -15,7 +15,10 @@ class ParentAlgo:
         #Initialize Algo with data from Algo Config
         self.name = algoConfigData['idname']
         self.ticker = algoConfigData['ticker']
-        self.stoplossPercent = float(algoConfigData['stoplossPercent'])
+
+        #dont think i want this in the parent class
+        # self.stoplossPercent = float(algoConfigData['stoplossPercent'])
+        
         self.logger = utils.create_logger("algo:"+self.name+":"+self.ticker)
 
         #Initialize singleton TWS api

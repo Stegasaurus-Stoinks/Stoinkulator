@@ -14,8 +14,8 @@ LiveTrading = False
 Debug = False
 
 #Frontend Variables
-FrontEndDisplay = False
-FrontEndPort = '192.168.1.108:3000' # '24.56.52.6:3000' # 
+FrontEndDisplay = True
+FrontEndPort = '24.56.52.6:3000' # '192.168.1.108:3000' # 
 updating = 1
 tickerIndex = 0
 #LiveData Variables

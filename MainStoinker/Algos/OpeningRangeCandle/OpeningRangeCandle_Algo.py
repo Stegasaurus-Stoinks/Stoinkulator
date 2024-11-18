@@ -37,10 +37,12 @@ class Algo(ParentAlgo):
         super().__init__(algoConfigData)
 
         self.ibape = IBapi()
+        #algo_config
+        self.RRRatio = float(algoConfigData['RRRatio'])
 
         #Data to send to the frontend
-        self.FrontEndDataStruct = ['UpperBound','LowerBound','StopPrice',"Trade"]
-        self.FrontEndDataType = ['line','line','segment','baseline']
+        self.FrontEndDataStruct = ['UpperBound','LowerBound','tp','StopPrice',"Trade"]
+        self.FrontEndDataType = ['segment','segment','segment','segment','baseline']
 
         #Data frame to store data for Algo ( Uses Front End Data Struct to create dataframe, can add whaterver you want also))  
         self.DataColumns = ['time'] + self.FrontEndDataStruct
@@ -53,6 +55,9 @@ class Algo(ParentAlgo):
         self.firstcandletime = 0
         self.upperbound = 0
         self.lowerbound = 0
+        self.tp = 0
+
+        self.inTrade = False
         
 
     def update(self, StockData):
@@ -90,10 +95,16 @@ class Algo(ParentAlgo):
 
             print("first candle confirmed, upperbound: ", self.upperbound, " lowerbound: ", self.lowerbound)
 
+            #frontend
+            self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
+            self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
+
 
         #waitingState
-        if self.TradeState.current_state_value == 'waitingState':
+        elif self.TradeState.current_state_value == 'waitingState':
             print("waiting")
+
+            #frontend
             self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
             self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
 
@@ -102,8 +113,8 @@ class Algo(ParentAlgo):
             #check for break outside of range:
             if self.curStockData['close'] > self.upperbound or self.curStockData['close'] < self.lowerbound:
                 print('detected a potential break...')
-                #check to make sure candle stradled the bounds and didnt gap down
-                if self.curStockData['open'] > self.lowerbound and self.curStockData['open'] < self.upperbound:
+                #check to make sure candle stradled the bounds and didnt gap across bounds
+                if self.curStockData['open'] > self.lowerbound or self.curStockData['open'] < self.upperbound:
                     print('breakout confirmed')
 
                     #breakout direction:
@@ -117,48 +128,63 @@ class Algo(ParentAlgo):
                     self.TradeState.breakoutconfirmed()
 
         #breakoutState
-        if self.TradeState.current_state_value == 'breakoutState':
+        elif self.TradeState.current_state_value == 'breakoutState':
+
+            #frontend
+            self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
+            self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
+
+
             #check for retest
             print('waitng for retest')
+            #if down direction, check for retest is high of candle is above lowerbound and close is below range
+            wiggleroom = 0.01
+            if self.direction == 'down':
+                if self.curStockData['high'] >= self.lowerbound-wiggleroom and self.curStockData['close'] < self.lowerbound:
+                    print('retest completed')
+                    self.entertrade()
+                    self.TradeState.retestconfirmed()
+
+                if self.curStockData['close'] > self.lowerbound:
+                    print('retest failed, trade conditions invalid')
+                    self.TradeState.retestfailed()
+
+            if self.direction == 'up':
+                if self.curStockData['low'] <= self.upperbound+wiggleroom and self.curStockData['close'] > self.upperbound:
+                    print('retest completed')
+                    self.entertrade()
+                    self.TradeState.retestconfirmed()
+
+                if self.curStockData['close'] < self.upperbound:
+                    print('retest failed, trade conditions invalid')
+                    self.TradeState.retestfailed()
+            
                     
 
         #inTradeState
-        if self.TradeState.current_state_value == 'inTradeState':
-            print("In a trade")
+        elif self.TradeState.current_state_value == 'inTradeState':
+
             
+            print("In a trade")
+
             # logic for manual stoploss
             if not self.trade.check_stoploss(self.curStockData):
                 self.logger.debug("***received false from check_stoploss***")
                 self.inTrade = False
 
-            else:
+            #frontend
+            self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
+            self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
+
                 # Update AlgoData with newest StopPrice Data
-                self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+            self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+            self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
+            self.AlgoData.at[self.AlgoData.index[-1],'tp'] = self.tp
 
-                # Update AlgoData with trade data (midpoint of price data)
-                if self.trade.openTime == self.curStockData['time']: #if this is the first point in the trade
-                    midpoint = self.curStockData['close']
-                else:
-
-                    diff = self.curStockData['close'] - self.curStockData['open']
-                    if diff > 0:
-                        midpoint = self.curStockData['open'] + (diff/2)
-                    else:
-                        midpoint = self.curStockData['close'] - (diff/2)
-
-                self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = midpoint
-
-                #End of day trade closing
-                endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
-                if self.curStockData['date'] > endofDay:
-                    self.logger.info("***end of day close position***")
-                    self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
-                    print("Closing position based on end of day")
-                    self.inTrade = False
-
+            
 
         #doneTradingState
-        if self.TradeState.current_state_value == 'doneTradingState':
+        elif self.TradeState.current_state_value == 'doneTradingState':
             print("Done for the day :)")
 
 
@@ -167,6 +193,32 @@ class Algo(ParentAlgo):
         self.curAlgoData = self.AlgoData.iloc[-1]
 
 
+    def entertrade(self):
+        self.inTrade = True
+        enterTime = self.curStockData['date']
+        enterPrice = self.curStockData['close']
+        self.trade = 0
+
+        if self.direction == 'up':
+            trend = 1
+            range = enterPrice - self.lowerbound
+            self.tp = self.upperbound+(self.RRRatio*range)
+
+        else:
+            trend = 0
+            range = self.upperbound - enterPrice
+            self.tp = self.lowerbound-(self.RRRatio*range)
+
+        #sets stoploss at the opposite side of the range
+        self.stoplossPercent = range/self.curStockData['close']
+        
+        # TODO: gonna need a system to take profits...
+        # use self.RRRatio
+        
+        self.logger.info("***opening trade***")
+        tradeid = str(self.name) + str(len(self.trades))
+        self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, (self.stoplossPercent), self.logger)
+        self.trades.append(self.trade)
 
 
 class AlgoLogic(StateMachine):
@@ -193,5 +245,6 @@ class AlgoLogic(StateMachine):
     firstcandleconfirmed = initState.to(waitingState)
     breakoutconfirmed = waitingState.to(breakoutState)
     retestconfirmed = breakoutState.to(inTradeState)
+    retestfailed = breakoutState.to(waitingState)
     closeout = inTradeState.to(doneTradingState)
     cancel = waitingState.to(doneTradingState)
