@@ -4,8 +4,8 @@
     "data":[
       {
         "idname": "AAPL-opencandle",
-        "ticker": "SPY",
-        "RRRatio": "2"
+        "ticker": "MSFT",
+        "RRRatio": "1.5"
       }
     ]
   }

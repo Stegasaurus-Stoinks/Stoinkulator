@@ -16,6 +16,7 @@ class Trade:
         self.tradeID = ID
         self.stoplossId = 0
         self.openPrice = openPrice
+        self.tp = 0
         
         self.openTime = openTime
         self.direction = direction
@@ -187,13 +188,44 @@ class Trade:
                     self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
                 result = 1
 
-            elif price > self.stopLoss:
+            elif price > self.stopPrice:
                 self.close_position(self.stopPrice,curpoint['date'])       
                 self.logger.info(self.tradeID+" - Manually closing position based on stoploss: "+self.tradeID)         
                 result = 0
         
         return result
+    
 
+    def create_tp(self, tp):
+        self.tp = tp
+
+        if config.LiveTrading:
+            print("sending tp order to ibkr NOT IMPLEMENTED")
+            #TODO: https://interactivebrokers.github.io/tws-api/bracket_order.html
+
+        print("TP set to ", self.tp)
+
+
+    #check to see if we should take profit
+    def check_tp(self, curpoint):
+        result = 0
+        if self.direction:
+            if curpoint['high'] > self.tp:
+                self.close_position(self.tp, curpoint['date'])
+                self.logger.info(self.tradeID+" - Manually closing position based on TP: "+self.tradeID)
+                result = 1
+
+        else:
+            if curpoint['low'] < self.tp:
+                self.close_position(self.tp, curpoint['date'])
+                self.logger.info(self.tradeID+" - Manually closing position based on TP: "+self.tradeID)
+                result = 1
+
+        return result
+    
+
+    def update_tp(self, tp):
+        self.create_tp(tp)
 
 
     # def get_stopPrice(self,curpoint):

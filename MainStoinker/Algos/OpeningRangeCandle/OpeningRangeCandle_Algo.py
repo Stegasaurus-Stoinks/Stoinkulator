@@ -138,7 +138,7 @@ class Algo(ParentAlgo):
             #check for retest
             print('waitng for retest')
             #if down direction, check for retest is high of candle is above lowerbound and close is below range
-            wiggleroom = 0.01
+            wiggleroom = 0.05
             if self.direction == 'down':
                 if self.curStockData['high'] >= self.lowerbound-wiggleroom and self.curStockData['close'] < self.lowerbound:
                     print('retest completed')
@@ -171,6 +171,12 @@ class Algo(ParentAlgo):
             if not self.trade.check_stoploss(self.curStockData):
                 self.logger.debug("***received false from check_stoploss***")
                 self.inTrade = False
+                self.TradeState.closeout()
+
+            if self.trade.check_tp(self.curStockData):
+                self.logger.debug("***received true from check_tp***")
+                self.inTrade = False
+                self.TradeState.closeout()
 
             #frontend
             self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
@@ -199,26 +205,28 @@ class Algo(ParentAlgo):
         enterPrice = self.curStockData['close']
         self.trade = 0
 
+        range = self.upperbound - self.lowerbound
+
         if self.direction == 'up':
             trend = 1
-            range = enterPrice - self.lowerbound
-            self.tp = self.upperbound+(self.RRRatio*range)
+            self.tp = round(self.upperbound+(self.RRRatio*range),2)
 
         else:
             trend = 0
-            range = self.upperbound - enterPrice
-            self.tp = self.lowerbound-(self.RRRatio*range)
+            self.tp = round(self.lowerbound-(self.RRRatio*range),2)
 
         #sets stoploss at the opposite side of the range
         self.stoplossPercent = range/self.curStockData['close']
-        
-        # TODO: gonna need a system to take profits...
-        # use self.RRRatio
         
         self.logger.info("***opening trade***")
         tradeid = str(self.name) + str(len(self.trades))
         self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, (self.stoplossPercent), self.logger)
         self.trades.append(self.trade)
+
+        # TODO: gonna need a system to take profits... (sort of done?)
+        # use self.RRRatio
+
+        self.trade.create_tp(self.tp)
 
 
 class AlgoLogic(StateMachine):
