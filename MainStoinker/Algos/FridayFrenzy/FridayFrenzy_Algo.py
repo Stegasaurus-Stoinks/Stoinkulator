@@ -19,16 +19,8 @@ from MainStoinker.Algos.ParentAlgo import ParentAlgo
 '''
 ALGO PLAN/IDEA:
 
-Once opening candle has fully formed, record the min and max values.
-Use these values as guidlines for what the market initially considered as a fair price for the ticker.
-
-Wait for a break (candle closes outside the "fair value range"), 
-then wait for a retest of the level, a pull back where the close of candle is still outside of the range but the min or max is in the range
-(basically means the price climbed back within range but pulled back out indicating a strong move in the direction of the break)
-
-set 2:1 RR trade with stop at opposite side of "fair value range"
-
-(would be interesting to check different time frames for each ticker, recommended is 5min to establish solid range but not have trade take too long where you loose morning momentum)
+Psychological Trading Algo, 
+Friday Frenzy, Using momentum beginning of day on fridays to scalp trade based on first 15 min candle
 
 '''
 
