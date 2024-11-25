@@ -3,8 +3,8 @@
     "ID":"OpeningRangeCandle",
     "data":[
       {
-        "idname": "AAPL-opencandle",
-        "ticker": "TSLA",
+        "idname": "GME-opencandle",
+        "ticker": "GME",
         "RRRatio": "1.5"
       }
     ]

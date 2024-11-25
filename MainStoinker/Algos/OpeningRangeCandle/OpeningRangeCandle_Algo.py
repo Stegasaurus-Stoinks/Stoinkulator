@@ -41,7 +41,7 @@ class Algo(ParentAlgo):
         self.RRRatio = float(algoConfigData['RRRatio'])
 
         #duration we wait for a retest before its become too long and invalid
-        self.retestTimeout = 20
+        self.retestTimeout = 30
 
         #Data to send to the frontend
         self.FrontEndDataStruct = ['UpperBound','LowerBound','tp','StopPrice',"Trade"]
@@ -149,7 +149,14 @@ class Algo(ParentAlgo):
                 self.TradeState.retesttimout()
 
             #if down direction, check for retest is high of candle is above lowerbound and close is below range
-            wiggleroom = 0.05
+
+            #dynamic wiggle room calc, allow for a small amount of wiggle room in the retest value due to volume blocks being unpredictable
+            wiggleroom = self.curStockData['high']/5000
+            if wiggleroom > 0.05:
+                wiggleroom = 0.05
+            if wiggleroom < 0.01:
+                wiggleroom = 0.01
+
             if self.direction == 'down':
                 if self.curStockData['high'] >= self.lowerbound-wiggleroom and self.curStockData['close'] < self.lowerbound:
                     print('retest completed')
