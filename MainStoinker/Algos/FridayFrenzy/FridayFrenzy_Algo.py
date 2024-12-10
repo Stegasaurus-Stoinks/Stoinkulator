@@ -22,6 +22,8 @@ ALGO PLAN/IDEA:
 Psychological Trading Algo, 
 Friday Frenzy, Using momentum beginning of day on fridays to scalp trade based on first 15 min candle
 
+Still in concept mode...
+
 '''
 
 class Algo(ParentAlgo):
