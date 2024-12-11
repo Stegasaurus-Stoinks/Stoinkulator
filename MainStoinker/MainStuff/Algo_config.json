@@ -1,11 +1,10 @@
 [
   {
-    "ID":"OpeningRangeCandle",
+    "ID":"FVG",
     "data":[
       {
-        "idname": "AAPL-opencandle",
-        "ticker": "MSFT",
-        "RRRatio": "1.5"
+        "idname": "MSFT-FVG",
+        "ticker": "MSFT"
       }
     ]
   }
