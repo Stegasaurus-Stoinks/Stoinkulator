@@ -77,6 +77,9 @@ class Algo(ParentAlgo):
         n = 5
 
         self.AlgoData['mins'] = StockData.iloc[argrelextrema(StockData.close.values, np.less_equal, order=n)[0]]['close']
+        print(self.AlgoData['mins'])
+        print(StockData)
+        print(self.AlgoData)
         self.AlgoData['maxs'] = StockData.iloc[argrelextrema(StockData.close.values, np.greater_equal, order=n)[0]]['close']
         self.AlgoData['random'] = StockData.iloc[argrelextrema(StockData.close.values, np.less_equal, order=n+2)[0]]['close']
 

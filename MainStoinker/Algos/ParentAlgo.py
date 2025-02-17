@@ -1,4 +1,3 @@
-from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
@@ -21,8 +20,6 @@ class ParentAlgo:
         
         self.logger = utils.create_logger("algo:"+self.name+":"+self.ticker)
 
-        #Initialize singleton TWS api
-        self.ibape = IBapi()
 
         #Other inits/variables
         self.inTrade = False
