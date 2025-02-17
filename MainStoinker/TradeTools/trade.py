@@ -15,6 +15,7 @@ class Trade:
         self.volume = volume
         self.tradeID = ID
         self.stoplossId = 0
+        self.stopLossType = "Trailing" #Trailing or Fixed
         self.openPrice = openPrice
         self.tp = 0
         
@@ -143,9 +144,9 @@ class Trade:
         return(self.status)
     
     # manual stoploss check. returns true if trade is still good
-    def check_stoploss(self, curpoint):
+    def check_stoploss(self, curpoint, value='close'):
         result = 1
-        price = curpoint["close"]
+        price = curpoint[value]
         if config.LiveTrading:
             self.logger.debug(self.tradeID+" - printing open orders, looking for "+str(self.stoplossId))
             self.logger.debug(self.tradeID+" - "+str(self.ibape.all_openorders))
@@ -164,31 +165,36 @@ class Trade:
         #return 1 if good 0 if bad
         if self.direction: #UP Trade
 
-            if price > self.stopPrice + self.stopLoss:
-                self.stopPrice = price - self.stopLoss
-                
-                if config.LiveTrading: 
-                    self.stopOrder.auxPrice = self.stopPrice
-                    self.logger.info(self.tradeID+" - updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
-                    self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
-                result = 1
+            if self.stopLossType == 'Trailing':
 
-            elif price < self.stopPrice:
+                if price > self.stopPrice + self.stopLoss:
+                    self.stopPrice = price - self.stopLoss
+                    
+                    if config.LiveTrading: 
+                        self.stopOrder.auxPrice = self.stopPrice
+                        self.logger.info(self.tradeID+" - updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
+                        self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
+                    result = 1
+
+            if price < self.stopPrice:
                 self.close_position(self.stopPrice,curpoint['date'])
                 self.logger.info(self.tradeID+" - Manually closing position based on stoploss: "+self.tradeID)
                 result = 0    
 
         else: #DOWN Trade
-            if price < self.stopPrice - self.stopLoss:
-                self.stopPrice = price + self.stopLoss
-                
-                if config.LiveTrading: 
-                    self.stopOrder.auxPrice = self.stopPrice
-                    self.logger.info(self.tradeID+" - updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
-                    self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
-                result = 1
+            
+            if self.stopLossType == 'Trailing':
 
-            elif price > self.stopPrice:
+                if price < self.stopPrice - self.stopLoss:
+                    self.stopPrice = price + self.stopLoss
+                    
+                    if config.LiveTrading: 
+                        self.stopOrder.auxPrice = self.stopPrice
+                        self.logger.info(self.tradeID+" - updating auxPrice for "+self.symbol+": " + str(self.stopOrder.auxPrice))
+                        self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
+                    result = 1
+
+            if price > self.stopPrice:
                 self.close_position(self.stopPrice,curpoint['date'])       
                 self.logger.info(self.tradeID+" - Manually closing position based on stoploss: "+self.tradeID)         
                 result = 0
@@ -226,6 +232,20 @@ class Trade:
 
     def update_tp(self, tp):
         self.create_tp(tp)
+
+
+    def change_stoploss_type(self,typeofstoploss):
+        self.stopLossType = typeofstoploss
+
+
+    #updates stoploss price for 'Fixed' stoploss
+    #updates stoploss trailing amount for 'Trailing' stoploss
+    def update_stoploss_price(self,price):
+        if self.stopLossType == 'Fixed':
+            self.stopPrice = price
+
+        if self.stopLossType == 'Trailing':
+            self.stopLoss = price
 
 
     # def get_stopPrice(self,curpoint):

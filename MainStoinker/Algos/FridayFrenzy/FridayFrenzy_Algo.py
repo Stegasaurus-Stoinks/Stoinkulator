@@ -19,16 +19,10 @@ from MainStoinker.Algos.ParentAlgo import ParentAlgo
 '''
 ALGO PLAN/IDEA:
 
-Once opening candle has fully formed, record the min and max values.
-Use these values as guidlines for what the market initially considered as a fair price for the ticker.
+Psychological Trading Algo, 
+Friday Frenzy, Using momentum beginning of day on fridays to scalp trade based on first 15 min candle
 
-Wait for a break (candle closes outside the "fair value range"), 
-then wait for a retest of the level, a pull back where the close of candle is still outside of the range but the min or max is in the range
-(basically means the price climbed back within range but pulled back out indicating a strong move in the direction of the break)
-
-set 2:1 RR trade with stop at opposite side of "fair value range"
-
-(would be interesting to check different time frames for each ticker, recommended is 5min to establish solid range but not have trade take too long where you loose morning momentum)
+Still in concept mode...
 
 '''
 
@@ -41,7 +35,7 @@ class Algo(ParentAlgo):
         self.RRRatio = float(algoConfigData['RRRatio'])
 
         #duration we wait for a retest before its become too long and invalid
-        self.retestTimeout = 30
+        self.retestTimeout = 20
 
         #Data to send to the frontend
         self.FrontEndDataStruct = ['UpperBound','LowerBound','tp','StopPrice',"Trade"]
@@ -149,14 +143,7 @@ class Algo(ParentAlgo):
                 self.TradeState.retesttimout()
 
             #if down direction, check for retest is high of candle is above lowerbound and close is below range
-
-            #dynamic wiggle room calc, allow for a small amount of wiggle room in the retest value due to volume blocks being unpredictable
-            wiggleroom = self.curStockData['high']/5000
-            if wiggleroom > 0.05:
-                wiggleroom = 0.05
-            if wiggleroom < 0.01:
-                wiggleroom = 0.01
-
+            wiggleroom = 0.05
             if self.direction == 'down':
                 if self.curStockData['high'] >= self.lowerbound-wiggleroom and self.curStockData['close'] < self.lowerbound:
                     print('retest completed')
