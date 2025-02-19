@@ -7,7 +7,7 @@ tickers = {}
 algos = []
 loggers = ["dum_dum"]
 log_level = logging.INFO
-LiveData = False
+LiveData = True
 LiveTrading = False
 #once trade excecution is figured out we should be able to get rid of one of these variables
 
