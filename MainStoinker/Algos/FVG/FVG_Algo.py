@@ -9,12 +9,15 @@ import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
 import math
+from enum import Enum
 
 from statemachine import StateMachine, State
 
 from MainStoinker.TradeTools.trade import Trade
 
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
+
+from MainStoinker.Algos.FVG.FVG import FVG
 
 '''
 ALGO PLAN/IDEA:
@@ -55,6 +58,8 @@ class Algo(ParentAlgo):
         self.lowerbound = 0
         self.tp = 0
 
+        self.FVGs = []
+
         self.inTrade = False
         
 
@@ -83,24 +88,48 @@ class Algo(ParentAlgo):
             
             #check last 3 candles if all going in the same direction
             if isupcandle(StockData.iloc[-1]) and isupcandle(StockData.iloc[-2]) and isupcandle(StockData.iloc[-3]):
-                print("last 3 going up!")
+                # print("last 3 going up!")
 
                 #check for gap
-                if StockData.iloc[-1]["low"] - StockData.iloc[-3]["high"] > 0.03:
-                    print("FVG Detected")
-                    self.upperbound = StockData.iloc[-1]["low"]
-                    self.lowerbound = StockData.iloc[-3]["high"]
+                if StockData.iloc[-1]["low"] - StockData.iloc[-3]["high"] > 0.05:
+                    #TODO make  size of valid FVG variable based on price of commodity
+
+                    FVGupperbound = StockData.iloc[-1]["low"]
+                    FVGlowerbound = StockData.iloc[-3]["high"]
+
+                    print("Descending FVG Detected: Upperbound: ",FVGupperbound," Lowerbound: ", FVGlowerbound)
+
+                    # upperbound, lowerbound, time, direction
+                    self.FVGs.append(FVG(FVGupperbound, FVGlowerbound, StockData.iloc[-2]['time'], 1))
 
                     
 
 
 
             elif isdowncandle(StockData.iloc[-1]) and isdowncandle(StockData.iloc[-2]) and isdowncandle(StockData.iloc[-3]):
-                print("last 3 going down!")
+                # print("last 3 going down!")
 
-            if self.upperbound is not 0:
+                #check for gap
+                if StockData.iloc[-3]["low"] - StockData.iloc[-1]["high"] > 0.05:
+                    #TODO make  size of valid FVG variable based on price of commodity
+                    
+                    
+                    FVGupperbound = StockData.iloc[-3]["low"]
+                    FVGlowerbound = StockData.iloc[-1]["high"]
+
+                    print("Descending FVG Detected: Upperbound: ",FVGupperbound," Lowerbound: ", FVGlowerbound)
+
+                    self.FVGs.append(FVG(FVGupperbound, FVGlowerbound, StockData.iloc[-2]['time'], 1))
+
+
+            for gap in self.FVGs:
+                gap.updateFVG(self.curStockData)
+
+            if self.upperbound != 0:
                 self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
                 self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
+
+            
 
         #loadingState
         elif self.TradeState.current_state_value == 'loadingState':
