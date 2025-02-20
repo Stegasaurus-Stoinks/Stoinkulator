@@ -35,8 +35,8 @@ class Algo(ParentAlgo):
         super().__init__(algoConfigData)
 
         self.ibape = IBapi()
-        #algo_config
-        # self.RRRatio = float(algoConfigData['RRRatio'])
+        # algo_config
+        self.RRRatio = float(algoConfigData['RRRatio'])
 
         #duration we wait for a retest before its become too long and invalid
         self.retestTimeout = 20
@@ -59,6 +59,7 @@ class Algo(ParentAlgo):
         self.tp = 0
 
         self.FVGs = []
+        self.currentTradedFVG = 0
 
         self.inTrade = False
         
@@ -97,7 +98,7 @@ class Algo(ParentAlgo):
                     FVGupperbound = StockData.iloc[-1]["low"]
                     FVGlowerbound = StockData.iloc[-3]["high"]
 
-                    print("Descending FVG Detected: Upperbound: ",FVGupperbound," Lowerbound: ", FVGlowerbound)
+                    print("Ascending FVG Detected: Upperbound: ",FVGupperbound," Lowerbound: ", FVGlowerbound)
 
                     # upperbound, lowerbound, time, direction
                     self.FVGs.append(FVG(FVGupperbound, FVGlowerbound, StockData.iloc[-2]['time'], 1))
@@ -119,17 +120,19 @@ class Algo(ParentAlgo):
 
                     print("Descending FVG Detected: Upperbound: ",FVGupperbound," Lowerbound: ", FVGlowerbound)
 
-                    self.FVGs.append(FVG(FVGupperbound, FVGlowerbound, StockData.iloc[-2]['time'], 1))
+                    self.FVGs.append(FVG(FVGupperbound, FVGlowerbound, StockData.iloc[-2]['time'], 0))
 
 
             for gap in self.FVGs:
                 gap.updateFVG(self.curStockData)
 
-            if self.upperbound != 0:
-                self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
-                self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
+                if gap.Status == "RETESTED" or gap.Status == "FULLYTESTED":
+                    gap.Status = "TRADED"
+                    print("Entering Trade in " , gap.direction)
+                    self.TradeState.FVGFilled()
+                    self.currentTradedFVG = gap
+                    self.enterFVGtrade(gap)
 
-            
 
         #loadingState
         elif self.TradeState.current_state_value == 'loadingState':
@@ -142,6 +145,7 @@ class Algo(ParentAlgo):
                     
 
         #inTradeState
+        #TODO I still want to check for new FVGs in this state... maybe i need to scrap the state machine in this algo?
         elif self.TradeState.current_state_value == 'inTradeState':
 
             
@@ -159,8 +163,8 @@ class Algo(ParentAlgo):
                 self.TradeState.closeout()
 
             #frontend
-            self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.upperbound
-            self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.lowerbound
+            self.AlgoData.at[self.AlgoData.index[-1],'UpperBound'] = self.currentTradedFVG.upperbound
+            self.AlgoData.at[self.AlgoData.index[-1],'LowerBound'] = self.currentTradedFVG.lowerbound
 
                 # Update AlgoData with newest StopPrice Data
             self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
@@ -178,6 +182,45 @@ class Algo(ParentAlgo):
 
         self.curAlgoData = self.AlgoData.iloc[-1]
 
+
+    def enterFVGtrade(self,FVG):
+        self.inTrade = True
+        enterTime = self.curStockData['date']
+        enterPrice = self.curStockData['close']
+        self.trade = 0
+
+        if FVG.direction:
+            range = enterPrice-FVG.lowerbound
+            trend = 1
+            self.tp = round(FVG.upperbound+(self.RRRatio*range),2)
+            #sets stoploss at the opposite side of the range
+            self.stoplossprice = FVG.lowerbound
+        
+        if not FVG.direction:
+            range = FVG.upperbound - enterPrice
+            trend = 0
+            self.tp = round(FVG.lowerbound-(self.RRRatio*range),2)
+            #sets stoploss at the opposite side of the range
+            self.stoplossprice = FVG.upperbound
+
+        self.logger.info("***opening trade***")
+        tradeid = str(self.name) + str(len(self.trades))
+        self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, 1, self.logger)
+
+        #change stoploss to fixed type and set price
+        self.trade.change_stoploss_type('Fixed')
+        self.trade.update_stoploss_price(self.stoplossprice)
+
+        self.trades.append(self.trade)
+
+        # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)
+        # use self.RRRatio
+
+        self.trade.create_tp(self.tp)
+
+        self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+        self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
+        self.AlgoData.at[self.AlgoData.index[-1],'tp'] = self.tp
 
 
 class AlgoLogic(StateMachine):
@@ -201,14 +244,16 @@ class AlgoLogic(StateMachine):
       
 
     # transitions of the state
+    FVGFilled = initState.to(inTradeState)
+    closeout = inTradeState.to(initState)
+    closeforday = initState.to(doneTradingState)
+
     approachedFVG = initState.to(loadingState)
     returntoinit = loadingState.to(initState)
     launching = loadingState.to(bounceState)
     retestconfirmed = bounceState.to(inTradeState)
     # retestfailed = breakoutState.to(waitingState)
-    # closeout = inTradeState.to(doneTradingState)
-    cancel = initState.to(doneTradingState)
-
+    
 
 def isupcandle(candle):
     if candle["open"] < candle["close"]:
@@ -217,3 +262,6 @@ def isupcandle(candle):
 def isdowncandle(candle):
     if candle["open"] > candle["close"]:
         return True
+    
+
+

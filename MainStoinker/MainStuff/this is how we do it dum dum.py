@@ -55,7 +55,7 @@ if not config.offline:
     app.connect('127.0.0.1', 7497, 123)
 
     while(not app.isConnected()):
-        print("Order Status: " + str(app.isConnected()))
+        print("TWS Connection: " + str(app.isConnected()))
         time.sleep(.5)
     time.sleep(1)
     print("TWS Connected")

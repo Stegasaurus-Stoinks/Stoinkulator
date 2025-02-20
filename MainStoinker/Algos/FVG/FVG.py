@@ -6,6 +6,7 @@ class FVG:
     # TESTED (first test: must close outside of FVG, low must be in FVG)
     # RETESTED  (second test: must close in or low must be in FVG)
     # FULLYTESTED  (low of candle fully swept range of FVG)
+    # TRADED    (Trade was placed on this gap, not going to trade it again)
     # INVALID   (FVG was invalidated by closing outside of the range on the wrong side)
 
     def __init__(self, upperbound, lowerbound, time, direction):
@@ -16,6 +17,9 @@ class FVG:
         self.Status = "VALID"
 
     def updateFVG(self, currentData):
+        if self.Status == "TRADED":
+            return
+        
         #if up candles formed the FVG
         if self.direction:
             if currentData['close'] < self.lowerbound:
