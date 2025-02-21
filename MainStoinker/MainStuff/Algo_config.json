@@ -1,11 +1,23 @@
 [
   {
-    "ID":"OpeningRangeCandle",
+    "ID":"Elliot",
     "data":[
       {
-        "idname": "AAPL-opencandle",
+        "idname": "MSFT-elliot",
         "ticker": "MSFT",
-        "RRRatio": "1.5"
+        "order": 2
+      }
+    ]
+  },
+  {
+    "ID":"TrendLine",
+    "data":[
+      {
+        "idname": "AAPL-10/30trend",
+        "ticker": "AAPL",
+        "short": "10",
+        "long": "30",
+        "stoplossPercent": ".1"
       }
     ]
   }
