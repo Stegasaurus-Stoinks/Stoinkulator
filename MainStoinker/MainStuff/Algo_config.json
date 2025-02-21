@@ -3,9 +3,9 @@
     "ID":"FVG",
     "data":[
       {
-        "idname": "MSFT-FVG",
-        "ticker": "MSFT",
-        "RRRatio": 1
+        "idname": "AAPL-FVG",
+        "ticker": "AAPL",
+        "RRRatio": 3
       }
     ]
   }

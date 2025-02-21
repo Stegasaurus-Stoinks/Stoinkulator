@@ -128,10 +128,11 @@ class Algo(ParentAlgo):
 
                 if gap.Status == "RETESTED" or gap.Status == "FULLYTESTED":
                     gap.Status = "TRADED"
-                    print("Entering Trade in " , gap.direction)
-                    self.TradeState.FVGFilled()
-                    self.currentTradedFVG = gap
-                    self.enterFVGtrade(gap)
+                    if self.inTrade == False:
+                        print("Entering Trade in " , gap.direction)
+                        self.TradeState.FVGFilled()
+                        self.currentTradedFVG = gap
+                        self.enterFVGtrade(gap)
 
 
         #loadingState
@@ -157,7 +158,7 @@ class Algo(ParentAlgo):
                 self.inTrade = False
                 self.TradeState.closeout()
 
-            if self.trade.check_tp(self.curStockData):
+            elif self.trade.check_tp(self.curStockData):
                 self.logger.debug("***received true from check_tp***")
                 self.inTrade = False
                 self.TradeState.closeout()
