@@ -33,9 +33,18 @@ class ParentAlgo:
         self.AlgoData = 0
         self.FrontEndDataStruct = 0
         self.FrontEndDataType = 0
-        
+
+    def pre_update(self, StockData):
+        print("YARGHHH")
+        if StockData.shape[0] != self.AlgoData.shape[0]:
+            diff = StockData.shape[0] - self.AlgoData.shape[0]
+            new_row = pd.DataFrame(index=range(diff),columns=self.DataColumns)
+            self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
+        self.AlgoData['time'] = StockData['time']
+
 
     def update_frontend(self):
+        self.curAlgoData = self.AlgoData.iloc[-1]
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
             data = self.curAlgoData[self.FrontEndDataStruct[x]]
