@@ -7,6 +7,8 @@ from enum import Enum
 
 from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
+from MainStoinker.Algos.Elliot import ElliotImpulse as ElliotImpulse
+
 import numpy as np
 import pandas as pd
 import math
@@ -59,6 +61,3 @@ class Algo(ParentAlgo):
 
 
 
-        # -----------Run at end of update for every algo ever----------------------
-        #Variables to store most recent stock data and algo data 
-        self.curStockData = StockData.iloc[-1]

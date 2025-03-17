@@ -36,15 +36,20 @@ class ParentAlgo:
 
     def pre_update(self, StockData):
         print("YARGHHH")
+        # verifying data and adding time to algo data
         if StockData.shape[0] != self.AlgoData.shape[0]:
             diff = StockData.shape[0] - self.AlgoData.shape[0]
             new_row = pd.DataFrame(index=range(diff),columns=self.DataColumns)
             self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
         self.AlgoData['time'] = StockData['time']
 
+        #Variables to store most recent stock data and previous algo data 
+        self.curStockData = StockData.iloc[-1]
+        self.curAlgoData = self.AlgoData.iloc[-1]
+
 
     def update_frontend(self):
-        self.curAlgoData = self.AlgoData.iloc[-1]
+
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
             data = self.curAlgoData[self.FrontEndDataStruct[x]]
