@@ -35,7 +35,8 @@ class ParentAlgo:
         self.FrontEndDataType = 0
 
     def pre_update(self, StockData):
-        print("YARGHHH")
+        # TODO: add check_stoploss in here
+
         # verifying data and adding time to algo data
         if StockData.shape[0] != self.AlgoData.shape[0]:
             diff = StockData.shape[0] - self.AlgoData.shape[0]
@@ -45,6 +46,9 @@ class ParentAlgo:
 
         #Variables to store most recent stock data and previous algo data 
         self.curStockData = StockData.iloc[-1]
+        
+
+    def post_update(self):
         self.curAlgoData = self.AlgoData.iloc[-1]
 
 

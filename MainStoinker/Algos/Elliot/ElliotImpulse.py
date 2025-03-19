@@ -24,74 +24,74 @@ class ElliotImpulse(object):
     # |________________
 
 
-    def __init__(self, plotSize,x1= np.NaN,y1= np.NaN,x2= np.NaN,y2= np.NaN,x3= np.NaN,y3= np.NaN,x4= np.NaN,y4= np.NaN,x5= np.NaN,y5= np.NaN,x6= np.NaN,y6= np.NaN):
+    def __init__(self, plotSize, time_1=np.NaN, price_1=np.NaN, time_2=np.NaN, price_2=np.NaN, time_3= np.NaN, price_3=np.NaN, time_4=np.NaN, price_4=np.NaN, time_5=np.NaN, price_5=np.NaN, time_6=np.NaN, price_6=np.NaN):
 
         self.plotSize = plotSize
         #CheckyBouncyLimitOfMostRecentPointyFoRealsy is the validation limit for the most recent min/max
         # in other words, we use this to make sure the price is going up before declaring a min
         self.CheckyBouncyLimitOfMostRecentPointyFoRealsy = plotSize - 3
-        self.x1 = x1
-        self.y1 = y1
-        self.x2 = x2
-        self.y2 = y2
-        self.x3 = x3
-        self.y3 = y3
-        self.x4 = x4
-        self.y4 = y4
-        self.x5 = x5
-        self.y5 = y5 
-        self.x6 = x6
-        self.y6 = y6
+        self.time_1 = time_1
+        self.price_1 = price_1
+        self.time_2 = time_2
+        self.price_2 = price_2
+        self.time_3 = time_3
+        self.price_3 = price_3
+        self.time_4 = time_4
+        self.price_4 = price_4
+        self.time_5 = time_5
+        self.price_5 = price_5 
+        self.time_6 = time_6
+        self.price_6 = price_6
 
     def printdata(self):
-        print(self.x1,self.y1,self.x2,self.y2,self.x3,self.y3,self.x4,self.y4,self.x5,self.y5,self.x6,self.y6)
+        print(self.time_1,self.price_1,self.time_2,self.price_2,self.time_3,self.price_3,self.time_4,self.price_4,self.time_5,self.price_5,self.time_6,self.price_6)
 
     def assemble(self,print=False):
         #calculate slopes between each line and create a plotable line
 
         #check to see if all the values have been defined
         #NEED TO CHANGE THIS TO TRIGGER ON BEING NANS IF I WANT IT TO WORK?
-        if(self.y1 == 0 or self.y2 == 0 or self.y3 == 0 or self.y4 == 0 or self.y5 == 0 or self.y5 == 0):
+        if(self.price_1 == 0 or self.price_2 == 0 or self.price_3 == 0 or self.price_4 == 0 or self.price_5 == 0 or self.price_5 == 0):
             print("Error! Could not assemble the Elliot wave due to missing/undefined data")
-            print("Y1:{} Y2:{} Y3:{} Y4:{} Y5:{} Y6:{}".format(self.y1,self.y2,self.y3,self.y4,self.y5,self.y6))
+            print("Y1:{} Y2:{} Y3:{} Y4:{} Y5:{} Y6:{}".format(self.price_1,self.price_2,self.price_3,self.price_4,self.price_5,self.price_6))
             return()
 
         if(print):
             print("Assembling the Elliot wave with the given parameters")
             self.printdata()
 
-        self.slope1 = ElliotFuncs.calculate_slope(self.x1, self.y1, self.x2, self.y2)
-        self.slope2 = ElliotFuncs.calculate_slope(self.x2, self.y2, self.x3, self.y3)
-        self.slope3 = ElliotFuncs.calculate_slope(self.x3, self.y3, self.x4, self.y4)
-        self.slope4 = ElliotFuncs.calculate_slope(self.x4, self.y4, self.x5, self.y5)
-        self.slope5 = ElliotFuncs.calculate_slope(self.x5, self.y5, self.x6, self.y6)
+        self.slope1 = ElliotFuncs.calculate_slope(self.time_1, self.price_1, self.time_2, self.price_2)
+        self.slope2 = ElliotFuncs.calculate_slope(self.time_2, self.price_2, self.time_3, self.price_3)
+        self.slope3 = ElliotFuncs.calculate_slope(self.time_3, self.price_3, self.time_4, self.price_4)
+        self.slope4 = ElliotFuncs.calculate_slope(self.time_4, self.price_4, self.time_5, self.price_5)
+        self.slope5 = ElliotFuncs.calculate_slope(self.time_5, self.price_5, self.time_6, self.price_6)
 
         #print(self.slope1,self.slope2,self.slope3,self.slope4,self.slope5)
         wave = [np.NaN] * self.plotSize
         try:
             x = 0
-            for k in range(self.x1, self.x2+1):
-                wave[k] = float(x*self.slope1) + self.y1
+            for k in range(self.time_1, self.time_2+1):
+                wave[k] = float(x*self.slope1) + self.price_1
                 x += 1
 
             x = 0
-            for k in range(self.x2, self.x3+1):
-                wave[k] = float(x*self.slope2) + self.y2
+            for k in range(self.time_2, self.time_3+1):
+                wave[k] = float(x*self.slope2) + self.price_2
                 x += 1
 
             x = 0
-            for k in range(self.x3, self.x4+1):
-                wave[k] = float(x*self.slope3) + self.y3
+            for k in range(self.time_3, self.time_4+1):
+                wave[k] = float(x*self.slope3) + self.price_3
                 x += 1
 
             x = 0
-            for k in range(self.x4, self.x5+1):
-                wave[k] = float(x*self.slope4) + self.y4
+            for k in range(self.time_4, self.time_5+1):
+                wave[k] = float(x*self.slope4) + self.price_4
                 x += 1
 
             x = 0
-            for k in range(self.x5, self.x6+1):
-                wave[k] = float(x*self.slope5) + self.y5
+            for k in range(self.time_5, self.time_6+1):
+                wave[k] = float(x*self.slope5) + self.price_5
                 x += 1
         except:
             return(wave)
@@ -102,8 +102,8 @@ class ElliotImpulse(object):
     def checkpoint2(self,x2,y2,mins):
         result = False
         #add rules and conditions that would make this point work in the elliot wave
-        if x2>self.x1 and y2>self.y1:
-            if not ElliotFuncs.min_limit_rule_break(x2, self.x1, self.y1, mins):#check if max exists between points 2 and 3
+        if x2>self.time_1 and y2>self.price_1:
+            if not ElliotFuncs.min_limit_rule_break(x2, self.time_1, self.price_1, mins):#check if max exists between points 2 and 3
                 result = True
         return result
 
@@ -113,10 +113,10 @@ class ElliotImpulse(object):
         result = False
         #add rules and conditions that would make this point work in the elliot wave
         if x3 < self.CheckyBouncyLimitOfMostRecentPointyFoRealsy:
-            if x3>self.x2 and y3>self.y1 and y3 < self.y2:
-                if not ElliotFuncs.max_limit_rule_break(x3, self.x1, self.y2, maxs):#check if max exists between points 1 and 3
-                    if not ElliotFuncs.min_limit_rule_break(x3, self.x1, self.y1, mins):#check if max exists between points 2 and 3
-                        if ElliotFuncs.check_retracement(self.y1,self.y2,y3,retList):
+            if x3>self.time_2 and y3>self.price_1 and y3 < self.price_2:
+                if not ElliotFuncs.max_limit_rule_break(x3, self.time_1, self.price_2, maxs):#check if max exists between points 1 and 3
+                    if not ElliotFuncs.min_limit_rule_break(x3, self.time_1, self.price_1, mins):#check if max exists between points 2 and 3
+                        if ElliotFuncs.check_retracement(self.price_1,self.price_2,y3,retList):
                             result = True
                     
         return result
@@ -124,8 +124,8 @@ class ElliotImpulse(object):
     def checkpoint4(self,x4,y4,mins):
         result = False
         #add rules and conditions that would make this point work in the elliot wave
-        if x4>self.x3 and y4>self.y2 and y4 > self.y3:
-            if not ElliotFuncs.min_limit_rule_break(x4, self.x3, self.y3, mins):#check if min exists between points 3 and 4
+        if x4>self.time_3 and y4>self.price_2 and y4 > self.price_3:
+            if not ElliotFuncs.min_limit_rule_break(x4, self.time_3, self.price_3, mins):#check if min exists between points 3 and 4
                 result = True
 
         return result
@@ -134,8 +134,8 @@ class ElliotImpulse(object):
         result = False
         #add rules and conditions that would make this point work in the elliot wave
         if x5 < self.CheckyBouncyLimitOfMostRecentPointyFoRealsy:
-            if x5>self.x4 and y5>self.y3 and y5<self.y4:
-                if not ElliotFuncs.max_limit_rule_break(x5, self.x4, self.y4, maxs):#check if max exists between points 4 and 5
+            if x5>self.time_4 and y5>self.price_3 and y5<self.price_4:
+                if not ElliotFuncs.max_limit_rule_break(x5, self.time_4, self.price_4, maxs):#check if max exists between points 4 and 5
                     result = True
 
         return result
@@ -143,8 +143,8 @@ class ElliotImpulse(object):
     def checkpoint6(self,x6,y6,mins):
         result = False
         #add rules and conditions that would make this point work in the elliot wave
-        if x6>self.x5 and y6>self.y4 and y6>self.y5:
-            if not ElliotFuncs.min_limit_rule_break(x6, self.x5, self.y5, mins):#check if min exists between points 5 and 6
+        if x6>self.time_5 and y6>self.price_4 and y6>self.price_5:
+            if not ElliotFuncs.min_limit_rule_break(x6, self.time_5, self.price_5, mins):#check if min exists between points 5 and 6
                 result = True
 
         return result
@@ -155,32 +155,32 @@ class ElliotImpulse(object):
 
 
     def definepoints(self,x1,y1,x2,y2,x3,y3,x4,y4,x5,y5,x6,y6):
-        self.x1 = x1
-        self.y1 = y1
-        self.x2 = x2
-        self.y2 = y2
-        self.x3 = x3
-        self.y3 = y3
-        self.x4 = x4
-        self.y4 = y4
-        self.x5 = x5
-        self.y5 = y5
-        self.x6 = x6
-        self.y6 = y6
+        self.time_1 = x1
+        self.price_1 = y1
+        self.time_2 = x2
+        self.price_2 = y2
+        self.time_3 = x3
+        self.price_3 = y3
+        self.time_4 = x4
+        self.price_4 = y4
+        self.time_5 = x5
+        self.price_5 = y5
+        self.time_6 = x6
+        self.price_6 = y6
 
     def clear(self):
-        self.x1 = np.NaN
-        self.y1 = np.NaN
-        self.x2 = np.NaN
-        self.y2 = np.NaN
-        self.x3 = np.NaN
-        self.y3 = np.NaN
-        self.x4 = np.NaN
-        self.y4 = np.NaN
-        self.x5 = np.NaN
-        self.y5 = np.NaN
-        self.x6 = np.NaN
-        self.y6 = np.NaN
+        self.time_1 = np.NaN
+        self.price_1 = np.NaN
+        self.time_2 = np.NaN
+        self.price_2 = np.NaN
+        self.time_3 = np.NaN
+        self.price_3 = np.NaN
+        self.time_4 = np.NaN
+        self.price_4 = np.NaN
+        self.time_5 = np.NaN
+        self.price_5 = np.NaN
+        self.time_6 = np.NaN
+        self.price_6 = np.NaN
 
         
     def score():
