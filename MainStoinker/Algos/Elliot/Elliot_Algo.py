@@ -50,10 +50,10 @@ class Algo(ParentAlgo):
         self.AlgoData['maxs'] = StockData.iloc[argrelextrema(StockData.close.values, np.greater_equal, order=self.order)[0]]['close']
         # pruning NaNs from mins and maxs in AlgoData, for more usable data
         # creates pandas df with [time, mins] and [time, maxs] where all min/max values are real values
-        self.mins = self.AlgoData.loc[pd.notnull(self.AlgoData.mins)][['time', 'mins']]
-        self.maxs = self.AlgoData.loc[pd.notnull(self.AlgoData.maxs)][['time', 'maxs']]
+        self.mins = self.AlgoData.loc[pd.notnull(self.AlgoData.mins)][['time', 'mins']].rename(columns={'mins':'price'})
+        self.maxs = self.AlgoData.loc[pd.notnull(self.AlgoData.maxs)][['time', 'maxs']].rename(columns={'maxs':'price'})
 
-
+        tradingWave = self.elliot_recursive_blast()
 
 
         super().post_update()
@@ -107,19 +107,19 @@ class Algo(ParentAlgo):
         tradingWaves = list()
 
         #for every min in chart
-        for i in range (0,len(ilocs_min)):
+        for index, min in self.mins.iterrows():
             if(1):
             #try:
                 #temp block checks if we are in a recursive function and already have a startX. We only want to be checking elliots with that startX
                 temp = False
                 if not np.isnan(startX):
-                    if ilocs_min[i] != startX:
+                    if min.time != startX:
                         temp = True
                 if temp is True:
                     continue
                 wave = ElliotImpulse(plotSize)
-                wave.time_1 = ilocs_min[i]
-                wave.price_1 = mins[ilocs_min[i]]
+                wave.time_1 = min.time
+                wave.price_1 = min.price
                 
                 #checking wave 1/point 2 [ / ]
                 ilocs_max_valid = ElliotFuncs.find_line(endX,wave.time_1,ilocs_max)
@@ -147,7 +147,7 @@ class Algo(ParentAlgo):
                                         ElliotFuncs.check_future_points(curPoint, ilocs_max_valid,reach,tradingWaves,wave)
 
                                         #checking wave 4/point 5 [ /\/\ ]
-                                        ilocs_min_valid = find_line(endX,wave.time_4,ilocs_min)
+                                        ilocs_min_valid = ElliotFuncs.find_line(endX,wave.time_4,ilocs_min)
                                         for curPoint in ilocs_min_valid[0:reach+1]:
                                             if(wave.checkpoint5(curPoint,mins[curPoint],maxs)):
                                                 wave.time_5 = curPoint
