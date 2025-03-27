@@ -7,18 +7,23 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from MainStoinker.DataCollection.apiApi import IBapi
+
 import time
 import threading
 import keyboard
-
 import tkinter as tk
+import pandas as pd
+import datetime
+from zoneinfo import ZoneInfo
 
 from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.common import *
 
+import MainStoinker.MainStuff.main_utils as utils
+from MainStoinker.DataCollection.apiApi import IBapi
 from MainStoinker.Util.IBKRHelper import *
+from trade_copy import Trade
 
 import pandas
 
@@ -26,6 +31,9 @@ QUANTITY = 10
 SYMBOL = 'AAPL'
 STOPLOSS = 1
 STOPLOSS_ENABLE = 0
+
+#pandas dataframe for trades
+tradelog = 0
 
 trades = [1,2,3,4,5]
 tradesfrontend = []
@@ -39,7 +47,12 @@ ticker_entry = ''
 stoploss_entry = ''
 stoploss_enable_var = tk.IntVar()
 
+logger = utils.create_logger("tradelogger")
+
+
 def main():
+
+    initialize()
     global qty_entry,ticker_entry,stoploss_entry,stoploss_enable
     
     app.connect('127.0.0.1', 7497, 123)
@@ -221,26 +234,33 @@ def buy_order_object(quantity, limitPrice = None):
     return order
 
 def buy_button_clicked():
+    global tradelist, SYMBOL, QUANTITY, STOPLOSS, STOPLOSS_ENABLE
     print("Buy Button clicked!")
 
     update_entry_values()
-
+    
     if(STOPLOSS_ENABLE):
-        print("Creating Buy Trade with " + STOPLOSS + "% Stoploss")
+        print("Creating Buy Trade with " + str(STOPLOSS) + "% Stoploss")
 
-
-    app.getNextOrderID()
-    parentId = app.nextValidOrderId
-
+    else:
+        STOPLOSS = 5
+        print("Creating Buy Trade with default " + str(STOPLOSS) + "% Stoploss")
+    
     symbol = SYMBOL
-    volume = QUANTITY
-    price = 212.00
+    volume = int(QUANTITY)
+    ID = "TestyTrade#" + str(len(tradelist))
 
-    contract = create_stock_contract(symbol)
+    newTrade = Trade(symbol, volume, ID, 0, datetime.datetime.now(ZoneInfo("America/Los_Angeles")), 1, float(STOPLOSS)/100, logger)
 
-    parentOrder = buy_order_object(volume)
+    tradelist.append(newTrade)
 
-    app.placeOrder(parentId,contract,parentOrder)
+    print(tradelist)
+
+    # contract = create_stock_contract(symbol)
+
+    # parentOrder = buy_order_object(volume)
+
+    # app.placeOrder(parentId,contract,parentOrder)
 
 def sell_button_clicked():
     print("Sell Button clicked!")
@@ -262,6 +282,19 @@ def sell_button_clicked():
     parentOrder = sell_order_object(volume)
 
     app.placeOrder(parentId,contract,parentOrder)
+
+def initialize():
+    global tradelog, tradelist
+    #load previous trade data from last session
+
+    # # Load the CSV file into a DataFrame
+    # tradelog = pd.read_csv('tradelog.csv')
+
+    # # Print the DataFrame
+    # print(tradelog)
+
+    tradelist = []
+
 
 
 main()
