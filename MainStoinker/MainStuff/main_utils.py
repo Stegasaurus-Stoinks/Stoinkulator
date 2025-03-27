@@ -92,7 +92,7 @@ def backtesting_data_blast():
     simulatedDatadict = ibape.simulatedDatadict
     socket = sio()
 
-    #MOVE FRONT END STUFF SOMEWHERE ELSE
+    #TODO: MOVE FRONT END STUFF SOMEWHERE ELSE
     if config.FrontEndDisplay:
         tickerfulldata = []
         socket.Config_send()

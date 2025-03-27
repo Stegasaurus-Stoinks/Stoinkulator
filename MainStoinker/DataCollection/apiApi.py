@@ -340,7 +340,7 @@ class IBapi(TestWrapper, TestClient):
         
         self.getNextOrderID()
         OrderId = self.nextValidOrderId
-        print(OrderId)
+        print("Stoploss OrderId:" + str(OrderId))
 
         stopLoss = Order()
         stopLoss.orderId = OrderId

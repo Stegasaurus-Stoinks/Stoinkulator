@@ -1,23 +1,11 @@
 [
   {
-    "ID":"Elliot",
+    "ID":"FVG",
     "data":[
       {
-        "idname": "MSFT-elliot",
+        "idname": "MSFT-FVG",
         "ticker": "MSFT",
-        "order": 2
-      }
-    ]
-  },
-  {
-    "ID":"TrendLine",
-    "data":[
-      {
-        "idname": "AAPL-10/30trend",
-        "ticker": "AAPL",
-        "short": "10",
-        "long": "30",
-        "stoplossPercent": ".1"
+        "RRRatio": 3
       }
     ]
   }
