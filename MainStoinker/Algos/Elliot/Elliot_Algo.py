@@ -16,8 +16,6 @@ import math
 
 from scipy.signal import argrelextrema
 
-from MainStoinker.TradeTools.trade import Trade
-
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 
 

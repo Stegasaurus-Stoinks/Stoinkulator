@@ -2,6 +2,7 @@ import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
 import math
+from MainStoinker.TradeTools.trade import Trade
 
 fulldatatypes = ['marker-up','marker-down','marker-dot','line-f']
 
@@ -33,6 +34,7 @@ class ParentAlgo:
         self.AlgoData = 0
         self.FrontEndDataStruct = 0
         self.FrontEndDataType = 0
+        self.trade = 0
 
     def pre_update(self, StockData):
         # TODO: add check_stoploss in here
@@ -46,11 +48,34 @@ class ParentAlgo:
 
         #Variables to store most recent stock data and previous algo data 
         self.curStockData = StockData.iloc[-1]
-        
+
+        # run checks against stop and tp if applicable
+        if(self.inTrade == True):
+            tpCheck = 17
+            if (self.tp != 0):
+                tpCheck = self.trade.check_tp(self.curStockData)
+            stopCheck = self.trade.check_stoploss(self.curStockData)
+            if (tpCheck == 1 or stopCheck == 0):
+                self.inTrade = False
+                self.logger.debug("trade triggered from tp or stop, indicated below:")
+                self.logger.debug("TP = "+str(tpCheck))
+                self.logger.debug("stop = "+str(stopCheck))
+
 
     def post_update(self):
         self.curAlgoData = self.AlgoData.iloc[-1]
 
+    def open_trade(self, volume, trend):
+        self.logger.debug("***opening trade***")
+        enterPrice = self.curStockData['close']
+        enterTime = self.curStockData['date']
+        tradeid = str(self.name) + str(len(self.trades))
+        newTrade = Trade(self.ticker, volume, tradeid, enterPrice, enterTime, trend, self.logger)
+
+        self.inTrade = True
+        self.trades.append(newTrade)
+        
+        return newTrade
 
     def update_frontend(self):
 
