@@ -145,6 +145,9 @@ class Trade:
     
     # manual stoploss check. returns true if trade is still good
     def check_stoploss(self, curpoint, value='close'):
+        # TODO: record StopPrice and Trade (for AlgoData) in here perhaps? just put it somewhere where it can handle itself
+        #       need to pass AlgoData through for this to work (hopefully)
+
         result = 1
         price = curpoint[value]
         if config.LiveTrading:

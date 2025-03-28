@@ -1,4 +1,3 @@
-from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
@@ -21,8 +20,6 @@ class ParentAlgo:
         
         self.logger = utils.create_logger("algo:"+self.name+":"+self.ticker)
 
-        #Initialize singleton TWS api
-        self.ibape = IBapi()
 
         #Other inits/variables
         self.inTrade = False
@@ -36,9 +33,27 @@ class ParentAlgo:
         self.AlgoData = 0
         self.FrontEndDataStruct = 0
         self.FrontEndDataType = 0
+
+    def pre_update(self, StockData):
+        # TODO: add check_stoploss in here
+
+        # verifying data and adding time to algo data
+        if StockData.shape[0] != self.AlgoData.shape[0]:
+            diff = StockData.shape[0] - self.AlgoData.shape[0]
+            new_row = pd.DataFrame(index=range(diff),columns=self.DataColumns)
+            self.AlgoData = pd.concat([self.AlgoData.loc[:],new_row],ignore_index=True)
+        self.AlgoData['time'] = StockData['time']
+
+        #Variables to store most recent stock data and previous algo data 
+        self.curStockData = StockData.iloc[-1]
         
 
+    def post_update(self):
+        self.curAlgoData = self.AlgoData.iloc[-1]
+
+
     def update_frontend(self):
+
         dataToSend = []
         for x in range(0,len(self.FrontEndDataStruct)):
             data = self.curAlgoData[self.FrontEndDataStruct[x]]
