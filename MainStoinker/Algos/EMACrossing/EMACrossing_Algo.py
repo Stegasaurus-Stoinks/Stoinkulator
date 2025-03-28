@@ -125,7 +125,7 @@ class Algo(ParentAlgo):
                 
                 self.logger.info("***opening trade on cross-up***")
                 tradeid = str(self.name) + str(len(self.trades))
-                self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, (self.stoplossPercent/100), self.logger)
+                self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, self.logger)
                 self.trades.append(self.trade)
                 # ime.sleep(1)
 

@@ -13,7 +13,7 @@ class Trade:
     #OpenPrice is the price the algo tried to buy at, which will likely be different from the entryPrice, same for openTime vs entryTime
     #used for tracking entry discrpencies since we are going to start with market orders and not limit orders
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, stoploss, logger, limitOrder = False):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, logger, limitOrder = False):
         self.ibape = IBapi()
         self.symbol = symbol
         self.volume = volume
@@ -29,17 +29,18 @@ class Trade:
         self.direction = direction
         self.limitOrder = limitOrder
 
+        self.ocaGroupName = "oca"+str(ID)
+
         self.logger = logger
 
+        # setting hardcoded emergency stoploss. Can be changed with functions
         # set trailingPercent to be the exact amount above or below 1 for equations
         if self.direction:
-            self.trailingPercent = 1 - stoploss
+            self.trailingPercent = 1 - 0.05
         else:
-            self.trailingPercent = 1 + stoploss
-
-        
+            self.trailingPercent = 1 + 0.05
         self.stopPrice = round(self.openPrice * (self.trailingPercent), 2)
-        self.stopLoss = abs(openPrice - self.stopPrice)
+        self.stopLossValue = abs(openPrice - self.stopPrice)
         
 
         if config.LiveTrading:
@@ -53,7 +54,6 @@ class Trade:
 
     def open_position(self):
         #call funtion to open order through api
-        # TODO: Open stoploss position here too
         if self.symbol == "ETH" or self.symbol == "BTC":
             self.contract = create_crypto_contract(self.symbol)
         else:
@@ -74,21 +74,28 @@ class Trade:
             else:
                 self.parentOrder = sell_order_object(self.volume)
         
-        print(self.ibape.readPositions())
+        #ocaGroup
+        self.parentOrder.ocaGroup = self.ocaGroupName
+        self.parentOrder.ocaType = 1 #cancel all remaining orders
+
         self.ibape.getNextOrderID()
         self.parentId = self.ibape.nextValidOrderId
+
         # "20200923 15:13:20 EST"
-        print(self.openTime)
+        #TODO Fix time error, IBKR not happy with Timezone format
         temptime = self.openTime + pd.Timedelta(2,"min")
         temptime = temptime.strftime('%X')
         self.parentOrder.tif = "GTD"
         self.parentOrder.goodTillDate = temptime
-        print("Order Valid Until: ", temptime)
-        print("Open Order ID: ", self.parentId)
+        self.logger.debug("Order Valid Until: ", temptime)
+        self.logger.debug("Open Order ID: ", self.parentId)
+        
         self.ibape.placeOrder(self.parentId,self.contract,self.parentOrder)
 
         #set stoploss
-        self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.parentId, self.contract, self.stopPrice)
+        self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.contract, self.stopPrice)
+        self.stopOrder.ocaGroup = self.ocaGroupName
+        self.stopOrder.ocaType = 1 #cancel all remaining orders with block
         self.stoplossId = self.stopOrder.orderId
 
 
@@ -119,12 +126,13 @@ class Trade:
                 if self.limitOrder:
                     self.parentCloseOrder = buy_order_object(self.volume, limitPrice=self.openPrice)
                 else:
-                    self.parentCloseOrder = buy_order_object(self.volume) 
-            self.ibape.cancelOrder(self.stoplossId,"")
+                    self.parentCloseOrder = buy_order_object(self.volume)
+
+            self.logger.debug("StopLoss Order Id: "+str(self.stoplossId))
+            self.ibape.cancelOrder(self.stoplossId)
             
             self.ParentCloseId = self.ibape.getNextOrderID()
-            print("close order id")
-            print(self.ParentCloseId)
+            self.logger.debug("Parent Close Order ID " + str(self.ParentCloseId))
             self.ibape.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
 
             self.position = False
@@ -172,8 +180,8 @@ class Trade:
 
             if self.stopLossType == 'Trailing':
 
-                if price > self.stopPrice + self.stopLoss:
-                    self.stopPrice = price - self.stopLoss
+                if price > self.stopPrice + self.stopLossValue:
+                    self.stopPrice = price - self.stopLossValue
                     
                     if config.LiveTrading: 
                         self.stopOrder.auxPrice = self.stopPrice
@@ -190,8 +198,8 @@ class Trade:
             
             if self.stopLossType == 'Trailing':
 
-                if price < self.stopPrice - self.stopLoss:
-                    self.stopPrice = price + self.stopLoss
+                if price < self.stopPrice - self.stopLossValue:
+                    self.stopPrice = price + self.stopLossValue
                     
                     if config.LiveTrading: 
                         self.stopOrder.auxPrice = self.stopPrice
@@ -250,7 +258,7 @@ class Trade:
             self.stopPrice = price
 
         if self.stopLossType == 'Trailing':
-            self.stopLoss = price
+            self.stopLossValue = price
 
 
     # def get_stopPrice(self,curpoint):
@@ -336,7 +344,7 @@ class Trade:
             'openPrice' : self.openPrice,
             'openTime' : self.openTime,
             'direction' : self.direction,
-            'stoploss' : self.stopLoss,
+            'stoploss' : self.stopLossValue,
             'status' : self.status,
             'closePrice' : self.closePrice,
             'closeTime' : self.closeTime,

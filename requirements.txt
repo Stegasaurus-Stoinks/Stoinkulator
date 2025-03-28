@@ -4,7 +4,6 @@ psycopg2
 pandas==1.5.3
 numpy==1.26.4
 yfinance
-ib_insync==0.9.86
 tzdata
 ibapi
 python-socketio
@@ -12,4 +11,4 @@ simplejson
 keyboard
 TA_Lib-0.4.20-cp39-cp39-win_amd64.whl
 python-statemachine
-# pip install -e .
+# pip install -e . 

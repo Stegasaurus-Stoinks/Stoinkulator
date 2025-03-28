@@ -32,6 +32,9 @@ SYMBOL = 'AAPL'
 STOPLOSS = 1
 STOPLOSS_ENABLE = 0
 
+inTrade = False
+newTrade = 0
+
 #pandas dataframe for trades
 tradelog = 0
 
@@ -91,6 +94,10 @@ def main():
              text="ACCOUNT INFO"
              ).pack(padx=50,pady=5)
     
+    tk.Label(account_frame,
+             text="In Trade: "
+             ).pack(padx=50,pady=5)
+    
     #trades sub frame
     trade_list_subframe = tk.Frame(account_frame,width=390, height=300)
     trade_list_subframe.pack(padx=5,pady=5)
@@ -141,9 +148,10 @@ def main():
     stoploss_entry.insert(tk.END,STOPLOSS)
     stoploss_entry.pack(side=tk.LEFT, pady=10)
 
-
+    button_frame = tk.Frame(trading_frame,width=590,height=300,bg="skyblue")
+    button_frame.pack(padx=5,pady=5,side=tk.RIGHT)
     # Creating a button with specified options
-    buybutton = tk.Button(trading_frame, 
+    buybutton = tk.Button(button_frame, 
                     text="Buy", 
                     command=buy_button_clicked,
                     activebackground="blue", 
@@ -166,9 +174,32 @@ def main():
                     width=15,
                     wraplength=100)
 
-    sellbutton = tk.Button(trading_frame,
+    sellbutton = tk.Button(button_frame,
                     text="Sell", 
                     command=sell_button_clicked,
+                    activebackground="blue", 
+                    activeforeground="white",
+                    anchor="center",
+                    bd=3,
+                    bg="lightgray",
+                    cursor="hand2",
+                    disabledforeground="gray",
+                    fg="black",
+                    font=("Arial", 12),
+                    height=2,
+                    highlightbackground="black",
+                    highlightcolor="green",
+                    highlightthickness=2,
+                    justify="center",
+                    overrelief="raised",
+                    padx=10,
+                    pady=5,
+                    width=15,
+                    wraplength=100)
+    
+    cancelbutton = tk.Button(button_frame,
+                    text="Cancel", 
+                    command=cancel_button_clicked,
                     activebackground="blue", 
                     activeforeground="white",
                     anchor="center",
@@ -191,6 +222,7 @@ def main():
 
     buybutton.pack(padx=20, pady=20)
     sellbutton.pack(padx=20, pady=20)
+    cancelbutton.pack(padx=20, pady=20)
 
     root.mainloop()
 
@@ -234,7 +266,7 @@ def buy_order_object(quantity, limitPrice = None):
     return order
 
 def buy_button_clicked():
-    global tradelist, SYMBOL, QUANTITY, STOPLOSS, STOPLOSS_ENABLE
+    global tradelist, SYMBOL, QUANTITY, STOPLOSS, STOPLOSS_ENABLE, inTrade, newTrade
     print("Buy Button clicked!")
 
     update_entry_values()
@@ -250,16 +282,17 @@ def buy_button_clicked():
     volume = int(QUANTITY)
     ID = "TestyTrade#" + str(len(tradelist))
 
-    newTrade = Trade(symbol, volume, ID, 0, datetime.datetime.now(ZoneInfo("America/Los_Angeles")), 1, float(STOPLOSS)/100, logger)
+    newTrade = Trade(symbol, volume, ID, 200, datetime.datetime.now(ZoneInfo("America/Los_Angeles")), 1, float(STOPLOSS)/100, logger)
 
     tradelist.append(newTrade)
 
     print(tradelist)
 
+    inTrade = True
+    
+
     # contract = create_stock_contract(symbol)
-
     # parentOrder = buy_order_object(volume)
-
     # app.placeOrder(parentId,contract,parentOrder)
 
 def sell_button_clicked():
@@ -282,6 +315,18 @@ def sell_button_clicked():
     parentOrder = sell_order_object(volume)
 
     app.placeOrder(parentId,contract,parentOrder)
+
+def cancel_button_clicked():
+    global newTrade, inTrade
+    print("Cancel Button Clicked")
+    if inTrade:
+        print("Closing Trade " + str(newTrade.tradeID))
+        newTrade.close_position(250, datetime.datetime.now(ZoneInfo("America/Los_Angeles")))
+    else:
+        print("No Open Trade.  Cant cancel something thats not open dum dum")
+    
+def tp_button_clicked():
+    
 
 def initialize():
     global tradelog, tradelist

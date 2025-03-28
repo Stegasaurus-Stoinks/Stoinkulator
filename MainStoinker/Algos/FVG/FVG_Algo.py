@@ -206,7 +206,7 @@ class Algo(ParentAlgo):
 
         self.logger.info("***opening trade***")
         tradeid = str(self.name) + str(len(self.trades))
-        self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, 1, self.logger)
+        self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, self.logger)
 
         #change stoploss to fixed type and set price
         self.trade.change_stoploss_type('Fixed')
