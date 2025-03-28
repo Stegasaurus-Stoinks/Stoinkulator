@@ -331,7 +331,7 @@ class IBapi(TestWrapper, TestClient):
 
 
     
-    def addStoploss(self, parentOrder, contract, stopPrice):
+    def addStoploss(self, parentOrder, stopPrice):
         #StopId being set means you are updating a stoploss thats already been created
 
         parentAction = parentOrder.action
@@ -344,10 +344,8 @@ class IBapi(TestWrapper, TestClient):
 
         stopLoss = Order()
         stopLoss.orderId = OrderId
-        if parentAction == "Buy":
-            stopLoss.action = "SELL"  
-        else: 
-            stopLoss.action = "BUY"
+        print(parentAction)
+        stopLoss.action = "SELL" if parentAction == "BUY" else "BUY"
 
         #Stop trigger price
         
@@ -357,11 +355,25 @@ class IBapi(TestWrapper, TestClient):
         stopLoss.parentId = parentOrderId
         stopLoss.eTradeOnly = False
         stopLoss.firmQuoteOnly = False
-        
-
-        self.placeOrder(OrderId, contract, stopLoss)
 
         return stopLoss
+    
+
+    def addTP(self, parentOrder, tpPrice, quantity):
+        takeProfit = Order()
+        self.getNextOrderID()
+        OrderId = self.nextValidOrderId
+        takeProfit.orderId = OrderId
+        takeProfit.action = "SELL" if parentOrder.action == "BUY" else "BUY"
+        takeProfit.orderType = "LMT"
+        takeProfit.totalQuantity = quantity
+        takeProfit.lmtPrice = tpPrice
+        takeProfit.parentId = parentOrder.orderId
+        takeProfit.eTradeOnly = False
+        takeProfit.firmQuoteOnly = False
+
+        return takeProfit
+        
     
 
     def error(self, reqId:TickerId, errorCode:int, errorString:str, advancedOrderRejectJson = ""):

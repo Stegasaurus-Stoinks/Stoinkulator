@@ -5,6 +5,7 @@ from MainStoinker.DataCollection.apiApi import IBapi
 import pandas as pd
 import MainStoinker.MainStuff.main_utils as utils
 import logging
+import random
 
 class Trade:
     
@@ -29,7 +30,7 @@ class Trade:
         self.direction = direction
         self.limitOrder = limitOrder
 
-        self.ocaGroupName = "oca"+str(ID)
+        self.ocaGroupName = "oca"+str(ID)+str(random.random)
 
         self.logger = logger
 
@@ -75,8 +76,8 @@ class Trade:
                 self.parentOrder = sell_order_object(self.volume)
         
         #ocaGroup
-        self.parentOrder.ocaGroup = self.ocaGroupName
-        self.parentOrder.ocaType = 1 #cancel all remaining orders
+        # self.parentOrder.ocaGroup = self.ocaGroupName
+        # self.parentOrder.ocaType = 1 #cancel all remaining orders
 
         self.ibape.getNextOrderID()
         self.parentId = self.ibape.nextValidOrderId
@@ -87,16 +88,21 @@ class Trade:
         temptime = temptime.strftime('%X')
         self.parentOrder.tif = "GTD"
         self.parentOrder.goodTillDate = temptime
-        self.logger.debug("Order Valid Until: ", temptime)
-        self.logger.debug("Open Order ID: ", self.parentId)
+        self.logger.debug("Order Valid Until: "+ str(temptime))
+        self.logger.debug("Open Order ID: "+ str(self.parentId))
         
         self.ibape.placeOrder(self.parentId,self.contract,self.parentOrder)
 
         #set stoploss
-        self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.contract, self.stopPrice)
-        self.stopOrder.ocaGroup = self.ocaGroupName
-        self.stopOrder.ocaType = 1 #cancel all remaining orders with block
-        self.stoplossId = self.stopOrder.orderId
+        #TODO Move into addstoploss pass group name
+        try:
+            self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
+            self.stopOrder.ocaGroup = self.ocaGroupName
+            self.stopOrder.ocaType = 1 #cancel all remaining orders with block
+            self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
+        except:
+            self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
+            self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
 
 
         self.position = True
@@ -155,6 +161,7 @@ class Trade:
 
     def get_status(self):
         return(self.status)
+    
     
     # manual stoploss check. returns true if trade is still good
     def check_stoploss(self, curpoint, value='close'):
@@ -215,12 +222,20 @@ class Trade:
         return result
     
 
-    def create_tp(self, tp):
+    def create_tp(self, tp, quantity):
         self.tp = tp
 
         if config.LiveTrading:
             print("sending tp order to ibkr NOT IMPLEMENTED")
             #TODO: https://interactivebrokers.github.io/tws-api/bracket_order.html
+            self.tpOrder = self.ibape.addTP(self.parentOrder, tp, quantity)
+
+            self.tpOrder.ocaGroup = self.ocaGroupName
+            self.tpOrder.ocaType = 2 #Remaining orders are proportionately reduced in size with block
+
+            self.tpOrderId = self.tpOrder.orderId
+            self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
+
 
         print("TP set to ", self.tp)
 
@@ -253,21 +268,17 @@ class Trade:
 
     #updates stoploss price for 'Fixed' stoploss
     #updates stoploss trailing amount for 'Trailing' stoploss
-    def update_stoploss_price(self,price):
+    def update_stoploss_price(self,price,typeofstoploss = "Trailing"):
+        self.stopLossType = typeofstoploss
+
         if self.stopLossType == 'Fixed':
             self.stopPrice = price
 
         if self.stopLossType == 'Trailing':
             self.stopLossValue = price
 
+        
 
-    # def get_stopPrice(self,curpoint):
-    #     self.ibape.readOrders()
-    #     print(self.ibape.all_openorders)
-    #     stopOrder = self.ibape.all_openorders.loc[[self.stoplossId]]
-    #     print(stopOrder)
-    #     price = float(curpoint["close"])-float(stopOrder["LmtPrice"])
-    #     return price
 
     def get_stats(self, Fulldisplay = True):
 
