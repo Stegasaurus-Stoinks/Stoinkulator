@@ -12,8 +12,6 @@ import math
 
 from statemachine import StateMachine, State
 
-from MainStoinker.TradeTools.trade import Trade
-
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 
 '''
@@ -218,11 +216,6 @@ class Algo(ParentAlgo):
 
 
     def entertrade(self):
-        self.inTrade = True
-        enterTime = self.curStockData['date']
-        enterPrice = self.curStockData['close']
-        self.trade = 0
-
         range = self.upperbound - self.lowerbound
 
         if self.direction == 'up':
@@ -240,15 +233,11 @@ class Algo(ParentAlgo):
         
         
         
-        self.logger.info("***opening trade***")
-        tradeid = str(self.name) + str(len(self.trades))
-        self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, self.logger)
+        self.trade = self.open_trade(10, trend)
 
         #change stoploss to fixed type and set price
         self.trade.change_stoploss_type('Fixed')
         self.trade.update_stoploss_price(self.stoplossprice)
-
-        self.trades.append(self.trade)
 
         # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)
         # use self.RRRatio
