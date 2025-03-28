@@ -1,3 +1,6 @@
 # Stoinkulator
 calculator for ze stoinks
-run pip install -e . for proper imports
+for project imports:
+pip install -e .
+for all dependencies:
+pip install -r requirements.txt
