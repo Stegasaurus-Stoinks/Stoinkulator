@@ -48,7 +48,19 @@ class ParentAlgo:
 
         #Variables to store most recent stock data and previous algo data 
         self.curStockData = StockData.iloc[-1]
-        
+
+        # run checks against stop and tp if applicable
+        if(self.inTrade == True):
+            tpCheck = 17
+            if (self.tp != 0):
+                tpCheck = self.trade.check_tp(self.curStockData)
+            stopCheck = self.trade.check_stoploss(self.curStockData)
+            if (tpCheck == 1 or stopCheck == 0):
+                self.inTrade = False
+                self.logger.debug("trade triggered from tp or stop, indicated below:")
+                self.logger.debug("TP = "+str(tpCheck))
+                self.logger.debug("stop = "+str(stopCheck))
+
 
     def post_update(self):
         self.curAlgoData = self.AlgoData.iloc[-1]
@@ -59,7 +71,7 @@ class ParentAlgo:
         enterTime = self.curStockData['date']
         tradeid = str(self.name) + str(len(self.trades))
         newTrade = Trade(self.ticker, volume, tradeid, enterPrice, enterTime, trend, self.logger)
-        
+
         self.inTrade = True
         self.trades.append(newTrade)
         
