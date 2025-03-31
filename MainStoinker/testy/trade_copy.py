@@ -30,7 +30,9 @@ class Trade:
         self.direction = direction
         self.limitOrder = limitOrder
 
-        self.ocaGroupName = "oca"+str(ID)+str(random.random)
+        self.tpOrder = 0
+
+        self.ocaGroupName = "oca"+str(ID)+str(random.randint(0,100))
 
         self.logger = logger
 
@@ -98,7 +100,8 @@ class Trade:
         try:
             self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
             self.stopOrder.ocaGroup = self.ocaGroupName
-            self.stopOrder.ocaType = 1 #cancel all remaining orders with block
+            self.stopOrder.ocaType = 2 #cancel all remaining orders with block
+            self.stopOrder.transmit = True
             self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
         except:
             self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
@@ -226,15 +229,20 @@ class Trade:
         self.tp = tp
 
         if config.LiveTrading:
-            print("sending tp order to ibkr NOT IMPLEMENTED")
-            #TODO: https://interactivebrokers.github.io/tws-api/bracket_order.html
-            self.tpOrder = self.ibape.addTP(self.parentOrder, tp, quantity)
+            if self.tpOrder:
+                print("Modifying TP order")
+                self.tpOrder.lmtPrice = tp
+                self.tpOrder.totalQuantity = quantity
+                self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
+            else:        
+                print("Creating New TP order")
+                self.tpOrder = self.ibape.addTP(self.parentOrder, tp, quantity)
 
-            self.tpOrder.ocaGroup = self.ocaGroupName
-            self.tpOrder.ocaType = 2 #Remaining orders are proportionately reduced in size with block
+                self.tpOrder.ocaGroup = self.ocaGroupName
+                self.tpOrder.ocaType = 2 #Remaining orders are proportionately reduced in size with block
 
-            self.tpOrderId = self.tpOrder.orderId
-            self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
+                self.tpOrderId = self.tpOrder.orderId
+                self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
 
 
         print("TP set to ", self.tp)
@@ -277,7 +285,9 @@ class Trade:
         if self.stopLossType == 'Trailing':
             self.stopLossValue = price
 
-        
+        #TODO run stoploss check here :)
+
+
 
 
     def get_stats(self, Fulldisplay = True):

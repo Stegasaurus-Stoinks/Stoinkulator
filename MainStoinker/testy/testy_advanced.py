@@ -364,7 +364,7 @@ def modify_stoploss_clicked():
 
     print("Modify Stoploss Pressed")
 
-    newTrade.update_stoploss_price(PRICE)
+    newTrade.update_stoploss_price(PRICE,typeofstoploss="Fixed")
 
 def initialize():
     global tradelog, tradelist
