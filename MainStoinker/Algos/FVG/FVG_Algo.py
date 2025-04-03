@@ -202,7 +202,7 @@ class Algo(ParentAlgo):
         self.trade = self.open_trade(10, trend)
 
         #change stoploss to fixed type and set price
-        self.trade.change_stoploss_type('Fixed')
+        self.trade.set_stopLossType('Fixed')
         self.trade.update_stoploss_price(self.stoplossprice)
 
         # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)

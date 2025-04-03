@@ -237,7 +237,7 @@ class Trade:
         self.create_tp(tp)
 
 
-    def change_stoploss_type(self,typeofstoploss):
+    def set_stopLossType(self,typeofstoploss):
         self.stopLossType = typeofstoploss
 
 

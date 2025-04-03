@@ -39,11 +39,11 @@ class Trade:
         # setting hardcoded emergency stoploss. Can be changed with functions
         # set trailingPercent to be the exact amount above or below 1 for equations
         if self.direction:
-            self.trailingPercent = 1 - 0.05
+            trailingPercent = 1 - 0.05
         else:
-            self.trailingPercent = 1 + 0.05
-        self.stopPrice = round(self.openPrice * (self.trailingPercent), 2)
-        self.stopLossValue = abs(openPrice - self.stopPrice)
+            trailingPercent = 1 + 0.05
+        self.stopPrice = round(openPrice * (trailingPercent), 2)
+        self.stopDelta = abs(openPrice - self.stopPrice)
         
 
         if config.LiveTrading:
@@ -196,38 +196,23 @@ class Trade:
         #return 1 if good 0 if bad
         if self.direction: #UP Trade
 
-            if self.stopLossType == 'Trailing':
-
-                if price > self.stopPrice + self.stopLossValue:
-                    self.stopPrice = price - self.stopLossValue
-                    
-                    if config.LiveTrading: 
-                        self.stopOrder.auxPrice = self.stopPrice
-                        self.logger.info(str(self.tradeID)+" - updating auxPrice for "+str(self.symbol)+": " + str(self.stopOrder.auxPrice))
-                        self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
-                    result = 1
+            if (self.stopLossType == 'Trailing') and (price > (self.stopPrice + self.stopDelta)):
+                self.set_stopPrice(price - self.stopDelta)
+                result = 1
 
             if price < self.stopPrice:
-                self.close_position(self.stopPrice,curpoint['date'])
                 self.logger.info(str(self.tradeID)+" - Manually closing position based on stoploss: "+str(self.tradeID))
+                self.close_position(self.stopPrice,curpoint['date'])
                 result = 0    
 
         else: #DOWN Trade
-            
-            if self.stopLossType == 'Trailing':
-
-                if price < self.stopPrice - self.stopLossValue:
-                    self.stopPrice = price + self.stopLossValue
-                    
-                    if config.LiveTrading: 
-                        self.stopOrder.auxPrice = self.stopPrice
-                        self.logger.info(str(self.tradeID)+" - updating auxPrice for "+str(self.symbol)+": " + str(self.stopOrder.auxPrice))
-                        self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
-                    result = 1
+            if (self.stopLossType == 'Trailing') and (price < (self.stopPrice - self.stopDelta)):
+                self.set_stopPrice(price + self.stopDelta)
+                result = 1
 
             if price > self.stopPrice:
-                self.close_position(self.stopPrice,curpoint['date'])       
-                self.logger.info(str(self.tradeID)+" - Manually closing position based on stoploss: "+str(self.tradeID))         
+                self.logger.info(str(self.tradeID)+" - Manually closing position based on stoploss: "+str(self.tradeID))        
+                self.close_position(self.stopPrice,curpoint['date']) 
                 result = 0
         
         return result
@@ -278,22 +263,20 @@ class Trade:
         self.create_tp(tp)
 
 
-    def change_stoploss_type(self,typeofstoploss):
+
+    def set_stopLossType(self, typeofstoploss):
         self.stopLossType = typeofstoploss
 
+    # tying the stopOrder update to set_stopPrice because realistically we never want these to be out of sync to avoid misinformation
+    def set_stopPrice(self, price):
+        self.stopPrice = price
+        if config.LiveTrading:
+            self.stopOrder.auxPrice = price
+            self.logger.debug(str(self.tradeID)+" - updating auxPrice for "+str(self.symbol)+": " + str(self.stopOrder.auxPrice))
+            self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
 
-    #updates stoploss price for 'Fixed' stoploss
-    #updates stoploss trailing amount for 'Trailing' stoploss
-    def update_stoploss_price(self,price,typeofstoploss = "Trailing"):
-        self.stopLossType = typeofstoploss
-
-        if self.stopLossType == 'Fixed':
-            self.stopPrice = price
-
-        if self.stopLossType == 'Trailing':
-            self.stopLossValue = price
-
-        #TODO run stoploss check here :)
+    def set_stopDelta(self, value):
+        self.stopDelta = value
 
 
 
@@ -373,7 +356,7 @@ class Trade:
             'openPrice' : self.openPrice,
             'openTime' : self.openTime,
             'direction' : self.direction,
-            'stoploss' : self.stopLossValue,
+            'stopDelta' : self.stopDelta,
             'status' : self.status,
             'closePrice' : self.closePrice,
             'closeTime' : self.closeTime,
