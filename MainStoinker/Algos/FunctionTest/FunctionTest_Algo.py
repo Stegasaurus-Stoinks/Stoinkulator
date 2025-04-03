@@ -14,8 +14,6 @@ import math
 
 from scipy.signal import argrelextrema
 
-from MainStoinker.TradeTools.trade import Trade
-
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 
 
@@ -24,11 +22,8 @@ class Algo(ParentAlgo):
     def __init__(self, algoConfigData):
         super().__init__(algoConfigData)
 
-        #Initialize Algo with unique data from Algo Config
-        # order, srictness?, recursion
-        # self.recursion = bool(algoConfigData['recursion'])
-        self.order = int(algoConfigData['order'])
-
+        self.order = 2
+        self.i = 0
         #Data to send to the frontend
         self.FrontEndDataStruct = ['mins','maxs','StopPrice',"Trade"]
         self.FrontEndDataType = ['marker-up','marker-down','segment','baseline']
@@ -42,34 +37,38 @@ class Algo(ParentAlgo):
     def update(self, StockData):
         # setup that needs to be done in every algo is done here
         super().pre_update(StockData)
-        self.i = 0
+        self.logger.debug("i = "+str(self.i))
 
         # setting mins and maxs for plotting 
         self.AlgoData['mins'] = StockData.iloc[argrelextrema(StockData.close.values, np.less_equal, order=self.order)[0]]['close']
         self.AlgoData['maxs'] = StockData.iloc[argrelextrema(StockData.close.values, np.greater_equal, order=self.order)[0]]['close']
-
+        
+        tp = self.curStockData['close'] + 3.00
+        stopPrice = (self.curStockData['close'] - 1.00)
 
         if (self.inTrade):
-            if (self.i == 2):
+            self.trade.update_stoploss_price(stopPrice)
+            
+            self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+            self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
+            self.AlgoData.at[self.AlgoData.index[-1],'tp'] = tp
+            if (self.i == 3):
                 self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
                 self.i = 0
         else:
             if (self.i == 1):
                 self.trade = self.open_trade(10, 1)
+                #change stoploss to fixed type and set price
+                stopPrice = (self.curStockData['close'] - 1.00)
+                self.trade.change_stoploss_type('Fixed')
+                self.trade.update_stoploss_price(stopPrice)
+                self.trade.create_tp(tp, 10)
+
+                self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
+                self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
+                self.AlgoData.at[self.AlgoData.index[-1],'tp'] = tp
 
 
 
-        #change stoploss to fixed type and set price
-        stopPrice = (self.curStockData['close'] - 1.00)
-        self.trade.change_stoploss_type('Fixed')
-        self.trade.update_stoploss_price(stopPrice)
-
-        self.trade.create_tp(self.tp)
-
-
-
-        self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
-        self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
-        self.AlgoData.at[self.AlgoData.index[-1],'tp'] = self.tp
         self.i += 1
         super().post_update()
