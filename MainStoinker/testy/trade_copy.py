@@ -92,6 +92,7 @@ class Trade:
         self.parentOrder.goodTillDate = temptime
         self.logger.debug("Order Valid Until: "+ str(temptime))
         self.logger.debug("Open Order ID: "+ str(self.parentId))
+        self.parentOrder.orderId = self.parentId
         
         self.ibape.placeOrder(self.parentId,self.contract,self.parentOrder)
 
@@ -100,12 +101,14 @@ class Trade:
         try:
             self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
             self.stopOrder.ocaGroup = self.ocaGroupName
-            self.stopOrder.ocaType = 2 #cancel all remaining orders with block
+            self.stopOrder.ocaType = 2 #proportial reduction
             self.stopOrder.transmit = True
             self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
         except:
             self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
             self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
+
+        self.logger.debug("Stoploss OrderId:" + str(self.stopOrder.orderId))
 
 
         self.position = True
@@ -137,10 +140,15 @@ class Trade:
                 else:
                     self.parentCloseOrder = buy_order_object(self.volume)
 
-            self.logger.debug("StopLoss Order Id: "+str(self.stoplossId))
-            self.ibape.cancelOrder(self.stoplossId)
+            self.parentCloseOrder.ocaGroup = self.ocaGroupName
+            self.parentCloseOrder.ocaType = 2
+
+            #oca group handles the closing of the stoploss
+            # self.logger.debug("StopLoss Order Id: "+str(self.stoplossId))
+            # self.ibape.cancelOrder(self.stoplossId)
             
             self.ParentCloseId = self.ibape.getNextOrderID()
+            self.parentCloseOrder.orderId = self.ParentCloseId
             self.logger.debug("Parent Close Order ID " + str(self.ParentCloseId))
             self.ibape.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
 

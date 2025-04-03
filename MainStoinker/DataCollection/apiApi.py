@@ -43,6 +43,7 @@ class IBapi(TestWrapper, TestClient):
         self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
         self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
         self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
+        self.all_completed_orders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
         # self.all_executions = pd.DataFrame([], columns = ['reqId', 'Price'])
 
     def tickPrice(self, reqId, tickType, price, attrib):
@@ -286,6 +287,7 @@ class IBapi(TestWrapper, TestClient):
         #     "TotalQty:", (order.totalQuantity), "CashQty:", (order.cashQty), 
         #     "LmtPrice:", (order.lmtPrice), "AuxPrice:", (order.auxPrice), "Status:", orderState.status,
         #     "MinCompeteSize:", (order.minCompeteSize))
+        print('OrderId:',order.orderId,' Symbol:',contract.symbol, ' OrderType:' , order.orderType, ' Quantity:',order.totalQuantity, ' Action:',order.action, ' OrderState:',orderState.status,' SecType:',contract.secType, ' AuxPrice:',float(order.auxPrice),' LmtPrice:' ,float(order.lmtPrice))
         self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'OrderType':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'OrderState':orderState.status,'SecType':contract.secType, 'AuxPrice': float(order.auxPrice),'LmtPrice': float(order.lmtPrice)}
 
     def openOrderEnd(self):
@@ -299,34 +301,70 @@ class IBapi(TestWrapper, TestClient):
                 print("failed to set event object for readOrders")
 
 
+    #Completed Orders Call/Callbacks
+    def readCompletedOrders(self):
+        self.all_completed_orders = self.all_completed_orders.iloc[0:0]
+        self.completed_orders_event_obj = threading.Event()
+        self.reqCompletedOrders(True)
+        if config.Debug:
+            print("Waiting for IB's API response for completed orders requests...")
+        # time.sleep(3)
+        timeout = 2
+        flag = self.completed_orders_event_obj.wait(timeout)
+        if flag:
+            # print(self.all_openorders)
+            pass
+        else:
+            print("error with callback for readOrders")
+
+    def completedOrder(self,contract,order,orderState):
+        #TODO save completed orders to array, example below from open orders
+        # self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'OrderType':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'OrderState':orderState.status,'SecType':contract.secType, 'AuxPrice': float(order.auxPrice),'LmtPrice': float(order.lmtPrice)}
+        # print('OrderId:',order.orderId,' Symbol:',contract.symbol, ' OrderType:' , order.orderType, ' Quantity:',order.totalQuantity, ' Action:',order.action, ' OrderState:',orderState.status,' SecType:',contract.secType, ' AuxPrice:',float(order.auxPrice),' LmtPrice:' ,float(order.lmtPrice))
+        print("CompletedOrder: ",str(order)," | ", "OrderState:",orderState.status," Order Commission:",orderState.commission, " Completed Time:",orderState.completedTime)
+
+    def completedOrdersEnd(self):
+        if config.Debug:
+            print("completedOrderEnd CallBack")
+        try:
+            self.completed_orders_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for completedOrders")
 
 
-    #Generate new list of positions, returns Pandas DataFrame
-    # def readExecutions(self,tickerSymbol:str = None):
-    #     self.executions_event_obj = threading.Event()
-    #     self.temp = self.reqExecutions(10001, ExecutionFilter())
-    #     # self.reqPositionsMulti()
-    #     if config.Debug:
-    #         print("Waiting for IB's API response for accounts positions requests...")
-    #     # time.sleep(3)
-    #     timeout = 15
-    #     flag = self.executions_event_obj.wait(timeout)
-    #     if flag:
-    #         print(self.all_executions)
-    #     else:
-    #         print("error with callback for positions")
+
+
+    # Generate new list of positions, returns Pandas DataFrame
+
+    def readExecutions(self,tickerSymbol:str = None):
+        self.executions_event_obj = threading.Event()
+        self.temp = self.reqExecutions(10001, ExecutionFilter())
+        # self.reqPositionsMulti()
+        if config.Debug:
+            print("Waiting for IB's API response for accounts positions requests...")
+        # time.sleep(3)
+        timeout = 15
+        flag = self.executions_event_obj.wait(timeout)
+        if flag:
+            # print(self.all_executions)
+            print("successful read executions flag")
+        else:
+            print("error with callback for positions")
     
-    # def execDetails(self, reqId: int, contract: Contract, execution: Execution):
-    #     print("ExecDetails. ReqId:", reqId, "Symbol:", contract.symbol, "SecType:", contract.secType, "Currency:", contract.currency, execution)
-    #     self.all_executions.loc[orderId]= {'reqId':reqId, 'Price':execution.price}
-    # def execDetailsEnd(self, reqId: int):
-    #     print("ExecDetailsEnd. ReqId:", reqId)
-    #     try:
-    #         self.executions_event_obj.set()
-    #     except Exception as e:
-    #         if config.Debug:
-    #             print(e)
-    #             print("failed to set event object for readOrders")
+    def execDetails(self, reqId: int, contract: Contract, execution: Execution):
+        print("ExecDetails. Execution OrderId:", execution.orderId, "Symbol:", contract.symbol, "SecType:", contract.secType, execution)
+        # self.all_executions.loc[orderId]= {'reqId':reqId, 'Price':execution.price}
+
+    def execDetailsEnd(self, reqId: int):
+        print("ExecDetailsEnd. ReqId:", reqId)
+        try:
+            self.executions_event_obj.set()
+        except Exception as e:
+            if config.Debug:
+                print(e)
+                print("failed to set event object for readOrders")
     
 
 
@@ -336,23 +374,20 @@ class IBapi(TestWrapper, TestClient):
 
         parentAction = parentOrder.action
         quantity = parentOrder.totalQuantity
-        parentOrderId = parentOrder.orderId
+        # parentOrderId = parentOrder.orderId
         
         self.getNextOrderID()
         OrderId = self.nextValidOrderId
-        print("Stoploss OrderId:" + str(OrderId))
 
         stopLoss = Order()
         stopLoss.orderId = OrderId
-        print(parentAction)
         stopLoss.action = "SELL" if parentAction == "BUY" else "BUY"
 
         #Stop trigger price
-        
         stopLoss.orderType = "STP"
         stopLoss.auxPrice = stopPrice
         stopLoss.totalQuantity = quantity
-        stopLoss.parentId = parentOrderId
+        # stopLoss.parentId = parentOrderId
         stopLoss.eTradeOnly = False
         stopLoss.firmQuoteOnly = False
 
@@ -368,7 +403,7 @@ class IBapi(TestWrapper, TestClient):
         takeProfit.orderType = "LMT"
         takeProfit.totalQuantity = quantity
         takeProfit.lmtPrice = tpPrice
-        takeProfit.parentId = parentOrder.orderId
+        # takeProfit.parentId = parentOrder.orderId
         takeProfit.eTradeOnly = False
         takeProfit.firmQuoteOnly = False
 

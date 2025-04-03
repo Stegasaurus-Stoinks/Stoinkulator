@@ -83,10 +83,12 @@ if not config.offline:
         app.disconnect
         time.sleep(1)
         exit()
-
+    app.readCompletedOrders()
     app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
-else: #if offline load offline data
+
+#if offline load offline data
+else: 
     eventDict[0] = threading.Event()
     time.sleep(.5)
     print("____________________________________________")

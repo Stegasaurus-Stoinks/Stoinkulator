@@ -60,7 +60,7 @@ def main():
     initialize()
     global qty_entry,ticker_entry,stoploss_entry,stoploss_enable,price_entry
     
-    app.connect('127.0.0.1', 7497, 123)
+    app.connect('127.0.0.1', 7497, 69)
 
     while(not app.isConnected()):
         print("TWS Connection ", str(app.isConnected()))
@@ -246,8 +246,54 @@ def main():
                         wraplength=100)
 
     StopLossModifybutton = tk.Button(button_frame,
-                        text="Change StopLoss", 
-                        command=modify_stoploss_clicked,
+                        text="Get Execution Details", 
+                        command=get_execution_clicked,
+                        activebackground="blue", 
+                        activeforeground="white",
+                        anchor="center",
+                        bd=3,
+                        bg="lightgray",
+                        cursor="hand2",
+                        disabledforeground="gray",
+                        fg="black",
+                        font=("Arial", 12),
+                        height=2,
+                        highlightbackground="black",
+                        highlightcolor="green",
+                        highlightthickness=2,
+                        justify="center",
+                        overrelief="raised",
+                        padx=10,
+                        pady=5,
+                        width=15,
+                        wraplength=100)
+    
+    OpenOrdersbutton = tk.Button(button_frame,
+                        text="Get Open Orders", 
+                        command=get_open_orders_clicked,
+                        activebackground="blue", 
+                        activeforeground="white",
+                        anchor="center",
+                        bd=3,
+                        bg="lightgray",
+                        cursor="hand2",
+                        disabledforeground="gray",
+                        fg="black",
+                        font=("Arial", 12),
+                        height=2,
+                        highlightbackground="black",
+                        highlightcolor="green",
+                        highlightthickness=2,
+                        justify="center",
+                        overrelief="raised",
+                        padx=10,
+                        pady=5,
+                        width=15,
+                        wraplength=100)
+    
+    CompletedOrdersbutton = tk.Button(button_frame,
+                        text="Get Completed Orders", 
+                        command=get_completedOrders_clicked,
                         activebackground="blue", 
                         activeforeground="white",
                         anchor="center",
@@ -278,6 +324,8 @@ def main():
 
     TPbutton.pack(padx=20,pady=5)
     StopLossModifybutton.pack(padx=20,pady=5)
+    OpenOrdersbutton.pack(padx=20,pady=5)
+    CompletedOrdersbutton.pack(padx=20,pady=5)
 
 
     root.mainloop()
@@ -358,13 +406,27 @@ def tp_button_clicked():
     print("TP Button Pressed")
     newTrade.create_tp(PRICE,QUANTITY)
 
-def modify_stoploss_clicked():
+def get_execution_clicked():
     global newTrade
     update_entry_values()
 
-    print("Modify Stoploss Pressed")
+    print("Get Execution Details")
 
-    newTrade.update_stoploss_price(PRICE,typeofstoploss="Fixed")
+    # app.readCompletedOrders()
+    app.readExecutions()
+
+def get_completedOrders_clicked():
+    global newTrade
+    update_entry_values()
+
+    print("Get Completed Orders clicked")
+    app.readCompletedOrders()
+   
+
+def get_open_orders_clicked():
+
+    print("read orders clicked")
+    app.readOrders()
 
 def initialize():
     global tradelog, tradelist
