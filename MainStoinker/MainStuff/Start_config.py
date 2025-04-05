@@ -11,6 +11,7 @@ LiveData = True
 LiveTrading = False
 #once trade excecution is figured out we should be able to get rid of one of these variables
 
+#Apiapi debug
 Debug = False
 
 #Frontend Variables

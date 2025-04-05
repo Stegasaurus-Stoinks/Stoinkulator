@@ -227,7 +227,7 @@ class Algo(ParentAlgo):
         # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)
         # use self.RRRatio
 
-        self.trade.create_tp(self.tp)
+        self.trade.create_tp(self.tp,10)
 
         self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
         self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
