@@ -39,9 +39,9 @@ class Trade:
         # setting hardcoded emergency stoploss. Can be changed with functions
         # set trailingPercent to be the exact amount above or below 1 for equations
         if self.direction:
-            trailingPercent = 1 - 0.05
+            trailingPercent = 1 - 0.01
         else:
-            trailingPercent = 1 + 0.05
+            trailingPercent = 1 + 0.01
         self.stopPrice = round(openPrice * (trailingPercent), 2)
         self.stopDelta = abs(openPrice - self.stopPrice)
         
@@ -179,10 +179,10 @@ class Trade:
         result = 1
         price = curpoint[value]
         if config.LiveTrading:
-            self.logger.debug(str(self.tradeID)+" - printing open orders, looking for "+str(self.stoplossId))
+            self.logger.debug(str(self.tradeID)+" - printing open orders, looking for "+str(self.stopOrder.orderId))
             self.logger.debug(str(self.tradeID)+" - "+str(self.ibape.all_openorders))
-            if self.stoplossId in self.ibape.all_openorders.index:
-                if self.ibape.all_openorders.loc[self.stoplossId,'OrderState'] == 'Filled':
+            if self.stopOrder.orderId in self.ibape.all_openorders.index:
+                if self.ibape.all_openorders.loc[self.stopOrder.orderId,'OrderState'] == 'Filled':
                     return 0
             else:
                 self.logger.info(str(self.tradeID)+" - Position has been closed by TWS stoploss: ")
@@ -273,7 +273,7 @@ class Trade:
         if config.LiveTrading:
             self.stopOrder.auxPrice = price
             self.logger.debug(str(self.tradeID)+" - updating auxPrice for "+str(self.symbol)+": " + str(self.stopOrder.auxPrice))
-            self.ibape.placeOrder(self.stoplossId,self.contract,self.stopOrder)
+            self.ibape.placeOrder(self.stopOrder.orderId,self.contract,self.stopOrder)
 
     def set_stopDelta(self, value):
         self.stopDelta = value
@@ -351,7 +351,7 @@ class Trade:
         data = {
             'symbol' : self.symbol,
             'ID' : self.tradeID,
-            'stoplossID' : self.stoplossId,
+            'stoplossID' : self.stopOrder.orderId,
             'volume' : self.volume,
             'openPrice' : self.openPrice,
             'openTime' : self.openTime,

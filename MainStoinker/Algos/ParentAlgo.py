@@ -77,17 +77,12 @@ class ParentAlgo:
         
         return newTrade
     
-    def close_trade(self, volume, trend):
-        self.logger.debug("***opening trade***")
-        enterPrice = self.curStockData['close']
-        enterTime = self.curStockData['date']
-        tradeid = str(self.name) + str(len(self.trades))
-        newTrade = Trade(self.ticker, volume, tradeid, enterPrice, enterTime, trend, self.logger)
+    def close_trade(self):
+        self.logger.debug("***closing trade***")
+        self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
 
-        self.inTrade = True
-        self.trades.append(newTrade)
-        
-        return newTrade
+        self.inTrade = False
+        #TODO Append close data, simmed close time + simmed price
 
     def update_frontend(self):
 

@@ -61,7 +61,7 @@ class Algo(ParentAlgo):
                 #change stoploss to fixed type and set price
                 stopPrice = (self.curStockData['close'] - 1.00)
                 self.trade.set_stopLossType('Fixed')
-                self.trade.update_stoploss_price(stopPrice)
+                self.trade.set_stopPrice(stopPrice)
                 self.trade.create_tp(tp, 10)
 
                 self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
