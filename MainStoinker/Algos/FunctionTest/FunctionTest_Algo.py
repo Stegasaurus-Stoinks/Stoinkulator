@@ -38,6 +38,7 @@ class Algo(ParentAlgo):
         # setup that needs to be done in every algo is done here
         super().pre_update(StockData)
         self.logger.debug("i = "+str(self.i))
+        self.logger.debug("In trade: " + str(self.inTrade))
 
         # setting mins and maxs for plotting 
         self.AlgoData['mins'] = StockData.iloc[argrelextrema(StockData.close.values, np.less_equal, order=self.order)[0]]['close']
@@ -45,16 +46,18 @@ class Algo(ParentAlgo):
         
         tp = self.curStockData['close'] + 3.00
         stopPrice = (self.curStockData['close'] - 1.00)
-
+        if self.i >= 10:
+            self.i = 0
+            
         if (self.inTrade):
-            self.trade.update_stoploss_price(stopPrice)
+            self.trade.set_stopPrice(stopPrice)
             
             self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
             self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
             self.AlgoData.at[self.AlgoData.index[-1],'tp'] = tp
-            if (self.i == 3):
-                self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
-                self.i = 0
+            if (self.i >= 7):
+                self.close_trade()
+                
         else:
             if (self.i == 1):
                 self.trade = self.open_trade(10, 1)

@@ -1,6 +1,6 @@
 from MainStoinker.Util.IBKRHelper import *
 #needs to be changed back to #import MainStoinker.MainStuff.Start_config as config
-import testyconfig as config
+import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.DataCollection.apiApi import IBapi
 import pandas as pd
 import MainStoinker.MainStuff.main_utils as utils
@@ -123,7 +123,6 @@ class Trade:
         self.closeTime = closeTime
 
         #call funtion to close order through api
-        # TODO: close stoploss position here too
 
         if config.LiveTrading:
             if self.direction:
@@ -132,7 +131,7 @@ class Trade:
                 else:
                     self.parentCloseOrder = sell_order_object(self.volume)
 
-                    print("sell order created")
+                    self.logger.debug("sell order created in trade object")
 
             else:
                 if self.limitOrder:

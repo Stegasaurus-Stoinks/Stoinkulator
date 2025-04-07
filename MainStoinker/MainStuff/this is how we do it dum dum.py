@@ -75,7 +75,7 @@ if not config.offline:
         eventDict[0] = threading.Event()
 
 
-    #verify connection has read/write capabilities
+    #verify connection has read/write capabilities 
     if not app.getNextOrderID():
         print("Something wrong with connection (no response from TWS)")
         print("Shutting Down...")

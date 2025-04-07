@@ -52,7 +52,7 @@ class ParentAlgo:
         # run checks against stop and tp if applicable
         if(self.inTrade == True):
             tpCheck = 17
-            if (self.tp != 0):
+            if (self.trade.tp != 0):
                 tpCheck = self.trade.check_tp(self.curStockData)
             stopCheck = self.trade.check_stoploss(self.curStockData)
             if (tpCheck == 1 or stopCheck == 0):
@@ -71,7 +71,6 @@ class ParentAlgo:
         enterTime = self.curStockData['date']
         tradeid = str(self.name) + str(len(self.trades))
         newTrade = Trade(self.ticker, volume, tradeid, enterPrice, enterTime, trend, self.logger)
-
         self.inTrade = True
         self.trades.append(newTrade)
         
