@@ -16,6 +16,8 @@ from MainStoinker.NeatTools.decorators import singleton
 import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.Util.SocketIO_Client import FrontEndClient as Sio
 
+from MainStoinker.DataCollection.ExecutionsLogger import ExecutionLog
+
 import numpy as np
 import pandas as pd
 
@@ -43,8 +45,8 @@ class IBapi(TestWrapper, TestClient):
         self.all_positions = pd.DataFrame([], columns = ['Account','Symbol', 'Quantity', 'Average Cost', 'Sec Type'])
         self.all_accounts = pd.DataFrame([], columns = ['reqId','Account', 'Tag', 'Value' , 'Currency'])
         self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
-        self.all_completed_orders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
         # self.all_executions = pd.DataFrame([], columns = ['reqId', 'Price'])
+        self.executions_log = ExecutionLog()
 
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
@@ -152,6 +154,8 @@ class IBapi(TestWrapper, TestClient):
 
             if(config.LiveData):
                 self.reqHistoricalData(ticker.index, contract, "", str(warmup) + " D", "1 min", "TRADES", 1, 2, True, [])
+                self.readExecutions()
+                self.readCompletedOrders()
                 
 
             else:
@@ -287,7 +291,7 @@ class IBapi(TestWrapper, TestClient):
         #     "TotalQty:", (order.totalQuantity), "CashQty:", (order.cashQty), 
         #     "LmtPrice:", (order.lmtPrice), "AuxPrice:", (order.auxPrice), "Status:", orderState.status,
         #     "MinCompeteSize:", (order.minCompeteSize))
-        print('OrderId:',order.orderId,' Symbol:',contract.symbol, ' OrderType:' , order.orderType, ' Quantity:',order.totalQuantity, ' Action:',order.action, ' OrderState:',orderState.status,' SecType:',contract.secType, ' AuxPrice:',float(order.auxPrice),' LmtPrice:' ,float(order.lmtPrice))
+        # print('Open Orders Callback: OrderId:',order.orderId,' Symbol:',contract.symbol, ' OrderType:' , order.orderType, ' Quantity:',order.totalQuantity, ' Action:',order.action, ' OrderState:',orderState.status,' SecType:',contract.secType, ' AuxPrice:',float(order.auxPrice),' LmtPrice:' ,float(order.lmtPrice))
         self.all_openorders.loc[orderId]= {'Symbol':contract.symbol, 'OrderType':order.orderType, 'Quantity':order.totalQuantity, 'Action':order.action, 'OrderState':orderState.status,'SecType':contract.secType, 'AuxPrice': float(order.auxPrice),'LmtPrice': float(order.lmtPrice)}
 
     def openOrderEnd(self):
@@ -303,7 +307,6 @@ class IBapi(TestWrapper, TestClient):
 
     #Completed Orders Call/Callbacks
     def readCompletedOrders(self):
-        self.all_completed_orders = self.all_completed_orders.iloc[0:0]
         self.completed_orders_event_obj = threading.Event()
         self.reqCompletedOrders(True)
         if config.Debug:
@@ -354,8 +357,15 @@ class IBapi(TestWrapper, TestClient):
             print("error with callback for positions")
     
     def execDetails(self, reqId: int, contract: Contract, execution: Execution):
-        print("ExecDetails. Execution OrderId:", execution.orderId, "Symbol:", contract.symbol, "SecType:", contract.secType, execution)
+        # print("ExecDetails. Execution OrderId:", execution.orderId, "Symbol:", contract.symbol, "SecType:", contract.secType, execution)
         # self.all_executions.loc[orderId]= {'reqId':reqId, 'Price':execution.price}
+        print("Execution Callback Received: Adding to executions_log")
+        self.executions_log.add_execution(execution,contract)
+        #should i req completed orders here to get the rest of the info?
+        print(self.executions_log)
+        
+        
+        
 
     def execDetailsEnd(self, reqId: int):
         print("ExecDetailsEnd. ReqId:", reqId)

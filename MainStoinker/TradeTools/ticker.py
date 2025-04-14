@@ -30,7 +30,7 @@ class Ticker():
 
     def update_algos(self):
         if self.api.firstdataofminute == 1: #first time we get a minute of data:
-            self.api.readOrders()
+            # self.api.readOrders()
             self.api.firstdataofminute = 0
 
         algodata = []

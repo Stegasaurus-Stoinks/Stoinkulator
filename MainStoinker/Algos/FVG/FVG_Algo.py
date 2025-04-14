@@ -203,10 +203,7 @@ class Algo(ParentAlgo):
 
         #change stoploss to fixed type and set price
         self.trade.set_stopLossType('Fixed')
-        self.trade.update_stoploss_price(self.stoplossprice)
-
-        # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)
-        # use self.RRRatio
+        self.trade.set_stopPrice(self.stoplossprice)
 
         self.trade.create_tp(self.tp,10)
 

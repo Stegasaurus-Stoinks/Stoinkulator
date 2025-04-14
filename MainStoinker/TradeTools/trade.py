@@ -4,7 +4,7 @@ import MainStoinker.MainStuff.Start_config as config
 from MainStoinker.DataCollection.apiApi import IBapi
 import pandas as pd
 import MainStoinker.MainStuff.main_utils as utils
-import logging
+from MainStoinker.DataCollection.ExecutionsLogger import ExecutionLog
 import random
 
 class Trade:
@@ -22,19 +22,27 @@ class Trade:
         self.stoplossId = 0
         self.stopLossType = "Trailing" #Trailing or Fixed
         self.openPrice = openPrice
-        self.entryPrice = 0
-        self.entryTime = 0
-        self.tp = 0
-        
         self.openTime = openTime
+        self.closePrice = 0
+        self.closeTime = 0
         self.direction = direction
         self.limitOrder = limitOrder
-
         self.tpOrder = 0
-
+        self.tp = 0
+        
+        # TODO: need to get this data from executions of parent order
+        #these represent the actual trade price and time from ibapi
+        self.ibEntryPrice = 0
+        self.ibEntryTime = 0
+        #same for close, will be updated in some function
+        self.ibClosePrice = 0
+        self.ibCloseTime = 0
+        
         self.ocaGroupName = "oca"+str(ID)+str(random.randint(0,100))
 
         self.logger = logger
+        
+        self.executionLog = ExecutionLog()
 
         # setting hardcoded emergency stoploss. Can be changed with functions
         # set trailingPercent to be the exact amount above or below 1 for equations
@@ -77,9 +85,6 @@ class Trade:
             else:
                 self.parentOrder = sell_order_object(self.volume)
         
-        #ocaGroup
-        # self.parentOrder.ocaGroup = self.ocaGroupName
-        # self.parentOrder.ocaType = 1 #cancel all remaining orders
 
         self.ibape.getNextOrderID()
         self.parentId = self.ibape.nextValidOrderId
@@ -182,15 +187,24 @@ class Trade:
             self.logger.debug(str(self.tradeID)+" - "+str(self.ibape.all_openorders))
             if self.stopOrder.orderId in self.ibape.all_openorders.index:
                 if self.ibape.all_openorders.loc[self.stopOrder.orderId,'OrderState'] == 'Filled':
+                    self.executionLog.return_execution_details(self.stopOrder.orderId)
+                    self.logger.info("Got Execution Details for STOPLOSS that closed the trade :D")
                     return 0
+                else:
+                    self.logger.debug("OrderState for stoploss is not filled... its " + str(self.ibape.all_openorders.loc[self.stopOrder.orderId,'OrderState']))
+                    
             else:
-                self.logger.info(str(self.tradeID)+" - Position has been closed by TWS stoploss: ")
-                #TODO: ask TWS for close price + close time. populate variables in trade. probably use readExecutions
-                    # self.closePrice = closePrice
-                    # self.closeTime = closeTime
-                    # duration
-                    # profit
+                self.logger.info(str(self.tradeID)+" - StopLoss not found in Open Orders... ")
+                # We should only hit this if the order gets canceled, which means either the TP hit or we manually closed the position.
+                
+                
+                # stopOrderExecutionDetails = self.executionLog.return_execution_details(self.stopOrder.orderId)
+                # # for reference, Execution details look like this:
+                # # [OrderId, PermId, ib.Execution, ib.Contract, ib.CompletedOrder]
+                # self.closePrice = stopOrderExecutionDetails[2].price
                 return 0
+            
+            
         #stoploss check + reclaculation if necessary for either direction
         #return 1 if good 0 if bad
         if self.direction: #UP Trade
@@ -223,12 +237,12 @@ class Trade:
         if config.LiveTrading:
             if self.tpOrder:
                 print("Modifying TP order")
-                self.tpOrder.lmtPrice = tp
+                self.tpOrder.lmtPrice = self.tp
                 self.tpOrder.totalQuantity = quantity
                 self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
             else:        
                 print("Creating New TP order")
-                self.tpOrder = self.ibape.addTP(self.parentOrder, tp, quantity)
+                self.tpOrder = self.ibape.addTP(self.parentOrder, self.tp, quantity)
 
                 self.tpOrder.ocaGroup = self.ocaGroupName
                 self.tpOrder.ocaType = 2 #Remaining orders are proportionately reduced in size with block
@@ -243,6 +257,20 @@ class Trade:
     #check to see if we should take profit
     def check_tp(self, curpoint):
         result = 0
+        
+        if config.LiveTrading:
+            self.logger.debug(str(self.tradeID)+" - printing open orders, looking for "+str(self.tpOrder.orderId))
+            self.logger.debug(str(self.tradeID)+" - "+str(self.ibape.all_openorders))
+            if self.tpOrder.orderId in self.ibape.all_openorders.index:
+                if self.ibape.all_openorders.loc[self.tpOrder.orderId,'OrderState'] == 'Filled':
+                    self.executionLog.return_execution_details(self.tpOrder.orderId)
+                    self.logger.info("Got Execution Details for TAKE PROFIT that closed the trade :D")
+                    return 0
+            else:
+                self.logger.info(str(self.tradeID)+" - TP not in Open Orders... ")
+                # We should only hit this if the order gets canceled, which means either the StopLoss hit or we manually closed the position.
+ 
+            
         if self.direction:
             if curpoint['high'] > self.tp:
                 self.close_position(self.tp, curpoint['date'])
@@ -259,7 +287,7 @@ class Trade:
     
 
     def update_tp(self, tp):
-        self.create_tp(tp)
+        self.create_tp(tp,self.tpOrder.totalQuantity)
 
 
 

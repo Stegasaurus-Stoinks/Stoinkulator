@@ -50,12 +50,14 @@ class Algo(ParentAlgo):
             self.i = 0
             
         if (self.inTrade):
-            self.trade.set_stopPrice(stopPrice)
+            # tighten stoploss and tp by 10 cents every minute
+            self.trade.set_stopPrice(self.trade.stopPrice+0.1)
+            self.trade.update_tp(self.trade.tp - 0.1)
             
             self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
             self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']
             self.AlgoData.at[self.AlgoData.index[-1],'tp'] = tp
-            if (self.i >= 7):
+            if (self.i >= 8):
                 self.close_trade()
                 
         else:
