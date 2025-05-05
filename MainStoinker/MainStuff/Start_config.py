@@ -6,11 +6,12 @@ import logging
 tickers = {}
 algos = []
 loggers = ["dum_dum"]
-log_level = logging.INFO
+log_level = logging.DEBUG
 LiveData = True
-LiveTrading = False
+LiveTrading = True
 #once trade excecution is figured out we should be able to get rid of one of these variables
 
+#Apiapi debug
 Debug = False
 
 #Frontend Variables

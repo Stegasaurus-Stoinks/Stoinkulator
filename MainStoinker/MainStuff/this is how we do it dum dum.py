@@ -1,4 +1,3 @@
-import socketio
 import threading
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -76,7 +75,7 @@ if not config.offline:
         eventDict[0] = threading.Event()
 
 
-    #verify connection has read/write capabilities
+    #verify connection has read/write capabilities 
     if not app.getNextOrderID():
         print("Something wrong with connection (no response from TWS)")
         print("Shutting Down...")
@@ -84,10 +83,12 @@ if not config.offline:
         app.disconnect
         time.sleep(1)
         exit()
-
+    app.readCompletedOrders()
     app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
-else: #if offline load offline data
+
+#if offline load offline data
+else: 
     eventDict[0] = threading.Event()
     time.sleep(.5)
     print("____________________________________________")

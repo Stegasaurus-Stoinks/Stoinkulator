@@ -31,6 +31,10 @@ QUANTITY = 10
 SYMBOL = 'AAPL'
 STOPLOSS = 1
 STOPLOSS_ENABLE = 0
+PRICE = 0.00
+
+inTrade = False
+newTrade = 0
 
 #pandas dataframe for trades
 tradelog = 0
@@ -42,6 +46,7 @@ app = IBapi()
 
 root = tk.Tk()
 
+price_entry = ''
 qty_entry = ''
 ticker_entry = ''
 stoploss_entry = ''
@@ -53,9 +58,9 @@ logger = utils.create_logger("tradelogger")
 def main():
 
     initialize()
-    global qty_entry,ticker_entry,stoploss_entry,stoploss_enable
+    global qty_entry,ticker_entry,stoploss_entry,stoploss_enable,price_entry
     
-    app.connect('127.0.0.1', 7497, 123)
+    app.connect('127.0.0.1', 7497, 69)
 
     while(not app.isConnected()):
         print("TWS Connection ", str(app.isConnected()))
@@ -89,6 +94,10 @@ def main():
     account_frame.pack(padx=5, pady=5, side=tk.LEFT, fill=tk.Y)
     tk.Label(account_frame,
              text="ACCOUNT INFO"
+             ).pack(padx=50,pady=5)
+    
+    tk.Label(account_frame,
+             text="In Trade: "
              ).pack(padx=50,pady=5)
     
     #trades sub frame
@@ -141,9 +150,10 @@ def main():
     stoploss_entry.insert(tk.END,STOPLOSS)
     stoploss_entry.pack(side=tk.LEFT, pady=10)
 
-
+    button_frame = tk.Frame(trading_frame,width=590,height=300,bg="skyblue")
+    button_frame.pack(padx=5,pady=5,side=tk.RIGHT)
     # Creating a button with specified options
-    buybutton = tk.Button(trading_frame, 
+    buybutton = tk.Button(button_frame, 
                     text="Buy", 
                     command=buy_button_clicked,
                     activebackground="blue", 
@@ -166,7 +176,7 @@ def main():
                     width=15,
                     wraplength=100)
 
-    sellbutton = tk.Button(trading_frame,
+    sellbutton = tk.Button(button_frame,
                     text="Sell", 
                     command=sell_button_clicked,
                     activebackground="blue", 
@@ -188,78 +198,175 @@ def main():
                     pady=5,
                     width=15,
                     wraplength=100)
+    
+    cancelbutton = tk.Button(button_frame,
+                    text="Close Postion", 
+                    command=cancel_button_clicked,
+                    activebackground="blue", 
+                    activeforeground="white",
+                    anchor="center",
+                    bd=3,
+                    bg="lightgray",
+                    cursor="hand2",
+                    disabledforeground="gray",
+                    fg="black",
+                    font=("Arial", 12),
+                    height=2,
+                    highlightbackground="black",
+                    highlightcolor="green",
+                    highlightthickness=2,
+                    justify="center",
+                    overrelief="raised",
+                    padx=10,
+                    pady=5,
+                    width=15,
+                    wraplength=100)
 
-    buybutton.pack(padx=20, pady=20)
-    sellbutton.pack(padx=20, pady=20)
+    TPbutton = tk.Button(button_frame,
+                        text="Add/Modify Tp", 
+                        command=tp_button_clicked,
+                        activebackground="blue", 
+                        activeforeground="white",
+                        anchor="center",
+                        bd=3,
+                        bg="lightgray",
+                        cursor="hand2",
+                        disabledforeground="gray",
+                        fg="black",
+                        font=("Arial", 12),
+                        height=2,
+                        highlightbackground="black",
+                        highlightcolor="green",
+                        highlightthickness=2,
+                        justify="center",
+                        overrelief="raised",
+                        padx=10,
+                        pady=5,
+                        width=15,
+                        wraplength=100)
+
+    StopLossModifybutton = tk.Button(button_frame,
+                        text="Get Execution Details", 
+                        command=get_execution_clicked,
+                        activebackground="blue", 
+                        activeforeground="white",
+                        anchor="center",
+                        bd=3,
+                        bg="lightgray",
+                        cursor="hand2",
+                        disabledforeground="gray",
+                        fg="black",
+                        font=("Arial", 12),
+                        height=2,
+                        highlightbackground="black",
+                        highlightcolor="green",
+                        highlightthickness=2,
+                        justify="center",
+                        overrelief="raised",
+                        padx=10,
+                        pady=5,
+                        width=15,
+                        wraplength=100)
+    
+    OpenOrdersbutton = tk.Button(button_frame,
+                        text="Get Open Orders", 
+                        command=get_open_orders_clicked,
+                        activebackground="blue", 
+                        activeforeground="white",
+                        anchor="center",
+                        bd=3,
+                        bg="lightgray",
+                        cursor="hand2",
+                        disabledforeground="gray",
+                        fg="black",
+                        font=("Arial", 12),
+                        height=2,
+                        highlightbackground="black",
+                        highlightcolor="green",
+                        highlightthickness=2,
+                        justify="center",
+                        overrelief="raised",
+                        padx=10,
+                        pady=5,
+                        width=15,
+                        wraplength=100)
+    
+    CompletedOrdersbutton = tk.Button(button_frame,
+                        text="Get Completed Orders", 
+                        command=get_completedOrders_clicked,
+                        activebackground="blue", 
+                        activeforeground="white",
+                        anchor="center",
+                        bd=3,
+                        bg="lightgray",
+                        cursor="hand2",
+                        disabledforeground="gray",
+                        fg="black",
+                        font=("Arial", 12),
+                        height=2,
+                        highlightbackground="black",
+                        highlightcolor="green",
+                        highlightthickness=2,
+                        justify="center",
+                        overrelief="raised",
+                        padx=10,
+                        pady=5,
+                        width=15,
+                        wraplength=100)
+
+    buybutton.pack(padx=20, pady=5)
+    sellbutton.pack(padx=20, pady=5)
+    cancelbutton.pack(padx=20, pady=5)
+
+    price_entry = tk.Entry(button_frame)
+    price_entry.insert(tk.END,"100.00")
+    price_entry.pack(pady=5)
+
+    TPbutton.pack(padx=20,pady=5)
+    StopLossModifybutton.pack(padx=20,pady=5)
+    OpenOrdersbutton.pack(padx=20,pady=5)
+    CompletedOrdersbutton.pack(padx=20,pady=5)
+
 
     root.mainloop()
 
 def update_entry_values():
-    global SYMBOL
-    global QUANTITY
-    global STOPLOSS, STOPLOSS_ENABLE
+    global SYMBOL, QUANTITY, STOPLOSS, STOPLOSS_ENABLE, PRICE
 
     SYMBOL = ticker_entry.get()
     QUANTITY = qty_entry.get()
     STOPLOSS = stoploss_entry.get()
     STOPLOSS_ENABLE = stoploss_enable_var.get()
-
-def sell_order_object(quantity, limitPrice = None):
-    order = Order()
-    order.action = "Sell"
-    order.totalQuantity = quantity
-    if limitPrice == None:
-        order.orderType =  "MKT"
-    else:
-        order.orderType = "LMT"
-        order.lmtPrice = limitPrice
-    order.eTradeOnly = False
-    order.firmQuoteOnly = False
-
-    return order
-
-def buy_order_object(quantity, limitPrice = None):
-    order = Order()
-    order.action = "Buy"
-    order.totalQuantity = quantity
-    if limitPrice == None:
-        order.orderType =  "MKT"
-    else:       
-        order.orderType = "LMT"
-        order.lmtPrice = limitPrice
-    order.eTradeOnly = False
-    order.firmQuoteOnly = False
-    # order.adjustedStopLimitPrice = stopPrice
-
-    return order
+    PRICE = price_entry.get()
 
 def buy_button_clicked():
-    global tradelist, SYMBOL, QUANTITY, STOPLOSS, STOPLOSS_ENABLE
+    global tradelist, SYMBOL, QUANTITY, STOPLOSS, STOPLOSS_ENABLE, inTrade, newTrade, logger
     print("Buy Button clicked!")
 
     update_entry_values()
     
     if(STOPLOSS_ENABLE):
-        print("Creating Buy Trade with " + str(STOPLOSS) + "% Stoploss")
+        logger.debug("Creating Buy Trade with " + str(STOPLOSS) + "% Stoploss")
 
     else:
         STOPLOSS = 5
-        print("Creating Buy Trade with default " + str(STOPLOSS) + "% Stoploss")
+        logger.debug("Creating Buy Trade with default " + str(STOPLOSS) + "% Stoploss")
     
     symbol = SYMBOL
     volume = int(QUANTITY)
     ID = "TestyTrade#" + str(len(tradelist))
 
-    newTrade = Trade(symbol, volume, ID, 0, datetime.datetime.now(ZoneInfo("America/Los_Angeles")), 1, float(STOPLOSS)/100, logger)
+    newTrade = Trade(symbol, volume, ID, 200, datetime.datetime.now(ZoneInfo("America/Los_Angeles")), 1, logger)
 
     tradelist.append(newTrade)
 
     print(tradelist)
 
+    inTrade = True
+    
+
     # contract = create_stock_contract(symbol)
-
     # parentOrder = buy_order_object(volume)
-
     # app.placeOrder(parentId,contract,parentOrder)
 
 def sell_button_clicked():
@@ -282,6 +389,44 @@ def sell_button_clicked():
     parentOrder = sell_order_object(volume)
 
     app.placeOrder(parentId,contract,parentOrder)
+
+def cancel_button_clicked():
+    global newTrade, inTrade
+    print("Cancel Button Clicked")
+    if inTrade:
+        print("Closing Trade " + str(newTrade.tradeID))
+        newTrade.close_position(250, datetime.datetime.now(ZoneInfo("America/Los_Angeles")))
+    else:
+        print("No Open Trade.  Cant cancel something thats not open dum dum")
+    
+def tp_button_clicked():
+    global newTrade
+    update_entry_values()
+
+    print("TP Button Pressed")
+    newTrade.create_tp(PRICE,QUANTITY)
+
+def get_execution_clicked():
+    global newTrade
+    update_entry_values()
+
+    print("Get Execution Details")
+
+    # app.readCompletedOrders()
+    app.readExecutions()
+
+def get_completedOrders_clicked():
+    global newTrade
+    update_entry_values()
+
+    print("Get Completed Orders clicked")
+    app.readCompletedOrders()
+   
+
+def get_open_orders_clicked():
+
+    print("read orders clicked")
+    app.readOrders()
 
 def initialize():
     global tradelog, tradelist

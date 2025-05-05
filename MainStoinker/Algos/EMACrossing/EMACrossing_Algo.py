@@ -10,8 +10,6 @@ import numpy as np
 import pandas as pd
 import math
 
-from MainStoinker.TradeTools.trade import Trade
-
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 
 
@@ -117,17 +115,8 @@ class Algo(ParentAlgo):
 
             
             if trend:
-                print("Crossing Up!")
-                self.inTrade = True
-                enterTime = self.curStockData['date']
-                enterPrice = self.curStockData['close']
-                self.trade = 0
-                
-                self.logger.info("***opening trade on cross-up***")
-                tradeid = str(self.name) + str(len(self.trades))
-                self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, (self.stoplossPercent/100), self.logger)
-                self.trades.append(self.trade)
-                # ime.sleep(1)
+                self.logger.info("Crossing Up!")   
+                self.trade = self.open_trade(10, trend)
 
 
             else:

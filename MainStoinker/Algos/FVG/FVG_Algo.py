@@ -13,8 +13,6 @@ from enum import Enum
 
 from statemachine import StateMachine, State
 
-from MainStoinker.TradeTools.trade import Trade
-
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 
 from MainStoinker.Algos.FVG.FVG import FVG
@@ -185,10 +183,7 @@ class Algo(ParentAlgo):
 
 
     def enterFVGtrade(self,FVG):
-        self.inTrade = True
-        enterTime = self.curStockData['date']
         enterPrice = self.curStockData['close']
-        self.trade = 0
 
         if FVG.direction:
             range = enterPrice-FVG.lowerbound
@@ -204,20 +199,16 @@ class Algo(ParentAlgo):
             #sets stoploss at the opposite side of the range
             self.stoplossprice = FVG.upperbound
 
-        self.logger.info("***opening trade***")
-        tradeid = str(self.name) + str(len(self.trades))
-        self.trade = Trade(self.ticker, 10, tradeid, enterPrice, enterTime, trend, 1, self.logger)
+        self.trade = self.open_trade(10, trend)
 
         #change stoploss to fixed type and set price
-        self.trade.change_stoploss_type('Fixed')
+        self.trade.set_stopLossType('Fixed')
         self.trade.update_stoploss_price(self.stoplossprice)
-
-        self.trades.append(self.trade)
 
         # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)
         # use self.RRRatio
 
-        self.trade.create_tp(self.tp)
+        self.trade.create_tp(self.tp,10)
 
         self.AlgoData.at[self.AlgoData.index[-1],'StopPrice'] = self.trade.stopPrice
         self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = self.curStockData['close']

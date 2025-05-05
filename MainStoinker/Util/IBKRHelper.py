@@ -4,7 +4,7 @@ from ibapi.common import *
 
 def buy_order_object(quantity, limitPrice = None):
     order = Order()
-    order.action = "Buy"
+    order.action = "BUY"
     order.totalQuantity = quantity
     if limitPrice == None:
         order.orderType =  "MKT"
@@ -19,7 +19,7 @@ def buy_order_object(quantity, limitPrice = None):
 
 def sell_order_object(quantity, limitPrice = None):
     order = Order()
-    order.action = "Sell"
+    order.action = "SELL"
     order.totalQuantity = quantity
     if limitPrice == None:
         order.orderType =  "MKT"
