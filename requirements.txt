@@ -1,12 +1,12 @@
 mplfinance
-scipy==1.12.0
+scipy==1.13.1
 psycopg2
-pandas==1.5.3
+pandas==2.2.3
 numpy==1.26.4
 yfinance
 tzdata
 ./ibapi-10.30.1-py3-none-any.whl
-python-socketio
+python-socketio==5.12.1
 simplejson
 keyboard
 ./TA_Lib-0.4.20-cp39-cp39-win_amd64.whl
