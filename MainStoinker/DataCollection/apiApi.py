@@ -58,7 +58,7 @@ class IBapi(TestWrapper, TestClient):
         if(config.LiveData):
             config.tickers[reqId].append([candleData])
         else:
-            self.simulatedDatadict[reqId] = self.simulatedDatadict[reqId].append([candleData], ignore_index=True)
+            self.simulatedDatadict[reqId] = pd.concat([self.simulatedDatadict[reqId], pd.DataFrame([candleData])], ignore_index=True)
 
     # terminal callback from reqHistoricalData
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -424,8 +424,8 @@ class IBapi(TestWrapper, TestClient):
                 data = pd.read_csv(filename,usecols=['date','time', 'open','high','low','close','volume'])
                 print("Found data for " + config.tickers[ticker].name)
 
-            except:
-                print("file " + filename + " cannot be found or does not exist")
+            except (FileNotFoundError, pd.errors.ParserError) as e:
+                print(f"Error loading {filename}: {e}")
                 print("not all data cant be collected, shutting down...")
                 # TODO Filter out the algos that use the tickers that dont have data and dont run them?  could be fun
                 quit()

@@ -104,7 +104,7 @@ class ElliotImpulse(object):
             for k in range(self.x5, self.x6+1):
                 wave[k] = float(x*self.slope5) + self.y5
                 x += 1
-        except:
+        except (IndexError, ValueError):
             return(wave)
 
         return(wave)

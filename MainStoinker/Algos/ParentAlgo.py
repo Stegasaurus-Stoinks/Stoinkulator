@@ -147,7 +147,7 @@ class ParentAlgo:
         try:
             avgLoss = avgLoss/(len(self.trades)-winningTrades)
 
-        except:
+        except ZeroDivisionError:
             avgLoss = 0
 
         winRate = winningTrades/len(self.trades) * 100

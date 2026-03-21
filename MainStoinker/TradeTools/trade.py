@@ -104,7 +104,8 @@ class Trade:
             self.stopOrder.ocaType = 2 #proportial reduction
             self.stopOrder.transmit = True
             self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
-        except:
+        except Exception as e:
+            self.logger.warning(f"OCA group setup failed, falling back to basic stoploss: {e}")
             self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
             self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
 

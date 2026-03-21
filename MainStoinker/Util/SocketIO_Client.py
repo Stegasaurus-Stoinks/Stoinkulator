@@ -20,8 +20,8 @@ class FrontEndClient:
             self.sio.connect('http://'+config.FrontEndPort)
             self.sio.wait()
 
-        except:
-            print("Connecting to Front End (Socketio) failed")
+        except Exception as e:
+            print(f"Connecting to Front End (Socketio) failed: {e}")
 
     def call_backs(self):
         @self.sio.on('message2')
@@ -125,5 +125,5 @@ class FrontEndClient:
         # print(parsed_json)
         try:
             self.sio.emit('config_send', parsed_json)
-        except:
-            print("Cant send Config, /Not connected to front end")
+        except Exception as e:
+            print(f"Cant send Config, not connected to front end: {e}")
