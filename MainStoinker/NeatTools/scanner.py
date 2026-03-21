@@ -18,8 +18,9 @@ def scanner(num = 0, signal = '', filter = {'Exchange':'NASDAQ','Index':'S&P 500
         else:
             return(df.head(num))
 
-    except:
-        print("No results or there was an Error")
+    except Exception as e:
+        print(f"Scanner error: {e}")
+        return pd.DataFrame()
     
     #stock = finvizfinance('tsla')
     #print(stock.TickerDescription())
