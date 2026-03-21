@@ -14,6 +14,18 @@ LiveTrading = True
 #Apiapi debug
 Debug = False
 
+# TWS Connection Settings
+TWS_HOST = '127.0.0.1'
+TWS_PORT = 7497
+TWS_CLIENT_ID = 123
+
+# API Timeouts (seconds)
+TIMEOUT_ORDER_ID = 5
+TIMEOUT_POSITIONS = 2
+TIMEOUT_ORDERS = 2
+TIMEOUT_COMPLETED_ORDERS = 2
+TIMEOUT_EXECUTIONS = 15
+
 #Frontend Variables
 FrontEndDisplay = False
 FrontEndPort = '24.56.52.6:3000' # '192.168.1.108:3000'  # 

@@ -202,8 +202,7 @@ class IBapi(TestWrapper, TestClient):
         self.reqIds(-1)
         if config.Debug:
             print("waiting for getNextOrderID thread")
-        timeout = 5
-        flag = self.event_obj.wait(timeout)
+        flag = self.event_obj.wait(config.TIMEOUT_ORDER_ID)
         if flag:
             if config.Debug:
                 print("getNextOrderID Event Triggered, This means it worked")
@@ -234,8 +233,7 @@ class IBapi(TestWrapper, TestClient):
         if config.Debug:
             print("Waiting for IB's API response for accounts positions requests...")
         # time.sleep(3)
-        timeout = 2
-        flag = self.positions_event_obj.wait(timeout)
+        flag = self.positions_event_obj.wait(config.TIMEOUT_POSITIONS)
         if flag:
             current_positions = self.all_positions # associated callback: position
             # dont know why i cant shift the index of the array, adding line below breaks stuff :(
@@ -271,8 +269,7 @@ class IBapi(TestWrapper, TestClient):
         if config.Debug:
             print("Waiting for IB's API response for accounts positions requests...")
         # time.sleep(3)
-        timeout = 2
-        flag = self.orders_event_obj.wait(timeout)
+        flag = self.orders_event_obj.wait(config.TIMEOUT_ORDERS)
         if flag:
             # print(self.all_openorders)
             pass
@@ -309,8 +306,7 @@ class IBapi(TestWrapper, TestClient):
         if config.Debug:
             print("Waiting for IB's API response for completed orders requests...")
         # time.sleep(3)
-        timeout = 2
-        flag = self.completed_orders_event_obj.wait(timeout)
+        flag = self.completed_orders_event_obj.wait(config.TIMEOUT_COMPLETED_ORDERS)
         if flag:
             # print(self.all_openorders)
             pass
@@ -345,8 +341,7 @@ class IBapi(TestWrapper, TestClient):
         if config.Debug:
             print("Waiting for IB's API response for accounts positions requests...")
         # time.sleep(3)
-        timeout = 15
-        flag = self.executions_event_obj.wait(timeout)
+        flag = self.executions_event_obj.wait(config.TIMEOUT_EXECUTIONS)
         if flag:
             # print(self.all_executions)
             print("successful read executions flag")

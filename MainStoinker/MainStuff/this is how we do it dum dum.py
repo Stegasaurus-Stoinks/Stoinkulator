@@ -1,4 +1,3 @@
-import threading
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
@@ -51,7 +50,7 @@ if config.FrontEndDisplay:
 
 if not config.offline:
 
-    app.connect('127.0.0.1', 7497, 123)
+    app.connect(config.TWS_HOST, config.TWS_PORT, config.TWS_CLIENT_ID)
 
     while(not app.isConnected()):
         print("TWS Connection: ", str(app.isConnected()))
