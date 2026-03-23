@@ -5,7 +5,6 @@ import talib as ta
 import time
 from enum import Enum
 
-from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
 from MainStoinker.Algos.Elliot import ElliotImpulse
 from MainStoinker.Algos.Elliot import ElliotFuncs_new as ElliotFuncs

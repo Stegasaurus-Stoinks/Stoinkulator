@@ -21,7 +21,7 @@ from ibapi.order import Order
 from ibapi.common import *
 
 import MainStoinker.MainStuff.main_utils as utils
-from MainStoinker.DataCollection.apiApi import IBapi
+from MainStoinker.DataCollection.apiApi import ibapi as app
 from MainStoinker.Util.IBKRHelper import *
 from trade_copy import Trade
 
@@ -42,7 +42,7 @@ tradelog = 0
 trades = [1,2,3,4,5]
 tradesfrontend = []
 
-app = IBapi()
+# app is the module-level ibapi instance imported above
 
 root = tk.Tk()
 

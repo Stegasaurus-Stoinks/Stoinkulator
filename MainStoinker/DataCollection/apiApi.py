@@ -12,9 +12,9 @@ import simplejson
 
 from MainStoinker.Util.IBKRHelper import *
 
-from MainStoinker.NeatTools.decorators import singleton
-import MainStoinker.MainStuff.Start_config as config
-from MainStoinker.Util.SocketIO_Client import FrontEndClient as Sio
+from MainStoinker.MainStuff import Globals
+from MainStoinker.MainStuff.Globals import config
+from MainStoinker.Util.SocketIO_Client import frontend_client
 
 import numpy as np
 import pandas as pd
@@ -30,13 +30,12 @@ class TestClient(EClient):
     def __init__(self, wrapper):
         EClient.__init__(self, wrapper)
 
-@singleton
 class IBapi(TestWrapper, TestClient):
-    
+
     def __init__(self):
         # EWrapper.__init__(self)
         # EClient.__init__(self, wrapper=self)
-        self.socket = Sio()
+        self.socket = frontend_client
         TestWrapper.__init__(self)
         TestClient.__init__(self, wrapper=self)
         print("initializing new object")
@@ -56,7 +55,7 @@ class IBapi(TestWrapper, TestClient):
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume]
 
         if(config.LiveData):
-            config.tickers[reqId].append([candleData])
+            Globals.tickers[reqId].append([candleData])
         else:
             self.simulatedDatadict[reqId] = pd.concat([self.simulatedDatadict[reqId], pd.DataFrame([candleData])], ignore_index=True)
 
@@ -66,7 +65,7 @@ class IBapi(TestWrapper, TestClient):
         print("HistoricalDataEnd. ReqId:", reqId, "from", start, "to", end)
         
         if(config.LiveData):
-            print(config.tickers[reqId].data)
+            print(Globals.tickers[reqId].data)
             print("All Historical Data Collected: Live Data Starting Now...")
             # nothing else is needed here because historical data was set to keep live data
             
@@ -98,7 +97,7 @@ class IBapi(TestWrapper, TestClient):
 
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):           # Live Data Updates
-        ticker = config.tickers[reqId]
+        ticker = Globals.tickers[reqId]
         candleData = [datetime.fromtimestamp(int(bar.date)),int(bar.date), bar.open, bar.high, bar.low, bar.close, bar.volume]
 
         # is it intraminute?
@@ -411,13 +410,13 @@ class IBapi(TestWrapper, TestClient):
             print("Error. Id: " , reqId, " Code: " , errorCode , " Msg: " , errorString)
 
     def load_offline_data(self):
-        for ticker in config.tickers:
+        for ticker in Globals.tickers:
             # print("looking for data for " + tickername)
-            filename = "./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_"
+            filename = "./OfflineData/_" + str(Globals.tickers[ticker].name) + "_offlinedata_"
             # pd.read_csv(filename2)
             try:
                 data = pd.read_csv(filename,usecols=['date','time', 'open','high','low','close','volume'])
-                print("Found data for " + config.tickers[ticker].name)
+                print("Found data for " + Globals.tickers[ticker].name)
 
             except (FileNotFoundError, pd.errors.ParserError) as e:
                 print(f"Error loading {filename}: {e}")
@@ -434,7 +433,7 @@ class IBapi(TestWrapper, TestClient):
 
             firstDate = self.simulatedDatadict[reqId].at[0,'date']
             startDate = firstDate + timedelta(days=self.warmup)
-            config.tickers[reqId].data = data.loc[(data['date'] < startDate)]
+            Globals.tickers[reqId].data = data.loc[(data['date'] < startDate)]
 
             print("Warmup Start Date: " + str(firstDate))
             print("Warmup End Date: " + str(startDate))
@@ -448,4 +447,7 @@ class IBapi(TestWrapper, TestClient):
 
         print("------All Historical Data Collected------")
         self.eventDict[0].set()
-        
+
+
+# Module-level instance
+ibapi = IBapi()

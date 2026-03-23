@@ -1,9 +1,8 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from MainStoinker.NeatTools.decorators import singleton
 
-from MainStoinker.DataCollection.apiApi import IBapi
+from MainStoinker.DataCollection.apiApi import ibapi as app
 from datetime import datetime
 from enum import Enum
 
@@ -11,11 +10,12 @@ import threading
 import time
 import keyboard
 import os
-import MainStoinker.MainStuff.Start_config as config
+from MainStoinker.MainStuff import Globals
+from MainStoinker.MainStuff.Globals import config
 import main_utils as utils
 import logging
 
-from MainStoinker.Util.SocketIO_Client import FrontEndClient
+from MainStoinker.Util.SocketIO_Client import frontend_client as websock
 
 # check for config errors before doing anything else
 utils.check_valid_config()
@@ -32,16 +32,10 @@ logger.info("---------------------Starting Program----------------------")
 logger.info("___________________________________________________________\n")
 AlgoList = utils.algo_config_parse()
 print(AlgoList)
-print(config.algos)
-print(config.tickers) 
+print(Globals.algos)
+print(Globals.tickers) 
 
-# if not config.offline:
-app = IBapi()
-
-
-
-    
-websock = FrontEndClient()
+# app and websock are module-level instances imported above
 if config.FrontEndDisplay:
     wst = threading.Thread(target=websock.connect_websocket,daemon=True)
     wst.start()
@@ -63,11 +57,11 @@ if not config.offline:
 
 
     if config.LiveData:
-        for ticker in config.tickers.values():
+        for ticker in Globals.tickers.values():
             eventDict[ticker.index] = threading.Event()
 
         for index, event in eventDict.items():
-            event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True, name=config.tickers[index].name)
+            event_thread = threading.Thread(target=utils.event_loop, args=(event, index,), daemon=True, name=Globals.tickers[index].name)
             event_thread.start()
 
     else:
@@ -83,7 +77,7 @@ if not config.offline:
         time.sleep(1)
         exit()
     app.readCompletedOrders()
-    app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
+    app.startData(Globals.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
 
 #if offline load offline data
@@ -94,7 +88,7 @@ else:
     print("Setting up offline thread...")
     print("Loading offline data for tickers from CSV...")
     print("")
-    app.startData(config.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
+    app.startData(Globals.tickers,AlgoList,2,eventDict,config.Duration) # Backtesting
 
 
 # backtesting loop
@@ -104,9 +98,9 @@ if not config.LiveData:
     # collect offline data if configured to do so
     if(config.collectofflinedata):
         print(app.simulatedDatadict)
-        for ticker in config.tickers:
+        for ticker in Globals.tickers:
             tickerdf = app.simulatedDatadict[ticker]
-            tickerdf.to_csv("./OfflineData/_" + str(config.tickers[ticker].name) + "_offlinedata_")
+            tickerdf.to_csv("./OfflineData/_" + str(Globals.tickers[ticker].name) + "_offlinedata_")
     
     utils.backtesting_data_blast()
     eventDict[0].clear()
@@ -121,7 +115,7 @@ keyboard.wait('Delete')
 
 utils.get_algo_data()
 
-config.updating = 0
+Globals.updating = 0
 
 logger.info("___________________________________________________________")
 logger.info("------------------Closing Program...-----------------------")

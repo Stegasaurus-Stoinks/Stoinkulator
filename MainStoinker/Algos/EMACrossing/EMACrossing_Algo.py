@@ -4,7 +4,6 @@ from datetime import timedelta
 import talib as ta
 import time
 
-from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
@@ -21,8 +20,6 @@ class Algo(ParentAlgo):
         #Initialize Algo with unique data from Algo Config
         self.short = int(algoConfigData['short'])
         self.long = int(algoConfigData['long'])
-
-        self.ibape = IBapi()
 
         #Data to send to the frontend
         self.FrontEndDataStruct = ['MA20','MA50','StopPrice',"Trade"]

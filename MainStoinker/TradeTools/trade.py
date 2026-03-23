@@ -1,7 +1,6 @@
 from MainStoinker.Util.IBKRHelper import *
-#needs to be changed back to #import MainStoinker.MainStuff.Start_config as config
-import MainStoinker.MainStuff.Start_config as config
-from MainStoinker.DataCollection.apiApi import IBapi
+from MainStoinker.MainStuff.Globals import config
+from MainStoinker.DataCollection.apiApi import ibapi
 import pandas as pd
 import MainStoinker.MainStuff.main_utils as utils
 import logging
@@ -15,7 +14,6 @@ class Trade:
     #used for tracking entry discrpencies since we are going to start with market orders and not limit orders
 
     def __init__(self, symbol, volume, ID, openPrice, openTime, direction, logger, limitOrder = False):
-        self.ibape = IBapi()
         self.symbol = symbol
         self.volume = volume
         self.tradeID = ID
@@ -81,8 +79,8 @@ class Trade:
         # self.parentOrder.ocaGroup = self.ocaGroupName
         # self.parentOrder.ocaType = 1 #cancel all remaining orders
 
-        self.ibape.getNextOrderID()
-        self.parentId = self.ibape.nextValidOrderId
+        ibapi.getNextOrderID()
+        self.parentId = ibapi.nextValidOrderId
 
         # "20200923 15:13:20 EST"
         #TODO Fix time error, IBKR not happy with Timezone format
@@ -94,20 +92,20 @@ class Trade:
         self.logger.debug("Open Order ID: "+ str(self.parentId))
         self.parentOrder.orderId = self.parentId
         
-        self.ibape.placeOrder(self.parentId,self.contract,self.parentOrder)
+        ibapi.placeOrder(self.parentId,self.contract,self.parentOrder)
 
         #set stoploss
         #TODO Move into addstoploss pass group name
         try:
-            self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
+            self.stopOrder = ibapi.addStoploss(self.parentOrder, self.stopPrice)
             self.stopOrder.ocaGroup = self.ocaGroupName
             self.stopOrder.ocaType = 2 #proportial reduction
             self.stopOrder.transmit = True
-            self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
+            ibapi.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
         except Exception as e:
             self.logger.warning(f"OCA group setup failed, falling back to basic stoploss: {e}")
-            self.stopOrder = self.ibape.addStoploss(self.parentOrder, self.stopPrice)
-            self.ibape.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
+            self.stopOrder = ibapi.addStoploss(self.parentOrder, self.stopPrice)
+            ibapi.placeOrder(self.stopOrder.orderId, self.contract, self.stopOrder)
 
         self.logger.debug("Stoploss OrderId:" + str(self.stopOrder.orderId))
 
@@ -145,12 +143,12 @@ class Trade:
 
             #oca group handles the closing of the stoploss
             # self.logger.debug("StopLoss Order Id: "+str(self.stoplossId))
-            # self.ibape.cancelOrder(self.stoplossId)
+            # ibapi.cancelOrder(self.stoplossId)
             
-            self.ParentCloseId = self.ibape.getNextOrderID()
+            self.ParentCloseId = ibapi.getNextOrderID()
             self.parentCloseOrder.orderId = self.ParentCloseId
             self.logger.debug("Parent Close Order ID " + str(self.ParentCloseId))
-            self.ibape.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
+            ibapi.placeOrder(self.ParentCloseId,self.contract,self.parentCloseOrder)
 
             self.position = False
             self.status = "Closed"
@@ -180,9 +178,9 @@ class Trade:
         price = curpoint[value]
         if config.LiveTrading:
             self.logger.debug(str(self.tradeID)+" - printing open orders, looking for "+str(self.stopOrder.orderId))
-            self.logger.debug(str(self.tradeID)+" - "+str(self.ibape.all_openorders))
-            if self.stopOrder.orderId in self.ibape.all_openorders.index:
-                if self.ibape.all_openorders.loc[self.stopOrder.orderId,'OrderState'] == 'Filled':
+            self.logger.debug(str(self.tradeID)+" - "+str(ibapi.all_openorders))
+            if self.stopOrder.orderId in ibapi.all_openorders.index:
+                if ibapi.all_openorders.loc[self.stopOrder.orderId,'OrderState'] == 'Filled':
                     return 0
             else:
                 self.logger.info(str(self.tradeID)+" - Position has been closed by TWS stoploss: ")
@@ -226,16 +224,16 @@ class Trade:
                 print("Modifying TP order")
                 self.tpOrder.lmtPrice = tp
                 self.tpOrder.totalQuantity = quantity
-                self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
+                ibapi.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
             else:        
                 print("Creating New TP order")
-                self.tpOrder = self.ibape.addTP(self.parentOrder, tp, quantity)
+                self.tpOrder = ibapi.addTP(self.parentOrder, tp, quantity)
 
                 self.tpOrder.ocaGroup = self.ocaGroupName
                 self.tpOrder.ocaType = 2 #Remaining orders are proportionately reduced in size with block
 
                 self.tpOrderId = self.tpOrder.orderId
-                self.ibape.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
+                ibapi.placeOrder(self.tpOrderId, self.contract, self.tpOrder)
 
 
         print("TP set to ", self.tp)
@@ -273,7 +271,7 @@ class Trade:
         if config.LiveTrading:
             self.stopOrder.auxPrice = price
             self.logger.debug(str(self.tradeID)+" - updating auxPrice for "+str(self.symbol)+": " + str(self.stopOrder.auxPrice))
-            self.ibape.placeOrder(self.stopOrder.orderId,self.contract,self.stopOrder)
+            ibapi.placeOrder(self.stopOrder.orderId,self.contract,self.stopOrder)
 
     def set_stopDelta(self, value):
         self.stopDelta = value

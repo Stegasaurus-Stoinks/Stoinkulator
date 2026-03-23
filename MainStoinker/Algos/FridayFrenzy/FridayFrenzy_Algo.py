@@ -4,7 +4,6 @@ from datetime import timedelta
 import talib as ta
 import time
 
-from MainStoinker.DataCollection.apiApi import IBapi
 import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
@@ -28,7 +27,6 @@ class Algo(ParentAlgo):
     def __init__(self, algoConfigData):
         super().__init__(algoConfigData)
 
-        self.ibape = IBapi()
         #algo_config
         self.RRRatio = float(algoConfigData['RRRatio'])
 

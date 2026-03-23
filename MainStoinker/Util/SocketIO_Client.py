@@ -1,10 +1,10 @@
 import socketio
-import MainStoinker.MainStuff.Start_config as config
+from MainStoinker.MainStuff import Globals
+from MainStoinker.MainStuff.Globals import config
 import json
 import simplejson
-from MainStoinker.NeatTools.decorators import singleton
 
-@singleton
+
 class FrontEndClient:
 
     
@@ -33,11 +33,11 @@ class FrontEndClient:
 
         @self.sio.on('start_update')
         def on_message(data):
-            config.updating = 1
+            Globals.updating = 1
 
         @self.sio.on('stop_update')
         def on_message(data):
-            config.updating = 0
+            Globals.updating = 0
         
         @self.sio.on('req_config')
         def on_message(data):
@@ -48,15 +48,15 @@ class FrontEndClient:
             tickerfulldata = []
             algofulldata = []
 
-            for i in range(len(config.algos)):
-                Fulldata = config.algos[i].update_frontend_fulldata()
+            for i in range(len(Globals.algos)):
+                Fulldata = Globals.algos[i].update_frontend_fulldata()
                 algofulldata.append(Fulldata)
 
             # print(algofulldata)
 
-            for i in range(len(config.tickers)):
+            for i in range(len(Globals.tickers)):
                 Fulldata = self.get_data_json(i)
-                tickerfulldata.append({'ticker': config.tickers[i].name, 'data':Fulldata})
+                tickerfulldata.append({'ticker': Globals.tickers[i].name, 'data':Fulldata})
 
             print("Sending Fulldata")
 
@@ -95,7 +95,7 @@ class FrontEndClient:
 
 
     def get_data_json(self, index:int):
-        result = config.tickers[index].data.to_json(orient="records")
+        result = Globals.tickers[index].data.to_json(orient="records")
         # print(result)
         return(result)
     
@@ -127,3 +127,7 @@ class FrontEndClient:
             self.sio.emit('config_send', parsed_json)
         except Exception as e:
             print(f"Cant send Config, not connected to front end: {e}")
+
+
+# Module-level instance
+frontend_client = FrontEndClient()

@@ -1,14 +1,15 @@
 mplfinance
-scipy==1.13.1
+scipy
 psycopg2
-pandas==2.2.3
-numpy==1.26.4
+pandas
+numpy
 yfinance
 tzdata
-./ibapi-10.30.1-py3-none-any.whl
-python-socketio==5.12.1
+./ibapi-10.37.2-py3-none-any.whl
+python-socketio
 simplejson
 keyboard
-./TA_Lib-0.4.20-cp39-cp39-win_amd64.whl
+TA-Lib
 python-statemachine
-# pip install -e . 
+./ta_lib-0.6.8-cp314-cp314-win_amd64.whl
+# pip install -e .

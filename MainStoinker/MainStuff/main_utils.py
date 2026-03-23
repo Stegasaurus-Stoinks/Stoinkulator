@@ -1,7 +1,8 @@
-import MainStoinker.MainStuff.Start_config as config
-from MainStoinker.Util.SocketIO_Client import FrontEndClient as sio
+from MainStoinker.MainStuff import Globals
+from MainStoinker.MainStuff.Globals import config
+from MainStoinker.Util.SocketIO_Client import frontend_client
 import simplejson
-from MainStoinker.DataCollection.apiApi import IBapi
+from MainStoinker.DataCollection.apiApi import ibapi
 from datetime import datetime
 import time
 import importlib
@@ -16,8 +17,8 @@ import pandas as pd
 def event_loop(event, index):
     while(not event.is_set()):
         event.wait()
-        # print("Event called for " + config.tickers[index].name)
-        config.tickers[index].update_algos()
+        # print("Event called for " + Start_config.tickers[index].name)
+        Globals.tickers[index].update_algos()
         event.clear()
 
 
@@ -55,9 +56,9 @@ def algo_config_parse():
             
             if ticker is None:
                 # create ticker object
-                ticker = Ticker(tickerName, config.tickerIndex)
+                ticker = Ticker(tickerName, Globals.tickerIndex)
                 tickerDict[tickerName] = ticker
-                config.tickerIndex += 1
+                Globals.tickerIndex += 1
                 configTickerDict[ticker.index] = ticker
             
             
@@ -72,8 +73,8 @@ def algo_config_parse():
     # print(algolist) # list of all the unique algos
     # print(tickerlist) # list of all the unique tickers
     # print(parsed_json) # all the data from json file
-    config.tickers = configTickerDict
-    config.algos = algoObjectList
+    Globals.tickers = configTickerDict
+    Globals.algos = algoObjectList
 
     return algoObjectList
 
@@ -88,38 +89,36 @@ def algo_starter(algo, data):
 
 def backtesting_data_blast():
     print("---Simulated Live Data Starting Now...---")
-    ibape = IBapi()
-    simulatedDatadict = ibape.simulatedDatadict
-    socket = sio()
+    simulatedDatadict = ibapi.simulatedDatadict
 
     #TODO: MOVE FRONT END STUFF SOMEWHERE ELSE
     if config.FrontEndDisplay:
         tickerfulldata = []
-        socket.Config_send()
-        for i in range(len(config.tickers)):
+        frontend_client.Config_send()
+        for i in range(len(Globals.tickers)):
             Fulldata = get_data_json(index = i)
-            tickerfulldata.append({'ticker': config.tickers[i].name, 'data':Fulldata})
+            tickerfulldata.append({'ticker': Globals.tickers[i].name, 'data':Fulldata})
         print("Sending Fulldata")
-        try: 
+        try:
             # self.socket.emit('update_send',{)
             payload = {"tickerdata":tickerfulldata}
             payload = simplejson.dumps(payload, ignore_nan=True)
             # print(payload)
-            socket.sio.emit('data_send',payload)
-        except Exception as e: 
+            frontend_client.sio.emit('data_send',payload)
+        except Exception as e:
             print(e)
 
 
-    startpoint = config.tickers[0].data.shape[0]
-    numpoints = simulatedDatadict[config.tickers[0].index].shape[0] - startpoint
+    startpoint = Globals.tickers[0].data.shape[0]
+    numpoints = simulatedDatadict[Globals.tickers[0].index].shape[0] - startpoint
 
 
     starttime = datetime.now()
     #for every point collected during backtesting
     for k in range(numpoints):
         #for all tickers in list
-        for ticker in config.tickers.values():
-            while(not config.updating):
+        for ticker in Globals.tickers.values():
+            while(not Globals.updating):
                 time.sleep(1)
             try:
                 entry = simulatedDatadict[ticker.index].iloc[startpoint+k]
@@ -132,7 +131,7 @@ def backtesting_data_blast():
         
         # loop through tickers and update algos
         # we do this separate to get all data for minute first and then analyze
-        for ticker in config.tickers.values():
+        for ticker in Globals.tickers.values():
             ticker.update_algos()
 
 
@@ -151,14 +150,14 @@ def backtesting_data_blast():
     print("___________________________________________________________")
 
 def get_data_json(index):
-    result = config.tickers[index].data.to_json(orient="records")
+    result = Globals.tickers[index].data.to_json(orient="records")
     # print(result)
     return(result)
 
 # Grabs all algo data from all tickers and makes big ole df and sends it to a file
 def get_algo_data():
     temparray = []
-    for ticker in config.tickers.values():
+    for ticker in Globals.tickers.values():
             temparray.append(ticker.save_algos())
             pd.concat(temparray).to_csv('algo.csv')
 

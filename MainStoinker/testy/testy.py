@@ -7,7 +7,7 @@
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from MainStoinker.DataCollection.apiApi import IBapi
+from MainStoinker.DataCollection.apiApi import ibapi as app
 import time
 import threading
 import keyboard
@@ -30,7 +30,7 @@ STOPLOSS_ENABLE = 0
 trades = [1,2,3,4,5]
 tradesfrontend = []
 
-app = IBapi()
+# app is the module-level ibapi instance imported above
 
 root = tk.Tk()
 
