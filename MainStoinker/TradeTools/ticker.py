@@ -50,7 +50,7 @@ class Ticker():
         # send data to front end
         if config.FrontEndDisplay:
             entry = self.data.tail(2).head(1)
-            tickerdata = [{"ticker":self.name,"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}]
+            tickerdata = [{"ticker":self.name,"time":int(entry['time'].iloc[0]), "open":float(entry['open'].iloc[0]),"high":float(entry['high'].iloc[0]),"low":float(entry['low'].iloc[0]),"close":float(entry['close'].iloc[0]),"volume":float(entry['volume'].iloc[0])}]
             payload = {"tickerdata":tickerdata,"algodata":algodata}
             frontend_client.emit_data("update_send", payload)
 
@@ -65,7 +65,7 @@ class Ticker():
 
     def intraminute_update(self):
         entry = self.data.tail(1)
-        tickerdata = [{"ticker":self.name,"time":int(entry['time']), "open":float(entry['open']),"high":float(entry['high']),"low":float(entry['low']),"close":float(entry['close']),"volume":float(entry['volume'])}]
+        tickerdata = [{"ticker":self.name,"time":int(entry['time'].iloc[0]), "open":float(entry['open'].iloc[0]),"high":float(entry['high'].iloc[0]),"low":float(entry['low'].iloc[0]),"close":float(entry['close'].iloc[0]),"volume":float(entry['volume'].iloc[0])}]
         payload = {"tickerdata":tickerdata}
         if config.FrontEndDisplay:
             frontend_client.emit_data("update_send", payload)

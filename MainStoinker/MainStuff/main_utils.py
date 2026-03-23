@@ -136,7 +136,7 @@ def backtesting_data_blast():
 
 
         time.sleep(config.TimeDelayPerPoint)
-        print(entry[0])
+        print(entry.iloc[0])
 
     # Done with the Backtesting loop here
     get_algo_data()
