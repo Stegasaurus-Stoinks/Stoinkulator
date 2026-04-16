@@ -6,10 +6,11 @@ numpy
 yfinance
 tzdata
 ./ibapi-10.37.2-py3-none-any.whl
-python-socketio
+python-socketio==5.12.1
 simplejson
 keyboard
 TA-Lib
 python-statemachine
+websocket-client==1.8.0
 ./ta_lib-0.6.8-cp314-cp314-win_amd64.whl
-# pip install -e .
+# pip install -e . 
