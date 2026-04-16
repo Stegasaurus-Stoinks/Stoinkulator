@@ -24,7 +24,7 @@ class ElliotImpulse(object):
     # |________________
 
 
-    def __init__(self, plotSize, time_1=np.NaN, price_1=np.NaN, time_2=np.NaN, price_2=np.NaN, time_3= np.NaN, price_3=np.NaN, time_4=np.NaN, price_4=np.NaN, time_5=np.NaN, price_5=np.NaN, time_6=np.NaN, price_6=np.NaN):
+    def __init__(self, plotSize, time_1=np.nan, price_1=np.nan, time_2=np.nan, price_2=np.nan, time_3= np.nan, price_3=np.nan, time_4=np.nan, price_4=np.nan, time_5=np.nan, price_5=np.nan, time_6=np.nan, price_6=np.nan):
 
         self.plotSize = plotSize
         #CheckyBouncyLimitOfMostRecentPointyFoRealsy is the validation limit for the most recent min/max
@@ -67,7 +67,7 @@ class ElliotImpulse(object):
         self.slope5 = ElliotFuncs.calculate_slope(self.time_5, self.price_5, self.time_6, self.price_6)
 
         #print(self.slope1,self.slope2,self.slope3,self.slope4,self.slope5)
-        wave = [np.NaN] * self.plotSize
+        wave = [np.nan] * self.plotSize
         try:
             x = 0
             for k in range(self.time_1, self.time_2+1):
@@ -169,18 +169,18 @@ class ElliotImpulse(object):
         self.price_6 = y6
 
     def clear(self):
-        self.time_1 = np.NaN
-        self.price_1 = np.NaN
-        self.time_2 = np.NaN
-        self.price_2 = np.NaN
-        self.time_3 = np.NaN
-        self.price_3 = np.NaN
-        self.time_4 = np.NaN
-        self.price_4 = np.NaN
-        self.time_5 = np.NaN
-        self.price_5 = np.NaN
-        self.time_6 = np.NaN
-        self.price_6 = np.NaN
+        self.time_1 = np.nan
+        self.price_1 = np.nan
+        self.time_2 = np.nan
+        self.price_2 = np.nan
+        self.time_3 = np.nan
+        self.price_3 = np.nan
+        self.time_4 = np.nan
+        self.price_4 = np.nan
+        self.time_5 = np.nan
+        self.price_5 = np.nan
+        self.time_6 = np.nan
+        self.price_6 = np.nan
 
         
     def score():

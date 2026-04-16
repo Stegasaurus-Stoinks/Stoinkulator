@@ -35,8 +35,8 @@ class Algo:
         self.type = ticker.type
         self.inPosition = False
         self.status = "Initialized"
-        self.exitPrice = np.NaN
-        self.entryPrice = np.NaN
+        self.exitPrice = np.nan
+        self.entryPrice = np.nan
 
         self.secondexit = 0
 
@@ -75,12 +75,12 @@ class Algo:
             self.plotInit()
 
         #Initialize extra plot data arrays
-        self.finishedWaves = [np.NaN] * self.ticker.dataSize
-        self.tradingWaves = [np.NaN] * self.ticker.dataSize
-        self.mins = [np.NaN] * self.ticker.dataSize
-        self.maxs = [np.NaN] * self.ticker.dataSize
-        self.entry = [np.NaN] * self.ticker.dataSize
-        self.exit = [np.NaN] * self.ticker.dataSize
+        self.finishedWaves = [np.nan] * self.ticker.dataSize
+        self.tradingWaves = [np.nan] * self.ticker.dataSize
+        self.mins = [np.nan] * self.ticker.dataSize
+        self.maxs = [np.nan] * self.ticker.dataSize
+        self.entry = [np.nan] * self.ticker.dataSize
+        self.exit = [np.nan] * self.ticker.dataSize
 
         #array for all extra plot data
         self.extraPlots = [self.mins, self.maxs, self.exit, self.entry]
@@ -159,8 +159,8 @@ class Algo:
                     self.saveWave = waveNum
                     self.secondexit = curWave.y4
                 else:#clear exit and entry price and place empty point
-                    self.exitPrice = np.NaN
-                    self.entryPrice = np.NaN
+                    self.exitPrice = np.nan
+                    self.entryPrice = np.nan
                     self.exit.append(self.exitPrice)
                     self.entry.append(self.entryPrice)
             #check if the next wave point has been added. When found, sell.
@@ -266,7 +266,7 @@ class Algo:
                 #     array.pop(0)
 
                 if len(array) < self.plotSize:
-                    array.append(np.NaN)
+                    array.append(np.nan)
 
             if(self.inPosition):
                 self.status = "In a Position. ID: " + self.tradeID
@@ -282,7 +282,7 @@ class Algo:
     #clear array without reinitializing. If reinitialized then it will not plot properly
     def clearArray(self, array):
         for i in range (0,len(array)):
-                array[i] = np.NaN       
+                array[i] = np.nan       
 
 #------------------------------------------------------------
 #--------------|---ALGO SPECIFIC FUNCTIONS----|--------------

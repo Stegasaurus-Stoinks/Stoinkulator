@@ -8,5 +8,16 @@
         "RRRatio": 3
       }
     ]
+  },
+  {
+    "ID": "Elliot",
+    "data": [
+      {
+        "idname": "elliot-msft",
+        "ticker": "MSFT",
+        "order": 10,
+        "trailingStopDelta": 0.10
+      }
+    ]
   }
 ]

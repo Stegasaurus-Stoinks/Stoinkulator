@@ -56,10 +56,21 @@ def max_limit_rule_break(x, wavex, wavey, maxs):
     return ruleBreak
 
 #if there are more future points to check and wave is valid, then print incomplete wave
-def check_future_points(x, ilocs_min_valid,reach,tradingWaves,wave):
+def check_future_points(x, ilocs_min_valid, reach, tradingWaves, wave):
+    # Lazy import to avoid circular dependency
+    from MainStoinker.Algos.Elliot.ElliotImpulse import ElliotImpulse
+
     if ilocs_min_valid:
-        if(x == ilocs_min_valid[-1] and reach > len(ilocs_min_valid)):
-            tradingWaves.append(ElliotImpulse(wave.plotSize,wave.x1,wave.y1,wave.x2,wave.y2,wave.x3,wave.y3,wave.x4,wave.y4,wave.x5,wave.y5,wave.x6,wave.y6))
+        if x == ilocs_min_valid[-1] and reach > len(ilocs_min_valid):
+            tradingWaves.append(ElliotImpulse(
+                wave.plotSize,
+                wave.time_1, wave.price_1,
+                wave.time_2, wave.price_2,
+                wave.time_3, wave.price_3,
+                wave.time_4, wave.price_4,
+                wave.time_5, wave.price_5,
+                wave.time_6, wave.price_6
+            ))
     
 def check_retracement(num1,num2,num3,retList):
     reach = 0.03

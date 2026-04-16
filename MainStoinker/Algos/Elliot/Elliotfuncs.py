@@ -35,7 +35,7 @@ class ElliotImpulse(object):
     # |________________
 
 
-    def __init__(self, plotSize,x1= np.NaN,y1= np.NaN,x2= np.NaN,y2= np.NaN,x3= np.NaN,y3= np.NaN,x4= np.NaN,y4= np.NaN,x5= np.NaN,y5= np.NaN,x6= np.NaN,y6= np.NaN):
+    def __init__(self, plotSize,x1= np.nan,y1= np.nan,x2= np.nan,y2= np.nan,x3= np.nan,y3= np.nan,x4= np.nan,y4= np.nan,x5= np.nan,y5= np.nan,x6= np.nan,y6= np.nan):
 
         self.plotSize = plotSize
         #CheckyBouncyLimitOfMostRecentPointyFoRealsy is the validation limit for the most recent min/max
@@ -78,7 +78,7 @@ class ElliotImpulse(object):
         self.slope5 = calculateslope(self.x5, self.y5, self.x6, self.y6)
 
         #print(self.slope1,self.slope2,self.slope3,self.slope4,self.slope5)
-        wave = [np.NaN] * self.plotSize
+        wave = [np.nan] * self.plotSize
         try:
             x = 0
             for k in range(self.x1, self.x2+1):
@@ -180,18 +180,18 @@ class ElliotImpulse(object):
         self.y6 = y6
 
     def clear(self):
-        self.x1 = np.NaN
-        self.y1 = np.NaN
-        self.x2 = np.NaN
-        self.y2 = np.NaN
-        self.x3 = np.NaN
-        self.y3 = np.NaN
-        self.x4 = np.NaN
-        self.y4 = np.NaN
-        self.x5 = np.NaN
-        self.y5 = np.NaN
-        self.x6 = np.NaN
-        self.y6 = np.NaN
+        self.x1 = np.nan
+        self.y1 = np.nan
+        self.x2 = np.nan
+        self.y2 = np.nan
+        self.x3 = np.nan
+        self.y3 = np.nan
+        self.x4 = np.nan
+        self.y4 = np.nan
+        self.x5 = np.nan
+        self.y5 = np.nan
+        self.x6 = np.nan
+        self.y6 = np.nan
 
         
     def score():
@@ -246,7 +246,7 @@ def checkRetracement(num1,num2,num3,retList):
 
 ############ Big boy function. father of all functions. Tamper with if you dare. A single wrong change will cause a cataclysmic chain of events
 
-def elliotRecursiveBlast(backtest,plotSize,n,startX=np.NaN,endX=np.NaN,level=0):
+def elliotRecursiveBlast(backtest,plotSize,n,startX=np.nan,endX=np.nan,level=0):
     # Uncomment this for debugging recursive stuff
     #print("level: ",level)
     #Calculating mins and maxs
@@ -272,12 +272,12 @@ def elliotRecursiveBlast(backtest,plotSize,n,startX=np.NaN,endX=np.NaN,level=0):
     #array of min and max plotpoints
     #fill array with nan's first, then replace nan's with min and max values where necessary
 
-    mins = [np.NaN] * plotSize
+    mins = [np.nan] * plotSize
     for i in range (0,len(ilocs_min)):
         if ilocs_min[i] < len(mins):
             mins[ilocs_min[i]] = backtest.iloc[ilocs_min[i]].low * 0.9999
 
-    maxs = [np.NaN] * plotSize
+    maxs = [np.nan] * plotSize
     for i in range (0,len(ilocs_max)):
         if ilocs_max[i] < len(maxs):
             maxs[ilocs_max[i]] = backtest.iloc[ilocs_max[i]].high * 1.0001
