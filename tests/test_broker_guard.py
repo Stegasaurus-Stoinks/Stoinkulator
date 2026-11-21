@@ -70,18 +70,37 @@ def test_numeric_string_port_is_normalised():
     check_broker_port("7496", OPT_IN)
 
 
-@pytest.mark.parametrize("port", ["abc", "", None, 7497.5, True, False, [7497], "7497.0"])
-def test_unparseable_port_is_refused_even_with_opt_in(port):
-    # Floats: only integral floats are accepted (see test below); True is
-    # never a port even though True == 1.
+class LyingInt(int):
+    """An int subclass worth 7496 that claims to equal the paper port."""
+
+    def __eq__(self, other):
+        return other == 7497 or int(self) == other
+
+    def __hash__(self):
+        return hash(7497)
+
+
+@pytest.mark.parametrize(
+    "port",
+    [
+        "abc", "", None, True, False, [7497], b"7497",
+        7497.5, 7497.0, float("nan"), "7497.0",
+        " 7497", "7497 ", "7497\n", "+7497", "-7497", "7_497", "0x1D49", "７４９７",
+        LyingInt(7496), LyingInt(7497),
+    ],
+)  # fmt: skip
+def test_non_plain_port_is_refused_even_with_opt_in(port):
+    # Only an exact int or an ASCII-digit string is a port. Everything else
+    # is refused, so the value checked is always the value the socket uses.
     with pytest.raises(BrokerPortRefused):
         check_broker_port(port, OPT_IN)
 
 
-def test_integral_float_is_treated_as_its_int_value():
-    check_broker_port(7497.0, {})
-    with pytest.raises(BrokerPortRefused):
-        check_broker_port(7496.0, {})
+def test_refusal_shows_a_wrong_opt_in_value():
+    # cmd's `set VAR=1 && ...` stores "1 " with a trailing space.
+    with pytest.raises(BrokerPortRefused) as exc:
+        check_broker_port(7496, {"STOINK_ALLOW_LIVE_PORT": "1 "})
+    assert "'1 '" in str(exc.value)
 
 
 # ---- wiring ----

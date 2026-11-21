@@ -26,26 +26,22 @@ class BrokerPortRefused(RuntimeError):
 
 
 def _normalise_port(port: object) -> int | None:
-    """Return port as an int, or None if it is not a valid integer port.
+    """Return port as a plain int, or None if it is not a valid integer port.
 
-    bool is rejected (True == 1). A float is accepted only if integral
-    (7497.0 -> 7497); 7497.5 is rejected. Strings must be plain integers.
+    Deliberately strict, so the value judged here is the value the socket
+    layer will use: only an exact int, or a str of ASCII digits, is accepted.
+    bool (True == 1), floats, int subclasses (which can override equality),
+    and strings with whitespace, signs, underscores or non-ASCII digits are
+    all rejected.
     """
-    if isinstance(port, bool):
-        return None
-    if isinstance(port, int):
+    if type(port) is int:
         return port
-    if isinstance(port, float):
-        return int(port) if port.is_integer() else None
-    if isinstance(port, str):
-        try:
-            return int(port)
-        except ValueError:
-            return None
+    if type(port) is str and port.isascii() and port.isdigit():
+        return int(port)
     return None
 
 
-def check_broker_port(port: int | str, env: Mapping[str, str]) -> None:
+def check_broker_port(port: object, env: Mapping[str, str]) -> None:
     """Raise BrokerPortRefused unless the port is paper or a human opted in."""
     number = _normalise_port(port)
     if number is None:
@@ -58,8 +54,10 @@ def check_broker_port(port: int | str, env: Mapping[str, str]) -> None:
     if env.get(ALLOW_LIVE_ENV) == "1":
         return
     kind = "a known live-trading port" if number in KNOWN_LIVE_PORTS else "an unrecognised port"
+    current = env.get(ALLOW_LIVE_ENV)
+    found = "" if current is None else f" It is currently set to {current!r}, which is not exactly '1'."
     raise BrokerPortRefused(
         f"Refusing to connect: port {number} is not a paper-trading port "
         f"({kind}). Paper ports are {sorted(PAPER_PORTS)}. A human must set "
-        f"{ALLOW_LIVE_ENV}=1 in the environment to opt in."
+        f"{ALLOW_LIVE_ENV}=1 in the environment to opt in.{found}"
     )
