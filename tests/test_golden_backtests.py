@@ -24,6 +24,21 @@ CASES = [
         id="functiontest_msft",
     ),
     pytest.param(
+        "OpeningRangeCandle",
+        {"idname": "AAPL-orc", "ticker": "AAPL", "RRRatio": 3},
+        id="openingrangecandle_aapl",
+    ),
+    pytest.param(
+        "FridayFrenzy",
+        {"idname": "TSLA-ff", "ticker": "TSLA", "RRRatio": 3},
+        id="fridayfrenzy_tsla",
+    ),
+    pytest.param(
+        "FVG",
+        {"idname": "AAPL-fvg", "ticker": "AAPL", "RRRatio": 3},
+        id="fvg_aapl",
+    ),
+    pytest.param(
         "Elliot",
         {"idname": "elliot-msft", "ticker": "MSFT", "order": 10, "trailingStopDelta": 0.10},
         id="elliot_msft",

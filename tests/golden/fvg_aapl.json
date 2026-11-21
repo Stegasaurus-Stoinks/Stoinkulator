@@ -1,0 +1,178 @@
+[
+ {
+  "id": "AAPL-fvg0",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 06:46:00",
+  "openPrice": 224.81,
+  "closeTime": "2024-08-19 06:50:00",
+  "closePrice": 224.72,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg1",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-19 07:32:00",
+  "openPrice": 223.99,
+  "closeTime": "2024-08-19 08:03:00",
+  "closePrice": 224.34,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg2",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 06:35:00",
+  "openPrice": 226.65,
+  "closeTime": "2024-08-20 06:43:00",
+  "closePrice": 226.27,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg3",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 06:44:00",
+  "openPrice": 226.29,
+  "closeTime": "2024-08-20 06:46:00",
+  "closePrice": 226.57,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg4",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 08:11:00",
+  "openPrice": 226.92,
+  "closeTime": "2024-08-22 08:19:00",
+  "closePrice": 226.79,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg5",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 08:35:00",
+  "openPrice": 226.02,
+  "closeTime": "2024-08-22 08:38:00",
+  "closePrice": 225.83,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg6",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 11:07:00",
+  "openPrice": 224.02,
+  "closeTime": "2024-08-22 11:08:00",
+  "closePrice": 224.27,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg7",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 12:07:00",
+  "openPrice": 224.69,
+  "closeTime": "2024-08-22 12:20:00",
+  "closePrice": 224.58,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg8",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:25:00",
+  "openPrice": 227.99,
+  "closeTime": "2024-08-23 07:32:00",
+  "closePrice": 227.8,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg9",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:33:00",
+  "openPrice": 227.7,
+  "closeTime": "2024-08-23 07:36:00",
+  "closePrice": 227.59,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg10",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-23 12:05:00",
+  "openPrice": 226.51,
+  "closeTime": "2024-08-23 12:10:00",
+  "closePrice": 226.58,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg11",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 12:56:00",
+  "openPrice": 226.91,
+  "closeTime": "2024-08-26 06:30:00",
+  "closePrice": 226.72,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg12",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 06:31:00",
+  "openPrice": 226.71,
+  "closeTime": "2024-08-26 06:42:00",
+  "closePrice": 226.5,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg13",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 07:17:00",
+  "openPrice": 225.18,
+  "closeTime": "2024-08-26 07:19:00",
+  "closePrice": 224.91,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg14",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 10:11:00",
+  "openPrice": 226.15,
+  "closeTime": "2024-08-26 10:39:00",
+  "closePrice": 225.97,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-fvg15",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 11:43:00",
+  "openPrice": 226.12,
+  "closeTime": "2024-08-26 12:22:00",
+  "closePrice": 226.58,
+  "status": "Closed"
+ }
+]

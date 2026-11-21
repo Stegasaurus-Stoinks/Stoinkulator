@@ -1,0 +1,13 @@
+[
+ {
+  "id": "AAPL-orc0",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-19 06:33:00",
+  "openPrice": 225.08,
+  "closeTime": "2024-08-19 07:17:00",
+  "closePrice": 223.34,
+  "status": "Closed"
+ }
+]

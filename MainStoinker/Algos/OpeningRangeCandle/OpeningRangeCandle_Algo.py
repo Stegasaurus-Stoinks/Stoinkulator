@@ -235,7 +235,7 @@ class Algo(ParentAlgo):
 
         #change stoploss to fixed type and set price
         self.trade.set_stopLossType('Fixed')
-        self.trade.update_stoploss_price(self.stoplossprice)
+        self.trade.set_stopPrice(self.stoplossprice)
 
         # TODO: gonna need a system to take profits... (sort of done? need to add live stuff)
         # use self.RRRatio
@@ -266,7 +266,7 @@ class AlgoLogic(StateMachine):
     inTradeState = State("inTrade")
 
     #done for the day, stop checking anything else
-    doneTradingState = State("done")
+    doneTradingState = State("done", final=True)
       
 
     # transitions of the state
