@@ -1,0 +1,13 @@
+[
+ {
+  "id": "TSLA-ff0",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-19 06:43:00",
+  "openPrice": 216.47,
+  "closeTime": "2024-08-19 06:48:00",
+  "closePrice": 219.47,
+  "status": "Closed"
+ }
+]
