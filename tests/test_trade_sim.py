@@ -108,3 +108,17 @@ def test_to_json_works_for_simulated_trade():
 )
 def test_open_simulated_trade_reports_status():
     assert make_trade(LONG).get_status() == "Open"
+
+
+def test_short_fixed_stop_set_by_algo_does_not_trail_and_closes_at_stop():
+    # The call sequence the opening-range algos use on entry.
+    trade = make_trade(SHORT, price=100.0)
+    trade.set_stopLossType("Fixed")
+    trade.set_stopPrice(103.0)
+    assert trade.stopPrice == 103.0
+    assert trade.check_stoploss(bar(95.0)) == 1  # price falls: no trailing
+    assert trade.stopPrice == 103.0
+    assert trade.check_stoploss(bar(103.0)) == 1  # at the stop is not a stop-out
+    assert trade.check_stoploss(bar(103.5)) == 0
+    assert trade.closePrice == 103.0
+    assert trade.get_status() == "Closed"
