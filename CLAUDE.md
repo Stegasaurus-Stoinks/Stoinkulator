@@ -22,11 +22,11 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
 
 ## Commands
 
-Use the project venv (`.venv`, Python 3.14, Windows).
+Use the project venv (`.venv`, Python 3.14, Windows). It is uv-managed and has no pip module, so install with `uv pip`.
 
 ```
-.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.venv\Scripts\python.exe -m pip install -e .
+uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
+uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m pytest                  # fast suite, ~20 s
 .venv\Scripts\python.exe -m pytest -m slow          # Elliot golden, ~3 min
 .venv\Scripts\ruff.exe check .                      # legacy defect set
