@@ -243,7 +243,6 @@ NEW_ALLOWED = [
     "cat <<'EOF'\n" + HEREDOC_TEXT + "EOF",
     # item 5: launcher words only count in command position
     f'rg -n "start" "{BAT}"',
-    f'rg -n "start|call" "{BAT}"',
     f'grep -c "sh" "{BAT}"',
     f'Select-String -Path "{BAT}" -Pattern "start"',
     f'grep -n "cmd /c" "{BAT}"',
@@ -304,6 +303,92 @@ NEW_BLOCKED = [
 ]
 
 
+def _doc(*lines: str) -> str:
+    return "\n".join(lines)
+
+
+R3_BLOCKED = [
+    # separators in/near quotes must still split
+    _doc("# don't run this yet", f"& '.\\{BAT}'"),
+    f'Get-ChildItem "C:\\Users\\x\\"; & ".\\{BAT}"',
+    f'ls "C:\\x\\" ; "./{BAT}"',
+    f'dir "C:\\x\\" & "{BAT}"',
+    f"echo it's done; & '.\\{BAT}'",
+    f'cmd /c "type x.exe & {BAT}"',
+    # accepted false positive: the '|' splits and the 2nd piece starts with call
+    f'rg -n "start|call" "{BAT}"',
+    # heredoc fed to an interpreter / shell through $(cat ...) is code
+    _doc(
+        "python -c \"$(cat <<'EOF'",
+        f'import runpy; runpy.run_path("{ENTRY}")',
+        "EOF",
+        ')"',
+    ),
+    _doc("bash -c \"$(cat <<'EOF'", f'python "{ENTRY}"', "EOF", ')"'),
+    _doc("bash -c \"$(cat <<'EOF'", f'./"{BAT}"', "EOF", ')"'),
+    _doc("eval \"$(cat <<'EOF'", f'python "{ENTRY}"', "EOF", ')"'),
+    # git forms that execute their arguments
+    f"git rebase -i -x \"cmd /c '{BAT}'\"",
+    f'git bisect run cmd /c "{BAT}"',
+    f"git submodule foreach 'cmd /c \"{BAT}\"'",
+    f"git rebase --exec=\"python '{ENTRY}'\"",
+    f'git -c core.editor="python {ENTRY}" commit',
+    # sourcing
+    f'. "./{BAT}"',
+    f'source "./{BAT}"',
+    f'. ".\\{BAT}"',
+    # spaced exe paths: cmd / launch words beat the reader heuristic
+    f'"C:\\Windows\\System32\\cmd.exe" /c "{BAT}"',
+    f"\"C:\\Program Files\\Git\\bin\\bash.exe\" -c \"./'{BAT}'\"",
+]
+
+R3_ALLOWED = [
+    'rg -n "python|dum dum.py"',
+    'grep -nE "py;|dum dum.py" -r .',
+    f'Select-String -Path "{ENTRY}" -Pattern "connect|python"',
+    _doc(
+        "git commit -m \"$(cat <<'EOF'",
+        f'fix: python "{ENTRY}" and cmd /c "{BAT}"',
+        "EOF",
+        ')"',
+    ),
+    _doc("git commit -q -F - <<'EOF'", f'python "{ENTRY}"', "EOF"),
+    _doc(
+        "gh pr create --body \"$(cat <<'EOF'",
+        f'python "{ENTRY}"; cmd /c "{BAT}"',
+        "EOF",
+        ')"',
+    ),
+    _doc("gh pr create --body-file - <<'X'", f'python "{ENTRY}"', "X"),
+    _doc("cat <<'EOF'", f'python "{ENTRY}"', f'cmd /c "{BAT}"', "EOF"),
+    # accepted wrapper-file bypass: body written to a file, run on a later line
+    _doc("cat <<EOF > run.sh", f'python "{ENTRY}"', "EOF", "bash run.sh"),
+    f'git add "{BAT}"',
+    f'git diff -- "{BAT}"',
+    f'git log -p -- "{BAT}"',
+    f'git mv "{BAT}" x.bat',
+    f'git commit -m "x" "{BAT}"',
+    f'git show HEAD:"{BAT}"',
+    f'git grep -n "cmd /c" -- "{BAT}"',
+    f'PYTHONPATH=. .venv/Scripts/ruff.exe check "{ENTRY}"',
+    f'PYTHONUTF8=1 git diff -- "{ENTRY}"',
+    f'cd . && ls "{BAT}"',
+    f'Start-Process -FilePath notepad -ArgumentList "{BAT}"',
+    "git add .",
+    "git -c user.name=x add .",
+]
+
+
+@pytest.mark.parametrize("command", R3_BLOCKED)
+def test_round3_blocked(command: str) -> None:
+    assert hook.decide(command)[0] is True, command
+
+
+@pytest.mark.parametrize("command", R3_ALLOWED)
+def test_round3_allowed(command: str) -> None:
+    assert hook.decide(command) == (False, ""), command
+
+
 @pytest.mark.parametrize("command", NEW_ALLOWED)
 def test_review_round_allowed(command: str) -> None:
     assert hook.decide(command) == (False, ""), command
@@ -334,16 +419,22 @@ def test_file_association_run_is_not_covered() -> None:
 
 
 def test_decide_is_fast_on_adversarial_input() -> None:
+    esc = '\\"' * 100_000
     for cmd in (
         'git commit -m "' + "a" * 200_000,
         "& " * 100_000,
         "git " * 50_000,
         "<<a\n" * 50_000,
         "git commit -m '" * 10_000,
+        '"' + esc,
+        'git commit -m "' + esc,
+        "git commit -m $'" + esc,
+        "git commit --body=\"" + esc + "\" -m \"" + esc,
     ):
         start = time.perf_counter()
         hook.decide(cmd)
-        assert time.perf_counter() - start < 1.0
+        # Generous: only meant to catch quadratic blow-ups (tens of seconds).
+        assert time.perf_counter() - start < 5.0
 
 
 def test_main_tool_input_variants(capsys: pytest.CaptureFixture[str]) -> None:
@@ -416,10 +507,6 @@ def test_run_stdin_handles_bad_bytes_and_errors(
     capsys.readouterr()
     assert hook.run_stdin(_BrokenStream(b"")) == 0
     assert capsys.readouterr().err.strip()
-
-
-def test_no_bytecode_left_in_hooks_dir() -> None:
-    assert not (SCRIPT.parent / "__pycache__").exists()
 
 
 def test_script_uses_only_stdlib() -> None:

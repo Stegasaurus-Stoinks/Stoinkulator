@@ -26,7 +26,8 @@ This is a tripwire against accidents, NOT a security boundary. Known bypasses:
 copying or renaming the script, wrapper files that run it, globs, building the
 path dynamically (variables, concatenation, encoding), and running the ``.py``
 by file association (``& ".\\...dum dum.py"``, ``./MainStoinker/.../dum dum.py``),
-which has no interpreter token and is NOT covered.
+which has no interpreter token and is NOT covered. Also not covered: ``find
+-exec``, ``xargs``, ``watch``, ``if exist`` and leading redirects.
 
 Accepted false positives (blocked although harmless):
 * searching the entry script for an interpreter word, e.g.
@@ -35,7 +36,10 @@ Accepted false positives (blocked although harmless):
   script name;
 * ``python -m ruff check "<entry>"`` and ``python tools/lint.py "<entry>"``;
 * a double-quoted commit message containing ``$(...)`` or backticks is scanned,
-  because those would execute.
+  because those would execute;
+* separators inside quotes still split segments, e.g.
+  ``rg -n "start|call" "<launcher>"`` is blocked (second piece starts with
+  ``call``).
 
 Standard library only; must not import anything from the repo.
 """
@@ -74,6 +78,8 @@ _LAUNCH_WORDS = frozenset(
         "sh",
         "powershell",
         "pwsh",
+        ".",
+        "source",
     }
 )
 _START_WORDS = frozenset({"start", "start-process", "saps"})
@@ -102,7 +108,7 @@ _PREFIX_RE = re.compile(
 _HEREDOC = re.compile(
     r"(?<!<)<<(-?)[ \t]*(?:'([A-Za-z_]\w*)'|\"([A-Za-z_]\w*)\"|([A-Za-z_]\w*))"
 )
-_CMD_PIECE_SPLIT = re.compile(r"[;&|(`]")
+_CMD_PIECE_SPLIT = re.compile(r"[;&|]")
 _MAX_MATCHES = 200
 
 _BLOCK_MESSAGE = (
@@ -146,15 +152,22 @@ def _command_position(raw: str, pos: int) -> bool:
     return _PREFIX_RE.fullmatch(window[idx + 1 :]) is not None
 
 
-def _consumer_is_textual(prefix: str) -> bool:
-    piece = _CMD_PIECE_SPLIT.split(prefix)[-1]
+def _first_word(piece: str) -> str:
     words = piece.split()
     i = 0
     while i < len(words) and (words[i].lower() in _TRANSPARENT or _ASSIGN.match(words[i])):
         i += 1
-    if i >= len(words):
-        return False
-    return _cmd_base(words[i].lower().strip("\"'")) in {"cat", "git", "gh"}
+    return _cmd_base(words[i].lower().strip("\"'")) if i < len(words) else ""
+
+
+def _consumer_is_textual(prefix: str) -> bool:
+    """Heredoc body is plain text: git/gh/cat directly, or cat inside git/gh's $(...)."""
+    seg = _CMD_PIECE_SPLIT.split(prefix)[-1]
+    sub = max(seg.rfind("$("), seg.rfind("`"))
+    if sub == -1:
+        return _first_word(seg) in {"cat", "git", "gh"}
+    inner = seg[sub + (2 if seg.startswith("$(", sub) else 1) :]
+    return _first_word(inner) == "cat" and _first_word(seg[:sub]) in {"git", "gh"}
 
 
 def _strip_heredocs(raw: str) -> str:
@@ -277,17 +290,8 @@ def _normalise(command: str) -> str:
     return re.sub(r"[ \t]+", " ", text)
 
 
-_QUOTED_ANY = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', re.S)
-_SEP_CHARS = re.compile(r"[;&|\r\n]")
-
-
-def _mask_quoted_separators(command: str) -> str:
-    """Make separators inside complete quotes inert so quoted text stays in one segment."""
-    return _QUOTED_ANY.sub(lambda m: _SEP_CHARS.sub(" ", m.group(0)), command)
-
-
 def _segments(command: str) -> list[str]:
-    parts = _SEGMENT_SPLIT.split(_normalise(_mask_quoted_separators(command)))
+    parts = _SEGMENT_SPLIT.split(_normalise(command))
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -296,9 +300,19 @@ def _has_interpreter(segment: str) -> bool:
         return True
     if _RUNNER.search(segment):
         return True
-    for tok in segment.split():
+    for tok in re.split(r"[\s=]+", segment):
         tok = tok.strip("(){}$`")
         if _PYTHON_TOKEN.match(tok.rsplit("/", 1)[-1]):
+            return True
+    return False
+
+
+def _git_runs_args(words: list[str]) -> bool:
+    """True for git forms that execute their arguments (bisect run, -x, foreach, -c k=v)."""
+    for i, w in enumerate(words):
+        if w in ("bisect", "-x", "foreach") or w.startswith("--exec"):
+            return True
+        if w == "-c" and i + 1 < len(words) and "=" in words[i + 1]:
             return True
     return False
 
@@ -323,25 +337,28 @@ def _executes_launcher(segment: str) -> bool:
     pre_tokens = pre.split()
     if not pre_tokens:
         return True
-    # A path containing spaces can hide the real command word; prefer the last
-    # token that names an .exe.
-    cmd_tok = pre_tokens[0]
-    for tok in pre_tokens:
-        if tok.endswith(".exe"):
-            cmd_tok = tok
-    base = _cmd_base(cmd_tok)
-    if base in _READERS:
-        return False
-    if base == "cmd":
+    # A path containing spaces can hide the real command word, so the last
+    # ".exe" token is a second candidate. cmd / launch words win over readers.
+    bases = [_cmd_base(pre_tokens[0])]
+    exes = [t for t in pre_tokens if t.endswith(".exe")]
+    if exes:
+        bases.append(_cmd_base(exes[-1]))
+    if "cmd" in bases:
         return any(_CMD_SWITCH.match(t) for t in words)
-    if base in _LAUNCH_WORDS:
-        if (
-            base in _START_WORDS
-            and len(pre_tokens) > 1
-            and _cmd_base(pre_tokens[1]) in _READERS
+    if any(b in _LAUNCH_WORDS for b in bases):
+        if bases[0] in _START_WORDS and any(
+            _cmd_base(t) in _READERS for t in pre_tokens[1:3]
         ):
-            return False  # e.g. "start notepad <launcher>": opens an editor
+            return False  # "start notepad <launcher>": opens an editor
         return True
+    if "git" in bases and _git_runs_args(words):
+        return any(
+            _cmd_base(t) in _LAUNCH_WORDS - {".", "source"}
+            or (_cmd_base(t) == "cmd" and any(_CMD_SWITCH.match(u) for u in words))
+            for t in words[1:]
+        )
+    if any(b in _READERS for b in bases):
+        return False
     # Direct run: the segment is (a directory path ending in) the launcher.
     return pre.endswith("/") and ("/" in pre_tokens[0] or ":" in pre_tokens[0])
 
