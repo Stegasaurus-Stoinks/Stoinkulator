@@ -230,7 +230,7 @@ class AlgoLogic(StateMachine):
     inTradeState = State("inTrade")
 
     #done for the day, stop checking anything else
-    doneTradingState = State("done")
+    doneTradingState = State("done", final=True)
       
 
     # transitions of the state
