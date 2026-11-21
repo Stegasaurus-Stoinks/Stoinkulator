@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Windows + Python 3.14 to match the trading machine and the vendored
+    # TA-Lib wheel in requirements.txt.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e .
+      - name: Lint (legacy defect set)
+        run: ruff check .
+      - name: Lint (new code)
+        run: ruff check tests --select E,F,W,I,B
+      - name: Tests
+        run: pytest
+      - name: Slow golden backtests
+        run: pytest -m slow
