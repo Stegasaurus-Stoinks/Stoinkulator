@@ -9,8 +9,10 @@ from csv import writer
 from datetime import datetime
 from datetime import timedelta
 import simplejson
+import os
 
 from MainStoinker.Util.IBKRHelper import *
+from MainStoinker.Util.broker_guard import check_broker_port
 
 from MainStoinker.MainStuff import Globals
 from MainStoinker.MainStuff.Globals import config
@@ -44,6 +46,11 @@ class IBapi(TestWrapper, TestClient):
         self.all_openorders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
         self.all_completed_orders = pd.DataFrame([], columns = ['Symbol', 'OrderType', 'Quantity', 'Action', 'OrderState', 'SecType', 'AuxPrice', 'LmtPrice'])
         # self.all_executions = pd.DataFrame([], columns = ['reqId', 'Price'])
+
+    def connect(self, host, port, clientId):
+        # Refuse non-paper ports unless a human set STOINK_ALLOW_LIVE_PORT=1.
+        check_broker_port(port, os.environ)
+        return super().connect(host, port, clientId)
 
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 2 and reqId == 1:
