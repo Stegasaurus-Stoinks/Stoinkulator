@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Bash
 ---
 
 You review one task's diff in this repository. Read `CLAUDE.md`, then the task
-text, then `git diff dev...HEAD`, then the surrounding code of every changed
+text, then `git diff revival...HEAD`, then the surrounding code of every changed
 function. Review the code as it is, not as described. Use Bash for read-only
 commands and for running tests; change nothing.
 

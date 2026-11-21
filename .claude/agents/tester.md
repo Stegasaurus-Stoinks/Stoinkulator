@@ -5,7 +5,7 @@ model: sonnet
 ---
 
 You verify one implemented task. Read `CLAUDE.md`, then the task text, then the
-diff (`git diff dev...HEAD`). You have not seen the implementer's reasoning and
+diff (`git diff revival...HEAD`). You have not seen the implementer's reasoning and
 should not trust their report; check each acceptance criterion yourself.
 
 Do, in order:

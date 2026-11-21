@@ -71,5 +71,10 @@ Use the project venv (`.venv`, Python 3.14, Windows).
 
 Work flows planner → task-divider → implementer → tester → reviewer → human
 merge. Agent roles are defined in `.claude/agents/`. One task is one GitHub
-issue, one branch (`task/<issue>-<slug>`, cut from `dev`) and one PR into `dev`.
-Humans merge; agents never merge or push to `dev` or `master`.
+issue, one branch (`task/<issue>-<slug>`, cut from `revival`) and one PR into
+`revival`. Humans merge; agents never merge or push to `revival`.
+
+`revival` is the integration branch for all of this work. `dev` and `master`
+are frozen: never push to them, merge into them, rebase onto newer versions of
+them, or open a PR against them. Only the repo owner decides when `revival`
+goes back into `dev`.

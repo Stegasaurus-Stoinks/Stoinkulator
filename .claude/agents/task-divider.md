@@ -12,7 +12,7 @@ the spec touches. Do not divide from the spec alone.
 A good task:
 
 - Is one reviewable PR: roughly one concern, ideally under ~300 changed lines.
-- Leaves `dev` green on its own. No task may depend on a later task to pass tests.
+- Leaves `revival` green on its own. No task may depend on a later task to pass tests.
 - Names the files it creates or changes, and the files it must not touch.
 - Has acceptance criteria a tester can check mechanically: named tests that
   must exist and pass, golden files that must or must not change, commands to run.
