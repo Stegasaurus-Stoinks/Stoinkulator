@@ -2,10 +2,48 @@ import json
 from pathlib import Path
 
 import pytest
+from ibapi import connection as ibapi_connection
 
 from tests import harness
 
 GOLDEN_DIR = Path(__file__).parent / "golden"
+
+
+class BrokerConnectionBlockedUnderPytest(RuntimeError):
+    """Raised when anything tries to open a broker socket during a test run.
+
+    Deliberately not an OSError: ibapi's EClient.connect catches socket.error
+    (an alias of OSError) and would swallow it.
+    """
+
+
+_BLOCK_PATCH = pytest.StashKey[pytest.MonkeyPatch]()
+
+
+def _blocked_connect(self, *args, **kwargs):
+    host = getattr(self, "host", "?")
+    port = getattr(self, "port", "?")
+    raise BrokerConnectionBlockedUnderPytest(
+        f"Refusing to connect to a broker at {host}:{port}: tests must never "
+        "connect to TWS / IB Gateway on any port."
+    )
+
+
+def pytest_configure(config):
+    # Patch the method on the class (not the class name), so every reference
+    # to Connection, including the one inside ibapi.client, is covered.
+    # Done here rather than in a fixture so it is active during collection
+    # and for every test without opt-in.
+    mp = pytest.MonkeyPatch()
+    mp.setattr(ibapi_connection.Connection, "connect", _blocked_connect)
+    config.stash[_BLOCK_PATCH] = mp
+
+
+def pytest_unconfigure(config):
+    mp = config.stash.get(_BLOCK_PATCH, None)
+    if mp is not None:
+        mp.undo()
+        del config.stash[_BLOCK_PATCH]
 
 
 def pytest_addoption(parser):
