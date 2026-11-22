@@ -8,6 +8,7 @@ using the real one.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -25,8 +26,9 @@ import MainStoinker.engine.store as store_module
 from MainStoinker.engine.cli import CliError, main
 from MainStoinker.engine.feed import CsvBarFeed
 from MainStoinker.engine.stats import account_summary, round_trip_record
-from MainStoinker.engine.store import StoreError, open_store
-from tests.test_cli_modes import EMA, EMA_MSFT, FUNC_MSFT, GOLDEN, Env, ema_config
+from MainStoinker.engine.store import StoreError, expand_equity, open_store
+from tests.test_cli_modes import EMA, EMA_MSFT, FF, FUNC_MSFT, FVG, GOLDEN, ORC, Env, ema_config
+from tests.test_paper_goldens import equity_series_bytes
 
 REPO = Path(__file__).resolve().parent.parent
 VERSION = "0123456789abcdef0123456789abcdef01234567"
@@ -619,6 +621,197 @@ def test_importing_cli_does_not_run_git():
     done = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True,
                           text=True, timeout=120)
     assert done.returncode == 0, done.stderr
+
+
+# ---- verification additions: goldens through the store, processes, output failures ----
+
+GOLDEN_PAPER = Path(__file__).parent / "golden_paper"
+LEGACY_GOLDEN = Path(__file__).parent / "golden"
+FAST_CASES = {
+    "emacrossing_aapl": ("EMACrossing", EMA, "AAPL"),
+    "openingrangecandle_aapl": ("OpeningRangeCandle", ORC, "AAPL"),
+    "fridayfrenzy_tsla": ("FridayFrenzy", FF, "TSLA"),
+    "fvg_aapl": ("FVG", FVG, "AAPL"),
+}
+_full: dict[str, Env] = {}
+
+
+def full_store_run(tmp_path_factory, fills: str) -> tuple[Env, Path]:
+    """All fast golden cases in one config, full data, one database (cached per fill model)."""
+    if fills not in _full:
+        root = tmp_path_factory.mktemp(f"store-full-{fills}")
+        full = Env(root)
+        full.setup([{"ID": a, "data": [c]} for a, c, _ in FAST_CASES.values()],
+                   ["AAPL", "TSLA"], rows=None)
+        database = root / "runs.db"
+        assert main(["backtest", "--algos", str(full.algos), "--data", str(full.data),
+                     "--out", str(full.out), "--quiet", "--fills", fills,
+                     "--db", str(database)]) == 0
+        _full[fills] = full
+    return _full[fills], _full[fills].inputs.parent / "runs.db"
+
+
+@pytest.mark.parametrize("case", sorted(FAST_CASES))
+def test_stored_realistic_run_equals_golden_paper(tmp_path_factory, case):
+    """One database run of four algos: each algo's stored rows reproduce its golden
+    (trades, summary, and the equity series expanded to the bar grid by hash)."""
+    full, database = full_store_run(tmp_path_factory, "realistic")
+    _algo, cfg, symbol = FAST_CASES[case]
+    golden = json.loads((GOLDEN_PAPER / f"{case}.json").read_text())
+    data = stored(database)
+    assert len(data.algos) == 4 and data.summary.status == "completed"
+    idname = cfg["idname"]
+    trips = [t for t in data.round_trips if t.account == idname]
+    assert [round_trip_record(t) for t in trips] == golden["trades"]
+    stamps = [stamp.to_pydatetime() for stamp, _ in CsvBarFeed(full.data, [symbol], 2)]
+    grid = expand_equity(data.equity_series(idname), stamps)
+    assert len(grid) == golden["equity_points"]
+    assert hashlib.sha256(equity_series_bytes(grid)).hexdigest() == golden["equity_sha256"]
+    ignored = {k: sum(1 for e in data.ignored_events if e.account == idname and e.kind == k)
+               for k in ("close", "modify_stop", "take_profit")}
+    assert account_summary(
+        trips, grid[-1].equity, Decimal(golden["capital"]), equity_series=[p.equity for p in grid],
+        ignored_events=ignored, cancelled_entries=golden["summary"]["cancelled_entries"],
+    ) == golden["summary"]
+    # ledger.json of the same run agrees with the golden's account
+    assert full.ledger()["accounts"][idname]["summary"] == golden["summary"]
+
+
+@pytest.mark.parametrize("case", sorted(FAST_CASES))
+def test_stored_legacy_run_matches_the_legacy_golden(tmp_path_factory, case):
+    """Legacy fills with --db: trades.json is the legacy golden byte for byte, and the stored
+    round trips are the golden's closed trades, without commission."""
+    full, database = full_store_run(tmp_path_factory, "legacy")
+    idname = FAST_CASES[case][1]["idname"]
+    golden = json.loads((LEGACY_GOLDEN / f"{case}.json").read_text())
+    assert full.trades()[idname] == golden
+    assert not (full.out / "ledger.json").exists()
+    data = stored(database)
+    assert data.summary.fills == "legacy"
+    closed = [g for g in golden if g["status"] == "Closed"]
+    trips = [t for t in data.round_trips if t.account == idname]
+    assert [(str(t.entry_time), float(t.entry_price), str(t.exit_time), float(t.exit_price),
+             t.side, int(t.quantity)) for t in trips if not t.synthetic] == [
+        (g["openTime"], g["openPrice"], g["closeTime"], g["closePrice"],
+         "long" if g["direction"] == 1 else "short", g["volume"]) for g in closed]
+    assert all(t.commission == 0 and t.net == t.gross for t in trips)
+
+
+def test_a_failed_output_write_after_the_run_is_failed_not_completed(env, db):
+    """`trades.json` cannot be replaced (it is a directory): the run row says failed."""
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    (env.out / "trades.json").mkdir(parents=True)
+    with pytest.raises(OSError):
+        run(env, "--db", str(db))
+    data = stored(db)
+    assert data.summary.status == "failed" and data.summary.ended_at is not None
+    db.unlink()  # closed
+
+
+def test_out_pointing_at_a_file_is_an_error_and_no_run_is_stored(env, db, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    env.out.write_text("not a directory")
+    assert run(env, "--db", str(db)) == 2
+    one_line_error(capsys)
+    assert env.out.read_text() == "not a directory"
+    if db.exists():
+        store = read(db)
+        try:
+            assert store.list_runs() == ()
+        finally:
+            store.close()
+        db.unlink()
+
+
+def test_begin_run_failure_propagates_and_closes_the_store(env, db, monkeypatch):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+
+    def broken(self, meta):
+        raise StoreError("attempt to write a readonly database")
+
+    monkeypatch.setattr(store_module.SqliteStore, "begin_run", broken)
+    with pytest.raises(StoreError):
+        run(env, "--db", str(db))
+    db.unlink()  # a connection left open would make this fail on Windows
+    assert not list(db.parent.glob("runs.db*"))
+
+
+def _spawn(env: Env, db: Path, out: Path, *extra: str, code: str | None = None):
+    argv = ["backtest", "--algos", str(env.algos), "--data", str(env.data), "--out", str(out),
+            "--quiet", "--db", str(db), *extra]
+    program = code or "import sys; from MainStoinker.engine.cli import main; sys.exit(main(sys.argv[1:]))"
+    return subprocess.Popen([sys.executable, "-c", program, *argv], cwd=env.start,
+                            env={**os.environ, "PYTHONPATH": str(REPO)},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def test_two_processes_write_different_runs_to_one_database_at_once(env, db):
+    env.setup(MULTI, ["AAPL", "MSFT"], rows=900)
+    other = env.inputs / "other.json"
+    other.write_text(json.dumps(ema_config()))
+    first = _spawn(env, db, env.out / "a", "--fills", "realistic")
+    env.algos, saved = other, env.algos
+    second = _spawn(env, db, env.out / "b", "--fills", "legacy")
+    env.algos = saved
+    results = [p.communicate(timeout=300) for p in (first, second)]
+    assert [p.returncode for p in (first, second)] == [0, 0], results
+    store = read(db)
+    try:
+        runs = {r.run_id: r for r in store.list_runs()}
+        assert sorted(r.status for r in runs.values()) == ["completed", "completed"]
+        by_fills = {r.fills: store.load_run(r.run_id) for r in runs.values()}
+    finally:
+        store.close()
+    assert len(by_fills["realistic"].algos) == 3 and len(by_fills["legacy"].algos) == 1
+    for data in by_fills.values():
+        names = {a.idname for a in data.algos}
+        assert data.fills and {f.account for f in data.fills} <= names
+        assert {t.account for t in data.round_trips} <= names
+
+
+def test_a_killed_process_leaves_a_running_row_and_the_database_stays_usable(env, db):
+    import time
+
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    stall = ("import sys, time\n"
+             "import MainStoinker.engine.cli as cli\n"
+             "cli.Engine.run_backtest = lambda self: time.sleep(600)\n"
+             "sys.exit(cli.main(sys.argv[1:]))\n")
+    proc = _spawn(env, db, env.out / "killed", "--fills", "realistic", code=stall)
+    try:
+        deadline = time.monotonic() + 120
+        seen = False
+        while time.monotonic() < deadline and proc.poll() is None and not seen:
+            if db.exists():
+                with contextlib.suppress(StoreError):  # the child may still be creating it
+                    seen = [r.status for r in read_runs(db)] == ["running"]
+            time.sleep(0.1)
+        assert seen, "the run row never appeared"
+    finally:
+        proc.kill()
+        proc.communicate(timeout=60)
+    # On Windows the first open right after a kill can fail once ("disk I/O error")
+    # while the dead process's handles are released; it works a moment later.
+    for attempt in range(100):
+        try:
+            (row,) = read_runs(db)
+            break
+        except StoreError:
+            if attempt == 99:
+                raise
+            time.sleep(0.1)
+    assert (row.status, row.ended_at) == ("running", None)
+    assert run(env, "--db", str(db)) == 0
+    assert [r.status for r in read_runs(db)] == ["running", "completed"]
+    assert not (env.out / "killed" / "trades.json").exists()
+
+
+def read_runs(db: Path):
+    store = read(db)
+    try:
+        return store.list_runs()
+    finally:
+        store.close()
 
 
 # ---- housekeeping -----------------------------------------------------------------
