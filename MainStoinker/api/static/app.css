@@ -182,7 +182,7 @@ th, td { padding: 6px 10px; text-align: left; white-space: nowrap; border-bottom
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: var(--surface-2); }
 tbody tr.selectable { cursor: pointer; }
-tbody tr[aria-selected="true"] { background: var(--surface-2); box-shadow: inset 4px 0 0 var(--accent); font-weight: 600; }
+tbody tr[aria-current="true"] { background: var(--surface-2); box-shadow: inset 4px 0 0 var(--accent); font-weight: 600; }
 th { font-weight: 600; color: var(--muted); background: var(--surface-2); }
 th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.num { font-family: var(--mono); font-size: 13px; }
@@ -242,4 +242,27 @@ td.total, th.total { font-weight: 600; background: var(--surface-2); }
 @media (max-width: 480px) {
   .chart-canvas { height: 340px; }
   .status-line li { white-space: normal; }
+}
+
+/* Algo detail: back links, summary, day control, candle chart, trade table selection */
+.back-links { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 12px; }
+.params.summary { grid-template-columns: max-content max-content; gap: 2px 16px; }
+.params.summary dd { font-variant-numeric: tabular-nums; }
+.day-control { margin: 0 0 8px; }
+.day-label { min-width: 12ch; text-align: center; font-variant-numeric: tabular-nums; }
+.bars-error:empty { display: none; }
+.marker-key { gap: 0 16px; }
+.marker-shape { display: inline-block; width: 1.4em; text-align: center; color: var(--accent); }
+td button.row-select {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  min-width: 3ch;
+  padding: 0 8px;
+}
+td button.row-select[aria-pressed="true"],
+td button.row-select[aria-pressed="true"]:hover:not(:disabled):not([aria-disabled="true"]) {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
 }

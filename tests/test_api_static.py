@@ -883,7 +883,7 @@ globalThis.document = { activeElement: null, createElement: (t) => new FakeEl(t)
 
 def test_table_helpers_with_node(node_workdir: Path) -> None:
     out = run_node(node_workdir, "table", """
-import { compareValues, isSelectKey, netCell, nextSort, sortRows } from "./js/table.js";
+import { compareValues, netCell, nextSort, sortRows } from "./js/table.js";
 const rows = [{ n: "10" }, { n: "9" }, { n: null }, { n: "100" }, { n: "9" }].map((r, i) => ({ ...r, i }));
 const key = (r) => (r.n === null ? null : Number(r.n));
 console.log(JSON.stringify({
@@ -895,7 +895,6 @@ console.log(JSON.stringify({
   pos: netCell("12.3400"), neg: netCell("-0.0600"), zero: netCell("0.0000"), none: netCell(null),
   next: [nextSort({ column: -1, direction: "asc" }, 2), nextSort({ column: 2, direction: "asc" }, 2),
     nextSort({ column: 2, direction: "desc" }, 2), nextSort({ column: 2, direction: "desc" }, 1)],
-  keys: ["Enter", " ", "a", "Tab"].map(isSelectKey),
 }));
 """)
     assert isinstance(out, dict)
@@ -909,7 +908,6 @@ console.log(JSON.stringify({
     assert out["none"] == {"content": "-", "className": ""}
     assert out["next"] == [{"column": 2, "direction": "asc"}, {"column": 2, "direction": "desc"},
                            {"column": 2, "direction": "asc"}, {"column": 1, "direction": "asc"}]
-    assert out["keys"] == [True, True, False, False]
 
 
 def test_data_table_selection_and_sort_survive_updates_with_node(node_workdir: Path) -> None:
@@ -926,11 +924,17 @@ const table = dataTable({ columns, rows, caption: "t", rowKey: (r) => r.id, sele
   onSelect: (r) => picked.push(r.id) });
 const bodyRows = () => table.element.all("tbody")[0].children;
 const ids = () => bodyRows().map((tr) => tr.children[0].textContent);
-const selected = () => bodyRows().filter((tr) => tr.getAttribute("aria-selected") === "true")
+const selected = () => bodyRows().filter((tr) => tr.getAttribute("aria-current") === "true")
+  .map((tr) => tr.children[0].textContent);
+const buttonOf = (tr) => tr.children[0].children[0];
+const pressed = () => bodyRows().filter((tr) => buttonOf(tr).getAttribute("aria-pressed") === "true")
   .map((tr) => tr.children[0].textContent);
 const out = {};
-out.start = { ids: ids(), selected: selected(), tabindex: bodyRows().map((tr) => tr.getAttribute("tabindex")),
-  cls: bodyRows()[0].className };
+out.start = { ids: ids(), selected: selected(), pressed: pressed(),
+  tabindex: bodyRows().map((tr) => tr.getAttribute("tabindex")), cls: bodyRows()[0].className,
+  buttons: bodyRows().map((tr) => [buttonOf(tr).tag, buttonOf(tr).getAttribute("type")]),
+  keydown: bodyRows().map((tr) => (tr.listeners.keydown || []).length),
+  aria: bodyRows().map((tr) => tr.getAttribute("aria-selected")) };
 
 // the user sorts by Net descending (two clicks on the header button)
 const netButton = table.element.all("th")[1].children[0];
@@ -939,53 +943,56 @@ out.sorted = { ids: ids(), sort: table.getSort(), aria: table.element.all("th")[
 
 // a re-render with new rows keeps the sort and the selection follows the key
 table.update({ rows: [{ id: 1, net: 5 }, { id: 2, net: 9 }, { id: 3, net: 7 }, { id: 4, net: 8 }] });
-out.afterRows = { ids: ids(), sort: table.getSort(), selected: selected() };
+out.afterRows = { ids: ids(), sort: table.getSort(), selected: selected(), pressed: pressed() };
 
 // a new selectedKey alone does not rebuild the rows
 const before = bodyRows()[0];
 table.update({ selectedKey: 3 });
-out.afterSelect = { same: bodyRows()[0] === before, selected: selected(), sort: table.getSort() };
+out.afterSelect = { same: bodyRows()[0] === before, selected: selected(), pressed: pressed(),
+  sort: table.getSort() };
 table.update({ selectedKey: null });
-out.none = selected();
+out.none = { selected: selected(), pressed: pressed() };
 
-// click selects, a click on a link inside the row does not, Enter and Space select, other keys do not
+// a click on the row (mouse) selects, a click on a link inside the row does not, a press of the row's
+// button selects (a keyboard user reaches it with Tab and presses Enter or Space: native button behaviour)
 const first = bodyRows()[0];
 first.fire("click");
 first.children[2].children[0].fire("click"); // the <a> inside the row: ignored
-bodyRows()[1].fire("keydown", { key: "Enter" });
-const space = bodyRows()[2].fire("keydown", { key: " " });
-bodyRows()[2].fire("keydown", { key: "x" });
+buttonOf(bodyRows()[1]).fire("click");
+buttonOf(bodyRows()[2]).fire("click");
 out.picked = picked;
-out.spacePrevented = space.prevented === true;
 
-// a focused row keeps focus when the rows are re-rendered
-const focusTarget = bodyRows()[2];
+// a focused row button keeps focus when the rows are re-rendered
+const focusTarget = buttonOf(bodyRows()[2]);
 focusTarget.focus();
-const focusedId = focusTarget.children[0].textContent;
+const focusedId = bodyRows()[2].children[0].textContent;
 table.update({ rows: [{ id: 1, net: 5 }, { id: 2, net: 9 }, { id: 3, net: 7 }] });
-out.focus = { kept: document.activeElement.children[0].textContent === focusedId, isNewRow: document.activeElement !== focusTarget };
+out.focus = { kept: document.activeElement.parent.parent.children[0].textContent === focusedId,
+  isNewButton: document.activeElement !== focusTarget };
 
-// without onSelect rows are not focusable and carry no handlers; without rowKey no aria-selected
+// without onSelect there is no button and no handler; without rowKey no aria-current
 const plain = dataTable({ columns, rows });
 const plainRow = plain.element.all("tbody")[0].children[0];
-out.plain = { tabindex: plainRow.getAttribute("tabindex"), aria: plainRow.getAttribute("aria-selected"),
-  click: (plainRow.listeners.click || []).length };
+out.plain = { tabindex: plainRow.getAttribute("tabindex"), aria: plainRow.getAttribute("aria-current"),
+  buttons: plainRow.children[0].all("button").length, click: (plainRow.listeners.click || []).length };
 console.log(JSON.stringify(out));
 """)  # noqa: E501
     assert isinstance(out, dict)
-    assert out["start"] == {"ids": ["1", "2", "3"], "selected": ["2"], "tabindex": ["0", "0", "0"],
-                            "cls": "selectable"}
+    assert out["start"] == {"ids": ["1", "2", "3"], "selected": ["2"], "pressed": ["2"],
+                            "tabindex": [None, None, None], "cls": "selectable",
+                            "buttons": [["BUTTON", "button"]] * 3, "keydown": [0, 0, 0],
+                            "aria": [None, None, None]}
     assert out["sorted"] == {"ids": ["2", "3", "1"],
                              "sort": {"column": 1, "direction": "desc"}, "aria": "descending"}
     assert out["afterRows"] == {"ids": ["2", "4", "3", "1"], "sort": {"column": 1, "direction": "desc"},
-                                "selected": ["2"]}
-    assert out["afterSelect"] == {"same": True, "selected": ["3"], "sort": {"column": 1, "direction": "desc"}}
-    assert out["none"] == []
-    # first click on the row selects id 2; the click whose target sits in a link is ignored
+                                "selected": ["2"], "pressed": ["2"]}
+    assert out["afterSelect"] == {"same": True, "selected": ["3"], "pressed": ["3"],
+                                  "sort": {"column": 1, "direction": "desc"}}
+    assert out["none"] == {"selected": [], "pressed": []}
+    # the row click selects id 2; the click whose target sits in a link is ignored; two button presses
     assert out["picked"] == [2, 4, 3]
-    assert out["spacePrevented"] is True
-    assert out["focus"] == {"kept": True, "isNewRow": True}
-    assert out["plain"] == {"tabindex": None, "aria": None, "click": 0}
+    assert out["focus"] == {"kept": True, "isNewButton": True}
+    assert out["plain"] == {"tabindex": None, "aria": None, "buttons": 0, "click": 0}
 
 
 # --- format.js: chart time ---------------------------------------------------------------------
