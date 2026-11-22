@@ -31,7 +31,7 @@ jobs:
       - name: Lint (legacy defect set)
         run: ruff check .
       - name: Lint (new code)
-        run: ruff check tests MainStoinker/engine --select E,F,W,I,B
+        run: ruff check tests MainStoinker/engine MainStoinker/__main__.py --select E,F,W,I,B
       - name: Tests
         run: pytest
       - name: Slow golden backtests
