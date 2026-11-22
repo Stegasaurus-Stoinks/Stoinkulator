@@ -13,7 +13,9 @@ solid to build on.
 Done means:
 
 1. An offline backtest runs through a new `Engine` with every dependency
-   passed in. No module-level state is read or written on that path.
+   passed in. Engine modules read and write no module-level state. (Algo
+   imports still construct the legacy `ibapi` and front-end objects, without
+   connecting, until Phase B removes them.)
 2. All six golden backtests produce byte-identical files through the new
    engine. Algo files do not change.
 3. A backtest of the committed data runs with no sleeps and no socket, from a
@@ -51,16 +53,19 @@ changed as little as possible and deleted only once nothing uses them.
 
 Small `typing.Protocol` classes, each with a real and a test implementation.
 
-- **`Broker`**: what `Trade` needs. Open an entry (market or limit), place a
-  stop, modify a stop, place or modify a take-profit, close a position, and
-  report whether a given stop order is still open or has filled. Order ids are
+- **`Broker`**: what `Trade` needs. Open a position (market or limit entry
+  together with its initial stop), modify the stop, place or modify a
+  take-profit, close the position, and report whether the stop is still
+  working. Order ids are
   the broker's business and do not appear in `Trade`.
   - `SimBroker`: fills exactly as the current non-live code does (at the price
     the caller passes, immediately). It records every call, so tests can
     assert on the sequence. A better fill model is milestone 2.
   - `IbkrBroker`: the existing order code from `Trade` and `IBapi`, moved, not
     rewritten.
-- **`BarFeed`**: yields warm-up bars, then bars one at a time per symbol.
+- **`BarFeed`**: yields warm-up bars, then one batch per timestamp holding
+  the bar for every symbol. The Phase A protocol is for backtests; a
+  push-based live feed is designed in Phase B.
   - `CsvBarFeed`: reads the offline files. Deterministic.
   - `IbkrBarFeed`: wraps the existing historical and live callbacks.
 - **`EventSink`**: receives "bar closed", "intrabar update" and "algo data"
@@ -90,8 +95,10 @@ then its mutable state is removed.
 
 ### Performance
 
-`Ticker.append` rebuilds the whole DataFrame for every bar, so a run costs
-time proportional to the square of the number of bars. The feed will hold the
+`Ticker.append` rebuilds the whole DataFrame for every bar. Measured on the
+committed data that is about a third of a fast algo's run time; it only
+dominates from roughly two months of 1-minute bars. Most of the remaining cost
+is per-bar pandas work inside the algo files, which Phase A does not touch. The feed will hold the
 full history once and hand algos a growing view of it. Algos still receive a
 DataFrame with the same columns and values. The Elliot rewrite (issue 11) is
 a separate task inside this milestone.
@@ -107,25 +114,46 @@ broker: it only constructs `CsvBarFeed` and `SimBroker`.
 Each phase leaves `revival` green with identical goldens. The task-divider
 splits each into tasks.
 
-**Phase A: backtest side.** No change to what is sent to the broker.
+**Phase A: backtest side.** Nothing that is sent to the broker changes. The
+legacy `Ticker`, `main_utils.backtesting_data_blast`, `apiApi.py`,
+`Globals.py` and the entry script are not modified, because the live path uses
+them; they are retired in Phase B. Only A3 touches order-path code.
 
-1. `Broker` protocol and `SimBroker`. `Trade` takes a broker argument; when
-   none is given it behaves exactly as today. Goldens identical.
-2. `BarFeed` protocol and `CsvBarFeed`.
-3. `EventSink` protocol, `NullSink`, `SocketIoSink`. `Ticker` publishes
-   through a sink and no longer imports the front-end client or `ibapi`.
-4. `Engine.run_backtest()`. The test harness switches to it. The legacy
-   backtest loop in `main_utils` is deleted.
-5. Linear-time bar storage. Command line entry point.
-6. Elliot made incremental (issue 11). Issues 8, 12, 14 and 16 fit here too.
+- **A1** Tests that pin today's live order sequence, using a fake `ibapi`
+  object (pulled forward from Phase B step 7 as the safety net for A3).
+- **A2** `MainStoinker/engine/` package: `Broker` protocol and a record-only
+  `SimBroker`; a test that the engine package imports no legacy or broker
+  modules.
+- **A3** `Trade` takes an optional `broker`. When one is given it is used and
+  the live branch cannot be reached; when none is given `Trade` behaves
+  exactly as today. Additions only inside `trade.py`.
+- **A4** `BarFeed` protocol and `CsvBarFeed` (per-timestamp batches; symbols
+  whose timestamps do not line up raise an error); `EventSink` protocol with
+  `NullSink` and a recording sink.
+- **A5** `Engine.run_backtest()` with its own per-symbol bar store and an algo
+  loader.
+- **A6** The test harness runs through the engine. The legacy loop is kept
+  under another name and compared, read-only, against all six goldens in the
+  slow suite.
+- **A7** Linear-time bar storage.
+- **A8** The engine creates algo loggers, so no log file opens in the current
+  directory.
+- **A9** Command line: `python -m MainStoinker backtest --algos <json>
+  --data <dir> --out <dir>`, writing `trades.json` in the golden record shape.
+
+Then, in this order: issue 11 (Elliot incremental), issue 8 (TrendLine
+golden), issue 12, issue 14, issue 16.
+
+Byte-identity of goldens is checked by regenerating them and running
+`git diff --exit-code tests/golden`; the test fixture alone compares parsed
+JSON.
 
 **Phase B: live side.** Order-path changes; every pull request needs owner
 review.
 
-7. Characterization first: with a fake `ibapi` object, tests that record the
-   exact sequence and fields of `placeOrder` calls for a long and a short
-   trade through entry, stop change, take-profit and close, on today's code.
-   This is the safety net for step 8 and covers issue 15 item 8.
+7. Extend the A1 characterization tests to the rest of the live path:
+   `Ticker` (order polling, the partial last bar), the data callbacks and the
+   entry script's sequence.
 8. `IbkrBroker`: move the order code out of `Trade` behind the protocol. The
    recorded sequences from step 7 must not change.
 9. `IbkrBarFeed` and `Engine.run_live()`. The entry script becomes a thin
