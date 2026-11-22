@@ -150,9 +150,10 @@ def test_every_algo_in_the_repository_stores_what_it_declares(env, tmp_path, fra
         {"ID": "OpeningRangeCandle", "data": [{"idname": "AAPL-orc", "ticker": "AAPL",
                                                "RRRatio": 3}]},
     ]
-    env.setup(configs, ["AAPL", "MSFT"], rows=1500)
+    # Few rows and a one-day warm-up: TrendLine prints its whole frame on every bar.
+    env.setup(configs, ["AAPL", "MSFT"], rows=700)
     db = tmp_path / "s" / "r.db"
-    assert backtest(env, db) == 0
+    assert backtest(env, db, "--warmup-days", "1") == 0
     trend = check_against_frame(db, "AAPL-trend", bar_dates(env, "AAPL"), frames)
     assert trend["random"][0] == "marker-dot" and trend["random"][2]  # unknown type kept as text
     func = check_against_frame(db, "MSFT-ft", bar_dates(env, "MSFT"), frames)
@@ -162,9 +163,19 @@ def test_every_algo_in_the_repository_stores_what_it_declares(env, tmp_path, fra
     assert orc["tp"][0] == "segment"
 
 
+# Every golden case with legacy fills; realistic fills only differ in the
+# StopPrice / Trade columns, so two cases cover them.
+REALISTIC = {"emacrossing_aapl", "elliot_msft"}
+RUNS = [
+    pytest.param(*case.values, fills, id=f"{case.id}-{fills}")
+    for fills in ("legacy", "realistic")
+    for case in CASES
+    if fills == "legacy" or case.id in REALISTIC
+]
+
+
 @pytest.mark.slow
-@pytest.mark.parametrize("fills", ["legacy", "realistic"])
-@pytest.mark.parametrize("algo_id, cfg", CASES)
+@pytest.mark.parametrize("algo_id, cfg, fills", RUNS)
 def test_golden_cases_store_the_algodata_columns_point_for_point(
         algo_id, cfg, fills, env, tmp_path, frames):
     env.setup([{"ID": algo_id, "data": [cfg]}], [cfg["ticker"]], rows=None)

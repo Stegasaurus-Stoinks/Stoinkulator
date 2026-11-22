@@ -56,6 +56,23 @@ def test_length_mismatch_skips_algo_with_warning(capsys):
     assert len(lines) == 2 and all(line.startswith("warning: algo-1:") for line in lines)
 
 
+def test_repeated_bar_time_skips_algo_naming_the_first_repeat(capsys):
+    times = [*BAR_TIMES[:3], BAR_TIMES[1], BAR_TIMES[2]]  # first repeat is BAR_TIMES[1]
+    assert extract_series(fake_algo(frame(a=[1.0] * 5, b=[1.0] * 5)), times) == ([], [])
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert len(lines) == 1 and lines[0].startswith("warning: algo-1:")
+    assert str(BAR_TIMES[1]) in lines[0]
+
+
+def test_algo_that_never_ran_is_skipped_silently(capsys):
+    never = fake_algo(frame(a=[1.0] * 5, b=[1.0] * 5).iloc[:0])
+    assert extract_series(never, BAR_TIMES) == ([], [])
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
 def test_missing_attributes_store_nothing():
     good = frame(a=[1.0] * 5, b=[1.0] * 5)
     for algo in (

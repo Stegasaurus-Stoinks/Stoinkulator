@@ -49,7 +49,9 @@ def extract_series(
     `FrontEndDataStruct`, `FrontEndDataType` or `AlgoData` is missing or
     malformed (not two equal-length lists, not a DataFrame). When the frame
     length differs from `len(bar_times)` the algo is skipped with a one-line
-    warning on stderr. Otherwise each declared column becomes one series in
+    warning on stderr; so is an algo when `bar_times` repeats a time (the
+    warning names the first repeated one). An algo with an empty frame never
+    ran and is skipped silently. Otherwise each declared column becomes one series in
     declaration order (a name listed twice keeps the first; a name that is not
     a column, or a draw type that is not a non-empty string, is left out). Values
     go through `pd.to_numeric(errors="coerce")`; empty and non-finite values
@@ -65,6 +67,8 @@ def extract_series(
     account = getattr(algo, "name", None)
     if not isinstance(account, str) or not account:
         return [], []
+    if len(frame) == 0:
+        return [], []  # the algo never ran (replay shorter than the warm-up): nothing to say
     if len(frame) != len(bar_times):
         _warn(f"warning: {account}: indicator series not stored "
               f"({len(frame)} algo rows for {len(bar_times)} bars)")
@@ -74,6 +78,13 @@ def extract_series(
     except ValueError as exc:
         _warn(f"warning: {account}: indicator series not stored ({exc})")
         return [], []
+    seen_times: set[datetime] = set()
+    for when in times:
+        if when in seen_times:  # the engine accepts repeated bar times; the store does not
+            _warn(f"warning: {account}: indicator series not stored "
+                  f"(bar time {when} appears more than once in the data)")
+            return [], []
+        seen_times.add(when)
     infos: list[SeriesInfo] = []
     points: list[SeriesPoint] = []
     seen: set[str] = set()

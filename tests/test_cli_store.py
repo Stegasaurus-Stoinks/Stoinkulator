@@ -1084,7 +1084,7 @@ def series_of(db: Path, algo: str, run_id: int = 1):
     return data, points
 
 
-def test_symbol_pattern_is_the_feeds(monkeypatch):
+def test_symbol_pattern_is_the_feeds():
     from MainStoinker.engine import feed
 
     assert cli._SYMBOL is feed._SYMBOL
@@ -1205,6 +1205,89 @@ def test_trades_and_ledger_json_unchanged_with_capture(env, db, fills):
     assert run(env, "--fills", fills, "--db", str(db)) == 0
     assert stored(db).series  # capture really happened
     assert {p.name: p.read_bytes() for p in env.out.glob("*.json")} == plain
+
+
+def test_repeated_bar_time_skips_the_algo_and_the_run_completes(env, db, capsys):
+    import pandas as pd
+
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    path = env.data / "_AAPL_offlinedata_"
+    frame = pd.read_csv(path, index_col=0)
+    repeated = frame["date"].iloc[880]
+    frame = pd.concat([frame.iloc[:881], frame.iloc[880:]], ignore_index=True)
+    frame.to_csv(path)
+    assert run(env, "--db", str(db)) == 0
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1 and err[0].startswith(f"warning: {EMA['idname']}:")
+    assert repeated in err[0]
+    data = stored(db)
+    assert data.summary.status == "completed"
+    assert data.series == ()
+    assert (env.out / "trades.json").exists()
+    assert data.round_trips or data.fills or data.equity  # results are stored
+
+
+def test_an_exception_while_reading_one_algos_series_skips_that_algo(
+        env, db, monkeypatch, capsys):
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    real = cli.extract_series
+
+    class Broken:
+        name = EMA["idname"]
+        ticker = "AAPL"
+        FrontEndDataStruct = ["MA20"]  # noqa: RUF012
+        FrontEndDataType = ["line"]  # noqa: RUF012
+
+        @property
+        def AlgoData(self):  # noqa: N802
+            raise RuntimeError("frame is gone")
+
+    def extract(algo, bar_times):
+        return real(Broken() if algo.name == EMA["idname"] else algo, bar_times)
+
+    monkeypatch.setattr(cli, "extract_series", extract)
+    assert run(env, "--db", str(db)) == 0
+    err = capsys.readouterr().err.splitlines()
+    assert err == [f"warning: {EMA['idname']}: indicator series not stored (RuntimeError)"]
+    data = stored(db)
+    assert data.summary.status == "completed"
+    assert {s.account for s in data.series} == {EMA_MSFT["idname"]}
+
+
+def test_write_series_is_called_once_per_algo_with_series(env, db, monkeypatch):
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    accounts: list[set[str]] = []
+    real = store_module.SqliteStore.write_series
+
+    def spy(self, run_id, infos, points=()):
+        points = list(points)
+        accounts.append({i.account for i in infos} | {p.account for p in points})
+        return real(self, run_id, infos, points)
+
+    monkeypatch.setattr(store_module.SqliteStore, "write_series", spy)
+    assert run(env, "--db", str(db)) == 0
+    assert accounts == [{EMA["idname"]}, {EMA_MSFT["idname"]}]
+    assert {s.account for s in stored(db).series} == {EMA["idname"], EMA_MSFT["idname"]}
+
+
+def test_a_store_error_part_way_keeps_earlier_series_and_fails_the_run(
+        env, db, monkeypatch, capsys):
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    real = store_module.SqliteStore.write_series
+    calls: list[int] = []
+
+    def second_fails(self, run_id, infos, points=()):
+        calls.append(1)
+        if len(calls) == 2:
+            raise StoreError("disk full")
+        return real(self, run_id, infos, points)
+
+    monkeypatch.setattr(store_module.SqliteStore, "write_series", second_fails)
+    assert run(env, "--db", str(db)) == 3
+    assert "disk full" in capsys.readouterr().err
+    data = stored(db)
+    assert data.summary.status == "failed"
+    assert {s.account for s in data.series} == {EMA["idname"]}
 
 
 def test_no_database_file_in_the_repository():

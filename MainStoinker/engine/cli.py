@@ -764,15 +764,23 @@ def run_backtest_command(
                 )
                 # The indicator series: the full history each algo saw (its
                 # symbol's warm-up bars, then every replayed bar), matched by position.
-                all_infos: list = []
-                all_points: list = []
+                # Series are secondary data: a problem with one algo's series skips that
+                # algo with a warning and never fails the run. Each algo is written in
+                # its own transaction (peak memory is one algo's points), so a StoreError
+                # part-way leaves the earlier algos' series stored and the run marked failed.
                 for algo in algos:
-                    history = [*feed.warmup(algo.ticker)["date"].tolist(), *replay_times]
-                    infos, points = extract_series(algo, history)
-                    all_infos += infos
-                    all_points += points
-                if all_infos:  # one transaction: a run has all its series or none
-                    store.write_series(run_id, all_infos, all_points)
+                    try:
+                        history = [*feed.warmup(algo.ticker)["date"].tolist(), *replay_times]
+                        infos, points = extract_series(algo, history)
+                    except StoreError:
+                        raise
+                    except Exception as exc:
+                        print(f"warning: {getattr(algo, 'name', '?')}: indicator series not "
+                              f"stored ({type(exc).__name__})", file=sys.stderr)
+                        continue
+                    if infos:
+                        store.write_series(run_id, infos, points)
+                    del infos, points
                 store.end_run(run_id, "completed")
         except BaseException as exc:
             if not engine_started:
