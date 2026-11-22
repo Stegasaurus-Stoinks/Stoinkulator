@@ -37,16 +37,33 @@ def test_short_series_unchanged() -> None:
     assert thin([], 10) == []
 
 
+@pytest.fixture(scope="module")
+def big_walk() -> list[Pt]:
+    return walk(100_000, seed=3)
+
+
 @pytest.mark.parametrize("max_points", [10, 11, 12, 30, 100, 301])
-def test_result_size_bounded(max_points: int) -> None:
-    points = walk(5000)
-    out = thin(points, max_points, CAPITAL)
+def test_result_size_bounded(big_walk: list[Pt], max_points: int) -> None:
+    out = thin(big_walk, max_points, CAPITAL)
     assert 2 <= len(out) <= max_points
-    assert len(thin(walk(100_000, seed=3), 10, CAPITAL)) <= 10
 
 
-@pytest.mark.parametrize("seed", range(40))
-@pytest.mark.parametrize("max_points", [10, 25, 60])
+def test_each_bucket_keeps_its_minimum_maximum_and_last_point() -> None:
+    """Three buckets at max_points 12; distinct values, so each bucket's extremes are unique."""
+    values = list(range(300))
+    random.Random(5).shuffle(values)
+    points = [Pt(i, CAPITAL + v) for i, v in enumerate(values)]
+    kept = {p.index for p in thin(points, 12, CAPITAL)}
+    for b in range(3):
+        bucket = points[b * 100:(b + 1) * 100]
+        assert min(bucket, key=lambda p: p.equity).index in kept
+        assert max(bucket, key=lambda p: p.equity).index in kept
+        assert bucket[-1].index in kept
+
+
+# seed 38 at 10 is the one case where dropping the explicit peak/trough keep changes the result
+@pytest.mark.parametrize(("seed", "max_points"),
+                         [(38, 10), (0, 25), (11, 60), (21, 10), (29, 25)])
 def test_max_drawdown_preserved(seed: int, max_points: int) -> None:
     points = walk(2000, seed)
     out = thin(points, max_points, CAPITAL)

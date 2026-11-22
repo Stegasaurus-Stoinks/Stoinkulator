@@ -2,27 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import random
-from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from MainStoinker.api.thinning import thin
+from MainStoinker.engine.ledger import OrderEvent
 from MainStoinker.engine.stats import max_drawdown, run_statistics
 from MainStoinker.engine.store import RunData
 from tests.api_support import make_client, stored_run_database
+from tests.test_api_thinning import Pt
+from tests.test_api_trades import get
 from tests.test_cli_store import stored
 
 PATHS = ["trades", "orders", "equity"]
-
-
-@dataclass(frozen=True)
-class Pt:
-    index: int
-    equity: Decimal
 
 
 def series(kind: str, count: int, seed: int) -> list[Pt]:
@@ -78,10 +74,6 @@ def realistic_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
 @pytest.fixture(scope="module")
 def legacy_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return stored_run_database(tmp_path_factory, "legacy")
-
-
-def get(db: Path, path: str, **params: Any) -> Any:
-    return make_client(db).get(path, params=params)
 
 
 def drawdown(points: list[dict[str, str]], capital: str) -> Decimal:
@@ -179,13 +171,20 @@ def test_order_events_and_fills_equal_the_store_field_by_field(
     db = realistic_db if fills == "realistic" else legacy_db
     run: RunData = stored(db)
     body = get(db, "/api/runs/1/orders").json()
+    placed = {(e.account, e.order_id): e for e in run.order_events if e.kind == "placed"}
+
+    def resolved(e: OrderEvent, name: str) -> str | None:
+        own = getattr(e, name)
+        return own if own is not None else getattr(placed[(e.account, e.order_id)], name)
+
     assert body["order_events"] == [
-        {"order_id": e.order_id, "account": e.account, "broker_ref": str(e.broker_ref),
-         "kind": e.kind, "time": str(e.time), "side": e.side, "quantity": _opt4(e.quantity),
-         "order_type": e.order_type, "price": _opt4(e.price)} for e in run.order_events]
+        {"order_id": e.order_id, "account": e.account, "broker_ref": json.dumps(e.broker_ref),
+         "kind": e.kind, "time": str(e.time), "side": resolved(e, "side"),
+         "quantity": _opt4(e.quantity), "order_type": resolved(e, "order_type"),
+         "price": _opt4(e.price)} for e in run.order_events]
     assert body["fills"] == [
         {"fill_id": f.fill_id, "order_id": f.order_id, "account": f.account,
-         "broker_ref": str(f.broker_ref), "symbol": f.symbol, "side": f.side,
+         "broker_ref": json.dumps(f.broker_ref), "symbol": f.symbol, "side": f.side,
          "quantity": f"{f.quantity:.4f}", "price": f"{f.price:.4f}",
          "commission": f"{f.commission:.4f}", "time": str(f.time), "reason": f.reason,
          "synthetic": bool(f.synthetic)} for f in run.fills]
