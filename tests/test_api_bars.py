@@ -75,30 +75,43 @@ def test_bars_window_matches_csv(client: TestClient, data_dir: Path) -> None:
     assert body["symbol"] == "AAPL" and body["available"] is True and body["reason"] is None
     assert len(body["bars"]) == len(rows) > 0
     for bar, (_, row) in zip(body["bars"], rows.iterrows(), strict=True):
-        assert bar == {"time": row["date"].isoformat(), "open": row["open"], "high": row["high"],
+        assert bar == {"time": str(row["date"]), "open": row["open"], "high": row["high"],
                        "low": row["low"], "close": row["close"], "volume": row["volume"]}
         assert isinstance(bar["open"], float) and isinstance(bar["volume"], int)
-        assert "+" not in bar["time"] and "Z" not in bar["time"]  # naive, as stored
+        assert "T" not in bar["time"] and "+" not in bar["time"] and "Z" not in bar["time"]
 
 
 def test_default_window_is_last_day(client: TestClient, data_dir: Path) -> None:
     body = client.get("/api/runs/1/bars", params={"symbol": "AAPL"}).json()
     assert len(body["bars"]) == PER_DAY
     assert {bar["time"][:10] for bar in body["bars"]} == {"2024-01-10"}
-    assert body["bars"][0]["time"] == "2024-01-10T09:30:00"
+    assert body["bars"][0]["time"] == "2024-01-10 09:30:00"
 
 
 def test_window_too_wide_422(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     wide = client.get("/api/runs/1/bars", params={
         "symbol": "AAPL", "start": "2024-01-02T00:00:00", "end": "2024-01-10T23:59:59"})
-    assert wide.status_code == 422 and "trading days" in wide.json()["detail"]
+    assert wide.status_code == 422 and "calendar days" in wide.json()["detail"]
     five = client.get("/api/runs/1/bars", params={
         "symbol": "AAPL", "start": "2024-01-02T00:00:00", "end": "2024-01-08T23:59:59"})
     assert five.status_code == 200 and len(five.json()["bars"]) == 5 * PER_DAY
+    edge = client.get("/api/runs/1/bars", params={  # 7 calendar days apart fails, whatever the data
+        "symbol": "AAPL", "start": "2024-01-02 00:00", "end": "2024-01-09 00:00"})
+    assert edge.status_code == 422 and "2024" not in edge.json()["detail"]
     monkeypatch.setattr(routes_bars, "MAX_BARS", 10)
     many = client.get("/api/runs/1/bars", params={
         "symbol": "AAPL", "start": "2024-01-02T00:00:00", "end": "2024-01-04T23:59:59"})
     assert many.status_code == 422 and "bars" in many.json()["detail"]
+
+
+def test_space_separator_and_window_error_detail(client: TestClient) -> None:
+    ok = client.get("/api/runs/1/bars", params={
+        "symbol": "AAPL", "start": "2024-01-10 09:30", "end": "2024-01-10 09:32"})
+    assert ok.status_code == 200 and len(ok.json()["bars"]) == 3
+    bad = client.get("/api/runs/1/bars", params={
+        "symbol": "AAPL", "start": "2024-01-02", "end": "2024-01-03T09:30:00"})
+    assert bad.status_code == 422 and "start" in bad.json()["detail"]
+    assert "2024-01-02" not in bad.json()["detail"]
 
 
 def test_one_bound_422(client: TestClient) -> None:
