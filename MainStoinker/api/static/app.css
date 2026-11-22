@@ -221,7 +221,9 @@ td.num { font-family: var(--mono); font-size: 13px; }
 
 td.total, th.total { font-weight: 600; background: var(--surface-2); }
 
-.chart-box {
+/* .chart-box holds, in normal flow: the legend, the empty note, then .chart-canvas (the chart itself). */
+.chart-box { position: relative; }
+.chart-canvas {
   position: relative;
   height: 440px;
   min-height: 240px;
@@ -230,22 +232,14 @@ td.total, th.total { font-weight: 600; background: var(--surface-2); }
   border-radius: 4px;
   overflow: hidden;
 }
-.chart-legend {
-  position: absolute;
-  top: 6px;
-  left: 8px;
-  z-index: 3;
-  max-width: calc(100% - 90px);
-  font-size: 12px;
-  pointer-events: none;
-}
+.chart-legend { margin: 0 0 6px; font-size: 12px; }
 .chart-legend ul { list-style: none; margin: 0 0 2px; padding: 0; display: flex; flex-wrap: wrap; gap: 0 14px; }
 .chart-legend .swatch { display: inline-block; width: 12px; height: 3px; margin-right: 6px; vertical-align: middle; }
-.chart-note { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; margin: 0; z-index: 3; }
-.chart-note[hidden], .chart-legend[hidden] { display: none; }
+.chart-note { margin: 0; padding: 12px 0; text-align: center; }
+.chart-note[hidden], .chart-legend[hidden], .chart-canvas[hidden] { display: none; }
 .chart-caption { margin: 6px 0 0; font-size: 12px; }
 
 @media (max-width: 480px) {
-  .chart-box { height: 340px; }
+  .chart-canvas { height: 340px; }
   .status-line li { white-space: normal; }
 }

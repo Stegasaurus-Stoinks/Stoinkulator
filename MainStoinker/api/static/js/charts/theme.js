@@ -2,20 +2,30 @@
 // light and dark themes of app.css. No DOM is needed to import this file: every function that reads the
 // page takes the window object (default: the global) so node can test it with a stand-in.
 //
-// Exports: FALLBACK_THEMES, readTheme, hexToRgba, chartOptions, seriesColor, watchTheme.
+// Exports: FALLBACK_THEMES, readTheme, hexToRgba, crosshairTime, chartOptions, seriesColor, isThemeOrHexColor,
+// watchTheme.
 //
 // readTheme(view)          {dark, text, muted, border, surface, accent, pos, neg, warn}: the colours of
 //                          the page right now (CSS properties --text, --muted, --border, --surface,
 //                          --accent, --pos, --neg, --warn-text); a property that is missing falls back
 //                          to FALLBACK_THEMES for the current light or dark scheme.
 // chartOptions(theme)      options for createChart / chart.applyOptions: panel background, text and
-//                          grid colours, time axis in data time (UTC clock, no seconds).
+//                          grid colours, time axis in data time (UTC clock, no seconds). The axis needs no
+//                          tickMarkFormatter: the vendored library 5.3.0 formats its default tick marks
+//                          with timeZone "UTC", which is the data wall clock (format.js dataTimeToChartTime).
+//                          localization.timeFormatter (the crosshair label) is crosshairTime.
+// crosshairTime(t)         chart seconds as "YYYY-MM-DD HH:MM" (data time); a value that is not a number is
+//                          returned as text.
+// isThemeOrHexColor(c, theme)  true for a #rgb / #rrggbb colour or one of the theme's own colours: the only
+//                          colours a caller may pass on to a style attribute.
 // seriesColor(theme, i)    the default colour of the i-th series on a chart (accent, then warn, ...).
 // hexToRgba(color, alpha)  "#rrggbb" or "#rgb" as "rgba(r, g, b, alpha)"; anything else is returned as is.
 // watchTheme(chart, ctx, onChange, view)
 //                          re-applies chartOptions when prefers-color-scheme changes, then calls
 //                          onChange(theme). The listener's removal is registered with ctx.onCleanup.
 //                          Returns a function that removes the listener early (safe to call twice).
+
+import { chartTimeToDataTime } from "../format.js";
 
 export const FALLBACK_THEMES = {
   light: {
@@ -70,6 +80,20 @@ export function hexToRgba(color, alpha) {
   return "rgba(" + [(n >> 16) & 255, (n >> 8) & 255, n & 255].join(", ") + ", " + alpha + ")";
 }
 
+export function crosshairTime(time) {
+  const text = chartTimeToDataTime(time);
+  return text === null ? String(time) : text.slice(0, 16);
+}
+
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+const THEME_COLOR_KEYS = ["text", "muted", "border", "surface", "accent", "pos", "neg", "warn"];
+
+export function isThemeOrHexColor(color, theme) {
+  if (typeof color !== "string") return false;
+  if (HEX_COLOR.test(color)) return true;
+  return THEME_COLOR_KEYS.some((key) => theme && theme[key] === color);
+}
+
 export function chartOptions(theme) {
   return {
     layout: {
@@ -82,6 +106,7 @@ export function chartOptions(theme) {
       horzLines: { color: hexToRgba(theme.border, 0.6) },
     },
     rightPriceScale: { borderColor: theme.border },
+    localization: { timeFormatter: crosshairTime },
     timeScale: { borderColor: theme.border, timeVisible: true, secondsVisible: false },
     crosshair: {
       vertLine: { labelBackgroundColor: theme.muted },

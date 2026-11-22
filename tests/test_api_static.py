@@ -1219,6 +1219,178 @@ console.log(JSON.stringify({ registered, two, colourB, noteHiddenWithData, after
     assert out["EMPTY_NOTE"] == "No equity points stored"
 
 
+def test_equity_chart_dispose_removes_the_theme_listener_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "equity_dispose", FAKE_DOM + FAKE_CHART_LIB + """
+const { createEquityChart } = await import("./js/charts/equity.js");
+const schemeListeners = [];
+const view = {
+  matchMedia: () => ({ matches: false,
+    addEventListener: (t, f) => schemeListeners.push(f),
+    removeEventListener: (t, f) => schemeListeners.splice(schemeListeners.indexOf(f), 1) }),
+};
+const cleanups = [];
+const ctx = { onCleanup: (f) => cleanups.push(f) };
+const box = document.createElement("div");
+const handle = createEquityChart(box, { ctx, view });
+const chart = globalThis.lastChart;
+let chartCalls = 0;
+chart.applyOptions = () => { chartCalls += 1; };
+const pts = [{ time: "2024-01-02 09:30:00", equity: "100.0000" }, { time: "2024-01-02 09:31:00", equity: "90.0000" }];
+handle.setSeries([{ label: "A", points: pts, capital: "100.0000" }]);
+const seriesRef = chart.series.slice();
+const registered = { count: cleanups.length, listeners: schemeListeners.length };
+const staleListener = schemeListeners[0];
+// the first cleanup is the chart's own disposal, registered before the theme listener
+cleanups[0]();
+const afterFirst = { removed: chart.removed, listeners: schemeListeners.length };
+handle.dispose(); cleanups.forEach((f) => f());
+staleListener(); // a scheme change that was already queued
+console.log(JSON.stringify({ registered, afterFirst, removed: chart.removed, chartCalls,
+  seriesCalls: seriesRef.map((s) => s.applied.length), listeners: schemeListeners.length }));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["registered"] == {"count": 2, "listeners": 1}  # dispose first, then the listener's remover
+    assert out["afterFirst"] == {"removed": 1, "listeners": 0}  # dispose itself removes the listener
+    assert out["removed"] == 1  # twice more: still one removal
+    assert out["chartCalls"] == 0 and out["seriesCalls"] == [0, 0]  # nothing reaches the removed chart
+    assert out["listeners"] == 0
+
+
+def test_equity_chart_structure_label_markers_and_colours_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "equity_structure", FAKE_DOM + FAKE_CHART_LIB + """
+const { createEquityChart, describeSeries } = await import("./js/charts/equity.js");
+const ctx = { onCleanup() {} };
+const pts = [{ time: "2024-01-02 09:30:00", equity: "100.0000" }, { time: "2024-01-02 09:31:00", equity: "90.0000" },
+  { time: "2024-01-02 09:32:00", equity: "1234.5000" }];
+const style = (box) => box.all("span").map((s) => s.getAttribute("style")).filter(Boolean);
+function build(list, opts = {}) {
+  const box = document.createElement("div");
+  const handle = createEquityChart(box, { ctx, ...opts });
+  handle.setSeries(list);
+  return { box, chart: globalThis.lastChart };
+}
+// structure and label
+const withData = build([{ label: "A", points: pts, capital: "100.0000" }]);
+const canvas = withData.box.querySelector(".chart-canvas");
+const structure = {
+  role: canvas.getAttribute("role"), label: canvas.getAttribute("aria-label"),
+  legendInside: canvas.querySelector(".chart-legend") !== null, noteInside: canvas.querySelector(".chart-note") !== null,
+  boxChildren: withData.box.children.map((c) => c.className),
+  boxRole: withData.box.getAttribute("role"), canvasHidden: canvas.hidden,
+};
+const empty = build([]);
+const emptyCanvas = empty.box.querySelector(".chart-canvas");
+const emptyState = { label: emptyCanvas.getAttribute("aria-label"), canvasHidden: emptyCanvas.hidden,
+  noteInside: emptyCanvas.querySelector(".chart-note") !== null, noteHidden: empty.box.querySelector(".chart-note").hidden };
+// the library gets the inner canvas, not the box
+const created = globalThis.lastChart !== undefined;
+// markers for a single point only
+const single = build([{ label: "A", points: pts.slice(0, 1), capital: "100.0000" }]);
+const two = build([{ label: "A", points: pts.slice(0, 2), capital: "100.0000" }]);
+const markers = { single: single.chart.series.map((s) => s.opts.pointMarkersVisible),
+  two: two.chart.series.map((s) => s.opts.pointMarkersVisible) };
+// colours: hex and theme colours pass, everything else falls back to the theme colour
+const themed = { getComputedStyle: () => ({ getPropertyValue: (p) => ({ "--accent": "rgb(1, 2, 3)" })[p] || "" }),
+  document: { documentElement: {} } };
+const bad = ["red; background:url(x)", "url(javascript:1)", "#12345", "#gggggg", "rgb(9, 9, 9)", "", 5, null, { a: 1 }];
+const colours = {};
+const colourCases = ["#abc", "#AABBCC", ...bad];
+colourCases.forEach((c, i) => {
+  const r = build([{ label: "A", points: pts, capital: "100.0000", color: c }]);
+  colours[i] = [r.chart.series[0].opts.color, style(r.box)];
+});
+const fromTheme = build([{ label: "A", points: pts, capital: "100.0000", color: "rgb(1, 2, 3)" }], { view: themed });
+const rejectedTheme = build([{ label: "A", points: pts, capital: "100.0000", color: "rgb(9, 9, 9)" }], { view: themed });
+console.log(JSON.stringify({ structure, emptyState, markers, colours, bad: bad.length, created,
+  fromTheme: [fromTheme.chart.series[0].opts.color, style(fromTheme.box)],
+  rejectedTheme: rejectedTheme.chart.series[0].opts.color,
+  described: describeSeries([{ label: "X", points: pts, capital: "100.0000" }, { label: "Y", points: [] }]) }));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    structure = out["structure"]
+    assert structure["role"] == "img" and structure["boxRole"] is None
+    assert structure["legendInside"] is False and structure["noteInside"] is False  # image: chart only
+    # the legend and the note come before the canvas, in normal flow
+    assert structure["boxChildren"] == ["chart-legend", "chart-note muted", "chart-canvas"]
+    assert structure["canvasHidden"] is False
+    assert structure["label"] == (
+        "Equity over the run, stepped, with the drawdown below it. "
+        "A: start equity 100.00, final equity 1,234.50, largest drawdown 10.00.")
+    empty = out["emptyState"]
+    no_points = "Equity over the run, stepped, with the drawdown below it: no equity points stored."
+    assert empty == {"label": no_points, "canvasHidden": True, "noteInside": False, "noteHidden": False}
+    assert out["markers"] == {"single": [True, True], "two": [False, False]}
+    assert out["described"].endswith("X: start equity 100.00, final equity 1,234.50, largest drawdown 10.00. "
+                                     "Y: no equity points stored.")
+    colours = out["colours"]
+    assert colours["0"] == ["#abc", ["background:#abc"]]
+    assert colours["1"] == ["#AABBCC", ["background:#AABBCC"]]
+    for i in range(2, 2 + out["bad"]):
+        # ignored: the theme colour of the first series (the light fallback accent), in series and swatch
+        assert colours[str(i)] == ["#1f5fbf", ["background:#1f5fbf"]], i
+    assert out["fromTheme"] == ["rgb(1, 2, 3)", ["background:rgb(1, 2, 3)"]]
+    assert out["rejectedTheme"] == "rgb(1, 2, 3)"  # the theme's own accent, not the caller's literal
+
+
+def test_equity_relative_mode_data_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "equity_relative", FAKE_DOM + FAKE_CHART_LIB + """
+const { buildChartData, createEquityChart } = await import("./js/charts/equity.js");
+const mk = (start) => [{ time: "2024-01-02 09:30:00", equity: String(start) },
+  { time: "2024-01-02 09:31:00", equity: String(start - 100) }, { time: "2024-01-02 09:32:00", equity: String(start + 50) }];
+const big = { points: mk(100000), capital: "100000.0000" };
+const small = { points: mk(10000), capital: "10000.0000" };
+const values = (d) => ({ equity: d.equity.map((p) => p.value), drawdown: d.drawdown.map((p) => p.value) });
+const unspecifiedCapital = { points: mk(500), capital: null };
+const ctx = { onCleanup() {} };
+const draw = (relative) => {
+  const box = document.createElement("div");
+  const opts = relative === undefined ? {} : { relative };
+  const handle = createEquityChart(box, { ctx, ...opts });
+  handle.setSeries([big, small]);
+  return globalThis.lastChart.series.filter((s) => s.pane === 0).map((s) => s.data.map((p) => p.value));
+};
+console.log(JSON.stringify({
+  absoluteDefault: values(buildChartData(big)), absoluteExplicit: values(buildChartData(big, { relative: false })),
+  relativeBig: values(buildChartData(big, { relative: true })), relativeSmall: values(buildChartData(small, { relative: true })),
+  relativeNoCapital: values(buildChartData(unspecifiedCapital, { relative: true })),
+  relativeEmpty: buildChartData({ points: [], capital: "5" }, { relative: true }),
+  drawnDefault: draw(undefined), drawnRelative: draw(true),
+}));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    absolute = {"equity": [100000, 99900, 100050], "drawdown": [0, -100, 0]}
+    assert out["absoluteDefault"] == absolute and out["absoluteExplicit"] == absolute
+    # relative: equity minus the series' own starting capital, drawdown in the same money, so runs with
+    # different capital land on the same scale
+    relative = {"equity": [0, -100, 50], "drawdown": [0, -100, 0]}
+    assert out["relativeBig"] == relative
+    assert out["relativeSmall"] == relative
+    assert out["relativeNoCapital"] == relative  # no capital: the base is the first equity
+    assert out["relativeEmpty"] == {"equity": [], "drawdown": []}
+    assert out["drawnDefault"] == [[100000, 99900, 100050], [10000, 9900, 10050]]
+    assert out["drawnRelative"] == [[0, -100, 50], [0, -100, 50]]
+
+
+def test_chart_options_format_the_crosshair_in_data_time_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "theme_time", """
+import { chartOptions, crosshairTime, readTheme } from "./js/charts/theme.js";
+const options = chartOptions(readTheme({}));
+const format = options.localization.timeFormatter;
+console.log(JSON.stringify({
+  same: format === crosshairTime, noTick: "tickMarkFormatter" in options.timeScale,
+  shown: [1704187800, 1704187800.9, 0, -60, 1709251199].map(format),
+  odd: ["x", null].map(format), tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+}));
+""")
+    assert isinstance(out, dict)
+    assert out["same"] is True
+    # the data's wall clock to the minute, whatever the machine zone; seconds are not shown
+    assert out["shown"] == ["2024-01-02 09:30", "2024-01-02 09:30", "1970-01-01 00:00", "1969-12-31 23:59",
+                            "2024-02-29 23:59"]
+    assert out["odd"] == ["x", "null"]
+    assert out["noTick"] is False  # the library's default tick marks are already UTC (see theme.js)
+
+
 OVERVIEW_DOC = {
     "run": {
         "run_id": 7, "status": "completed", "incomplete": False, "kind": "backtest", "fills": "realistic",
@@ -1264,6 +1436,8 @@ console.log(JSON.stringify({{
   duration: [runDurationSeconds(doc.run), runDurationSeconds({{ started_at: "x", ended_at: "y" }}),
     runDurationSeconds({{ started_at: "2026-11-22T17:31:13+00:00", ended_at: null }})],
   shown: displayStatus({{ status: "running", incomplete: true }}),
+  spaced: settingRows({{ ...doc.run, first_bar: "2024-01-02 09:30:00", last_bar: "2024-01-05 16:00:00" }}),
+  unparsable: settingRows({{ ...doc.run, first_bar: "not a time" }}),
 }}));
 """)  # noqa: E501
     assert isinstance(out, dict)
@@ -1286,7 +1460,10 @@ console.log(JSON.stringify({{
     assert settings["Capital per algo"] == "100,000.00"
     assert settings["Commission per share"] == "0.0050"  # not rounded to cents
     assert settings["Slippage per share"] == "0.0100"
-    assert settings["Bar range"] == "2024-01-02T09:30:00 to 2024-01-05T16:00:00 (data time)"
+    # both ends use the page's market-time form, without the ISO "T"
+    assert settings["Bar range"] == "2024-01-02 09:30:00 to 2024-01-05 16:00:00 (data time)"
+    assert settings["Bar range"] == dict(map(tuple, out["spaced"]))["Bar range"]  # a space already is fine
+    assert dict(map(tuple, out["unparsable"]))["Bar range"] == "not a time to 2024-01-05 16:00:00 (data time)"
     assert settings["Symbols"] == "AAPL, MSFT" and settings["Data folder"] == "OfflineData"
     legacy = dict(map(tuple, out["legacy"]))
     assert set(legacy.values()) == {"-"}  # legacy-fill run: capital, costs, range, symbols, folder
@@ -1309,12 +1486,15 @@ globalThis.fetch = (url) => {{
   seen.push(url);
   if (globalThis.fail === "equity" && url.endsWith("/equity")) return respond({{ detail: "equity broke" }}, 500);
   if (globalThis.fail === "doc" && !url.endsWith("/equity")) return respond({{ detail: "no run 7" }}, 404);
+  if (globalThis.fail === "both") return respond({{ detail: "no run 7" }}, 404);
+  if (globalThis.fail === "503") return respond({{ detail: "busy" }}, 503);
+  if (globalThis.fail === "down") return Promise.reject(new TypeError("Failed to fetch"));
   return respond(url.endsWith("/equity") ? equity : doc);
 }};
 const ctx = () => {{ const cleanups = []; return {{ signal: new AbortController().signal, isCurrent: () => true,
   onCleanup: (f) => cleanups.push(f), cleanups }}; }};
 const out = {{}};
-for (const fail of ["", "equity", "doc"]) {{
+for (const fail of ["", "equity", "doc", "both", "503", "down"]) {{
   globalThis.fail = fail;
   const box = document.createElement("div");
   const c = ctx();
@@ -1325,6 +1505,7 @@ for (const fail of ["", "equity", "doc"]) {{
     table: box.all("table").length, charts: box.all("div").filter((d) => d.className === "chart-box").length,
     cleanups: c.cleanups.length, created: globalThis.lastChart ? true : false,
     links: box.all("a").map((a) => a.getAttribute("href")),
+    sections: box.all("section").length,
   }};
   if (fail === "") {{
     const table = box.all("table")[0];
@@ -1352,6 +1533,14 @@ console.log(JSON.stringify(out));
     # one failing part gives one error panel; the other still renders
     assert out["equity"]["errors"] == ["Error 500: equity broke"]
     assert out["equity"]["table"] == 1 and out["equity"]["charts"] == 0
-    assert out["doc"]["errors"] == ["Error 404: no run 7"]
-    assert out["doc"]["table"] == 0 and out["doc"]["charts"] == 1
+    assert out["equity"]["sections"] >= 3  # settings, chart (with its error) and table stay
+    # the run document failing: heading, back link and ONE error panel, nothing else (no chart box, no
+    # settings or table sections), also when the equity request fails too (unknown run, 503, no server)
+    for case, message in [("doc", "Error 404: no run 7"), ("both", "Error 404: no run 7"),
+                          ("503", "Error 503: busy"), ("down", "The server could not be reached.")]:
+        failed = out[case]
+        assert failed["errors"] == [message], case
+        assert failed["h2"] == ["Run 7"] and failed["links"] == ["#/"], case
+        assert (failed["table"], failed["charts"], failed["sections"]) == (0, 0, 0), case
+        assert failed["cleanups"] == 0, case
     assert sorted(out["seen"]) == ["/api/runs/7", "/api/runs/7/equity"]

@@ -7,7 +7,8 @@ import { ApiError, getJson, isAbortError } from "../api.js";
 import { createEquityChart } from "../charts/equity.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
 import {
-  formatDuration, formatMoney, formatNet, formatPercent, formatUtc, shortVersion,
+  chartTimeToDataTime, dataTimeToChartTime, formatDuration, formatMoney, formatNet, formatPercent, formatUtc,
+  shortVersion,
 } from "../format.js";
 import { algoHash, runsHash } from "../routes.js";
 import { dataTable, netCell } from "../table.js";
@@ -111,12 +112,21 @@ export function runNotes(doc) {
   return notes;
 }
 
+// A bar time (the server sends ISO text with a "T") as "YYYY-MM-DD HH:MM:SS" like every other market time on
+// the page; text that cannot be parsed is shown as given.
+function barTime(value) {
+  if (value === null || value === undefined || value === "") return DASH;
+  const chart = dataTimeToChartTime(value);
+  const shown = chart === null ? null : chartTimeToDataTime(chart);
+  return shown === null ? String(value) : shown;
+}
+
 // [label, value] pairs of the settings panel. Costs are shown as stored (4 decimals): a per-share
 // figure such as 0.0050 must not be rounded to cents.
 export function settingRows(run) {
   const costs = run.costs && typeof run.costs === "object" ? run.costs : {};
   const range = run.first_bar || run.last_bar
-    ? text(run.first_bar) + " to " + text(run.last_bar) + " (data time)"
+    ? barTime(run.first_bar) + " to " + barTime(run.last_bar) + " (data time)"
     : DASH;
   const symbols = Array.isArray(run.symbols) && run.symbols.length > 0 ? run.symbols.join(", ") : DASH;
   return [
@@ -210,26 +220,31 @@ export async function render(container, params, ctx) {
 
   const parts = [viewHeading("Run " + runId), h("p", {}, h("a", { href: runsHash() }, "Back to the runs list"))];
 
+  // Without the run document there is nothing to show but why: one error panel. An unknown run, an
+  // unreachable server and a 503 fail both requests the same way, so the equity error is not repeated.
   let doc = null;
+  let docError = null;
   if (docResult.status === "fulfilled") {
     const value = docResult.value;
     if (value && value.run && typeof value.run === "object" && value.accounts && typeof value.accounts === "object"
         && value.total && typeof value.total === "object") {
       doc = value;
     } else {
-      parts.push(errorPanel(new ApiError(200, "The server sent an unexpected response.", "unexpected")));
+      docError = new ApiError(200, "The server sent an unexpected response.", "unexpected");
     }
   } else {
-    parts.push(errorPanel(docResult.reason));
+    docError = docResult.reason;
+  }
+  if (!doc) {
+    container.replaceChildren(...parts, errorPanel(docError));
+    return;
   }
 
-  if (doc) {
-    const warning = statusNotes(doc.run);
-    parts.push(
-      h("section", { class: "panel", "aria-label": "Run status" }, statusLine(doc.run),
-        warning ? h("p", { class: "warning", role: "note" }, warning) : null),
-      settingsPanel(doc.run));
-  }
+  const warning = statusNotes(doc.run);
+  parts.push(
+    h("section", { class: "panel", "aria-label": "Run status" }, statusLine(doc.run),
+      warning ? h("p", { class: "warning", role: "note" }, warning) : null),
+    settingsPanel(doc.run));
 
   let chartBox = null;
   let equity = null;
@@ -237,10 +252,7 @@ export async function render(container, params, ctx) {
     const value = equityResult.value;
     if (value && Array.isArray(value.points)) {
       equity = value;
-      chartBox = h("div", {
-        class: "chart-box", role: "img",
-        "aria-label": "Account equity over the run, stepped, with the drawdown below it",
-      });
+      chartBox = h("div", { class: "chart-box" });
       parts.push(chartPanel(chartBox, equity));
     } else {
       parts.push(errorPanel(new ApiError(200, "The server sent an unexpected response.", "unexpected")));
@@ -249,14 +261,12 @@ export async function render(container, params, ctx) {
     parts.push(errorPanel(equityResult.reason));
   }
 
-  if (doc) {
-    const table = algoTable(doc, runId);
-    parts.push(h("section", { "aria-label": "Per-algo results" }, h("h3", {}, "Algos"), table.element));
-    const notes = runNotes(doc);
-    if (notes.length > 0) {
-      parts.push(h("section", { class: "panel", "aria-label": "Notes" }, h("h3", {}, "Notes"),
-        h("ul", { class: "notes" }, notes.map((note) => h("li", {}, note)))));
-    }
+  const table = algoTable(doc, runId);
+  parts.push(h("section", { "aria-label": "Per-algo results" }, h("h3", {}, "Algos"), table.element));
+  const notes = runNotes(doc);
+  if (notes.length > 0) {
+    parts.push(h("section", { class: "panel", "aria-label": "Notes" }, h("h3", {}, "Notes"),
+      h("ul", { class: "notes" }, notes.map((note) => h("li", {}, note)))));
   }
 
   container.replaceChildren(...parts);
