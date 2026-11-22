@@ -7,6 +7,7 @@ from ibapi import connection as ibapi_connection
 from tests import harness
 
 GOLDEN_DIR = Path(__file__).parent / "golden"
+GOLDEN_PAPER_DIR = Path(__file__).parent / "golden_paper"
 
 
 class BrokerConnectionBlockedUnderPytest(RuntimeError):
@@ -81,5 +82,26 @@ def golden(request):
         assert path.exists(), f"No golden file {path.name}; run pytest --update-golden"
         expected = json.loads(path.read_text())
         assert actual == expected
+
+    return check
+
+
+@pytest.fixture
+def golden_paper(request):
+    """Compare `actual` with tests/golden_paper/<name>.json, or rewrite it.
+
+    The file is written as sorted-key JSON with LF newlines on every platform,
+    so regenerating on a clean tree gives a byte-identical file.
+    """
+
+    def check(name: str, actual):
+        path = GOLDEN_PAPER_DIR / f"{name}.json"
+        text = json.dumps(actual, indent=1, sort_keys=True) + "\n"
+        if request.config.getoption("--update-golden"):
+            GOLDEN_PAPER_DIR.mkdir(exist_ok=True)
+            path.write_bytes(text.encode("utf-8"))
+            return
+        assert path.exists(), f"No golden file {path.name}; run pytest --update-golden"
+        assert actual == json.loads(path.read_text(encoding="utf-8"))
 
     return check

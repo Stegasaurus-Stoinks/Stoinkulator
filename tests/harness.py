@@ -21,7 +21,10 @@ import logging
 import shutil
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -145,6 +148,99 @@ def run_mixed_offline_backtest(
     )
     engine.run_backtest()
     return algos
+
+
+@dataclass
+class PaperRun:
+    """What `run_paper_backtest` returns.
+
+    `violations` lists every per-bar disagreement found between the algo's own
+    view (`inTrade`) and the broker's position state, and `max_live` is the most
+    positions (pending, open or exiting) the algo ever had at once.
+    """
+
+    ledger: Any
+    broker: Any
+    algo: Any
+    capital: Decimal
+    violations: list[str] = field(default_factory=list)
+    bars_checked: int = 0
+    max_live: int = 0
+
+
+def run_paper_backtest(
+    algo_id: str,
+    cfg: dict,
+    costs=None,
+    capital: float | int | str | Decimal = 10_000,
+    warmup_days: int = 2,
+) -> PaperRun:
+    """Engine run of one algo through a `PaperBroker` and a `Ledger`.
+
+    One account (named after the algo), one `PaperBroker` behind a
+    `MappingRouter`, and the broker's cost model as `end_commission`. The
+    current working directory must contain OfflineData/. After every
+    `algo.update` the algo's `inTrade` is compared with the broker's state for
+    its current trade (see `PaperRun`); the engine is not modified for that,
+    `update` is wrapped on the algo instance.
+    """
+    from MainStoinker.engine.algos import load_algo
+    from MainStoinker.engine.engine import Engine, EngineConfig
+    from MainStoinker.engine.feed import CsvBarFeed
+    from MainStoinker.engine.ledger import Ledger
+    from MainStoinker.engine.paper_broker import PaperBroker
+    from MainStoinker.engine.router import MappingRouter
+    from MainStoinker.engine.sink import NullSink
+
+    apply_safe_config()
+    reset_runtime_state()
+
+    algo = load_algo(algo_id, cfg)
+    ledger = Ledger()
+    broker = PaperBroker(ledger.open_account(algo.name, algo.ticker, capital), costs)
+    run = PaperRun(ledger, broker, algo, Decimal(str(capital)))
+    unsettled: list = []  # refs of trades not yet closed or cancelled
+
+    def check() -> None:
+        run.bars_checked += 1
+        trades = algo.trades
+        unsettled.extend(t.brokerRef for t in trades[len(run_seen) :])
+        run_seen[:] = trades
+        states = {ref: broker.position_state(ref) for ref in unsettled}
+        unsettled[:] = [r for r, s in states.items() if s not in ("closed", "cancelled")]
+        live = [r for r in unsettled if states[r] in ("pending", "open", "exiting")]
+        run.max_live = max(run.max_live, len(live))
+        current = broker.position_state(trades[-1].brokerRef) if trades else None
+        flat_view = not algo.inTrade
+        flat_broker = current not in ("pending", "open")
+        if flat_view != flat_broker or len(live) > 1:
+            run.violations.append(
+                f"bar {run.bars_checked}: inTrade={algo.inTrade} state={current} live={len(live)}"
+            )
+
+    run_seen: list = []
+    original_update = algo.update
+
+    def update(frame):
+        result = original_update(frame)
+        check()
+        return result
+
+    algo.update = update
+
+    feed = CsvBarFeed(Path.cwd() / "OfflineData", [algo.ticker], warmup_days)
+    brokers = {algo.name: broker}
+    engine = Engine(
+        EngineConfig(),
+        feed,
+        MappingRouter(brokers),
+        NullSink(),
+        [algo],
+        ledger=ledger,
+        end_commission=lambda idname, quantity: brokers[idname].costs.commission(quantity),
+    )
+    engine.run_backtest()
+    return run
 
 
 def run_legacy_offline_backtest(
