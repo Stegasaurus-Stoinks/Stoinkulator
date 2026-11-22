@@ -144,7 +144,7 @@ def test_win_rate_and_averages():
                                 equity_series=[D("10004")])
     assert (st["trade_count"], st["wins"], st["losses"], st["break_even"]) == (5, 2, 2, 1)
     assert st["win_rate"] == D("0.4")  # wins / trades, the break-even trade counts as a trade
-    assert st["gross_profit"] == D("8") and st["gross_loss"] == D("-4")
+    assert st["total_win"] == D("8") and st["total_loss"] == D("-4")
     assert st["avg_win"] == D("4") and st["avg_loss"] == D("-2")
     assert st["net"] == D("4") and st["commission"] == D("5")
     assert st["final_equity"] == D("10004") and st["capital"] == D("10000")
@@ -155,7 +155,7 @@ def test_averages_are_rounded_to_four_places_in_the_record():
     rec = stats.statistics_record(st)
     assert rec["avg_win"] == "1.3333" and rec["win_rate"] == "1.0000"
     assert rec["avg_loss"] is None
-    assert rec["net"] == "4.0000" and rec["gross_loss"] == "0.0000"
+    assert rec["net"] == "4.0000" and rec["total_loss"] == "0.0000"
 
 
 def test_no_trades_no_division_error():
@@ -198,7 +198,7 @@ def test_synthetic_end_of_data_trade_counted_and_marked():
     st = stats.trade_statistics(trips, D("10000"))
     assert st["synthetic_closes"] == 1
     assert (st["trade_count"], st["wins"], st["losses"]) == (2, 1, 1)  # counted in the totals
-    assert st["net"] == D("2") and st["gross_loss"] == D("-1")
+    assert st["net"] == D("2") and st["total_loss"] == D("-1")
     assert round_trip_record(trips[1])["synthetic"] is True
 
 

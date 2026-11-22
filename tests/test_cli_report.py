@@ -342,7 +342,7 @@ def test_multi_algo_total_row_is_the_sums(env, db, capsys):
     for key in ("trade_count", "wins", "losses", "break_even", "synthetic_closes",
                 "cancelled_entries"):
         assert total[key] == sum(a[key] for a in accounts), key
-    for key in ("net", "commission", "gross_profit", "gross_loss", "capital"):
+    for key in ("net", "commission", "total_win", "total_loss", "capital"):
         assert D(total[key]) == sum(D(a[key]) for a in accounts), key
     assert total["capital"] == "15000.0000"
     assert total["trade_count"] > 0
@@ -388,7 +388,7 @@ def test_report_equals_ledger_and_golden_paper(tmp_path_factory, capsys, case):
     # derived figures agree with the golden's trades
     trades = json.loads((GOLDEN_PAPER / f"{case}.json").read_text())["trades"]
     nets = [D(t["net"]) for t in trades]
-    assert acct["gross_profit"] == format(sum((n for n in nets if n > 0), D("0")).quantize(
+    assert acct["total_win"] == format(sum((n for n in nets if n > 0), D("0")).quantize(
         D("0.0001")), "f")
     assert acct["losses"] == sum(1 for n in nets if n < 0)
     assert acct["wins"] + acct["losses"] + acct["break_even"] == acct["trade_count"]

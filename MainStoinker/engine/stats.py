@@ -101,10 +101,10 @@ def account_summary(
 # - a win is a round trip with net > 0, a loss one with net < 0; net == 0 is
 #   neither (`break_even`). `trade_count == wins + losses + break_even`.
 # - `win_rate` = wins / trade_count as a fraction (None without trades).
-# - `gross_profit` is the sum of the net of the winning trips, `gross_loss` the
+# - `total_win` is the sum of the net of the winning trips, `total_loss` the
 #   sum of the net of the losing trips (zero or negative); both are after
-#   commission. `net` = gross_profit + gross_loss + break-even nets (zero).
-# - `avg_win` = gross_profit / wins, `avg_loss` = gross_loss / losses (negative);
+#   commission. `net` = total_win + total_loss + break-even nets (zero).
+# - `avg_win` = total_win / wins, `avg_loss` = total_loss / losses (negative);
 #   None when there are no wins / losses. Rounded to 4 places.
 # - synthetic end-of-data closes are real round trips: counted in every total
 #   and also reported separately as `synthetic_closes`.
@@ -144,7 +144,7 @@ def trade_statistics(
     """Statistics of one account (or of all together); money as `Decimal`, see above.
 
     Keys: `trade_count`, `wins`, `losses`, `break_even`, `win_rate`, `net`,
-    `gross_profit`, `gross_loss`, `commission`, `avg_win`, `avg_loss`,
+    `total_win`, `total_loss`, `commission`, `avg_win`, `avg_loss`,
     `max_drawdown`, `final_equity`, `synthetic_closes`, `ignored_events`,
     `cancelled_entries`, `capital`.
     """
@@ -152,8 +152,8 @@ def trade_statistics(
     series = list(equity_series)
     winners = [t.net for t in trips if t.net > 0]
     losers = [t.net for t in trips if t.net < 0]
-    gross_profit = sum(winners, _ZERO4)
-    gross_loss = sum(losers, _ZERO4)
+    total_win = sum(winners, _ZERO4)
+    total_loss = sum(losers, _ZERO4)
     return {
         "trade_count": len(trips),
         "wins": len(winners),
@@ -161,11 +161,11 @@ def trade_statistics(
         "break_even": len(trips) - len(winners) - len(losers),
         "win_rate": Decimal(len(winners)) / len(trips) if trips else None,
         "net": sum((t.net for t in trips), _ZERO4),
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
+        "total_win": total_win,
+        "total_loss": total_loss,
         "commission": sum((t.commission for t in trips), _ZERO4),
-        "avg_win": gross_profit / len(winners) if winners else None,
-        "avg_loss": gross_loss / len(losers) if losers else None,
+        "avg_win": total_win / len(winners) if winners else None,
+        "avg_loss": total_loss / len(losers) if losers else None,
         "max_drawdown": max_drawdown(series, capital),
         "final_equity": series[-1] if series else capital,
         "synthetic_closes": sum(1 for t in trips if t.synthetic),
@@ -219,7 +219,7 @@ def statistics_record(stats: Mapping[str, Any]) -> dict[str, Any]:
 
     `win_rate` is the fraction (0.2286 for 22.86 %); None stays None.
     """
-    money = ("net", "gross_profit", "gross_loss", "commission", "max_drawdown", "final_equity",
+    money = ("net", "total_win", "total_loss", "commission", "max_drawdown", "final_equity",
              "capital")
     out: dict[str, Any] = {}
     for key, value in stats.items():
