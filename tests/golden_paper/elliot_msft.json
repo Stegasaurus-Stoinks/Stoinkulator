@@ -2,9 +2,9 @@
  "algo": "Elliot",
  "capital": "10000.0000",
  "costs": {
-  "commission_minimum": "1.00",
-  "commission_per_share": "0.005",
-  "slippage_per_share": "0"
+  "commission_minimum": "1.0000",
+  "commission_per_share": "0.0050",
+  "slippage_per_share": "0.0000"
  },
  "equity_points": 2340,
  "equity_sha256": "2b1f7da4eb0918943bd2cf3fe7fa366c0b4a1baad5b6bc4737fbd56114871229",

@@ -17,9 +17,10 @@ Each golden holds:
 - `equity_sha256`: sha256 of the per-bar account equity series, serialised by
   `equity_series_bytes` below.
 
-Regenerate with `pytest --update-golden tests/test_paper_goldens.py` (add
-`-m slow` for the slow cases) and explain the diff in the PR. The slow cases
-are FunctionTest and the three Elliot runs.
+Regenerate with `pytest tests/test_paper_goldens.py --update-golden`; to
+regenerate all eight goldens add `-m "slow or not slow"` (the slow cases are
+FunctionTest and the three Elliot runs, which a bare run skips). Explain the
+diff in the PR.
 """
 from __future__ import annotations
 
@@ -45,8 +46,6 @@ CASES = [
     for p in LEGACY_CASES
 ]
 
-_RUNS: dict[str, harness.PaperRun] = {}
-
 
 def _fmt(value: Decimal) -> str:
     """A Decimal as a plain fixed-point string (the ledger already quantizes to 4 places)."""
@@ -63,12 +62,13 @@ def equity_series_bytes(points) -> bytes:
     return "".join(f"{p.time},{_fmt(p.equity)}\n" for p in points).encode("utf-8")
 
 
-def max_drawdown(equities) -> Decimal:
-    """Largest peak-to-trough fall in a series of equities (zero or positive)."""
-    peak = None
+def max_drawdown(equities, capital: Decimal) -> Decimal:
+    """Peak to trough on the account equity series, starting capital counts as
+    the first peak. Zero or positive."""
+    peak = capital
     worst = Decimal("0.0000")
     for value in equities:
-        if peak is None or value > peak:
+        if value > peak:
             peak = value
         worst = max(worst, peak - value)
     return worst
@@ -77,6 +77,7 @@ def max_drawdown(equities) -> Decimal:
 def paper_golden(run: harness.PaperRun, algo_id: str) -> dict:
     ledger, algo = run.ledger, run.algo
     idname = algo.name
+    cent4 = Decimal("0.0001")
     trips = [t for t in ledger.round_trips if t.account == idname]
     points = [p for p in ledger.equity_points if p.account == idname]
     ignored = {kind: ledger.ignored_count(kind, idname) for kind in IGNORED_KINDS}
@@ -86,9 +87,9 @@ def paper_golden(run: harness.PaperRun, algo_id: str) -> dict:
         "ticker": algo.ticker,
         "capital": _fmt(run.capital.quantize(Decimal("0.0001"))),
         "costs": {
-            "commission_per_share": _fmt(run.broker.costs.commission_per_share),
-            "commission_minimum": _fmt(run.broker.costs.commission_minimum),
-            "slippage_per_share": _fmt(run.broker.costs.slippage_per_share),
+            "commission_per_share": _fmt(run.broker.costs.commission_per_share.quantize(cent4)),
+            "commission_minimum": _fmt(run.broker.costs.commission_minimum.quantize(cent4)),
+            "slippage_per_share": _fmt(run.broker.costs.slippage_per_share.quantize(cent4)),
         },
         "trades": [
             {
@@ -112,7 +113,7 @@ def paper_golden(run: harness.PaperRun, algo_id: str) -> dict:
             "commission": _fmt(sum((t.commission for t in trips), Decimal("0.0000"))),
             "net": _fmt(sum((t.net for t in trips), Decimal("0.0000"))),
             "final_equity": _fmt(ledger.equity(idname)),
-            "max_drawdown": _fmt(max_drawdown(p.equity for p in points)),
+            "max_drawdown": _fmt(max_drawdown((p.equity for p in points), run.capital)),
             "ignored_events": ignored,
             "cancelled_entries": run.broker.cancelled_entries,
             "synthetic_closes": sum(1 for t in trips if t.synthetic),
@@ -124,18 +125,19 @@ def paper_golden(run: harness.PaperRun, algo_id: str) -> dict:
 
 @pytest.fixture(scope="module")
 def paper_run(tmp_path_factory):
-    """A function giving the (cached) paper run of a case: both tests share one run."""
+    """A function giving the (cached) paper run of a case: tests share one run."""
+    runs: dict[str, harness.PaperRun] = {}
 
     def get(case_id: str, algo_id: str, cfg: dict) -> harness.PaperRun:
-        if case_id not in _RUNS:
+        if case_id not in runs:
             workdir = tmp_path_factory.mktemp(f"paper_{case_id}")
             harness.stage_offline_data(workdir, [cfg["ticker"]])
             with contextlib.chdir(workdir):
                 try:
-                    _RUNS[case_id] = harness.run_paper_backtest(algo_id, cfg)
+                    runs[case_id] = harness.run_paper_backtest(algo_id, cfg)
                 finally:
                     harness.reset_runtime_state()
-        return _RUNS[case_id]
+        return runs[case_id]
 
     return get
 
@@ -150,9 +152,11 @@ def test_paper_trades_match_golden(algo_id, cfg, paper_run, golden_paper, reques
 def test_algo_view_matches_broker_every_bar(algo_id, cfg, paper_run, request):
     """During the run (not after `ledger.finish`), `algo.inTrade` is True exactly
     when the broker's state for the algo's current trade is pending or open, and
-    the algo never has more than one live (pending, open or exiting) position."""
+    the algo never has more than one live (pending or open) position. The check
+    runs once per post-warm-up bar, i.e. once per equity point of the account."""
     run = paper_run(request.node.callspec.id, algo_id, cfg)
-    assert run.bars_checked > 0
+    points = [p for p in run.ledger.equity_points if p.account == run.algo.name]
+    assert run.bars_checked == len(points)
     assert run.violations == []
     assert run.max_live <= 1
 
@@ -217,19 +221,36 @@ def test_golden_file_is_self_consistent(algo_id, cfg, request):
         assert Decimal(trade["net"]) == gross - Decimal(trade["commission"])
 
 
-def test_paper_backtest_twice_in_one_process_is_identical(tmp_path):
-    """No state leaks between runs: two runs of the same case give the same golden."""
+def test_paper_backtest_twice_in_one_process_is_identical(paper_run, tmp_path):
+    """No state leaks between runs: a second, fresh run of a case gives the same
+    golden as the first (the first is the module's cached run of that case)."""
     algo_id, cfg = next(p.values for p in CASES if p.id == "fridayfrenzy_tsla")
-    results = []
-    for n in range(2):
-        workdir = tmp_path / str(n)
-        workdir.mkdir()
-        harness.stage_offline_data(workdir, [cfg["ticker"]])
-        with contextlib.chdir(workdir):
-            try:
-                run = harness.run_paper_backtest(algo_id, cfg)
-                results.append(paper_golden(run, algo_id))
-            finally:
-                harness.reset_runtime_state()
-    assert results[0] == results[1]
-    assert results[0]["summary"]["trade_count"] > 0
+    first = paper_golden(paper_run("fridayfrenzy_tsla", algo_id, cfg), algo_id)
+    harness.stage_offline_data(tmp_path, [cfg["ticker"]])
+    with contextlib.chdir(tmp_path):
+        try:
+            second = paper_golden(harness.run_paper_backtest(algo_id, cfg), algo_id)
+        finally:
+            harness.reset_runtime_state()
+    assert first == second
+    assert first["summary"]["trade_count"] > 0
+
+
+def test_view_problem_rules():
+    """The per-bar checker's two rules, on hand-made states."""
+    # flat view and flat broker: fine; exited trades do not count as live
+    assert harness.view_problem(False, "closed", []) == (None, 0)
+    assert harness.view_problem(False, None, []) == (None, 0)
+    # in a trade, pending or open: fine
+    assert harness.view_problem(True, "open", ["open"]) == (None, 1)
+    assert harness.view_problem(True, "pending", ["pending"]) == (None, 1)
+    # an exiting position next to a new pending one is legitimate
+    assert harness.view_problem(True, "pending", ["exiting", "pending"]) == (None, 1)
+    # view and broker disagree, either way round
+    assert harness.view_problem(True, "closed", [])[0] is not None
+    assert harness.view_problem(False, "open", ["open"])[0] is not None
+    assert harness.view_problem(True, None, [])[0] is not None
+    # two live positions
+    problem, live = harness.view_problem(True, "open", ["open", "pending"])
+    assert problem is not None
+    assert live == 2

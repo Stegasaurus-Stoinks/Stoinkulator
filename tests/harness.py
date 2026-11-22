@@ -156,7 +156,8 @@ class PaperRun:
 
     `violations` lists every per-bar disagreement found between the algo's own
     view (`inTrade`) and the broker's position state, and `max_live` is the most
-    positions (pending, open or exiting) the algo ever had at once.
+    live positions (pending or open) the algo ever had at once. `bars_checked`
+    is the number of `update` calls checked (one per post-warm-up bar).
     """
 
     ledger: Any
@@ -166,6 +167,24 @@ class PaperRun:
     violations: list[str] = field(default_factory=list)
     bars_checked: int = 0
     max_live: int = 0
+
+
+def view_problem(
+    in_trade: bool, current_state: str | None, unsettled_states: list[str]
+) -> tuple[str | None, int]:
+    """The per-bar consistency rules of `run_paper_backtest`, as a pure function.
+
+    Returns `(problem or None, live_count)`. Rules: (1) `in_trade` is True
+    exactly when the broker state of the algo's current trade is `pending` or
+    `open`; (2) at most one position is live, where only `pending` and `open`
+    count as live. An `exiting` position alongside a new `pending` one on the
+    same bar is legitimate under PaperBroker's rules, so `exiting` is not live.
+    """
+    live = sum(1 for s in unsettled_states if s in ("pending", "open"))
+    flat_broker = current_state not in ("pending", "open")
+    if (not in_trade) != flat_broker or live > 1:
+        return f"inTrade={in_trade} state={current_state} live={live}", live
+    return None, live
 
 
 def run_paper_backtest(
@@ -208,15 +227,11 @@ def run_paper_backtest(
         run_seen[:] = trades
         states = {ref: broker.position_state(ref) for ref in unsettled}
         unsettled[:] = [r for r, s in states.items() if s not in ("closed", "cancelled")]
-        live = [r for r in unsettled if states[r] in ("pending", "open", "exiting")]
-        run.max_live = max(run.max_live, len(live))
         current = broker.position_state(trades[-1].brokerRef) if trades else None
-        flat_view = not algo.inTrade
-        flat_broker = current not in ("pending", "open")
-        if flat_view != flat_broker or len(live) > 1:
-            run.violations.append(
-                f"bar {run.bars_checked}: inTrade={algo.inTrade} state={current} live={len(live)}"
-            )
+        problem, live = view_problem(algo.inTrade, current, list(states.values()))
+        run.max_live = max(run.max_live, live)
+        if problem:
+            run.violations.append(f"bar {run.bars_checked}: {problem}")
 
     run_seen: list = []
     original_update = algo.update

@@ -2,9 +2,9 @@
  "algo": "FVG",
  "capital": "10000.0000",
  "costs": {
-  "commission_minimum": "1.00",
-  "commission_per_share": "0.005",
-  "slippage_per_share": "0"
+  "commission_minimum": "1.0000",
+  "commission_per_share": "0.0050",
+  "slippage_per_share": "0.0000"
  },
  "equity_points": 2340,
  "equity_sha256": "8f384f670cf8cdbfb5effad17f8e1d33e61dc336c8f4c99465ab246577262524",
