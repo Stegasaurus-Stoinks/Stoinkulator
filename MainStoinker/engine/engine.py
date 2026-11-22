@@ -7,12 +7,15 @@ global state.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 
 from .bars import BarStore
 from .broker import Broker
 from .feed import BarFeed
+from .ledger import Ledger
+from .router import BarAwareBroker, BrokerRouter, SingleBrokerRouter
 from .sink import EventSink
 
 
@@ -35,21 +38,45 @@ class Engine:
     algo object appearing twice. A feed symbol with no algo is allowed: its
     bars are still stored and published to the sink (with `[]` as algo data
     when the sink wants it, else `None`).
+
+    The fourth argument is a `Broker` (shared by every algo, wrapped in a
+    `SingleBrokerRouter`) or a `BrokerRouter`. An object that satisfies both
+    protocols is treated as a `Broker`, so anything that worked before routers
+    existed behaves identically. Anything else raises `TypeError`. Every
+    routed value must be a `Broker`, checked for all algos before any algo is
+    touched (a router error such as `MappingRouter`'s `KeyError` is also
+    raised before that point).
+
+    `ledger`, if given, is marked after the algos at every post-warm-up
+    timestamp and finished after the last one. `end_commission` is passed to
+    `Ledger.finish` as its per-account `commission(idname, quantity)`
+    callable, charged on the synthetic end-of-data closes; the engine has no
+    cost model of its own, so the caller supplies it. Default None: free.
     """
 
     def __init__(
         self,
         config: EngineConfig,
         feed: BarFeed,
-        broker: Broker,
+        broker: Broker | BrokerRouter,
         sink: EventSink,
         algos: Sequence[object],
+        *,
+        ledger: Ledger | None = None,
+        end_commission: Callable[[str, Decimal], float | Decimal] | None = None,
     ) -> None:
         # Without a broker, Trade falls back to the legacy global live-trading
         # flag and the ibapi order calls. The engine must never allow that.
-        if not isinstance(broker, Broker):
+        router: BrokerRouter
+        if isinstance(broker, Broker):
+            router = SingleBrokerRouter(broker)
+        elif isinstance(broker, BrokerRouter):
+            router = broker
+        else:
             raise TypeError(f"Engine requires a Broker, got {type(broker).__name__}")
         self._config = config
+        self._ledger = ledger
+        self._end_commission = end_commission
         self._feed = feed
         self._broker = broker
         self._sink = sink
@@ -68,8 +95,19 @@ class Engine:
                 raise ValueError(f"algo {getattr(algo, 'name', algo)!r} was passed twice")
             seen.add(id(algo))
             by_symbol[ticker].append(algo)
-        for algo in self._algos:
-            algo.broker = broker  # type: ignore[attr-defined]
+        routed = [(algo, router.broker_for(algo)) for algo in self._algos]
+        for algo, routed_broker in routed:
+            if not isinstance(routed_broker, Broker):
+                raise TypeError(
+                    f"router gave algo {getattr(algo, 'name', algo)!r} a "
+                    f"{type(routed_broker).__name__}, which is not a Broker"
+                )
+        for algo, routed_broker in routed:
+            algo.broker = routed_broker  # type: ignore[attr-defined]
+        distinct = {id(b): b for _, b in routed}
+        self._bar_brokers: tuple[BarAwareBroker, ...] = tuple(
+            b for b in distinct.values() if isinstance(b, BarAwareBroker)
+        )
         self._symbols = symbols
         self._by_symbol = by_symbol
         self._ran = False
@@ -90,15 +128,30 @@ class Engine:
         sink wants algo data, `update_frontend()` is called right after each
         algo's `update` (as the legacy `Ticker.update_algos` does), then the
         sink gets one `on_bar` for the symbol. Warm-up bars update no algo.
+
+        Per timestamp the order is: append every symbol's bar; `on_bar(symbol,
+        bar)` on every distinct bar-aware broker (first-seen order among the
+        algos) for every symbol in feed order; update the algos; then
+        `ledger.mark(timestamp, closes)` if there is a ledger. Warm-up bars
+        reach no broker and no mark. After the last timestamp, `on_end(
+        last_bars)` is called once on each distinct bar-aware broker, then
+        `ledger.finish(last_timestamp, last_closes, end_commission)`. A feed
+        with no post-warm-up bars does none of that: no marks, no `on_end`, no
+        `finish`.
         """
         if self._ran:
             raise RuntimeError("run_backtest() can only be called once per Engine")
         self._ran = True
         stores = {symbol: BarStore(self._feed.warmup(symbol)) for symbol in self._symbols}
         wants_algo_data = self._sink.wants_algo_data
-        for _timestamp, bars in self._feed:
+        last: tuple | None = None
+        for timestamp, bars in self._feed:
+            last = (timestamp, bars)
             for symbol in self._symbols:
                 stores[symbol].append(bars[symbol])
+            for broker in self._bar_brokers:
+                for symbol in self._symbols:
+                    broker.on_bar(symbol, bars[symbol])
             for symbol in self._symbols:
                 algo_data: list | None = [] if wants_algo_data else None
                 for algo in self._by_symbol[symbol]:
@@ -106,3 +159,16 @@ class Engine:
                     if algo_data is not None:
                         algo_data.append(algo.update_frontend())  # type: ignore[attr-defined]
                 self._sink.on_bar(symbol, bars[symbol], algo_data)
+            if self._ledger is not None:
+                self._ledger.mark(timestamp, {s: bars[s].close for s in self._symbols})
+        if last is None:
+            return
+        last_time, last_bars = last
+        for broker in self._bar_brokers:
+            broker.on_end(dict(last_bars))
+        if self._ledger is not None:
+            self._ledger.finish(
+                last_time,
+                {s: b.close for s, b in last_bars.items()},
+                self._end_commission,
+            )
