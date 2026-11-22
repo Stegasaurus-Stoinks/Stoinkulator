@@ -209,3 +209,43 @@ td.num { font-family: var(--mono); font-size: 13px; }
   .app-main { padding: 12px; }
   .health { margin-left: 0; width: 100%; }
 }
+
+/* Run overview and charts */
+.view h3 { margin: 0 0 8px; font-size: 15px; }
+
+.status-line { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 24px; }
+.status-line li { white-space: nowrap; }
+.panel .warning { margin: 10px 0 0; padding: 6px 10px; border-radius: 4px; background: var(--warn-bg); color: var(--warn-text); }
+
+.notes { margin: 0; padding-left: 20px; }
+
+td.total, th.total { font-weight: 600; background: var(--surface-2); }
+
+.chart-box {
+  position: relative;
+  height: 440px;
+  min-height: 240px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.chart-legend {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  z-index: 3;
+  max-width: calc(100% - 90px);
+  font-size: 12px;
+  pointer-events: none;
+}
+.chart-legend ul { list-style: none; margin: 0 0 2px; padding: 0; display: flex; flex-wrap: wrap; gap: 0 14px; }
+.chart-legend .swatch { display: inline-block; width: 12px; height: 3px; margin-right: 6px; vertical-align: middle; }
+.chart-note { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; margin: 0; z-index: 3; }
+.chart-note[hidden], .chart-legend[hidden] { display: none; }
+.chart-caption { margin: 6px 0 0; font-size: 12px; }
+
+@media (max-width: 480px) {
+  .chart-box { height: 340px; }
+  .status-line li { white-space: normal; }
+}

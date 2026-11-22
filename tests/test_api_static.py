@@ -1032,3 +1032,326 @@ def test_chart_time_does_not_depend_on_the_machine_zone(
     assert out["offset"] == offset_minutes  # node really ran in that zone, not UTC
     assert out["seconds"] == EXPECTED_CHART_SECONDS
     assert out["back"][0] == "2024-01-02 09:30:00"
+
+
+# --- charts/equity.js, charts/theme.js, views/overview.js ----------------------------------------
+
+EQUITY_POINTS = [
+    ("2024-01-02 09:30:00", "100000.0000"), ("2024-01-02 09:31:00", "100050.2500"),
+    ("2024-01-02 09:32:00", "99980.5000"), ("2024-01-02 09:33:00", "99900.0000"),
+    ("2024-01-02 09:34:00", "100200.0000"), ("2024-01-02 09:35:00", "100150.1250"),
+    ("2024-01-02 09:36:00", "100010.0000"),
+]
+
+
+def equity_points_json(points: list[tuple[str, str]]) -> str:
+    return json.dumps([{"time": t, "equity": e} for t, e in points])
+
+
+def test_drawdown_series_matches_python_max_drawdown(node_workdir: Path) -> None:
+    from MainStoinker.engine.stats import max_drawdown
+
+    capital = "100000.0000"
+    out = run_node(node_workdir, "drawdown", f"""
+import {{ buildChartData, drawdownSeries, prepareSeries }} from "./js/charts/equity.js";
+const points = {equity_points_json(EQUITY_POINTS)};
+const prepared = prepareSeries(points, "{capital}");
+const falling = prepareSeries([{{time: "2024-01-02 09:30:00", equity: "99000.0000"}},
+  {{time: "2024-01-02 09:31:00", equity: "98500.0000"}}], "100000.0000");
+console.log(JSON.stringify({{
+  drawdown: drawdownSeries(prepared), data: buildChartData({{points, capital: "{capital}"}}),
+  falling: falling.map((p) => p.drawdown),
+  noCapital: prepareSeries([{{time: "2024-01-02 09:30:00", equity: "5.0000"}},
+    {{time: "2024-01-02 09:31:00", equity: "4.0000"}}], null).map((p) => p.drawdown),
+  negZero: Object.is(prepared[0].drawdown, -0),
+}}));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    dd = [p["value"] for p in out["drawdown"]]
+    equities = [Decimal(e) for _t, e in EQUITY_POINTS]
+    peak = Decimal(capital)
+    for value, equity in zip(dd, equities, strict=True):
+        peak = max(peak, equity)
+        assert value == pytest.approx(-float(peak - equity), abs=1e-6)
+        assert value <= 0
+    assert min(dd) == pytest.approx(-float(max_drawdown(equities, Decimal(capital))), abs=1e-6)
+    assert out["negZero"] is False
+    assert [p["value"] for p in out["data"]["equity"]] == pytest.approx([float(e) for e in equities])
+    assert [p["time"] for p in out["data"]["equity"]][:2] == [1704187800, 1704187860]
+    # a series that only falls below the starting capital measures the fall from the start
+    assert out["falling"] == [-1000, -1500]
+    assert float(max_drawdown([Decimal("99000"), Decimal("98500")], Decimal("100000"))) == 1500
+    assert out["noCapital"] == [0, -1]  # no capital: the first equity is the first peak
+
+
+def test_equity_series_deduplicates_times_and_handles_empty_input(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "equity_clean", """
+import { buildChartData, prepareSeries } from "./js/charts/equity.js";
+const p = (time, equity) => ({ time, equity });
+const dup = prepareSeries([p("2024-01-02 09:30:00", "100.0000"), p("2024-01-02 09:31:00", "120.0000"),
+  p("2024-01-02 09:31:00", "90.0000"), p("2024-01-02 09:32:00", "95.0000")], "100.0000");
+const back = prepareSeries([p("2024-01-02 09:31:00", "100.0000"), p("2024-01-02 09:30:00", "50.0000"),
+  p("2024-01-02 09:32:00", "100.0000")], "100.0000");
+const junk = prepareSeries([p("garbage", "1.0000"), p("2024-01-02 09:30:00", "x"), null,
+  p("2024-01-02 09:30:00Z", "1.0000"), p("2024-01-02 09:30:00", "7.5000")], "10.0000");
+console.log(JSON.stringify({
+  dup, back: back.map((x) => x.time), junk: junk.map((x) => [x.time, x.equity, x.drawdown]),
+  empty: prepareSeries([], "1.0000"), notList: [prepareSeries(null, "1"), prepareSeries(undefined, null)],
+  emptyData: buildChartData({ points: [], capital: "1.0000" }),
+}));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    times = [p["time"] for p in out["dup"]]
+    assert times == sorted(set(times)) and len(times) == 3
+    # the repeated time keeps its last point; the peak still counts the dropped 120
+    assert out["dup"][1]["equity"] == 90 and out["dup"][1]["drawdown"] == -30
+    assert out["dup"][2]["drawdown"] == -25
+    assert out["back"] == [1704187860, 1704187920]  # the point that goes back in time is dropped
+    assert out["junk"] == [[1704187800, 7.5, -2.5]]
+    assert out["empty"] == [] and out["notList"] == [[], []]
+    assert out["emptyData"] == {"equity": [], "drawdown": []}
+
+
+def test_theme_helpers_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "theme", """
+import { FALLBACK_THEMES, chartOptions, hexToRgba, readTheme, seriesColor, watchTheme } from "./js/charts/theme.js";
+const listeners = [];
+let dark = false;
+const view = {
+  matchMedia: () => ({ get matches() { return dark; },
+    addEventListener: (t, f) => listeners.push(f),
+    removeEventListener: (t, f) => listeners.splice(listeners.indexOf(f), 1) }),
+  document: { documentElement: {} },
+  getComputedStyle: () => ({ getPropertyValue: (p) => ({ "--accent": " #123456 ", "--text": "" })[p] || "" }),
+};
+const cleanups = [];
+const applied = [];
+const changed = [];
+const chart = { applyOptions: (o) => applied.push(o) };
+const ctx = { onCleanup: (f) => cleanups.push(f) };
+const light = readTheme(view);
+watchTheme(chart, ctx, (t) => changed.push(t.dark), view);
+const before = listeners.length;
+dark = true;
+listeners.forEach((f) => f());
+const darkTheme = readTheme(view);
+cleanups.forEach((f) => f());
+cleanups.forEach((f) => f());
+const after = listeners.length;
+console.log(JSON.stringify({
+  light, darkTheme, before, after, applied: applied.length, changed,
+  noView: readTheme({}), rgba: [hexToRgba("#1f5fbf", 0.5), hexToRgba("#fff", 1), hexToRgba("red", 1)],
+  opts: chartOptions(light).layout.background, color: [0, 1, 5].map((i) => seriesColor(light, i)),
+  fallbacks: Object.keys(FALLBACK_THEMES),
+  noMedia: typeof watchTheme(chart, ctx, null, {}),
+}));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["light"]["accent"] == "#123456"  # read from the page, trimmed
+    assert out["light"]["text"] == "#1c2230"  # missing property: the light fallback
+    assert out["light"]["dark"] is False and out["darkTheme"]["dark"] is True
+    assert out["darkTheme"]["muted"] == "#9aa4b8"  # dark fallback
+    assert (out["before"], out["after"]) == (1, 0)  # the listener is removed by ctx.onCleanup
+    assert out["applied"] == 1 and out["changed"] == [True]
+    assert out["noView"]["accent"] == "#1f5fbf"
+    assert out["rgba"] == ["rgba(31, 95, 191, 0.5)", "rgba(255, 255, 255, 1)", "red"]
+    assert out["opts"] == {"type": "solid", "color": "#ffffff"}
+    assert out["color"] == ["#123456", "#6b4a00", "#123456"]
+    assert out["noMedia"] == "function"
+
+
+FAKE_CHART_LIB = """
+const calls = [];
+globalThis.LightweightCharts = {
+  LineSeries: "line", BaselineSeries: "baseline", LineType: { WithSteps: 1 },
+  createChart(el, options) {
+    const chart = { removed: 0, series: [], options,
+      addSeries(type, opts, pane) { const s = { type, opts, pane, data: null, applied: [],
+        setData(d) { s.data = d; }, applyOptions(o) { s.applied.push(o); } }; chart.series.push(s); return s; },
+      removeSeries(s) { chart.series.splice(chart.series.indexOf(s), 1); },
+      panes: () => [{ setStretchFactor: (n) => calls.push(["pane0", n]) }, { setStretchFactor: (n) => calls.push(["pane1", n]) }],
+      timeScale: () => ({ fitContent: () => calls.push(["fit"]) }),
+      applyOptions() {}, remove() { chart.removed += 1; } };
+    calls.push(["create", el.tag]);
+    globalThis.lastChart = chart;
+    return chart;
+  },
+};
+"""  # noqa: E501
+
+
+def test_equity_chart_draws_two_panes_and_disposes_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "equity_chart", FAKE_DOM + FAKE_CHART_LIB + """
+const { createEquityChart, EMPTY_NOTE } = await import("./js/charts/equity.js");
+const cleanups = [];
+const ctx = { onCleanup: (f) => cleanups.push(f) };
+const box = document.createElement("div");
+const handle = createEquityChart(box, { ctx });
+const registered = cleanups.length;
+const pts = [{ time: "2024-01-02 09:30:00", equity: "100.0000" }, { time: "2024-01-02 09:31:00", equity: "90.0000" }];
+handle.setSeries([{ label: "A", points: pts, capital: "100.0000" }, { label: "B", points: pts, capital: "100.0000", color: "#abcdef" }]);
+const chart = globalThis.lastChart;
+const two = chart.series.map((s) => [s.type, s.pane, s.data.length, s.opts.lineType ?? null]);
+const colourB = chart.series[2].opts.color;
+const noteHiddenWithData = box.querySelector(".chart-note").hidden;
+handle.setSeries([]);
+const afterEmpty = { series: chart.series.length, hidden: box.querySelector(".chart-note").hidden,
+  text: box.querySelector(".chart-note").textContent };
+handle.setSeries([{ label: "A", points: [], capital: "1.0000" }]);
+const emptyPoints = box.querySelector(".chart-note").hidden;
+handle.dispose(); handle.dispose(); cleanups.forEach((f) => f());
+handle.setSeries([{ label: "A", points: pts, capital: "100.0000" }]); // after disposal: ignored
+let noLib = null;
+try { createEquityChart(box, { ctx, lib: {} }); } catch (err) { noLib = err.message; }
+console.log(JSON.stringify({ registered, two, colourB, noteHiddenWithData, afterEmpty, emptyPoints,
+  removed: chart.removed, seriesAfterDispose: chart.series.length, noLib, EMPTY_NOTE }));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["registered"] >= 1  # disposal registered at creation
+    pair = [["line", 0, 2, 1], ["baseline", 1, 2, None]]
+    assert out["two"] == pair + pair
+    assert out["colourB"] == "#abcdef"
+    assert out["noteHiddenWithData"] is True
+    assert out["afterEmpty"] == {"series": 0, "hidden": False, "text": "No equity points stored"}
+    assert out["emptyPoints"] is False
+    assert out["removed"] == 1 and out["seriesAfterDispose"] == 0
+    assert "not loaded" in out["noLib"]
+    assert out["EMPTY_NOTE"] == "No equity points stored"
+
+
+OVERVIEW_DOC = {
+    "run": {
+        "run_id": 7, "status": "completed", "incomplete": False, "kind": "backtest", "fills": "realistic",
+        "started_at": "2026-11-22T17:31:13+00:00", "ended_at": "2026-11-22T17:31:25.5+00:00",
+        "code_version": "0123456789abcdef-dirty:d06a", "symbols": ["AAPL", "MSFT"],
+        "first_bar": "2024-01-02T09:30:00", "last_bar": "2024-01-05T16:00:00",
+        "data_directory": "OfflineData",
+        "capital": "100000.0000",
+        "costs": {"commission_per_share": "0.0050", "commission_minimum": "1.0000",
+                  "slippage_per_share": "0.0100"},
+    },
+    "accounts": {
+        "B-algo": {"symbol": "MSFT", "algo": "B", "mode": "long", "trade_count": 0, "wins": 0,
+                   "win_rate": None, "net": "0.0000", "commission": "0.0000", "avg_win": None,
+                   "avg_loss": None, "max_drawdown": "0.0000", "final_equity": "100000.0000"},
+        "A-algo": {"symbol": "AAPL", "algo": "A", "mode": "long", "trade_count": 8, "wins": 3,
+                   "win_rate": "0.3750", "net": "-12.3450", "commission": "8.0000", "avg_win": "5.0000",
+                   "avg_loss": "-6.2000", "max_drawdown": "30.0000", "final_equity": "99987.6550"},
+    },
+    "total": {"trade_count": 8, "wins": 3, "win_rate": "0.3750", "net": "-12.3450", "commission": "8.0000",
+              "avg_win": "5.0000", "avg_loss": "-6.2000", "max_drawdown": "30.0000",
+              "final_equity": "199987.6550", "synthetic_closes": 2, "cancelled_entries": 1,
+              "ignored_events": {"late_fill": 0, "duplicate": 3}},
+}
+
+
+def test_overview_rows_match_the_report_table(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overview_rows", FAKE_DOM + f"""
+const {{ buildRows, runNotes, settingRows, statusNotes, runDurationSeconds, displayStatus }} =
+  await import("./js/views/overview.js");
+const {{ dataTable }} = await import("./js/table.js");
+const doc = {json.dumps(OVERVIEW_DOC)};
+const rows = buildRows(doc);
+const legacy = {{ ...doc.run, fills: "legacy", capital: null, costs: null, first_bar: null, last_bar: null,
+  symbols: [], data_directory: "" }};
+const partial = buildRows({{ accounts: {{ X: {{}} }}, total: null }});
+console.log(JSON.stringify({{
+  names: rows.map((r) => r.name), totals: rows.map((r) => r.total), cells: rows.map((r) => r.cells),
+  sort: rows.map((r) => r.sort), partial: partial.map((r) => r.cells),
+  notes: runNotes(doc), noNotes: runNotes({{ total: {{ synthetic_closes: 0, cancelled_entries: 0,
+    ignored_events: {{ a: 0 }} }} }}), settings: settingRows(doc.run), legacy: settingRows(legacy),
+  warn: [statusNotes(doc.run), statusNotes({{ status: "running", incomplete: true }}), statusNotes({{ status: "failed" }})],
+  duration: [runDurationSeconds(doc.run), runDurationSeconds({{ started_at: "x", ended_at: "y" }}),
+    runDurationSeconds({{ started_at: "2026-11-22T17:31:13+00:00", ended_at: null }})],
+  shown: displayStatus({{ status: "running", incomplete: true }}),
+}}));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["names"] == ["B-algo", "A-algo", "TOTAL"]
+    assert out["totals"] == [False, False, True]  # TOTAL last
+    a_cells = out["cells"][1]
+    # the figures `report` prints: money to 2 decimals half up, win rate to 1 decimal
+    assert a_cells == {"trades": "8", "wins": "3", "winPercent": "37.5", "net": "-12.35",
+                       "commission": "8.00", "avgWin": "5.00", "avgLoss": "-6.20",
+                       "maxDrawdown": "30.00", "finalEquity": "99,987.66"}
+    assert out["cells"][0]["winPercent"] == "-" and out["cells"][0]["avgWin"] == "-"  # no trades: "-"
+    assert out["cells"][0]["net"] == "0.00"
+    assert out["sort"][0]["winPercent"] is None and out["sort"][1]["net"] == -12.345
+    assert set(out["partial"][0].values()) == {"-"} and set(out["partial"][1].values()) == {"-"}
+    assert out["notes"] == [
+        "2 synthetic end-of-data closes (positions closed at the last bar; they are counted in the trades).",
+        "3 ignored events (duplicate: 3).", "1 cancelled entry."]
+    assert out["noNotes"] == []
+    settings = dict(map(tuple, out["settings"]))
+    assert settings["Capital per algo"] == "100,000.00"
+    assert settings["Commission per share"] == "0.0050"  # not rounded to cents
+    assert settings["Slippage per share"] == "0.0100"
+    assert settings["Bar range"] == "2024-01-02T09:30:00 to 2024-01-05T16:00:00 (data time)"
+    assert settings["Symbols"] == "AAPL, MSFT" and settings["Data folder"] == "OfflineData"
+    legacy = dict(map(tuple, out["legacy"]))
+    assert set(legacy.values()) == {"-"}  # legacy-fill run: capital, costs, range, symbols, folder
+    assert out["warn"][0] == "" and "incomplete" in out["warn"][1] and "failed" in out["warn"][2]
+    assert out["duration"] == [12.5, None, None] and out["shown"] == "incomplete"
+
+
+def test_overview_table_keeps_total_last_when_sorted_and_links_algos(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overview_table", FAKE_DOM + FAKE_CHART_LIB + f"""
+const {{ render }} = await import("./js/views/overview.js");
+const doc = {json.dumps(OVERVIEW_DOC)};
+const equity = {{ run_id: 7, step: true, capital: "200000.0000", stored_points: 3, points: [
+  {{ time: "2024-01-02 09:30:00", equity: "200000.0000" }}, {{ time: "2024-01-02 09:31:00", equity: "199900.0000" }},
+  {{ time: "2024-01-02 09:31:00", equity: "199950.0000" }}] }};
+function respond(body, status = 200) {{
+  return Promise.resolve({{ ok: status < 400, status, statusText: "x", json: async () => body }});
+}}
+const seen = [];
+globalThis.fetch = (url) => {{
+  seen.push(url);
+  if (globalThis.fail === "equity" && url.endsWith("/equity")) return respond({{ detail: "equity broke" }}, 500);
+  if (globalThis.fail === "doc" && !url.endsWith("/equity")) return respond({{ detail: "no run 7" }}, 404);
+  return respond(url.endsWith("/equity") ? equity : doc);
+}};
+const ctx = () => {{ const cleanups = []; return {{ signal: new AbortController().signal, isCurrent: () => true,
+  onCleanup: (f) => cleanups.push(f), cleanups }}; }};
+const out = {{}};
+for (const fail of ["", "equity", "doc"]) {{
+  globalThis.fail = fail;
+  const box = document.createElement("div");
+  const c = ctx();
+  await render(box, {{ runId: 7 }}, c);
+  const panels = box.all("div").filter((d) => d.className.includes("error")).map((d) => d.textContent);
+  out[fail || "ok"] = {{
+    h2: box.all("h2").map((h) => h.textContent), errors: panels,
+    table: box.all("table").length, charts: box.all("div").filter((d) => d.className === "chart-box").length,
+    cleanups: c.cleanups.length, created: globalThis.lastChart ? true : false,
+    links: box.all("a").map((a) => a.getAttribute("href")),
+  }};
+  if (fail === "") {{
+    const table = box.all("table")[0];
+    const button = box.all("th")[4].children[0]; // Net
+    button.fire("click");
+    out.asc = table.all("tbody")[0].children.map((tr) => tr.children[0].textContent);
+    button.fire("click");
+    out.desc = table.all("tbody")[0].children.map((tr) => tr.children[0].textContent);
+    out.headers = box.all("th").map((th) => th.textContent.replace(/[▲▼]/g, "").trim());
+  }}
+}}
+out.seen = seen.slice(0, 2);
+console.log(JSON.stringify(out));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    ok = out["ok"]
+    assert ok["h2"] == ["Run 7"] and ok["errors"] == [] and ok["table"] == 1 and ok["charts"] == 1
+    assert ok["cleanups"] >= 1  # the chart registered its disposal
+    assert "#/run/7/algo/A-algo" in ok["links"] and "#/run/7/algo/B-algo" in ok["links"]
+    assert "#/" in ok["links"]  # back to the runs list
+    assert out["headers"] == ["Algo", "Trades", "Wins", "Win %", "Net", "Commission", "Avg win", "Avg loss",
+                              "Max drawdown", "Final equity"]
+    assert out["asc"][-1] == "TOTAL" and out["desc"][-1] == "TOTAL"
+    assert out["asc"][:2] == ["A-algo", "B-algo"] and out["desc"][:2] == ["B-algo", "A-algo"]
+    # one failing part gives one error panel; the other still renders
+    assert out["equity"]["errors"] == ["Error 500: equity broke"]
+    assert out["equity"]["table"] == 1 and out["equity"]["charts"] == 0
+    assert out["doc"]["errors"] == ["Error 404: no run 7"]
+    assert out["doc"]["table"] == 0 and out["doc"]["charts"] == 1
+    assert sorted(out["seen"]) == ["/api/runs/7", "/api/runs/7/equity"]
