@@ -592,6 +592,247 @@ def test_trade_stands_down_after_broker_stop() -> None:
     assert len(ledger.fills) == 2
 
 
+def test_entry_bar_that_opens_beyond_the_stop_fills_both_at_the_open() -> None:
+    ledger, broker = make()
+    ref = open_pos(broker, stop=95.0)
+    broker.on_bar("AAPL", bar(1, 90.0, 91.0, 89.0))  # gaps below the stop of 95
+    assert [(f.reason, f.price) for f in ledger.fills] == [("entry", 90), ("stop", 90)]
+    assert broker.position_state(ref) == "closed"
+    assert ledger.open_positions() == ()
+    ledger2, broker2 = make()
+    ref2 = open_pos(broker2, long=False, stop=105.0)
+    broker2.on_bar("AAPL", bar(1, 110.0, 111.0, 109.0))
+    assert [(f.reason, f.price, f.side) for f in ledger2.fills] == [
+        ("entry", 110, "sell"), ("stop", 110, "buy")]
+    assert broker2.position_state(ref2) == "closed"
+    # with slippage both legs move against the trader
+    ledger3, broker3 = make(CostModel(Decimal(0), Decimal(0), Decimal("0.02")))
+    open_pos(broker3, stop=95.0)
+    broker3.on_bar("AAPL", bar(1, 90.0, 91.0, 89.0))
+    assert [f.price for f in ledger3.fills] == [Decimal("90.02"), Decimal("89.98")]
+
+
+def test_position_held_overnight_is_checked_against_the_next_days_bars() -> None:
+    # long: a quiet next day leaves it open, a gap below the stop fills at the open
+    ledger, broker = make()
+    ref = opened(broker, stop=95.0, tp=110.0)
+    broker.on_bar("AAPL", bar(0, 100.0, 101.0, 99.0, day=1))
+    assert broker.position_state(ref) == "open"
+    assert reasons(ledger) == ["entry"]
+    broker.on_bar("AAPL", bar(1, 93.0, 94.0, 92.0, day=1))
+    assert (ledger.fills[-1].reason, ledger.fills[-1].price) == ("stop", 93)
+    assert ledger.fills[-1].time == t(1, 1)
+    # short: gap above the stop
+    ledger2, broker2 = make()
+    opened(broker2, long=False, stop=105.0, tp=90.0)
+    broker2.on_bar("AAPL", bar(0, 107.0, 108.0, 106.0, day=1))
+    assert (ledger2.fills[-1].reason, ledger2.fills[-1].price) == ("stop", 107)
+    # gaps through the target on the next day
+    ledger3, broker3 = make()
+    opened(broker3, stop=95.0, tp=110.0)
+    broker3.on_bar("AAPL", bar(0, 112.0, 113.0, 111.0, day=1))
+    assert (ledger3.fills[-1].reason, ledger3.fills[-1].price) == ("target", 112)
+    ledger4, broker4 = make()
+    opened(broker4, long=False, stop=105.0, tp=90.0)
+    broker4.on_bar("AAPL", bar(0, 88.0, 89.0, 87.0, day=1))
+    assert (ledger4.fills[-1].reason, ledger4.fills[-1].price) == ("target", 88)
+
+
+def test_trailing_stop_modified_each_bar_long_and_short() -> None:
+    ledger, broker = make()
+    ref = opened(broker, stop=95.0)
+    broker.modify_stop(ref, 97.0)
+    broker.on_bar("AAPL", bar(2, 100.0, 101.0, 97.5))
+    broker.modify_stop(ref, 98.0)
+    broker.on_bar("AAPL", bar(3, 100.0, 102.0, 98.5))
+    broker.modify_stop(ref, 99.0)
+    assert reasons(ledger) == ["entry"]
+    broker.on_bar("AAPL", bar(4, 100.0, 100.0, 99.0))
+    assert (ledger.fills[-1].reason, ledger.fills[-1].price) == ("stop", 99)
+    assert [e.price for e in ledger.orders if e.kind == "modified"] == [97, 98, 99]
+    ledger2, broker2 = make()
+    ref2 = opened(broker2, long=False, stop=105.0)
+    broker2.modify_stop(ref2, 103.0)
+    broker2.on_bar("AAPL", bar(2, 100.0, 102.9, 99.0))
+    broker2.modify_stop(ref2, 102.0)
+    broker2.on_bar("AAPL", bar(3, 100.0, 101.9, 99.0))
+    assert reasons(ledger2) == ["entry"]
+    broker2.on_bar("AAPL", bar(4, 100.0, 102.0, 99.0))
+    assert (ledger2.fills[-1].side, ledger2.fills[-1].price) == ("buy", 102)
+
+
+def test_target_set_twice_uses_the_last_price_and_one_order() -> None:
+    ledger, broker = make()
+    ref = opened(broker, stop=90.0, tp=110.0)
+    broker.set_take_profit(ref, 105.0, 10)
+    broker.on_bar("AAPL", bar(2, 100.0, 105.5, 99.0))
+    assert (ledger.fills[-1].reason, ledger.fills[-1].price) == ("target", 105)
+    assert [e.order_type for e in ledger.orders if e.kind == "placed"].count("target") == 1
+    ledger2, broker2 = make()
+    ref2 = opened(broker2, long=False, stop=110.0, tp=90.0)
+    broker2.set_take_profit(ref2, 95.0, 10)
+    broker2.on_bar("AAPL", bar(2, 100.0, 101.0, 94.5))
+    assert (ledger2.fills[-1].reason, ledger2.fills[-1].price, ledger2.fills[-1].side) == (
+        "target", 95, "buy")
+
+
+def test_short_algo_close_next_open_and_session_end_fallback() -> None:
+    costs = CostModel(Decimal("0.005"), Decimal(1), Decimal("0.02"))
+    ledger, broker = make(costs)
+    ref = open_pos(broker, long=False, stop=110.0)
+    broker.on_bar("AAPL", bar(1, 100.0))
+    broker.close_position(ref, price=101.0, time=t(1))
+    assert broker.position_state(ref) == "exiting"
+    broker.on_bar("AAPL", bar(2, 98.0))
+    # sell 10 at 100 - 0.02, buy 10 at 98 + 0.02, 1.00 commission each way
+    assert [f.price for f in ledger.fills] == [Decimal("99.98"), Decimal("98.02")]
+    (trip,) = ledger.round_trips
+    assert (trip.side, trip.gross, trip.commission, trip.net) == (
+        "short", Decimal("19.6"), Decimal(2), Decimal("17.6"))
+    assert ledger.equity() == CAPITAL + Decimal("17.6")
+    # session end: the exit fills at the requested price, with the requesting time, no slippage
+    ledger2, broker2 = make(costs)
+    ref2 = open_pos(broker2, long=False, stop=110.0)
+    broker2.on_bar("AAPL", bar(1, 100.0))
+    broker2.close_position(ref2, price=101.0, time=t(1))
+    broker2.on_bar("AAPL", bar(0, 90.0, day=1))
+    last = ledger2.fills[-1]
+    assert (last.reason, last.side, last.price, last.time) == ("algo_exit", "buy", 101, t(1))
+    assert broker2.position_state(ref2) == "closed"
+
+
+def test_close_twice_and_close_after_stop_leave_one_exit() -> None:
+    ledger, broker = make()
+    ref = opened(broker, stop=95.0)
+    broker.close_position(ref, price=100.0, time=t(1))
+    broker.close_position(ref, price=100.0, time=t(1))
+    assert ledger.ignored_count("close") == 1
+    broker.on_bar("AAPL", bar(2, 99.0, 99.0, 90.0))
+    assert reasons(ledger) == ["entry", "algo_exit"]
+    broker.close_position(ref, price=99.0, time=t(2))
+    broker.on_end({})
+    assert ledger.ignored_count("close") == 2
+    assert reasons(ledger) == ["entry", "algo_exit"]
+    assert len(ledger.round_trips) == 1
+
+
+def test_prices_stay_exact_decimals() -> None:
+    ledger, broker = make()
+    open_pos(broker, stop=0.1)
+    broker.on_bar("AAPL", bar(1, 0.1 + 0.2, 0.4, 0.2))  # 0.30000000000000004 as a float
+    assert ledger.fills[0].price == Decimal("0.3000")
+    assert isinstance(ledger.fills[0].price, Decimal)
+    ledger2, broker2 = make(CostModel(Decimal(0), Decimal(0), Decimal("0.01")))
+    ref = open_pos(broker2, stop=123.4567)
+    broker2.on_bar("AAPL", bar(1, 123.4567, 124.0, 123.4568))
+    assert ledger2.fills[0].price == Decimal("123.4667")  # not 123.46670000000002
+    broker2.on_bar("AAPL", bar(2, 124.0, 124.0, 123.4567))
+    assert ledger2.fills[1].price == Decimal("123.4467")
+    assert broker2.position_state(ref) == "closed"
+    # exact money: 10 x (123.4467 - 123.4667) = -0.2
+    assert ledger2.round_trips[0].gross == Decimal("-0.2")
+
+
+def test_commission_is_charged_on_every_fill_including_the_minimum() -> None:
+    costs = CostModel(Decimal("0.005"), Decimal(1), Decimal(0))
+    ledger, broker = make(costs)
+    ref = open_pos(broker, volume=1000)  # 5.00 per fill
+    broker.on_bar("AAPL", bar(1, 100.0))
+    broker.close_position(ref, price=100.0, time=t(1))
+    broker.on_bar("AAPL", bar(2, 100.0))
+    assert [f.commission for f in ledger.fills] == [5, 5]
+    ledger2, broker2 = make(costs)
+    open_pos(broker2, long=False, stop=105.0, volume=10)  # minimum applies
+    broker2.on_bar("AAPL", bar(1, 100.0, 106.0, 99.0))
+    assert [(f.reason, f.commission) for f in ledger2.fills] == [("entry", 1), ("stop", 1)]
+    assert ledger2.round_trips[0].commission == 2
+
+
+def test_target_fill_has_no_slippage_and_stop_fill_has() -> None:
+    costs = CostModel(Decimal(0), Decimal(0), Decimal("0.05"))
+    ledger, broker = make(costs)
+    opened(broker, long=False, stop=105.0, tp=90.0)
+    broker.on_bar("AAPL", bar(2, 95.0, 96.0, 89.0))
+    assert ledger.fills[-1].price == 90  # short target buys at 90, no slippage
+    ledger2, broker2 = make(costs)
+    opened(broker2, long=False, stop=105.0, tp=90.0)
+    broker2.on_bar("AAPL", bar(2, 100.0, 105.5, 95.0))
+    assert ledger2.fills[-1].price == Decimal("105.05")  # buy stop, slipped up
+
+
+def test_two_symbols_on_one_broker_do_not_cross_talk() -> None:
+    ledger, broker = make()
+    a = open_pos(broker, symbol="AAPL", stop=95.0)
+    broker.on_bar("AAPL", bar(1, 100.0))  # a opens
+    m = open_pos(broker, symbol="MSFT", stop=190.0, minute=1)  # pending on another symbol
+    broker.on_bar("AAPL", bar(2, 90.0, 91.0, 80.0))  # stops a; must not touch m
+    assert broker.position_state(a) == "closed"
+    assert broker.position_state(m) == "pending"
+    broker.on_bar("MSFT", bar(2, 200.0))
+    assert broker.position_state(m) == "open"
+    assert reasons(ledger) == ["entry", "stop", "entry"]
+
+
+def test_empty_and_repeated_end_of_data_are_harmless() -> None:
+    ledger, broker = make()
+    broker.on_end({})
+    broker.on_end({})
+    assert ledger.fills == () and ledger.orders == ()
+    ref = open_pos(broker)
+    broker.on_end({})
+    broker.on_end({})
+    assert broker.cancelled_entries == 1
+    assert broker.position_state(ref) == "cancelled"
+    assert [e.kind for e in ledger.orders].count("cancelled") == 2
+
+
+def test_brokers_share_no_state() -> None:
+    ledger_a, a = make()
+    ledger_b, b = make()
+    ref_a = open_pos(a)
+    ref_b = open_pos(b)
+    assert ref_a == ref_b  # refs are per broker, so each ledger account sees its own
+    a.on_bar("AAPL", bar(1, 100.0))
+    assert b.position_state(ref_b) == "pending"
+    assert ledger_b.fills == ()
+    assert len(ledger_a.fills) == 1
+
+
+def test_ledger_agrees_with_broker_state_and_identity_holds_at_every_mark() -> None:
+    costs = CostModel(Decimal("0.005"), Decimal(1), Decimal("0.01"))
+    ledger, broker = make(costs)
+    long_ref = open_pos(broker, stop=85.0)
+    short_ref = open_pos(broker, long=False, stop=105.0, minute=0)
+    broker.set_take_profit(short_ref, 90.0, 10)
+    script = [
+        bar(1, 100.0, 101.0, 99.0, 100.5),
+        bar(2, 101.0, 102.0, 100.0, 101.5),
+        bar(3, 99.0, 100.0, 89.0, 92.0),   # short target (trade-through), long untouched
+        bar(4, 92.0, 93.0, 91.0, 93.0),
+        bar(5, 93.0, 94.0, 90.0, 91.0),
+        bar(0, 90.0, 91.0, 85.0, 86.0, day=1),
+    ]
+    broker.on_bar("AAPL", script[0])
+    ledger.mark(script[0].date, {"AAPL": script[0].close})
+    assert broker.position_state(long_ref) == "open" and broker.position_state(short_ref) == "open"
+    assert len(ledger.open_positions()) == 2
+    for b in script[1:3]:
+        broker.on_bar("AAPL", b)
+        ledger.mark(b.date, {"AAPL": b.close})
+    assert broker.position_state(short_ref) == "closed"
+    assert [p.side for p in ledger.open_positions()] == ["long"]
+    broker.close_position(long_ref, price=93.0, time=script[3].date)
+    for b in script[3:]:
+        broker.on_bar("AAPL", b)
+        ledger.mark(b.date, {"AAPL": b.close})
+    assert broker.position_state(long_ref) == "closed"
+    assert ledger.open_positions() == ()
+    assert all(f.order_id is not None for f in ledger.fills)
+    for p in ledger.equity_points:
+        assert p.equity == CAPITAL + p.realised + p.unrealised
+    assert ledger.equity_points[-1].position_value == 0
+
+
 # --- end to end through Engine + MappingRouter + Ledger ----------------------
 
 def _end_bar(minute: int, base: float) -> Bar:
