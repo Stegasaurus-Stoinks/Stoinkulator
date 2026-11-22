@@ -1,8 +1,12 @@
 // The runs view: every stored run, newest first, with filters and a two-run compare.
-import { HEALTH_EVENT, getJson, h, showError, showLoading } from "../api.js";
+// Follows the view contract documented at the top of main.js.
+import { ApiError, HEALTH_EVENT, getJson, isAbortError } from "../api.js";
+import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
 import {
-  formatDuration, formatNet, formatUtc, netClass, shortVersion,
+  formatDuration, formatUtc, shortVersion,
 } from "../format.js";
+import { compareHash, runHash } from "../routes.js";
+import { dataTable, netCell } from "../table.js";
 
 // A run that never finished is shown as "incomplete", otherwise by its stored status.
 export function displayStatus(run) {
@@ -21,22 +25,24 @@ function unique(values) {
   return [...new Set(values)].sort();
 }
 
-function headerCell(text, numeric) {
-  return h("th", { scope: "col", class: numeric ? "num" : "" }, text);
-}
+const HINT_NEED_TWO = "Tick two runs to compare";
 
-export async function render(container) {
+export async function render(container, params, ctx) {
   const ticked = new Set();
   let runs = [];
   let kind = "";
   let status = "";
+  let state = "loading"; // "loading" | "ok" | "error": what the body shows; filters never override it
+  let error = null;
+  let loading = false;
 
   const body = h("div", {});
-  const title = h("h2", {}, "Runs");
-
   const kindSelect = h("select", { id: "filter-kind", "aria-label": "Kind" });
   const statusSelect = h("select", { id: "filter-status", "aria-label": "Status" });
-  const compare = h("a", { class: "btn", id: "compare-button", role: "button", "aria-disabled": "true" }, "Compare");
+  const hint = h("span", { class: "muted", id: "compare-hint" }, HINT_NEED_TWO);
+  const compare = h("button", {
+    type: "button", class: "btn", id: "compare-button", "aria-disabled": "true", "aria-describedby": "compare-hint",
+  }, "Compare");
   const refresh = h("button", { type: "button", id: "refresh-button" }, "Refresh");
   const count = h("span", { class: "muted", role: "status" });
 
@@ -45,20 +51,18 @@ export async function render(container) {
     h("label", {}, "Status", statusSelect),
     count,
     h("span", { class: "spacer" }),
+    hint,
     compare,
     refresh);
 
+  // Compare is available only for exactly two ticked runs that are visible right now.
   function updateCompare() {
-    if (ticked.size === 2) {
-      const [a, b] = [...ticked].sort((x, y) => x - y);
-      compare.setAttribute("href", "#/compare/" + a + "," + b);
-      compare.setAttribute("aria-disabled", "false");
-      compare.removeAttribute("tabindex");
-    } else {
-      compare.removeAttribute("href");
-      compare.setAttribute("aria-disabled", "true");
-      compare.setAttribute("tabindex", "-1");
-    }
+    const ids = [...ticked].sort((a, b) => a - b);
+    const available = state === "ok" && ids.length === 2;
+    compare.setAttribute("aria-disabled", available ? "false" : "true");
+    if (available) hint.textContent = "";
+    else if (state === "ok" && ids.length > 2) hint.textContent = "Tick only two runs to compare (" + ids.length + " ticked)";
+    else hint.textContent = HINT_NEED_TWO;
   }
 
   function row(run) {
@@ -73,50 +77,50 @@ export async function render(container) {
         updateCompare();
       },
     });
-    const shown = displayStatus(run);
-    return h("tr", {},
-      h("td", {}, box),
-      h("td", { class: "num" }, h("a", { href: "#/run/" + id }, String(id))),
-      h("td", {}, formatUtc(run.started_at)),
-      h("td", { class: "num" }, formatDuration(run.duration_seconds)),
-      h("td", {}, h("span", { class: "badge " + shown }, shown)),
-      h("td", {}, run.kind),
-      h("td", {}, run.fills),
-      h("td", { class: "num" }, String(run.algo_count)),
-      h("td", { class: "num" }, String(run.trade_count)),
-      h("td", { class: "num " + netClass(run.net) }, formatNet(run.net)),
-      h("td", { class: "mono", title: run.code_version || "" }, shortVersion(run.code_version)));
+    return { run, box };
   }
 
-  function table(rows) {
-    return h("div", { class: "table-wrap" },
-      h("table", {},
-        h("thead", {}, h("tr", {},
-          h("th", { scope: "col" }, "Compare"),
-          headerCell("Id", true),
-          headerCell("Start (UTC)", false),
-          headerCell("Duration", true),
-          headerCell("Status", false),
-          headerCell("Kind", false),
-          headerCell("Fill model", false),
-          headerCell("Algos", true),
-          headerCell("Trades", true),
-          headerCell("Net", true),
-          headerCell("Code version", false))),
-        h("tbody", {}, rows.map(row))));
-  }
+  const columns = [
+    { label: "Compare", cell: (r) => r.box },
+    { label: "Id", numeric: true, cell: (r) => h("a", { href: runHash(r.run.run_id) }, String(r.run.run_id)) },
+    { label: "Start (UTC)", cell: (r) => formatUtc(r.run.started_at) },
+    { label: "Duration", numeric: true, cell: (r) => formatDuration(r.run.duration_seconds) },
+    {
+      label: "Status",
+      cell: (r) => h("span", { class: "badge " + displayStatus(r.run) }, displayStatus(r.run)),
+    },
+    { label: "Kind", cell: (r) => r.run.kind },
+    { label: "Fill model", cell: (r) => r.run.fills },
+    { label: "Algos", numeric: true, cell: (r) => String(r.run.algo_count) },
+    { label: "Trades", numeric: true, cell: (r) => String(r.run.trade_count) },
+    { label: "Net", numeric: true, cell: (r) => netCell(r.run.net) },
+    {
+      label: "Code version",
+      cell: (r) => ({ content: shortVersion(r.run.code_version), className: "mono", title: r.run.code_version || "" }),
+    },
+  ];
 
   function draw() {
-    const shown = filterRuns(runs, kind, status);
-    count.textContent = shown.length === runs.length
-      ? runs.length + (runs.length === 1 ? " run" : " runs")
-      : shown.length + " of " + runs.length + " runs";
-    if (runs.length === 0) {
-      body.replaceChildren(h("p", { class: "panel empty" }, "No runs are stored in this database yet."));
-    } else if (shown.length === 0) {
-      body.replaceChildren(h("p", { class: "panel empty" }, "No run matches these filters."));
+    if (state === "loading") {
+      count.textContent = "";
+      body.replaceChildren(loadingPanel("runs"));
+    } else if (state === "error") {
+      count.textContent = "";
+      body.replaceChildren(errorPanel(error));
     } else {
-      body.replaceChildren(table(shown));
+      const shown = filterRuns(runs, kind, status);
+      const visible = new Set(shown.map((r) => r.run_id));
+      for (const id of [...ticked]) if (!visible.has(id)) ticked.delete(id); // a hidden row is not selected
+      count.textContent = shown.length === runs.length
+        ? runs.length + (runs.length === 1 ? " run" : " runs")
+        : shown.length + " of " + runs.length + " runs";
+      if (runs.length === 0) {
+        body.replaceChildren(h("p", { class: "panel empty" }, "No runs are stored in this database yet."));
+      } else if (shown.length === 0) {
+        body.replaceChildren(h("p", { class: "panel empty" }, "No run matches these filters."));
+      } else {
+        body.replaceChildren(dataTable({ columns, rows: shown.map(row), caption: "Stored runs", captionHidden: true }));
+      }
     }
     updateCompare();
   }
@@ -130,35 +134,49 @@ export async function render(container) {
     if (statusSelect.value !== status) status = statusSelect.value;
   }
 
-  async function load() {
-    showLoading(body, "runs");
-    refresh.disabled = true;
+  // The refresh button keeps keyboard focus while loading: it is aria-disabled, not disabled,
+  // and clicks are ignored until the load ends.
+  async function load(userRefresh) {
+    if (loading) return;
+    loading = true;
+    state = "loading";
+    refresh.setAttribute("aria-disabled", "true");
+    draw();
     try {
-      const data = await getJson("/api/runs");
+      const data = await getJson("/api/runs", {}, { signal: ctx.signal });
+      if (!ctx.isCurrent()) return;
+      if (!Array.isArray(data.runs)) throw new ApiError(200, "The server sent an unexpected response.", "unexpected");
       runs = [...data.runs].sort((a, b) => b.run_id - a.run_id);
       const known = new Set(runs.map((r) => r.run_id));
       for (const id of [...ticked]) if (!known.has(id)) ticked.delete(id);
       fillFilters();
-      draw();
+      state = "ok";
     } catch (err) {
-      runs = [];
-      showError(body, err);
-      count.textContent = "";
-      updateCompare();
+      if (isAbortError(err) || !ctx.isCurrent()) return;
+      error = err;
+      state = "error";
     } finally {
-      refresh.disabled = false;
+      loading = false;
+      if (ctx.isCurrent()) {
+        refresh.setAttribute("aria-disabled", "false");
+        draw();
+        if (userRefresh) window.dispatchEvent(new Event(HEALTH_EVENT)); // the router did the first health request
+      }
     }
-    window.dispatchEvent(new Event(HEALTH_EVENT));
   }
 
   kindSelect.addEventListener("change", () => { kind = kindSelect.value; draw(); });
   statusSelect.addEventListener("change", () => { status = statusSelect.value; draw(); });
-  refresh.addEventListener("click", load);
-  compare.addEventListener("click", (event) => {
-    if (compare.getAttribute("aria-disabled") === "true") event.preventDefault();
+  refresh.addEventListener("click", () => {
+    if (refresh.getAttribute("aria-disabled") === "true") return;
+    load(true);
+  });
+  compare.addEventListener("click", () => {
+    if (compare.getAttribute("aria-disabled") === "true") return;
+    window.location.hash = compareHash([...ticked].sort((a, b) => a - b));
   });
 
-  container.replaceChildren(title, toolbar, body);
+  container.replaceChildren(viewHeading("Runs"), toolbar, body);
   updateCompare();
-  await load();
+  await load(false);
 }
