@@ -156,6 +156,13 @@ def test_main_allows(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().err == ""
 
 
+def test_main_ignores_leading_byte_order_mark(capsys: pytest.CaptureFixture[str]) -> None:
+    # Windows PowerShell prepends a BOM when piping text to a native program.
+    assert hook.main("﻿" + _payload(f'python "{ENTRY}"')) == 2
+    assert hook.main("﻿" + _payload("git status")) == 0
+    assert "not valid JSON" not in capsys.readouterr().err
+
+
 def test_main_non_shell_tool_allowed(capsys: pytest.CaptureFixture[str]) -> None:
     payload = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "x"}})
     assert hook.main(payload) == 0

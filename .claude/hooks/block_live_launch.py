@@ -391,7 +391,8 @@ def main(stdin_text: str) -> int:
     """Hook entry point; returns the process exit code and never raises."""
     try:
         try:
-            data = json.loads(stdin_text)
+            # Some shells prepend a byte-order mark when piping text.
+            data = json.loads(stdin_text.lstrip("﻿"))
         except ValueError:
             return _on_error(stdin_text, "stdin is not valid JSON")
         if not isinstance(data, dict):
