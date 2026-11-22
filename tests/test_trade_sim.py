@@ -2,6 +2,7 @@
 
 Tests marked xfail(strict=True) document known defects. When one is fixed the
 test starts passing, strict mode fails the run, and the marker must be removed.
+(None remain in this file.)
 """
 import logging
 
@@ -76,36 +77,23 @@ def test_take_profit_closes_long_when_high_exceeds_target():
 def test_long_profit_is_close_minus_open():
     trade = make_trade(LONG)
     trade.close_position(104.0, T0 + pd.Timedelta(minutes=5))
-    assert trade.get_profit() == pytest.approx(4.0)
+    # issue 4: profit is (close - open) * volume (volume 10)
+    assert trade.get_profit() == pytest.approx(40.0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known defect: get_profit compares direction to the string 'DOWN' "
-    "but direction is 1/0, so short P&L never flips sign.",
-)
 def test_short_profit_is_open_minus_close():
     trade = make_trade(SHORT)
     trade.close_position(96.0, T0 + pd.Timedelta(minutes=5))
-    assert trade.get_profit() == pytest.approx(4.0)
+    assert trade.get_profit() == pytest.approx(40.0)  # (100 - 96) * volume 10
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known defect: to_json reads self.stopOrder, which only exists in "
-    "live mode, so saving trades after a backtest raises AttributeError.",
-)
 def test_to_json_works_for_simulated_trade():
     trade = make_trade(LONG)
     trade.close_position(104.0, T0 + pd.Timedelta(minutes=5))
-    assert trade.to_json()["profit"] == pytest.approx(4.0)
+    # issue 4: profit is (close - open) * volume, so 40.0 (was 4.0 per share)
+    assert trade.to_json()["profit"] == pytest.approx(40.0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known defect: a simulated trade has no status/position until it is "
-    "closed (fake_open sets neither).",
-)
 def test_open_simulated_trade_reports_status():
     assert make_trade(LONG).get_status() == "Open"
 

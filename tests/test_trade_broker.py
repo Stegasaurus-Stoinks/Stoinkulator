@@ -149,11 +149,10 @@ def test_stop_not_working_returns_0_without_closing(direction):
     assert [c.method for c in broker.calls] == ["open_position"]
     assert not hasattr(trade, "closePrice")
     # Like the live "stop gone" path (which returns 0 and does not touch
-    # status), nothing local changes. The broker path never sets status or
-    # position on open (the simulated path does not either), and the early
-    # return leaves them alone, so both stay absent.
-    assert not hasattr(trade, "status")
-    assert not hasattr(trade, "position")
+    # status), nothing local changes. The broker path sets status and position
+    # on open (issue 5), and the early return leaves them alone.
+    assert trade.status == "Open"
+    assert trade.position is True
 
 
 def _scenario_default_stops(make):
@@ -253,14 +252,16 @@ def test_sim_scenarios_identical_with_and_without_broker(scenario):
 @pytest.mark.parametrize("direction", [LONG, SHORT])
 def test_known_defects_unchanged_with_broker(direction):
     trade = make_trade(direction, broker=SimBroker())
-    assert not hasattr(trade, "status")
-    assert not hasattr(trade, "position")
+    # issue 5: open sets status and position
+    assert trade.status == "Open"
+    assert trade.position is True
     assert not hasattr(trade, "stopOrder")
-    with pytest.raises(AttributeError):
-        trade.to_json()
+    # issue 3: to_json no longer needs stopOrder
+    assert trade.to_json()["stoplossID"] is None
     trade.close_position(104.0, T0 + pd.Timedelta(minutes=5))
-    with pytest.raises(AttributeError):
-        trade.to_json()  # still no stopOrder (issue 4)
+    assert trade.to_json()["stoplossID"] is None
+    # issue 4: profit is (close - open) * volume, sign flipped for a short
+    assert trade.to_json()["profit"] == (40.0 if direction else -40.0)
 
 
 def test_broker_argument_is_keyword_compatible():
