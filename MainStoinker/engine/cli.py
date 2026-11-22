@@ -782,8 +782,8 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     `os.environ` when the command runs.
     """
     args = build_parser().parse_args(argv)
-    if args.db is None:  # STOINK_DB from the injected environment; empty counts as unset
-        args.db = (os.environ if env is None else env).get("STOINK_DB") or None
+    if args.db is None:  # STOINK_DB from the injected environment; blank counts as unset
+        args.db = (os.environ if env is None else env).get("STOINK_DB", "").strip() or None
     try:
         if args.command == "backtest":
             return run_backtest_command(args, env=env)

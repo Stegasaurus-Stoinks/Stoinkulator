@@ -561,8 +561,10 @@ class SqliteStore:
         file = Path(self._path).expanduser()
         _refuse_cloud(file, env)
         try:
-            if not file.is_file():
+            if not file.exists():
                 raise StoreError(f"database {self._path} does not exist")
+            if not file.is_file():
+                raise StoreError(f"database {self._path} is not a file")
             uri = file.resolve().as_uri() + "?mode=ro"
             self._conn: sqlite3.Connection | None = sqlite3.connect(
                 uri, uri=True, isolation_level=None, timeout=busy_timeout)
@@ -894,6 +896,12 @@ def open_store_readonly(spec: str, *, env: Mapping[str, str],
     runs. A missing file or a schema newer than this code raises `StoreError`;
     every schema from 1 to `SCHEMA_VERSION` is accepted as is. Write methods
     raise `StoreError`. `spec` as for `open_store`.
+
+    The database file itself is never modified. Reading a WAL-mode database
+    needs SQLite's shared-memory index, so a read-only open of a cleanly
+    closed one may leave an empty `-wal` file and a `-shm` file beside it; the
+    next writer reuses and cleans them up. `immutable=1` is deliberately not
+    used: it is unsafe if a writer starts while the file is open.
     """
     if spec.startswith("sqlite:///"):
         spec = spec[len("sqlite:///"):]

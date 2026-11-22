@@ -550,6 +550,30 @@ def test_readonly_reads_wal_db_without_wal_and_shm_files(db):
         store.close()
 
 
+def test_readonly_open_of_closed_wal_db_leaves_main_file_identical(db):
+    with SqliteStore(db) as w:
+        stored_run(w)
+    before = db.read_bytes()
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        runs = store.list_runs()
+        assert len(runs) == 1
+    finally:
+        store.close()
+    assert db.read_bytes() == before
+    wal = Path(str(db) + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+    with SqliteStore(db) as w2:  # a writer afterwards still works and sees the same runs
+        assert w2.list_runs() == runs
+        w2.begin_run(meta())
+        assert len(w2.list_runs()) == 2
+
+
+def test_readonly_folder_is_not_a_file(tmp_path):
+    with pytest.raises(StoreError, match="is not a file"):
+        open_store_readonly(str(tmp_path), env=NO_ENV)
+
+
 def test_readonly_sees_committed_run_while_writer_open(db):
     writer = SqliteStore(db)
     try:

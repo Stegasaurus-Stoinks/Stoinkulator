@@ -435,6 +435,11 @@ def test_missing_database_is_an_error_and_is_not_created(tmp_path, capsys, comma
 
 def test_runs_and_report_leave_database_bytes_unchanged(db, capsys):
     make_run(db, algos=HAND_ALGOS, trips=HAND_TRIPS, equity=HAND_EQUITY)
+    # Rollback-journal mode: a writable open would switch the file to WAL and
+    # change its bytes, so this fails if runs/report open the database writable.
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.close()
     before = db.read_bytes()
     stat_before = db.stat().st_mtime_ns
     for command in (["runs"], ["report", "1"], ["runs", "--json"], ["report", "1", "--json"]):
@@ -442,8 +447,7 @@ def test_runs_and_report_leave_database_bytes_unchanged(db, capsys):
         capsys.readouterr()
     assert db.read_bytes() == before
     assert db.stat().st_mtime_ns == stat_before
-    wal = Path(str(db) + "-wal")
-    assert not wal.exists() or wal.stat().st_size == 0
+    assert [p.name for p in db.parent.iterdir()] == [db.name]
 
 
 @pytest.mark.parametrize("command", [["runs"], ["report", "1"]])
@@ -468,6 +472,13 @@ def test_flag_wins_over_stoink_db(db, tmp_path, capsys):
 @pytest.mark.parametrize("command", [["runs"], ["report", "1"]])
 def test_empty_stoink_db_is_unset_exit_2(capsys, command):
     assert main(command, env={"STOINK_DB": ""}) == 2
+    assert error_of(capsys) == "error: --db is required: give the database file (or sqlite:///path)"
+
+
+@pytest.mark.parametrize("command", [["runs"], ["report", "1"]])
+@pytest.mark.parametrize("blank", [" ", "  \t "])
+def test_whitespace_stoink_db_is_unset(capsys, command, blank):
+    assert main(command, env={"STOINK_DB": blank}) == 2
     assert error_of(capsys) == "error: --db is required: give the database file (or sqlite:///path)"
 
 

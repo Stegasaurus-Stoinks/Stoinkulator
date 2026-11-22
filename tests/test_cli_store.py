@@ -491,6 +491,12 @@ def test_backtest_uses_stoink_db(env, tmp_path, capsys):
     assert "stored run" not in capsys.readouterr().out
 
 
+def test_whitespace_stoink_db_is_unset(env, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    assert run(env, environ={"STOINK_DB": "   "}) == 0
+    assert "stored run" not in capsys.readouterr().out
+
+
 def test_relative_db_path_is_relative_to_the_start_directory(env, capsys):
     env.setup(ema_config(), ["AAPL"], rows=900)
     assert run(env, "--db", "rel.db") == 0
