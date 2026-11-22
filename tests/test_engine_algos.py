@@ -18,10 +18,29 @@ def test_load_algo_constructs_each_real_algo(algo_id: str, extra: dict) -> None:
     assert algo.broker is None
 
 
-@pytest.mark.parametrize("algo_id", ["../x", "a.b", "os; x", "", "a b", "1abc", "x/y", "..", "a-b"])
+@pytest.mark.parametrize(
+    "algo_id",
+    ["../x", "a.b", "os; x", "", "a b", "1abc", "x/y", "..", "a-b", "__init__", "__pycache__", "_x"],
+)
 def test_load_algo_rejects_non_identifier(algo_id: str) -> None:
     with pytest.raises(ValueError, match="invalid algo id"):
         load_algo(algo_id, {"idname": "x", "ticker": "AAPL"})
+
+
+def test_missing_dependency_with_a_prefix_name_is_not_reported_as_unknown_algo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # "MainStoinker.Algos.FVG.FVG" is a string prefix of the algo module's own
+    # name but is a different module: its absence must surface as itself.
+    import importlib
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        missing = "MainStoinker.Algos.FVG.FVG"
+        raise ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    with pytest.raises(ModuleNotFoundError):
+        load_algo("FVG", {"idname": "x", "ticker": "AAPL"})
 
 
 def test_load_algo_unknown_id_raises_value_error() -> None:

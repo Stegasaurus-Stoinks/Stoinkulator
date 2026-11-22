@@ -284,6 +284,15 @@ def test_algo_for_unknown_symbol_raises() -> None:
     assert algo.broker is None  # a failed construction does not touch the algo
 
 
+@pytest.mark.parametrize("not_a_broker", [None, object(), True])
+def test_engine_refuses_to_run_without_a_broker(not_a_broker: object) -> None:
+    # Without a broker, Trade would fall back to the legacy live-trading flag.
+    algo = SpyAlgo("a", "AAA", [])
+    with pytest.raises(TypeError, match="requires a Broker"):
+        Engine(EngineConfig(), ListFeed({"AAA": 1}, 1), not_a_broker, NullSink(), [algo])  # type: ignore[arg-type]
+    assert algo.broker is None
+
+
 def test_same_algo_twice_raises() -> None:
     algo = SpyAlgo("a", "AAA", [])
     with pytest.raises(ValueError, match="twice"):

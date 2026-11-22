@@ -45,6 +45,10 @@ class Engine:
         sink: EventSink,
         algos: Sequence[object],
     ) -> None:
+        # Without a broker, Trade falls back to the legacy global live-trading
+        # flag and the ibapi order calls. The engine must never allow that.
+        if not isinstance(broker, Broker):
+            raise TypeError(f"Engine requires a Broker, got {type(broker).__name__}")
         self._config = config
         self._feed = feed
         self._broker = broker
