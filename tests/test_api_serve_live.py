@@ -127,7 +127,7 @@ def test_overlong_static_path_is_404(db: Path) -> None:
 
 @pytest.mark.parametrize("name", [
     "%3C", "%3E", "%7C", "%2A", "%3F", "a%3Cb", "a%7Cb%2A", "CON", "NUL", "con.txt", "aux",
-    "COM1", "a%00b", "%3A", "D%3A", "D%3Asetup.py", "..%5C..%5Csetup.py", "a.%3C", "x/../../y",
+    "COM1", "a%00b", "%3A", "D%3Asetup.py", "..%5C..%5Csetup.py", "a.%3C", "x/../../y",
 ])
 def test_static_names_windows_rejects_are_404(db: Path, name: str) -> None:
     response = make_client(db).get("/" + name)
@@ -135,10 +135,11 @@ def test_static_names_windows_rejects_are_404(db: Path, name: str) -> None:
     assert "Traceback" not in response.text and "Error" not in response.text
 
 
-@pytest.mark.parametrize("name", ["index.html.", "index.html%20", "C%3A"])
+@pytest.mark.parametrize("name", ["index.html.", "index.html%20", "C%3A", "D%3A"])
 def test_static_names_windows_normalises_are_never_a_500(db: Path, name: str) -> None:
-    """Windows drops a trailing dot or space (and `C:` is the drive's current folder): such a
-    name may reach the placeholder page itself, never anything else and never an error."""
+    """Windows drops a trailing dot or space, and a bare drive such as `C:` or `D:` is that
+    drive's current folder, which depends on the machine. Such a name may reach the
+    placeholder page itself, never anything else and never an error."""
     response = make_client(db).get("/" + name)
     assert response.status_code in (200, 404)
     if response.status_code == 200:
