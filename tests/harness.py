@@ -78,16 +78,17 @@ def stage_offline_data(workdir: Path, symbols: list[str], max_rows: int | None =
 
 
 def run_offline_backtest(
-    algo_id: str, algo_configs: list[dict], warmup_days: int = 2, *, broker=None
+    algo_id: str, algo_configs: list[dict], warmup_days: int = 2, *, broker=None, ledger=None
 ) -> list:
     """Run algo_id over offline data for each config, through the Engine.
 
     Returns the algo objects in config order. The current working directory
     must contain OfflineData/ (see stage_offline_data). `broker` defaults to a
-    fresh SimBroker per call (the engine refuses to run without one).
+    fresh SimBroker per call (the engine refuses to run without one). `ledger`
+    is described on `run_mixed_offline_backtest`.
     """
     return run_mixed_offline_backtest(
-        [(algo_id, cfg) for cfg in algo_configs], warmup_days, broker=broker
+        [(algo_id, cfg) for cfg in algo_configs], warmup_days, broker=broker, ledger=ledger
     )
 
 
@@ -98,12 +99,23 @@ def run_mixed_offline_backtest(
     broker=None,
     sink=None,
     wrap: Callable[[object], None] | None = None,
+    ledger=None,
 ) -> list:
     """Engine run over (algo_id, cfg) pairs; algos come back in `specs` order.
 
     `sink` defaults to NullSink. `wrap`, if given, is called on each algo after
     it is built and before the engine takes it (to spy on `update`, say).
+
+    `ledger`, if given (an empty `Ledger`), is filled by the run: an account
+    named after the algo (capital 100000, notional) is opened and the default
+    SimBroker reports to it, and the engine marks and finishes the ledger.
+    Single algo only, and not together with `broker`: both raise `ValueError`.
     """
+    if ledger is not None:
+        if len(specs) != 1:
+            raise ValueError("ledger= supports a single algo only")
+        if broker is not None:
+            raise ValueError("ledger= cannot be combined with broker=")
     from MainStoinker.engine.algos import load_algo
     from MainStoinker.engine.broker import SimBroker
     from MainStoinker.engine.engine import Engine, EngineConfig
@@ -120,12 +132,16 @@ def run_mixed_offline_backtest(
     # First-appearance order, matching the legacy Ticker index order.
     symbols = list(dict.fromkeys(cfg["ticker"] for _, cfg in specs))
     feed = CsvBarFeed(Path.cwd() / "OfflineData", symbols, warmup_days)
+    if ledger is not None:
+        (only,) = algos
+        broker = SimBroker(account=ledger.open_account(only.name, only.ticker, 100_000))
     engine = Engine(
         EngineConfig(),
         feed,
         broker if broker is not None else SimBroker(),
         sink if sink is not None else NullSink(),
         algos,
+        ledger=ledger,
     )
     engine.run_backtest()
     return algos

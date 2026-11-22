@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from MainStoinker.engine.ledger import Ledger
+from MainStoinker.engine.report import ledger_trade_records
 from tests import harness
 
 CASES = [
@@ -59,5 +61,12 @@ CASES = [
 @pytest.mark.parametrize("algo_id, cfg", CASES)
 def test_trades_match_golden(algo_id, cfg, golden, request):
     harness.stage_offline_data(Path.cwd(), [cfg["ticker"]])
-    (algo,) = harness.run_offline_backtest(algo_id, [cfg])
-    golden(request.node.callspec.id, harness.trade_records(algo))
+    ledger = Ledger()
+    (algo,) = harness.run_offline_backtest(algo_id, [cfg], ledger=ledger)
+    records = harness.trade_records(algo)
+    golden(request.node.callspec.id, records)
+
+    # The ledger built in the same run must reproduce the golden trades.
+    # `status` is a legacy Trade attribute the ledger has no notion of.
+    expected = [{k: v for k, v in r.items() if k != "status"} for r in records]
+    assert ledger_trade_records(ledger) == expected
