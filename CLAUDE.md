@@ -39,7 +39,8 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m pytest                  # fast suite, ~30 s
 .venv\Scripts\python.exe -m pytest -m slow          # Elliot golden + legacy-path parity, several min
 .venv\Scripts\ruff.exe check .                      # legacy defect set
-.venv\Scripts\ruff.exe check tests MainStoinker/engine --select E,F,W,I,B   # new-code set
+.venv\Scripts\ruff.exe check tests MainStoinker/engine MainStoinker/__main__.py --select E,F,W,I,B   # new-code set
+.venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS.json --data OfflineData --out OUTDIR   # offline backtest -> OUTDIR/trades.json
 ```
 
 ## Layout

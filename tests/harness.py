@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from MainStoinker.engine.report import trade_records  # noqa: F401  (re-export)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OFFLINE_DATA = REPO_ROOT / "OfflineData"
 
@@ -200,25 +202,3 @@ def replay_bars(simulated: dict) -> None:
             ticker.append(simulated[ticker.index].iloc[start + k])
         for ticker in Globals.tickers.values():
             ticker.update_algos()
-
-
-def trade_records(algo) -> list[dict]:
-    """Plain, comparable record of each trade an algo made."""
-    records = []
-    for trade in algo.trades:
-        records.append(
-            {
-                "id": trade.tradeID,
-                "symbol": trade.symbol,
-                "volume": trade.volume,
-                "direction": int(trade.direction),
-                "openTime": str(trade.openTime),
-                "openPrice": round(float(trade.openPrice), 4),
-                "closeTime": str(getattr(trade, "closeTime", None)),
-                "closePrice": (
-                    round(float(trade.closePrice), 4) if hasattr(trade, "closePrice") else None
-                ),
-                "status": getattr(trade, "status", None),
-            }
-        )
-    return records
