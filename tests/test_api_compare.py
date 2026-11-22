@@ -18,7 +18,7 @@ import pytest
 from MainStoinker.api.routes_compare import last_folder_name
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.run_documents import report_document
-from MainStoinker.engine.store import SqliteStore, Store
+from MainStoinker.engine.store import RunMeta, SqliteStore, Store
 from tests.api_support import NO_ENV, make_client, stored_run_database
 from tests.test_api_health import copy_database
 from tests.test_cli_store import full_store_run
@@ -164,3 +164,54 @@ def test_compare_does_not_change_the_database(compare_db: Path, tmp_path: Path) 
     before = copy.read_bytes()
     assert make_client(copy).get("/api/compare?runs=1,2").status_code == 200
     assert copy.read_bytes() == before
+
+
+def test_incomplete_and_failed_runs_can_be_compared(compare_db: Path, tmp_path: Path) -> None:
+    copy = copy_database(compare_db, tmp_path / "shapes.db")
+    with SqliteStore(copy, env=NO_ENV) as store:
+        running = store.begin_run(RunMeta(kind="backtest", fills="legacy"))  # never ended
+        failed = store.begin_run(RunMeta(kind="backtest", fills="legacy"))
+        store.end_run(failed, "failed")
+    client = make_client(copy)
+    for first, second in ((1, running), (failed, 1), (running, failed)):
+        response = client.get(f"/api/compare?runs={first},{second}")
+        assert response.status_code == 200
+        body = response.json()
+        assert [r["run_id"] for r in body["runs"]] == [first, second]
+        assert list(body["total"]) == [str(first), str(second)]
+        assert all(set(row) == {str(first), str(second)} for row in body["algos"].values())
+    flags = {r["run_id"]: (r["status"], r["incomplete"])
+             for r in client.get(f"/api/compare?runs={running},{failed}").json()["runs"]}
+    assert flags == {running: ("running", True), failed: ("failed", False)}
+
+
+def test_schema_1_database_can_be_compared(compare_db: Path, tmp_path: Path) -> None:
+    v1 = copy_database(compare_db, tmp_path / "v1.db")
+    con = sqlite3.connect(v1)
+    con.execute("PRAGMA user_version=1")
+    con.close()
+    response = make_client(v1).get("/api/compare?runs=1,2")
+    assert response.status_code == 200
+    assert response.json() == make_client(compare_db).get("/api/compare?runs=1,2").json()
+
+
+@pytest.mark.parametrize("query", ["runs=1&runs=2", "runs=1,2&runs=3", "runs=%2B1,2", "runs=1,2,%20",
+                                   "runs=%EF%BC%91,2"])
+def test_repeated_or_signed_runs_parameter_422(compare_db: Path, query: str) -> None:
+    response = make_client(compare_db).get("/api/compare?" + query)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid parameter: query.runs"}
+
+
+def test_leading_zeros_name_the_same_run(compare_db: Path) -> None:
+    client = make_client(compare_db)
+    assert client.get("/api/compare?runs=01,2").json() == client.get("/api/compare?runs=1,2").json()
+    assert client.get("/api/compare?runs=01,1").status_code == 422  # still a duplicate
+
+
+def test_repeated_requests_in_one_process_agree(compare_db: Path) -> None:
+    client = make_client(compare_db)
+    first = client.get("/api/compare?runs=3,1").json()
+    assert client.get("/api/compare?runs=1,99").status_code == 404  # an error in between
+    assert client.get("/api/compare?runs=3,1").json() == first
+    assert make_client(compare_db).get("/api/compare?runs=3,1").json() == first
