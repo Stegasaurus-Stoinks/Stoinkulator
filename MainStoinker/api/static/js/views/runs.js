@@ -26,6 +26,7 @@ function unique(values) {
 }
 
 const HINT_NEED_TWO = "Tick two runs to compare";
+const HINT_CLEARED = "Ticks on hidden runs were cleared.";
 
 export async function render(container, params, ctx) {
   const ticked = new Set();
@@ -35,6 +36,8 @@ export async function render(container, params, ctx) {
   let state = "loading"; // "loading" | "ok" | "error": what the body shows; filters never override it
   let error = null;
   let loading = false;
+  let clearedTicks = false; // a filter hid ticked runs and their ticks were dropped
+  let table = null; // the dataTable handle, kept so the user's sort survives filters and refreshes
 
   const body = h("div", {});
   const kindSelect = h("select", { id: "filter-kind", "aria-label": "Kind" });
@@ -60,9 +63,12 @@ export async function render(container, params, ctx) {
     const ids = [...ticked].sort((a, b) => a - b);
     const available = state === "ok" && ids.length === 2;
     compare.setAttribute("aria-disabled", available ? "false" : "true");
-    if (available) hint.textContent = "";
-    else if (state === "ok" && ids.length > 2) hint.textContent = "Tick only two runs to compare (" + ids.length + " ticked)";
-    else hint.textContent = HINT_NEED_TWO;
+    let text = "";
+    if (available) text = "";
+    else if (state === "ok" && ids.length > 2) text = "Tick only two runs to compare (" + ids.length + " ticked)";
+    else text = HINT_NEED_TWO;
+    if (clearedTicks) text = (text ? text + ". " : "") + HINT_CLEARED;
+    hint.textContent = text;
   }
 
   function row(run) {
@@ -72,6 +78,7 @@ export async function render(container, params, ctx) {
       "aria-label": "Select run " + id + " for comparison",
       checked: ticked.has(id),
       onchange: (event) => {
+        clearedTicks = false;
         if (event.target.checked) ticked.add(id);
         else ticked.delete(id);
         updateCompare();
@@ -110,7 +117,11 @@ export async function render(container, params, ctx) {
     } else {
       const shown = filterRuns(runs, kind, status);
       const visible = new Set(shown.map((r) => r.run_id));
-      for (const id of [...ticked]) if (!visible.has(id)) ticked.delete(id); // a hidden row is not selected
+      for (const id of [...ticked]) {
+        if (visible.has(id)) continue;
+        ticked.delete(id); // a hidden row is not selected
+        clearedTicks = true;
+      }
       count.textContent = shown.length === runs.length
         ? runs.length + (runs.length === 1 ? " run" : " runs")
         : shown.length + " of " + runs.length + " runs";
@@ -119,7 +130,10 @@ export async function render(container, params, ctx) {
       } else if (shown.length === 0) {
         body.replaceChildren(h("p", { class: "panel empty" }, "No run matches these filters."));
       } else {
-        body.replaceChildren(dataTable({ columns, rows: shown.map(row), caption: "Stored runs", captionHidden: true }));
+        const rows = shown.map(row);
+        if (table) table.update({ rows });
+        else table = dataTable({ columns, rows, caption: "Stored runs", captionHidden: true, rowKey: (r) => r.run.run_id });
+        body.replaceChildren(table.element);
       }
     }
     updateCompare();

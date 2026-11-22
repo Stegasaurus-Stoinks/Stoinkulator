@@ -1,45 +1,80 @@
 // Hash router, view lifecycle, page title and focus, and the header health strip.
 //
-// Exports (stable; later tasks may not edit this file or api.js): parseRoute and algoHash, re-exported
-// from routes.js. Shared modules a view may import: api.js (getJson, ApiError, isAbortError,
-// describeError, HEALTH_EVENT), dom.js (h, clear, viewHeading, loadingPanel, showLoading, errorPanel,
-// showError, comingSoon), table.js (dataTable, netCell, sortRows), format.js, routes.js (hash builders).
+// This file, api.js, lifecycle.js and dom.js are the shell: later view tasks do not edit them.
+// Shared modules a view imports (never from this file, which exports nothing):
+//   api.js        getJson, ApiError, isAbortError, describeError, HEALTH_EVENT
+//   dom.js        h, clear, viewHeading, loadingPanel, showLoading, errorPanel, showError, comingSoon
+//   table.js      dataTable, netCell, compareValues, sortRows
+//   format.js     formatMoney, formatNet, netClass, formatPercent, formatDuration, formatUtc,
+//                 formatDataTime, shortVersion, dataTimeToChartTime, chartTimeToDataTime
+//   routes.js     parseRoute, runsHash, runHash, algoHash, compareHash, routeTitle (route helpers)
 //
 // VIEW CONTRACT. A view module exports
 //
 //     export async function render(container, params, ctx) { ... }
 //
-//   container  the <main id="app"> element; the router has already replaced its content with a
-//              "Loading..." panel. The view owns it until the next navigation.
-//   params     the parsed route parameters (see routes.js parseRoute).
-//   ctx        {signal, isCurrent}: signal is this navigation's AbortSignal, aborted as soon as
-//              another navigation starts; isCurrent() is false once another navigation started.
+//   container  a fresh <div class="view"> the router created inside <main id="app"> for this
+//              navigation, already showing "Loading...". The view owns it. When the navigation ends the
+//              router removes it from the document, so a late write by a superseded view lands in a
+//              detached node and is harmless. Replace its content with container.replaceChildren(...).
+//   params     the parsed route parameters (routes.js parseRoute): {runId}, {runId, idname}, {runIds}.
+//   ctx        {signal, isCurrent, onCleanup, child}:
+//     ctx.signal        this navigation's AbortSignal, aborted as soon as another navigation starts.
+//     ctx.isCurrent()   false once another navigation started.
+//     ctx.onCleanup(fn) register a disposal function. It is called when this navigation ends, however
+//                       the view ended: resolved, rejected, aborted or still pending. Reverse order of
+//                       registration, each at most once; one that throws is logged and does not stop the
+//                       others. If the navigation already ended, fn runs immediately.
+//     ctx.child()       returns {signal, isCurrent(), abort(), onCleanup(fn)}: a request scope inside
+//                       the view, aborted when the navigation ends or when abort() is called.
 //
 // Rules:
-//   1. Pass ctx.signal to every request: getJson(path, params, {signal: ctx.signal}).
-//   2. After every await, check ctx.isCurrent() (or rely on an aborted fetch rejecting) BEFORE writing
-//      to the container or to anything else shared. A superseded view must not draw.
-//   3. Build a heading with viewHeading(text) (an <h2 tabindex="-1">). After the view settles the router
-//      moves keyboard focus to the first <h2> of the container. The router sets document.title itself.
-//   4. The view may return a cleanup function (synchronously, as the value of the async function);
-//      the router calls it on the next navigation, after aborting the signal and before the next view
-//      renders. Dispose charts, observers and window or document listeners there. If the view was
-//      superseded before it resolved, the cleanup is called right away.
-//   5. Errors: let a rejection escape and the router draws the shared error panel (never a stuck
-//      "Loading..."). An AbortError (isAbortError) is ignored. A view that handles its own errors
-//      for a part of its page should use errorPanel(err) so all errors look alike.
-//   6. The header health strip is refreshed once per navigation by the router. A view that reloads
-//      data on request may dispatch HEALTH_EVENT on window to refresh it again.
+//   1. Pass a signal to every request: getJson(path, params, {signal: ctx.signal}), or the signal of a
+//      child scope (rule 6).
+//   2. Create a disposable thing (chart, ResizeObserver, timer, window or document listener) and
+//      register its disposal AT ONCE, before the first await:
+//          const chart = createChart(el);  ctx.onCleanup(() => chart.remove());
+//      A cleanup returned from render is accepted too (it is treated as one more onCleanup), but it only
+//      exists once the view has resolved, so it is too late for anything created before an await.
+//   3. After every await check ctx.isCurrent() before writing to anything shared or calling a library
+//      that is not abortable (timers, requestAnimationFrame, import(), chart calls). A rejected
+//      abortable fetch needs no check: catch it with isAbortError and return.
+//   4. Never write to `document` (title, body, head, other elements) outside the container, except
+//      through the shell's exports: the router sets document.title and moves focus itself.
+//   5. Build the heading with viewHeading(text) (an <h2 tabindex="-1">); after the view settles the
+//      router moves keyboard focus to the first <h2> of the container.
+//   6. A request inside the view that supersedes itself (a selected trade loads a new window; a Refresh
+//      button) uses a child scope; call abort() right before starting the replacement. abort() takes no
+//      argument: a reason would make the fetch reject with the reason, and isAbortError only recognises
+//      a plain AbortError.
+//          let request = null;
+//          async function load(id) {
+//            if (request) request.abort();
+//            const mine = request = ctx.child();
+//            try {
+//              const data = await getJson("/api/...", {id}, {signal: mine.signal});
+//              if (!mine.isCurrent()) return;
+//              draw(data);
+//            } catch (err) {
+//              if (isAbortError(err) || !mine.isCurrent()) return;
+//              show(errorPanel(err));
+//            }
+//          }
+//   7. Several independent requests run through Promise.allSettled, not Promise.all: draw each part that
+//      succeeded and put an errorPanel(err) where a part failed (skip rejections that isAbortError
+//      recognises), so one failing request does not blank the whole view.
+//   8. A rejection that escapes render shows the shared error panel (never a stuck "Loading..."); an
+//      AbortError is ignored.
+//   9. The router refreshes the health strip once per navigation. A view that reloads data on a user's
+//      request dispatches HEALTH_EVENT on window afterwards.
 import { HEALTH_EVENT, ApiError, describeError, getJson, isAbortError } from "./api.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "./dom.js";
 import { createNavigator } from "./lifecycle.js";
-import { algoHash, parseRoute, routeTitle } from "./routes.js";
+import { parseRoute, routeTitle } from "./routes.js";
 import { render as renderAlgo } from "./views/algo.js";
 import { render as renderCompare } from "./views/compare.js";
 import { render as renderOverview } from "./views/overview.js";
 import { render as renderRuns } from "./views/runs.js";
-
-export { algoHash, parseRoute };
 
 function renderNotFound(container, params) {
   container.replaceChildren(
@@ -72,35 +107,41 @@ let firstNavigation = true;
 
 // Keyboard focus goes to the view heading once the view has settled, unless the user has already
 // moved it somewhere else. Never scrolls (the page is scrolled to the top on navigation).
-function focusHeading(container) {
+function focusHeading(app, container) {
   const active = document.activeElement;
-  if (active && active !== document.body && active !== container) return;
-  const heading = container.querySelector("h2") || container;
+  if (active && active !== document.body && active !== app) return;
+  const heading = container.querySelector("h2") || app;
   if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
   heading.focus({ preventScroll: true });
 }
 
 async function route() {
-  const container = document.getElementById("app");
+  const app = document.getElementById("app");
   const first = firstNavigation;
   firstNavigation = false;
   const parsed = parseRoute(window.location.hash);
   markNav(parsed.view);
   document.title = routeTitle(parsed);
   refreshHealth();
-  const result = await viewNavigator.run(VIEWS[parsed.view], container, parsed.params, {
-    prepare() {
-      container.replaceChildren(loadingPanel(""));
+  let mounted = null;
+  const result = await viewNavigator.run(VIEWS[parsed.view], parsed.params, {
+    mount() {
+      mounted = h("div", { class: "view" }, loadingPanel(""));
+      app.replaceChildren(mounted); // the previous view's element is removed by its own unmount
       if (!first) {
         window.scrollTo(0, 0);
-        container.focus({ preventScroll: true }); // the activated link is gone; do not fall back to <body>
+        app.focus({ preventScroll: true }); // the activated link is gone; do not fall back to <body>
       }
+      return mounted;
     },
-    onError(err) {
-      container.replaceChildren(viewHeading("Something went wrong"), errorPanel(err));
+    unmount(element) {
+      element.remove();
+    },
+    onError(err, element) {
+      element.replaceChildren(viewHeading("Something went wrong"), errorPanel(err));
     },
   });
-  if (result.current && !first) focusHeading(container);
+  if (result.current && !first && mounted) focusHeading(app, mounted);
 }
 
 // Latest wins: a newer health request aborts the older one, and only the newest may draw.

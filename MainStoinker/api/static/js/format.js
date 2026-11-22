@@ -1,7 +1,7 @@
 // Pure formatting helpers. No DOM, no network, no clock.
 //
 // Exports: formatMoney, formatNet, netClass, formatPercent, formatDuration, formatUtc,
-// formatDataTime, shortVersion.
+// formatDataTime, shortVersion, dataTimeToChartTime, chartTimeToDataTime.
 // Money and percentages are decimal strings from the API; they are rounded with integer (BigInt)
 // arithmetic, half away from zero (the CLI's ROUND_HALF_UP), never through floating point.
 
@@ -137,4 +137,33 @@ export function shortVersion(version) {
   const text = String(version);
   const short = text.slice(0, 10);
   return text.includes("-dirty") ? short + "+dirty" : short;
+}
+
+const DATA_TIME_RE = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/;
+
+// A naive market time as the API sends it ("YYYY-MM-DD HH:MM:SS", optional fraction, a "T" separator
+// also accepted) as the integer seconds the chart library expects. The library draws its axis in UTC,
+// so the seconds are computed with Date.UTC from the parsed fields: the axis shows the data's own wall
+// clock on any machine, whatever its time zone. The fraction is dropped. Anything else (an offset or
+// "Z", a missing part, an impossible date or time, a non-string) gives null.
+export function dataTimeToChartTime(text) {
+  if (typeof text !== "string") return null;
+  const m = DATA_TIME_RE.exec(text.trim());
+  if (!m) return null;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  const ms = Date.UTC(year, month - 1, day, hour, minute, second);
+  const check = new Date(ms);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
+  return ms / 1000;
+}
+
+// The reverse: chart seconds as "YYYY-MM-DD HH:MM:SS", read in UTC (the axis's clock). Anything that is
+// not a finite number gives null; fractions are truncated.
+export function chartTimeToDataTime(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
+  const date = new Date(Math.floor(seconds) * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+  return pad(date.getUTCFullYear(), 4) + "-" + pad(date.getUTCMonth() + 1) + "-" + pad(date.getUTCDate()) + " "
+    + pad(date.getUTCHours()) + ":" + pad(date.getUTCMinutes()) + ":" + pad(date.getUTCSeconds());
 }

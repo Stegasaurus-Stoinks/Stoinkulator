@@ -1,8 +1,15 @@
 // A data table builder shared by the views.
 //
-// Exports: netCell, compareValues, sortRows, dataTable.
+// Exports: netCell, compareValues, sortRows, nextSort, isSelectKey, dataTable.
 //
-// dataTable({columns, rows, caption, captionHidden, sort}) returns a scrollable wrapper element.
+// const table = dataTable({columns, rows, caption, captionHidden, sort, rowKey, selectedKey, onSelect})
+// returns a handle {element, update({rows, selectedKey}), getSort()}:
+//   table.element   the scrollable wrapper to put in the page (the same element for the table's life);
+//   table.update()  re-renders with new rows and/or a new selectedKey (a key that is absent from the
+//                   argument is left as it is). The user's sort (the column they clicked) is kept across
+//                   updates, rows are re-sorted stably, and a focused row keeps focus. Changing only
+//                   selectedKey does not rebuild the rows. Call update, do not build a second table;
+//   table.getSort() the current {column, direction} (column is -1 when unsorted).
 // A column is {label, numeric, cell, sortKey}:
 //   label    header text;
 //   numeric  right-aligned tabular figures (header and cells);
@@ -10,6 +17,11 @@
 //   sortKey  optional (row) => number | string | null; makes the column sortable (click, Enter or Space
 //            on the header button; the sorted header carries aria-sort); null sorts last.
 // sort: {column, direction} is the initial order (column is an index, direction "asc" or "desc").
+// Selection (all optional): rowKey(row) gives a row's identity (string or number; keys are compared as
+// text), selectedKey is the key of the selected row, onSelect(row) is called when a row is clicked (not
+// on a link, button or input inside it) or when Enter or Space is pressed on the focused row. With
+// onSelect every row is focusable (tabindex 0, class "selectable"). With rowKey every row carries
+// aria-selected, "true" on the selected one.
 // caption: the table's accessible name; captionHidden hides it visually but keeps it for screen readers.
 import { h } from "./dom.js";
 import { formatNet, netClass } from "./format.js";
@@ -41,49 +53,101 @@ export function sortRows(rows, sortKey, direction) {
   return keyed.map((entry) => entry.row);
 }
 
+// The sort after the user activates the header of column `index`: a new column starts ascending,
+// the sorted column toggles. Pure: returns a new {column, direction}.
+export function nextSort(sort, index) {
+  const direction = sort.column === index && sort.direction === "asc" ? "desc" : "asc";
+  return { column: index, direction };
+}
+
+// Enter and Space select a focused row.
+export function isSelectKey(key) {
+  return key === "Enter" || key === " " || key === "Spacebar";
+}
+
 function isSpec(value) {
   return value !== null && typeof value === "object" && !(value instanceof Node) && "content" in value;
 }
 
-export function dataTable({ columns, rows, caption, captionHidden = false, sort = null }) {
-  let sortIndex = sort ? sort.column : -1;
-  let direction = sort && sort.direction === "desc" ? "desc" : "asc";
+const INTERACTIVE = "a, button, input, select, textarea, label, summary";
+
+function sameKey(a, b) {
+  return a !== null && a !== undefined && b !== null && b !== undefined && String(a) === String(b);
+}
+
+export function dataTable({
+  columns, rows, caption, captionHidden = false, sort = null, rowKey = null, selectedKey = null, onSelect = null,
+}) {
+  let current = rows;
+  let selected = selectedKey;
+  let sortState = { column: sort ? sort.column : -1, direction: sort && sort.direction === "desc" ? "desc" : "asc" };
+  const rowElements = new Map(); // String(key) -> <tr>, for the rows on show
   const tbody = h("tbody", {});
   const headers = columns.map((column, index) => headerCell(column, index));
 
   function headerCell(column, index) {
     const cls = column.numeric ? "num" : "";
     if (!column.sortKey) return h("th", { scope: "col", class: cls }, column.label);
-    const button = h("button", { type: "button", class: "sort", onclick: () => toggle(index) },
-      column.label, h("span", { class: "sort-mark", "aria-hidden": "true" }));
+    const button = h("button", {
+      type: "button",
+      class: "sort",
+      onclick: () => {
+        sortState = nextSort(sortState, index);
+        paint();
+      },
+    }, column.label, h("span", { class: "sort-mark", "aria-hidden": "true" }));
     return h("th", { scope: "col", class: cls }, button);
   }
 
-  function toggle(index) {
-    direction = index === sortIndex && direction === "asc" ? "desc" : "asc";
-    sortIndex = index;
-    paint();
+  function markSelected(tr, key) {
+    if (!rowKey) return;
+    tr.setAttribute("aria-selected", sameKey(key, selected) ? "true" : "false");
   }
 
   function bodyRow(row, rowIndex) {
-    return h("tr", {}, columns.map((column) => {
+    const key = rowKey ? rowKey(row) : null;
+    const attrs = {};
+    if (onSelect) {
+      attrs.class = "selectable";
+      attrs.tabindex = "0";
+      attrs.onclick = (event) => {
+        const inner = event.target && event.target.closest ? event.target.closest(INTERACTIVE) : null;
+        if (inner && tr.contains(inner)) return; // a link or a checkbox in the row does its own thing
+        onSelect(row);
+      };
+      attrs.onkeydown = (event) => {
+        if (event.target !== tr || !isSelectKey(event.key)) return;
+        event.preventDefault();
+        onSelect(row);
+      };
+    }
+    const tr = h("tr", attrs, columns.map((column) => {
       const made = column.cell(row, rowIndex);
       const spec = isSpec(made) ? made : { content: made };
       const cls = [column.numeric ? "num" : "", spec.className || ""].filter(Boolean).join(" ");
       return h("td", { class: cls, title: spec.title }, spec.content);
     }));
+    if (rowKey) {
+      rowElements.set(String(key), tr);
+      markSelected(tr, key);
+    }
+    return tr;
   }
 
   function paint() {
-    const key = sortIndex >= 0 && columns[sortIndex] ? columns[sortIndex].sortKey : null;
-    const ordered = key ? sortRows(rows, key, direction) : rows;
+    let focusedKey = null;
+    for (const [key, tr] of rowElements) if (tr === document.activeElement) focusedKey = key;
+    rowElements.clear();
+    const sortKey = sortState.column >= 0 && columns[sortState.column] ? columns[sortState.column].sortKey : null;
+    const ordered = sortKey ? sortRows(current, sortKey, sortState.direction) : current;
     tbody.replaceChildren(...ordered.map(bodyRow));
+    if (focusedKey !== null && rowElements.has(focusedKey)) rowElements.get(focusedKey).focus({ preventScroll: true });
     columns.forEach((column, index) => {
       if (!column.sortKey) return;
-      const sorted = index === sortIndex;
-      if (sorted) headers[index].setAttribute("aria-sort", direction === "asc" ? "ascending" : "descending");
+      const sorted = index === sortState.column;
+      if (sorted) headers[index].setAttribute("aria-sort", sortState.direction === "asc" ? "ascending" : "descending");
       else headers[index].removeAttribute("aria-sort");
-      headers[index].querySelector(".sort-mark").textContent = sorted ? (direction === "asc" ? " ▲" : " ▼") : "";
+      headers[index].querySelector(".sort-mark").textContent = sorted ? (sortState.direction === "asc" ? " ▲" : " ▼") : "";
     });
   }
 
@@ -91,6 +155,20 @@ export function dataTable({ columns, rows, caption, captionHidden = false, sort 
     caption ? h("caption", { class: captionHidden ? "visually-hidden" : "" }, caption) : null,
     h("thead", {}, h("tr", {}, headers)),
     tbody);
+  const element = h("div", { class: "table-wrap" }, table);
   paint();
-  return h("div", { class: "table-wrap" }, table);
+
+  return {
+    element,
+    update(change = {}) {
+      if ("selectedKey" in change) selected = change.selectedKey;
+      if (change.rows) {
+        current = change.rows;
+        paint();
+      } else if ("selectedKey" in change) {
+        for (const [key, tr] of rowElements) markSelected(tr, key);
+      }
+    },
+    getSort: () => ({ ...sortState }),
+  };
 }

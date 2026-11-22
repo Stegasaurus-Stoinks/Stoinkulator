@@ -119,6 +119,31 @@ def test_javascript_is_served_as_javascript(empty_db: Path) -> None:
         assert response.headers["content-type"].startswith("text/javascript"), url
 
 
+@pytest.mark.parametrize("registry_says", ["text/plain", "application/javascript"])
+def test_content_types_are_pinned_whatever_the_registry_says(
+        empty_db: Path, monkeypatch: pytest.MonkeyPatch, registry_says: str) -> None:
+    """Starlette asks `mimetypes`, which reads the Windows registry; the app must not depend on it."""
+    import mimetypes
+
+    import starlette.responses
+
+    monkeypatch.setattr(mimetypes, "guess_type", lambda *a, **k: (registry_says, None))
+    monkeypatch.setattr(starlette.responses, "guess_type", lambda *a, **k: (registry_says, None))
+    client = make_client(empty_db)
+    expected = {
+        "/js/main.js": "text/javascript; charset=utf-8",
+        "/js/views/runs.js": "text/javascript; charset=utf-8",
+        "/app.css": "text/css; charset=utf-8",
+        "/index.html": "text/html; charset=utf-8",
+        "/": "text/html; charset=utf-8",
+    }
+    for url, content_type in expected.items():
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert response.headers["content-type"] == content_type, url
+        assert response.headers["x-content-type-options"] == "nosniff", url
+
+
 def test_vendor_file_matches_recorded_sha256() -> None:
     data = (STATIC / VENDOR).read_bytes()
     assert len(data) == VENDOR_SIZE
@@ -179,8 +204,17 @@ def test_router_registers_all_four_routes_and_views_exist() -> None:
 def test_main_documents_the_view_contract() -> None:
     main = (STATIC / "js" / "main.js").read_text(encoding="utf-8")
     for needle in ("VIEW CONTRACT", "render(container, params, ctx)", "ctx.signal", "ctx.isCurrent()",
-                   "cleanup", "viewHeading", "HEALTH_EVENT"):
+                   "cleanup", "viewHeading", "HEALTH_EVENT", "ctx.onCleanup(fn)", "ctx.child()", "abort()",
+                   "Promise.allSettled", "errorPanel", "routes.js", "dom.js", "before the first await",
+                   "outside the container"):
         assert needle in main
+
+
+def test_main_exports_nothing_and_nobody_imports_from_it() -> None:
+    assert not re.search(r"^export\b", (STATIC / "js" / "main.js").read_text(encoding="utf-8"), re.MULTILINE)
+    for path in JS_FILES:
+        for _kind, target in page_references(path):
+            assert not target.endswith("main.js") or path.name == "index.html", (path, target)
 
 
 def test_dynamic_imports_are_followed() -> None:
@@ -508,20 +542,21 @@ import { createNavigator } from "./js/lifecycle.js";
 const log = [];
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 const nav = createNavigator();
-const container = { name: "c" };
+let mounts = 0;
 const hooks = (tag) => ({
-  prepare: () => log.push("prepare " + tag),
-  onError: (e) => log.push("error " + tag + " " + e.message),
+  mount: () => { mounts += 1; const el = { name: "el" + mounts }; log.push("mount " + tag); return el; },
+  unmount: (el) => log.push("unmount " + el.name),
+  onError: (e, el) => log.push("error " + tag + " " + e.message + " " + el.name),
 });
 
 // 1. the previous view is aborted and cleaned up before the next one renders
 const first = nav.run(async (c, p, ctx) => {
   ctx.signal.addEventListener("abort", () => log.push("abort A"));
-  log.push("render A");
+  log.push("render A " + c.name);
   return () => log.push("cleanup A");
-}, container, {}, hooks("A"));
+}, {}, hooks("A"));
 await first;
-await nav.run(async () => { log.push("render B"); }, container, {}, hooks("B"));
+await nav.run(async (c) => { log.push("render B " + c.name); }, {}, hooks("B"));
 
 // 2. a slow view that is superseded: it must see isCurrent() false, and its late cleanup runs at once
 let lateSawCurrent = null;
@@ -530,55 +565,325 @@ const slow = nav.run(async (c, p, ctx) => {
   lateSawCurrent = ctx.isCurrent();
   log.push("slow finished, aborted=" + ctx.signal.aborted);
   return () => log.push("cleanup slow");
-}, container, {}, hooks("S"));
+}, {}, hooks("S"));
 const fast = nav.run(async (c, p, ctx) => {
   log.push("render F " + ctx.isCurrent());
-}, container, {}, hooks("F"));
+}, {}, hooks("F"));
 const [slowResult, fastResult] = await Promise.all([slow, fast]);
 
 // 3. errors: a rejection reaches onError once; AbortError and errors of a superseded view do not
-const failed = await nav.run(async () => { throw new Error("boom"); }, container, {}, hooks("E"));
+const failed = await nav.run(async () => { throw new Error("boom"); }, {}, hooks("E"));
 const aborted = await nav.run(async () => {
   throw new DOMException("x", "AbortError");
-}, container, {}, hooks("X"));
-const syncThrow = await nav.run(() => { throw new Error("sync"); }, container, {}, hooks("Y"));
+}, {}, hooks("X"));
+const syncThrow = await nav.run(() => { throw new Error("sync"); }, {}, hooks("Y"));
 const supersededFail = nav.run(async () => {
   await tick();
   throw new Error("late");
-}, container, {}, hooks("Z"));
-const winner = nav.run(async () => { log.push("render W"); }, container, {}, hooks("W"));
+}, {}, hooks("Z"));
+const winner = nav.run(async () => { log.push("render W"); }, {}, hooks("W"));
 const [zr] = await Promise.all([supersededFail, winner]);
 
 // 4. a cleanup that throws does not stop the next navigation
 const origError = console.error; console.error = () => log.push("console.error");
-await nav.run(async () => () => { throw new Error("cleanup fails"); }, container, {}, hooks("T"));
-await nav.run(async () => { log.push("render after bad cleanup"); }, container, {}, hooks("U"));
+await nav.run(async () => () => { throw new Error("cleanup fails"); }, {}, hooks("T"));
+await nav.run(async () => { log.push("render after bad cleanup"); }, {}, hooks("U"));
 console.error = origError;
 console.log(JSON.stringify({ log, lateSawCurrent, slowResult, fastResult, failed, aborted, syncThrow, zr }));
 """)
     assert isinstance(out, dict)
     log = out["log"]
-    assert log[:7] == ["prepare A", "render A", "abort A", "cleanup A", "prepare B", "render B", "prepare S"]
+    # the previous navigation is torn down (abort, cleanup, unmount) before the next element is mounted
+    assert log[:9] == ["mount A", "render A el1", "abort A", "cleanup A", "unmount el1", "mount B",
+                       "render B el2", "unmount el2", "mount S"]
     assert out["lateSawCurrent"] is False
     assert "slow finished, aborted=true" in log
     assert log.index("slow finished, aborted=true") < log.index("cleanup slow")
     assert "render F true" in log
     assert out["slowResult"] == {"current": False, "failed": False}
     assert out["fastResult"] == {"current": True, "failed": False}
-    assert out["failed"] == {"current": True, "failed": True} and "error E boom" in log
+    assert out["failed"] == {"current": True, "failed": True}
+    assert any(e.startswith("error E boom el") for e in log)
     assert out["aborted"] == {"current": True, "failed": False}
     assert not any(e.startswith("error X") for e in log)
-    assert out["syncThrow"] == {"current": True, "failed": True} and "error Y sync" in log
+    assert out["syncThrow"] == {"current": True, "failed": True} and any(
+        e.startswith("error Y sync") for e in log)
     assert out["zr"] == {"current": False, "failed": False} and not any(e.startswith("error Z") for e in log)
     assert log.index("console.error") < log.index("render after bad cleanup")
+
+
+def test_on_cleanup_runs_however_the_view_ends_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "oncleanup", """
+import { createNavigator } from "./js/lifecycle.js";
+import { isAbortError } from "./js/api.js";
+const log = [];
+const nav = createNavigator();
+const none = {};
+// an abortable fetch stand-in: rejects with the AbortError the real fetch gives
+const fetchLike = (signal) => new Promise((resolve, reject) => {
+  signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+});
+const out = {};
+
+// 1. the reviewer's case: resource created, then an awaited fetch aborted by navigation
+const a = nav.run(async (c, p, ctx) => {
+  log.push("chart created");
+  ctx.onCleanup(() => log.push("chart disposed"));
+  await fetchLike(ctx.signal);
+  log.push("never");
+  return () => log.push("returned (never registered)");
+}, none);
+await nav.run(async () => { log.push("other rendered"); }, none);
+out.a = await a;
+
+// 2. reverse order of registration; a returned function counts as the last registration
+const order = [];
+await nav.run(async (c, p, ctx) => {
+  ctx.onCleanup(() => order.push("one"));
+  ctx.onCleanup(() => order.push("two"));
+  ctx.onCleanup(() => order.push("three"));
+  return () => order.push("returned");
+}, none);
+await nav.run(async () => {}, none);
+out.order = order;
+
+// 3. at most once: registered once, many teardown triggers
+let count = 0;
+let childCount = 0;
+await nav.run(async (c, p, ctx) => {
+  ctx.onCleanup(() => { count += 1; });
+  const child = ctx.child();
+  child.onCleanup(() => { childCount += 1; });
+  child.abort();
+  child.abort();
+}, none);
+await nav.run(async () => {}, none);
+await nav.run(async () => {}, none);
+out.once = { count, childCount };
+
+// 4. a throwing cleanup is logged and does not stop the others
+const errors = [];
+const origError = console.error; console.error = (...args) => errors.push(String(args[0]));
+const survivors = [];
+await nav.run(async (c, p, ctx) => {
+  ctx.onCleanup(() => survivors.push("first registered"));
+  ctx.onCleanup(() => { throw new Error("bad"); });
+  ctx.onCleanup(() => survivors.push("last registered"));
+}, none);
+await nav.run(async () => {}, none);
+console.error = origError;
+out.survivors = survivors;
+out.errors = errors;
+
+// 5. registration after teardown runs immediately (a view that registers after a late await)
+let late = null;
+let lateRanAt = null;
+const slow = nav.run(async (c, p, ctx) => {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  late = ctx.isCurrent();
+  ctx.onCleanup(() => { lateRanAt = "immediately"; });
+  lateRanAt = lateRanAt || "after registration";
+}, none);
+await nav.run(async () => {}, none);
+await slow;
+out.late = { late, lateRanAt };
+
+// 6. a view that rejects with a real error after registering: cleanup runs on the next navigation
+const errlog = [];
+const failed = await nav.run(async (c, p, ctx) => {
+  ctx.onCleanup(() => errlog.push("disposed after failure"));
+  throw new Error("boom");
+}, none, { onError: (e) => errlog.push("onError " + e.message) });
+errlog.push("before next");
+await nav.run(async () => {}, none);
+out.failed = { failed, errlog };
+
+// 7. a still-pending view whose later return value is a cleanup: runs at once
+const pendingLog = [];
+let release;
+const pending = nav.run(async () => {
+  await new Promise((resolve) => { release = resolve; });
+  return () => pendingLog.push("returned cleanup ran");
+}, none);
+await nav.run(async () => {}, none);
+pendingLog.push("superseded");
+release();
+await pending;
+out.pending = pendingLog;
+out.abortErrorRecognised = isAbortError(new DOMException("x", "AbortError"));
+out.log = log;
+console.log(JSON.stringify(out));
+""")
+    assert isinstance(out, dict)
+    assert out["log"] == ["chart created", "chart disposed", "other rendered"]
+    assert out["a"] == {"current": False, "failed": False}
+    assert out["order"] == ["returned", "three", "two", "one"]
+    assert out["once"] == {"count": 1, "childCount": 1}
+    assert out["survivors"] == ["last registered", "first registered"]
+    assert out["errors"] == ["view cleanup failed"]
+    assert out["late"] == {"late": False, "lateRanAt": "immediately"}
+    assert out["failed"]["failed"] == {"current": True, "failed": True}
+    assert out["failed"]["errlog"] == ["onError boom", "before next", "disposed after failure"]
+    assert out["pending"] == ["superseded", "returned cleanup ran"]
+
+
+def test_each_navigation_renders_into_its_own_detached_element_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "detached", """
+import { createNavigator } from "./js/lifecycle.js";
+class Box {
+  constructor(name) { this.name = name; this.parent = null; this.text = ""; }
+  remove() { if (this.parent) { this.parent.children = this.parent.children.filter((c) => c !== this); this.parent = null; } }
+}
+const app = { children: [], mount(box) { app.children = [box]; box.parent = app; } };
+const hooks = {
+  mount: () => { const box = new Box("v" + (app.children.length + Math.random())); app.mount(box); return box; },
+  unmount: (box) => box.remove(),
+};
+const nav = createNavigator();
+const order = [];
+let stale = null;
+const a = nav.run(async (box, p, ctx) => {
+  ctx.onCleanup(() => order.push("cleanup sees attached=" + (box.parent === app)));
+  await new Promise((resolve) => setTimeout(resolve, 10)); // not abortable, view forgets isCurrent()
+  box.text = "stale";
+  stale = box;
+}, {}, hooks);
+const b = await nav.run(async (box) => { box.text = "fresh"; }, {}, hooks);
+await a;
+console.log(JSON.stringify({
+  appText: app.children.map((c) => c.text), staleText: stale.text, staleAttached: stale.parent !== null,
+  count: app.children.length, order,
+}));
+""")  # noqa: E501
+    assert out == {"appText": ["fresh"], "staleText": "stale", "staleAttached": False, "count": 1,
+                   "order": ["cleanup sees attached=true"]}
+
+
+def test_child_scopes_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "child", """
+import { createNavigator } from "./js/lifecycle.js";
+import { isAbortError } from "./js/api.js";
+const nav = createNavigator();
+const none = {};
+const fetchLike = (signal, value) => new Promise((resolve, reject) => {
+  if (signal.aborted) reject(new DOMException("aborted", "AbortError"));
+  signal.addEventListener("abort", () => reject(signal.reason));
+  setTimeout(() => resolve(value), 15);
+});
+const out = { drawn: [], cleaned: [] };
+
+// 1. the documented pattern: a replacement aborts the previous request, only the last one draws
+await nav.run(async (c, p, ctx) => {
+  let request = null;
+  async function load(id) {
+    if (request) request.abort("some reason that must be ignored");
+    const mine = (request = ctx.child());
+    mine.onCleanup(() => out.cleaned.push("req " + id));
+    try {
+      const data = await fetchLike(mine.signal, id);
+      if (!mine.isCurrent()) return;
+      out.drawn.push(data);
+    } catch (err) {
+      out.drawn.push(isAbortError(err) ? "aborted " + id : "error " + id);
+    }
+  }
+  const one = load(1);
+  const two = load(2);
+  await Promise.all([one, two]);
+}, none);
+out.afterReplacement = out.cleaned.slice();
+
+// 2. abort() is idempotent, flips isCurrent and aborts without a reason
+await nav.run(async (c, p, ctx) => {
+  const child = ctx.child();
+  const before = [child.isCurrent(), child.signal.aborted];
+  child.abort(); child.abort();
+  out.flags = { before, after: [child.isCurrent(), child.signal.aborted], name: child.signal.reason.name };
+}, none);
+
+// 3. navigation ends every child (and runs its cleanups) without anyone calling abort()
+let kept;
+const slow = nav.run(async (c, p, ctx) => {
+  kept = ctx.child();
+  kept.onCleanup(() => out.cleaned.push("kept child"));
+  await fetchLike(kept.signal, 1);
+}, none);
+await nav.run(async () => {}, none);
+await slow;
+out.ended = { aborted: kept.signal.aborted, current: kept.isCurrent(), cleaned: out.cleaned.includes("kept child") };
+
+// 4. a child created after the navigation ended is already ended
+const late = nav.run(async (c, p, ctx) => {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const child = ctx.child();
+  out.lateChild = { aborted: child.signal.aborted, current: child.isCurrent() };
+}, none);
+await nav.run(async () => {}, none);
+await late;
+console.log(JSON.stringify(out));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["drawn"] == ["aborted 1", 2]
+    assert out["afterReplacement"] == ["req 1"]  # the replaced request's cleanup ran at once
+    assert out["flags"] == {"before": [True, False], "after": [False, True], "name": "AbortError"}
+    assert out["ended"] == {"aborted": True, "current": False, "cleaned": True}
+    assert out["lateChild"] == {"aborted": True, "current": False}
 
 
 # --- table.js ----------------------------------------------------------------------------------
 
 
+FAKE_DOM = """
+class FakeNode {}
+class FakeText extends FakeNode { constructor(data) { super(); this.data = data; this.parent = null; } get textContent() { return this.data; } }
+class FakeEl extends FakeNode {
+  constructor(tag) { super(); this.tag = tag.toUpperCase(); this.attrs = {}; this.children = []; this.listeners = {}; this.parent = null; }
+  set className(v) { this.attrs.class = v; }
+  get className() { return this.attrs.class || ""; }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+  hasAttribute(k) { return k in this.attrs; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  addEventListener(t, f) { (this.listeners[t] ||= []).push(f); }
+  append(...kids) { for (const k of kids) { k.parent = this; this.children.push(k); } }
+  replaceChildren(...kids) { this.children = []; this.append(...kids); }
+  set textContent(v) { this.children = []; this.append(new FakeText(String(v))); }
+  get textContent() { return this.children.map((c) => c.textContent).join(""); }
+  contains(n) { for (let x = n; x; x = x.parent) if (x === this) return true; return false; }
+  closest(selector) {
+    const tags = selector.split(",").map((t) => t.trim().toUpperCase());
+    for (let x = this; x; x = x.parent) if (tags.includes(x.tag)) return x;
+    return null;
+  }
+  querySelector(sel) {
+    const cls = sel.slice(1);
+    for (const k of this.children) {
+      if (!(k instanceof FakeEl)) continue;
+      if (k.className.split(" ").includes(cls)) return k;
+      const deeper = k.querySelector(sel); if (deeper) return deeper;
+    }
+    return null;
+  }
+  focus() { document.activeElement = this; }
+  fire(type, event = {}) {
+    const e = { target: this, preventDefault() { e.prevented = true; }, ...event };
+    for (const f of this.listeners[type] || []) f(e);
+    return e;
+  }
+  all(tag) {
+    const found = [];
+    for (const k of this.children) if (k instanceof FakeEl) { if (k.tag === tag.toUpperCase()) found.push(k); found.push(...k.all(tag)); }
+    return found;
+  }
+}
+globalThis.Node = FakeNode;
+globalThis.document = { activeElement: null, createElement: (t) => new FakeEl(t), createTextNode: (d) => new FakeText(d) };
+"""  # noqa: E501
+
+
 def test_table_helpers_with_node(node_workdir: Path) -> None:
     out = run_node(node_workdir, "table", """
-import { compareValues, netCell, sortRows } from "./js/table.js";
+import { compareValues, isSelectKey, netCell, nextSort, sortRows } from "./js/table.js";
 const rows = [{ n: "10" }, { n: "9" }, { n: null }, { n: "100" }, { n: "9" }].map((r, i) => ({ ...r, i }));
 const key = (r) => (r.n === null ? null : Number(r.n));
 console.log(JSON.stringify({
@@ -588,6 +893,9 @@ console.log(JSON.stringify({
   cmp: [compareValues(1, 2) < 0, compareValues(null, 1) > 0, compareValues(1, null) < 0,
     compareValues(null, null)],
   pos: netCell("12.3400"), neg: netCell("-0.0600"), zero: netCell("0.0000"), none: netCell(null),
+  next: [nextSort({ column: -1, direction: "asc" }, 2), nextSort({ column: 2, direction: "asc" }, 2),
+    nextSort({ column: 2, direction: "desc" }, 2), nextSort({ column: 2, direction: "desc" }, 1)],
+  keys: ["Enter", " ", "a", "Tab"].map(isSelectKey),
 }));
 """)
     assert isinstance(out, dict)
@@ -599,3 +907,128 @@ console.log(JSON.stringify({
     assert out["neg"] == {"content": "-0.06", "className": "neg"}
     assert out["zero"] == {"content": "0.00", "className": ""}
     assert out["none"] == {"content": "-", "className": ""}
+    assert out["next"] == [{"column": 2, "direction": "asc"}, {"column": 2, "direction": "desc"},
+                           {"column": 2, "direction": "asc"}, {"column": 1, "direction": "asc"}]
+    assert out["keys"] == [True, True, False, False]
+
+
+def test_data_table_selection_and_sort_survive_updates_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "table_dom", FAKE_DOM + """
+const { dataTable } = await import("./js/table.js");
+const picked = [];
+const columns = [
+  { label: "Id", numeric: true, cell: (r) => String(r.id), sortKey: (r) => r.id },
+  { label: "Net", numeric: true, cell: (r) => String(r.net), sortKey: (r) => r.net },
+  { label: "Link", cell: () => document.createElement("a") },
+];
+const rows = [{ id: 1, net: 5 }, { id: 2, net: 9 }, { id: 3, net: 7 }];
+const table = dataTable({ columns, rows, caption: "t", rowKey: (r) => r.id, selectedKey: 2,
+  onSelect: (r) => picked.push(r.id) });
+const bodyRows = () => table.element.all("tbody")[0].children;
+const ids = () => bodyRows().map((tr) => tr.children[0].textContent);
+const selected = () => bodyRows().filter((tr) => tr.getAttribute("aria-selected") === "true")
+  .map((tr) => tr.children[0].textContent);
+const out = {};
+out.start = { ids: ids(), selected: selected(), tabindex: bodyRows().map((tr) => tr.getAttribute("tabindex")),
+  cls: bodyRows()[0].className };
+
+// the user sorts by Net descending (two clicks on the header button)
+const netButton = table.element.all("th")[1].children[0];
+netButton.fire("click"); netButton.fire("click");
+out.sorted = { ids: ids(), sort: table.getSort(), aria: table.element.all("th")[1].getAttribute("aria-sort") };
+
+// a re-render with new rows keeps the sort and the selection follows the key
+table.update({ rows: [{ id: 1, net: 5 }, { id: 2, net: 9 }, { id: 3, net: 7 }, { id: 4, net: 8 }] });
+out.afterRows = { ids: ids(), sort: table.getSort(), selected: selected() };
+
+// a new selectedKey alone does not rebuild the rows
+const before = bodyRows()[0];
+table.update({ selectedKey: 3 });
+out.afterSelect = { same: bodyRows()[0] === before, selected: selected(), sort: table.getSort() };
+table.update({ selectedKey: null });
+out.none = selected();
+
+// click selects, a click on a link inside the row does not, Enter and Space select, other keys do not
+const first = bodyRows()[0];
+first.fire("click");
+first.children[2].children[0].fire("click"); // the <a> inside the row: ignored
+bodyRows()[1].fire("keydown", { key: "Enter" });
+const space = bodyRows()[2].fire("keydown", { key: " " });
+bodyRows()[2].fire("keydown", { key: "x" });
+out.picked = picked;
+out.spacePrevented = space.prevented === true;
+
+// a focused row keeps focus when the rows are re-rendered
+const focusTarget = bodyRows()[2];
+focusTarget.focus();
+const focusedId = focusTarget.children[0].textContent;
+table.update({ rows: [{ id: 1, net: 5 }, { id: 2, net: 9 }, { id: 3, net: 7 }] });
+out.focus = { kept: document.activeElement.children[0].textContent === focusedId, isNewRow: document.activeElement !== focusTarget };
+
+// without onSelect rows are not focusable and carry no handlers; without rowKey no aria-selected
+const plain = dataTable({ columns, rows });
+const plainRow = plain.element.all("tbody")[0].children[0];
+out.plain = { tabindex: plainRow.getAttribute("tabindex"), aria: plainRow.getAttribute("aria-selected"),
+  click: (plainRow.listeners.click || []).length };
+console.log(JSON.stringify(out));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["start"] == {"ids": ["1", "2", "3"], "selected": ["2"], "tabindex": ["0", "0", "0"],
+                            "cls": "selectable"}
+    assert out["sorted"] == {"ids": ["2", "3", "1"],
+                             "sort": {"column": 1, "direction": "desc"}, "aria": "descending"}
+    assert out["afterRows"] == {"ids": ["2", "4", "3", "1"], "sort": {"column": 1, "direction": "desc"},
+                                "selected": ["2"]}
+    assert out["afterSelect"] == {"same": True, "selected": ["3"], "sort": {"column": 1, "direction": "desc"}}
+    assert out["none"] == []
+    # first click on the row selects id 2; the click whose target sits in a link is ignored
+    assert out["picked"] == [2, 4, 3]
+    assert out["spacePrevented"] is True
+    assert out["focus"] == {"kept": True, "isNewRow": True}
+    assert out["plain"] == {"tabindex": None, "aria": None, "click": 0}
+
+
+# --- format.js: chart time ---------------------------------------------------------------------
+
+CHART_TIME_SOURCE = """
+import { chartTimeToDataTime, dataTimeToChartTime } from "./js/format.js";
+const inputs = ["2024-01-02 09:30:00", "2024-01-02T09:30:00", "2024-01-02 09:30:00.250", "2024-03-10 02:30:00",
+  "2024-11-03 01:30:00", "2024-02-29 23:59:59", "1970-01-01 00:00:00", "1969-12-31 23:59:59",
+  "2024-02-30 09:30:00", "2024-01-02 24:00:00", "2024-01-02 09:60:00", "2024-01-02 09:30:00Z",
+  "2024-01-02 09:30:00+05:30", "2024-01-02 09:30", "2024-01-02", "", "garbage", null, undefined, 5,
+  " 2024-01-02 09:30:00 ", "0050-01-02 09:30:00"];
+const seconds = inputs.map(dataTimeToChartTime);
+const back = [1704187800, 0, -1, 1704187800.9, NaN, "x", null, Infinity, 1e20].map(chartTimeToDataTime);
+console.log(JSON.stringify({ seconds, back, tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  offset: new Date(2024, 0, 2).getTimezoneOffset() }));
+"""  # noqa: E501
+
+
+def test_chart_time_helpers_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "chart_time", CHART_TIME_SOURCE)
+    assert isinstance(out, dict)
+    assert out["seconds"] == EXPECTED_CHART_SECONDS
+    assert out["back"] == ["2024-01-02 09:30:00", "1970-01-01 00:00:00", "1969-12-31 23:59:59",
+                           "2024-01-02 09:30:00", None, None, None, None, None]
+
+
+EXPECTED_CHART_SECONDS = [
+    1704187800, 1704187800, 1704187800, 1710037800, 1730597400, 1709251199, 0, -1,
+    None, None, None, None, None, None, None, None, None, None, None, None, 1704187800, None,
+]
+
+
+@pytest.mark.parametrize(("zone", "offset_minutes"), [("America/Los_Angeles", 480), ("Asia/Kolkata", -330)])
+def test_chart_time_does_not_depend_on_the_machine_zone(
+        node_workdir: Path, zone: str, offset_minutes: int) -> None:
+    """Spawn node under a non-UTC TZ: the seconds are the data's wall clock read as UTC."""
+    assert NODE is not None
+    script = node_workdir / f"chart_time_{zone.replace('/', '_')}.mjs"
+    script.write_text(CHART_TIME_SOURCE, encoding="utf-8")
+    done = subprocess.run([NODE, str(script)], capture_output=True, encoding="utf-8", timeout=120,
+                          cwd=node_workdir, env={**os.environ, "TZ": zone})
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert out["offset"] == offset_minutes  # node really ran in that zone, not UTC
+    assert out["seconds"] == EXPECTED_CHART_SECONDS
+    assert out["back"][0] == "2024-01-02 09:30:00"

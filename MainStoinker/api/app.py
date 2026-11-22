@@ -10,6 +10,8 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.responses import Response
+from starlette.types import Scope
 
 from MainStoinker.api import API_VERSION
 from MainStoinker.api.errors import install_error_handlers
@@ -20,11 +22,35 @@ from MainStoinker.api.routes_runs import router as runs_router
 from MainStoinker.api.routes_series import router as series_router
 from MainStoinker.api.routes_trades import router as trades_router
 
+PathLike = str | os.PathLike[str]
 LOCAL_HOST_HEADERS = ("127.0.0.1", "localhost", "[::1]")  # any port; others are 400 (DNS rebinding)
 
 
+# Starlette takes the type from `mimetypes`, which on Windows reads the registry: a machine that maps
+# `.js` to text/plain makes browsers refuse the ES modules. These are pinned, whatever the registry says.
+PINNED_CONTENT_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".json": "application/json",
+}
+
+
 class _StaticFiles(StaticFiles):
-    """Static files where a name the OS rejects (too long, illegal characters) is a plain 404."""
+    """Static files where a name the OS rejects (too long, illegal characters) is a plain 404.
+
+    Responses carry pinned content types for the dashboard's file kinds and `nosniff`.
+    """
+
+    def file_response(self, full_path: PathLike, stat_result: os.stat_result, scope: Scope,
+                      status_code: int = 200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        pinned = PINNED_CONTENT_TYPES.get(os.path.splitext(str(full_path))[1].lower())
+        if pinned is not None and "content-type" in response.headers:
+            response.headers["content-type"] = pinned
+        response.headers["x-content-type-options"] = "nosniff"
+        return response
 
     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
         try:
