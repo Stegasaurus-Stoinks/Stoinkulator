@@ -18,11 +18,14 @@ import pytest
 
 from MainStoinker.engine.ledger import EquityPoint, Ledger
 from MainStoinker.engine.store import (
+    MIGRATIONS,
     SCHEMA_VERSION,
     AlgoMeta,
     DataMeta,
     NullStore,
     RunMeta,
+    SeriesInfo,
+    SeriesPoint,
     SqliteStore,
     StoreError,
     expand_equity,
@@ -1038,7 +1041,7 @@ def test_first_open_from_many_threads_at_once(tmp_path):
         assert errors == []
         con = sqlite3.connect(path)
         try:
-            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1
+            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
             assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         finally:
             con.close()
@@ -1223,3 +1226,241 @@ def test_schema_version_is_kept_for_both_open_paths(db):
     conn.close()
     with open_store_readonly(str(db), env=NO_ENV) as store:
         assert store.schema_version == 1
+
+
+# --- schema 2: indicator series and data fingerprints ---------------------------
+
+V1_TABLES = ("runs", "algos", "order_events", "fills", "trades", "equity", "ignored_events")
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+
+
+def make_v1_file(src: Path, dest: Path) -> None:
+    """A version-1 file: the v1 DDL, the rows of `src` copied in, `files` key stripped."""
+    con = sqlite3.connect(dest)
+    for statement in MIGRATIONS[0]:
+        con.execute(statement)
+    con.execute("PRAGMA user_version=1")
+    con.execute("ATTACH DATABASE ? AS src", (str(src),))
+    for table in V1_TABLES:
+        con.execute(f"INSERT INTO {table} SELECT * FROM src.{table}")
+    con.commit()
+    con.execute("DETACH DATABASE src")
+    import json
+    for run_id, text in con.execute("SELECT id, data_json FROM runs").fetchall():
+        d = json.loads(text)
+        d.pop("files", None)
+        con.execute("UPDATE runs SET data_json=? WHERE id=?", (json.dumps(d), run_id))
+    con.commit()
+    con.close()
+
+
+def series_fixture() -> tuple[list[SeriesInfo], list[SeriesPoint]]:
+    infos = [SeriesInfo("a1", "ema", "line", 1), SeriesInfo("a1", "rsi", "histogram", 0),
+             SeriesInfo("a2", "ema", "line", 0)]
+    points = [SeriesPoint("a1", "ema", T0 + timedelta(minutes=m), 100.5 + m) for m in range(6)]
+    points += [SeriesPoint("a1", "rsi", T0 + timedelta(minutes=m), 50.0 - m) for m in range(3)]
+    points += [SeriesPoint("a2", "ema", T0 + timedelta(minutes=1), 7.25)]
+    return infos, points
+
+
+def running_run(store: SqliteStore) -> int:
+    run_id = store.begin_run(meta())
+    store.write_algos(run_id, algos())
+    return run_id
+
+
+def test_migration_v1_to_v2_keeps_existing_runs(db, tmp_path):
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+        expected = w.load_run(1)
+    make_v1_file(src, db)
+    con = sqlite3.connect(db)
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+    con.close()
+    with SqliteStore(db) as store:
+        assert store.schema_version == 2
+        loaded = store.load_run(1)
+        assert loaded == expected
+        assert loaded.series == ()
+        assert loaded.summary.data.files == ()
+        assert store.load_series(1, "a1") == ()
+    con = sqlite3.connect(db)
+    assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    con.close()
+    assert {"algo_series", "algo_series_points"} <= tables
+
+
+def test_v2_series_roundtrip(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points)
+        store.end_run(run_id, "completed")
+    with SqliteStore(db) as store:
+        data = store.load_run(run_id)
+        # only the infos come with the run, ordered by position; no points
+        assert data.series == (infos[1], infos[2], infos[0])
+        a1 = store.load_series(run_id, "a1")
+        assert a1 == tuple(sorted((p for p in points if p.account == "a1"),
+                                  key=lambda p: (p.name, p.time)))
+        assert all(isinstance(p.value, float) for p in a1)
+        assert store.load_series(run_id, "a2") == (points[-1],)
+        assert store.load_series(run_id, "nobody") == ()
+        with pytest.raises(StoreError, match="no run"):
+            store.load_series(99, "a1")
+
+
+def test_series_points_added_in_later_calls(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points[:2])
+        store.write_series(run_id, [], points[2:])
+        assert len(store.load_series(run_id, "a1")) == 9
+        with pytest.raises(StoreError, match="not declared"):
+            store.write_series(run_id, [], [SeriesPoint("a1", "zzz", T0, 1.0)])
+        with pytest.raises(StoreError):
+            store.write_series(run_id, [infos[0]])  # declared twice
+        assert len(store.load_series(run_id, "a1")) == 9
+
+
+def test_series_window_query(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points)
+        t = lambda m: T0 + timedelta(minutes=m)  # noqa: E731
+        win = store.load_series(run_id, "a1", t(2), t(4))
+        assert [(p.name, p.time) for p in win] == [
+            ("ema", t(2)), ("ema", t(3)), ("ema", t(4)), ("rsi", t(2))]
+        assert {p.time for p in store.load_series(run_id, "a1", start=t(5))} == {t(5)}
+        assert {p.time for p in store.load_series(run_id, "a1", end=t(0))} == {t(0)}
+        assert store.load_series(run_id, "a1", t(10), t(20)) == ()
+        # the window is applied in SQL, not after loading everything
+        plan = store._db().execute(
+            "EXPLAIN QUERY PLAN SELECT name, time, value FROM algo_series_points"
+            " WHERE run_id=? AND algo=? AND time >= ?", (run_id, "a1", "x")).fetchall()
+        assert any("idx_series_points" in str(row) for row in plan)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), "x", None])
+def test_series_values_must_be_finite(db, bad):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        with pytest.raises(StoreError):
+            store.write_series(run_id, infos, [*points, SeriesPoint("a1", "ema", T0, bad)])
+        # nothing was written, not even the infos
+        assert store.load_run(run_id).series == ()
+        assert store.load_series(run_id, "a1") == ()
+
+
+def test_series_written_only_to_running_run(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.end_run(run_id, "completed")
+        with pytest.raises(StoreError, match="already completed"):
+            store.write_series(run_id, infos, points)
+        with pytest.raises(StoreError, match="no run"):
+            store.write_series(99, infos, points)
+        assert store.load_run(run_id).series == ()
+
+
+def test_series_for_unknown_algo_refused(db):
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        with pytest.raises(StoreError):
+            store.write_series(run_id, [SeriesInfo("ghost", "ema", "line", 0)])
+        assert store.load_run(run_id).series == ()
+
+
+def test_series_deleted_with_run_cascade(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points)
+        keep = running_run(store)
+        store.write_series(keep, infos[:1], points[:1])
+        conn = store._db()
+        conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        for table in ("algo_series", "algo_series_points"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                                (run_id,)).fetchone()[0] == 0
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                                (keep,)).fetchone()[0] == 1
+
+
+def test_readonly_v1_database_has_no_series(db, tmp_path):
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+        expected = w.load_run(1)
+    make_v1_file(src, db)
+    before = db.read_bytes()
+    # the series tables do not exist in this file: any query against them would raise
+    con = sqlite3.connect(db)
+    assert not {"algo_series", "algo_series_points"} & {
+        r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+    con.close()
+    with open_store_readonly(str(db), env=NO_ENV) as store:
+        assert store.schema_version == 1
+        data = store.load_run(1)
+        assert data == expected and data.series == ()
+        assert store.load_series(1, "a1") == ()
+        assert store.load_series(1, "a1", T0, T0 + timedelta(days=1)) == ()
+        with pytest.raises(StoreError, match="no run"):
+            store.load_series(7, "a1")
+        with pytest.raises(StoreError, match="read-only"):
+            store.write_series(1, [SeriesInfo("a1", "ema", "line", 0)])
+    assert db.read_bytes() == before
+
+
+def test_readonly_v2_database_reads_series(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as w:
+        run_id = running_run(w)
+        w.write_series(run_id, infos, points)
+        w.end_run(run_id, "completed")
+    with open_store_readonly(str(db), env=NO_ENV) as store:
+        assert len(store.load_run(run_id).series) == 3
+        assert len(store.load_series(run_id, "a1")) == 9
+
+
+def test_data_files_roundtrip_and_absent_key_reads_empty(db):
+    files = (("AAPL", SHA_A, 1234), ("MSFT", SHA_B, 99))
+    data = DataMeta("csv", "OfflineData", ("AAPL", "MSFT"), T0, T0 + timedelta(days=1), files)
+    with SqliteStore(db) as store:
+        with_files = store.begin_run(RunMeta("backtest", "legacy", "x", {}, data))
+        without = store.begin_run(meta())
+        assert DataMeta().files == ()
+        assert store.load_run(with_files).summary.data.files == files
+        assert store.list_runs()[0].data.files == files
+        assert store.load_run(without).summary.data.files == ()
+        # a row written before schema 2 has no "files" key at all
+        store._db().execute(
+            "UPDATE runs SET data_json=json_remove(data_json, '$.files') WHERE id=?",
+            (with_files,))
+        assert store.load_run(with_files).summary.data.files == ()
+        assert store.list_runs()[0].data.files == ()
+
+
+def test_null_store_accepts_series():
+    infos, points = series_fixture()
+    with NullStore() as store:
+        assert store.schema_version == SCHEMA_VERSION
+        run_id = store.begin_run(meta())
+        store.write_series(run_id, infos, points)
+        store.write_series(run_id, infos, [SeriesPoint("a1", "ema", T0, float("nan"))])
+        assert store.load_series(run_id, "a1") == ()
+        assert store.load_series(run_id, "a1", T0, T0) == ()
+
+
+def test_store_protocol_declares_schema_version_and_series():
+    from MainStoinker.engine.store import Store
+    for name in ("schema_version", "write_series", "load_series"):
+        assert hasattr(Store, name)
+        assert hasattr(NullStore, name) and hasattr(SqliteStore, name)
