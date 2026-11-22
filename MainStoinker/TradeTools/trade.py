@@ -13,7 +13,7 @@ class Trade:
     #OpenPrice is the price the algo tried to buy at, which will likely be different from the entryPrice, same for openTime vs entryTime
     #used for tracking entry discrpencies since we are going to start with market orders and not limit orders
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, logger, limitOrder = False, broker = None):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, logger, limitOrder = False, *, broker = None):
         self.symbol = symbol
         self.volume = volume
         self.tradeID = ID
