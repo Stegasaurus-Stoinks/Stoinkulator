@@ -298,3 +298,70 @@ def test_offline_data_path_rejects_bad_symbol(symbol: str, tmp_path: Path) -> No
 
 def test_offline_data_path_good_symbol(tmp_path: Path) -> None:
     assert offline_data_path(tmp_path, "BRK.B") == tmp_path / "_BRK.B_offlinedata_"
+
+
+def _write_bars(path: Path, rows: list[str]) -> Path:
+    path.write_text("date,time,open,high,low,close,volume\n" + "".join(r + "\n" for r in rows))
+    return path
+
+
+def test_read_offline_bars_rejects_empty_and_header_only(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError):
+        read_offline_bars(empty)
+    with pytest.raises(ValueError, match="no rows"):
+        read_offline_bars(_write_bars(tmp_path / "hdr", []))
+    with pytest.raises(FileNotFoundError):
+        read_offline_bars(tmp_path / "missing")
+
+
+def test_bars_between_boundaries(tmp_path: Path) -> None:
+    single = read_offline_bars(_write_bars(tmp_path / "one", ["2024-01-02 09:30:00,x,1,2,1,2,5"]))
+    at = single["date"].iloc[0].to_pydatetime()
+    one_s = pd.Timedelta(seconds=1)
+    assert len(bars_between(single, at, at)) == 1
+    assert bars_between(single, at - 2 * one_s, at - one_s).empty
+    frame = read_offline_bars(offline_data_path(DATA_DIR, "AAPL"))
+    dates = frame["date"]
+    # bounds strictly between bars select the bars inside, not the neighbours
+    window = bars_between(
+        frame,
+        (dates.iloc[5] + pd.Timedelta(seconds=30)).to_pydatetime(),
+        (dates.iloc[9] + pd.Timedelta(seconds=30)).to_pydatetime(),
+    )
+    assert list(window["date"]) == list(dates.iloc[6:10])
+    # the window is a copy: mutating it leaves the source untouched
+    before = frame.copy()
+    window.loc[:, "close"] = -1.0
+    assert_frame_equal(frame, before)
+    # a window wider than the data returns every bar
+    wide = bars_between(frame, dates.iloc[0].to_pydatetime() - pd.Timedelta(days=9),
+                        dates.iloc[-1].to_pydatetime() + pd.Timedelta(days=9))
+    assert_frame_equal(wide, frame)
+
+
+def test_file_fingerprint_empty_missing_and_chunk_boundary(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    assert file_fingerprint(empty) == (hashlib.sha256(b"").hexdigest(), 0)
+    with pytest.raises(FileNotFoundError):
+        file_fingerprint(tmp_path / "missing")
+    for size in ((1 << 20) - 1, 1 << 20, (1 << 20) + 1, 2 * (1 << 20) + 7):
+        blob = bytes(range(256)) * (size // 256) + b"z" * (size % 256)
+        path = tmp_path / f"f{size}"
+        path.write_bytes(blob)
+        assert file_fingerprint(path) == (hashlib.sha256(blob).hexdigest(), size)
+
+
+@pytest.mark.parametrize("symbol", ["aapl", "A" * 300, "BRK-B", "A..B", "X1"])
+def test_offline_data_path_stays_in_directory(symbol: str, tmp_path: Path) -> None:
+    path = offline_data_path(tmp_path, symbol)
+    assert path.parent == tmp_path
+    assert path.name == f"_{symbol}_offlinedata_"
+
+
+@pytest.mark.parametrize("symbol", ["_x", "-x", "A:B", "A\x00", "\u00e9", None])
+def test_offline_data_path_rejects_more_bad_symbols(symbol: object, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid symbol"):
+        offline_data_path(tmp_path, symbol)  # type: ignore[arg-type]
