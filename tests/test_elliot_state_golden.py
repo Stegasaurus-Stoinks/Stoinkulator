@@ -23,6 +23,10 @@ Files live in tests/golden_state/ (NOT tests/golden, which only
 test_golden_backtests.py may write). Regenerate deliberately with
 `UPDATE_ELLIOT_STATE=1 pytest -m slow tests/test_elliot_state_golden.py`; the
 `--update-golden` option does not touch them.
+
+The full-length comparison (all 2,340 bars per ticker, dominated by the cost of
+the digest itself) is marked slow. A fast test replays the first PREFIX_ROWS
+rows and compares with the head of the same files.
 """
 from __future__ import annotations
 
@@ -201,6 +205,23 @@ def first_difference(actual: list[str], expected: list[str]) -> str | None:
     if len(actual) != len(expected):
         return f"bar count {len(actual)} != {len(expected)}"
     return None
+
+
+# The first PREFIX_ROWS rows of a ticker replay to the same first bars as the full
+# file (a bar's state depends only on the bars before it), so a short run can be
+# checked against the head of the golden. It is cheap enough for the fast suite.
+PREFIX_ROWS = 900
+
+
+@pytest.mark.parametrize("ticker", TICKERS)
+def test_elliot_state_matches_the_start_of_the_golden(ticker: str) -> None:
+    state = collect_state(ticker, max_rows=PREFIX_ROWS)
+    expected = json.loads(state_path(ticker).read_text(encoding="utf-8"))
+    n = len(state["bars"])
+    assert 0 < n < len(expected["bars"])
+    diff = first_difference(state["bars"], expected["bars"][:n])
+    assert diff is None, diff
+    assert state["summary"]["trades"] > 0, "the prefix should include trades, or it proves little"
 
 
 @pytest.mark.slow
