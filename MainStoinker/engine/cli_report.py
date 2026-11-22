@@ -3,7 +3,7 @@
     python -m MainStoinker runs --db SPEC [--json]
     python -m MainStoinker report RUN --db SPEC [--json]
 
-Both only read. They go through `store.open_store`, `Store.list_runs` and
+Both only read. They go through `store.open_store_readonly`, `Store.list_runs` and
 `Store.load_run` (no SQL here) and compute with `stats`; they need no algos,
 no data directory, no ledger, no git and never create a database: a missing
 file is an error. Every problem is a `ReportError` (the caller prints one line
@@ -44,7 +44,7 @@ from typing import Any
 
 from .ledger import IGNORED_KINDS
 from .stats import fmt4, run_statistics, statistics_record
-from .store import RunData, RunSummary, Store, StoreError, open_store
+from .store import RunData, RunSummary, Store, StoreError, open_store_readonly
 
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 _RUN_ID = re.compile(r"[0-9]+")
@@ -62,7 +62,7 @@ class ReportError(Exception):
 
 
 def _open_existing(spec: str | None, env: Mapping[str, str] | None) -> Store:
-    """Open an existing database for reading; never creates a file."""
+    """Open an existing database read-only; never creates or changes a file."""
     if spec is None:
         raise ReportError("--db is required: give the database file (or sqlite:///path)")
     path = spec[len("sqlite:///"):] if spec.startswith("sqlite:///") else spec
@@ -85,7 +85,7 @@ def _open_existing(spec: str | None, env: Mapping[str, str] | None) -> Store:
         if size == 0:
             raise ReportError(f"database {path} is empty (not a database)")
     try:
-        return open_store(spec, env=os.environ if env is None else env)
+        return open_store_readonly(spec, env=os.environ if env is None else env)
     except StoreError as exc:
         raise ReportError(str(exc)) from exc
 

@@ -28,6 +28,7 @@ from MainStoinker.engine.store import (
     expand_equity,
     is_cloud_synced,
     open_store,
+    open_store_readonly,
 )
 
 D = Decimal
@@ -464,9 +465,141 @@ def test_onedrive_path_refused(tmp_path, key):
     target = root / "Documents" / "runs.db"  # neither folder nor file exists
     assert is_cloud_synced(target, env)
     assert is_cloud_synced(root, env)
-    with pytest.raises(StoreError, match=r"LOCALAPPDATA%\\Stoinkulator\\runs.db"):
+    with pytest.raises(StoreError, match=r"USERPROFILE%\\Stoinkulator\\runs.db"):
         open_store(str(target), env=env)
     assert not root.exists()  # refused before anything was created
+
+
+def test_cloud_refusal_suggests_userprofile(tmp_path):
+    env = {"OneDrive": str(tmp_path / "OneDrive")}
+    target = tmp_path / "OneDrive" / "runs.db"
+    for opener in (open_store, open_store_readonly):
+        with pytest.raises(StoreError) as info:
+            opener(str(target), env=env)
+        assert r"%USERPROFILE%\Stoinkulator\runs.db" in str(info.value)
+
+
+# ---- read-only access ---------------------------------------------------------------
+
+
+def test_readonly_open_cannot_write(db):
+    with SqliteStore(db) as w:
+        run_id, led = stored_run(w)
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        assert len(store.list_runs()) == 1
+        with pytest.raises(StoreError):
+            store.begin_run(meta())
+        with pytest.raises(StoreError):
+            store.write_algos(run_id, algos())
+        with pytest.raises(StoreError):
+            write_all(store, run_id, led)
+        with pytest.raises(StoreError):
+            store.end_run(run_id, "completed")
+        with pytest.raises(sqlite3.OperationalError):
+            store._conn.execute("INSERT INTO runs (started_at, status, kind, fills, config_json,"
+                                " data_json, code_version) VALUES ('x','running','k','f','{}','{}','')")
+    finally:
+        store.close()
+    with SqliteStore(db) as check:
+        assert len(check.list_runs()) == 1
+
+
+def test_readonly_open_does_not_migrate_or_create(db, tmp_path):
+    missing = tmp_path / "nope" / "runs.db"
+    with pytest.raises(StoreError, match="does not exist"):
+        open_store_readonly(str(missing), env=NO_ENV)
+    assert not missing.exists() and not missing.parent.exists()
+    # a v1 file: build it the old way, then compare bytes after reading
+    with SqliteStore(db) as w:
+        stored_run(w)
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.close()
+    before = db.read_bytes()
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        runs = store.list_runs()
+        store.load_run(runs[0].run_id)
+    finally:
+        store.close()
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in db.parent.iterdir()) == [db.name]
+
+
+def test_readonly_newer_schema_refused(db):
+    with SqliteStore(db):
+        pass
+    con = sqlite3.connect(db)
+    con.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    con.close()
+    before = db.read_bytes()
+    with pytest.raises(StoreError, match="newer"):
+        open_store_readonly(str(db), env=NO_ENV)
+    assert db.read_bytes() == before
+
+
+def test_readonly_reads_wal_db_without_wal_and_shm_files(db):
+    with SqliteStore(db) as w:
+        stored_run(w)
+    assert not Path(str(db) + "-wal").exists() and not Path(str(db) + "-shm").exists()
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        assert len(store.list_runs()) == 1
+    finally:
+        store.close()
+
+
+def test_readonly_open_of_closed_wal_db_leaves_main_file_identical(db):
+    with SqliteStore(db) as w:
+        stored_run(w)
+    before = db.read_bytes()
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        runs = store.list_runs()
+        assert len(runs) == 1
+    finally:
+        store.close()
+    assert db.read_bytes() == before
+    wal = Path(str(db) + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+    with SqliteStore(db) as w2:  # a writer afterwards still works and sees the same runs
+        assert w2.list_runs() == runs
+        w2.begin_run(meta())
+        assert len(w2.list_runs()) == 2
+
+
+def test_readonly_folder_is_not_a_file(tmp_path):
+    with pytest.raises(StoreError, match="is not a file"):
+        open_store_readonly(str(tmp_path), env=NO_ENV)
+
+
+def test_readonly_sees_committed_run_while_writer_open(db):
+    writer = SqliteStore(db)
+    try:
+        run_id = writer.begin_run(meta())
+        reader = open_store_readonly(str(db), env=NO_ENV)
+        try:
+            assert [r.status for r in reader.list_runs()] == ["running"]
+            writer.write_algos(run_id, algos())
+            assert [a.idname for a in reader.load_run(run_id).algos] == ["a1", "a2"]
+        finally:
+            reader.close()
+    finally:
+        writer.close()
+
+
+def test_readonly_path_with_spaces_and_hash(tmp_path):
+    folder = tmp_path / "my runs #1 %20 x"
+    folder.mkdir()
+    path = folder / "r&d 100% #2.db"
+    with SqliteStore(path) as w:
+        stored_run(w)
+    store = open_store_readonly(str(path), env=NO_ENV)
+    try:
+        assert len(store.list_runs()) == 1
+    finally:
+        store.close()
 
 
 def test_not_cloud_synced_cases(tmp_path):
@@ -1055,3 +1188,38 @@ def test_windows_drive_letter_paths_are_plain_paths(tmp_path, sep):
         assert store.list_runs() == ()
     with open_store("sqlite:///" + spec, env=NO_ENV) as store:
         assert store.list_runs() == ()
+
+
+@pytest.mark.parametrize(("path", "uri"), [
+    (r"C:\Users\me\runs.db", "file:///C:/Users/me/runs.db?mode=ro"),
+    (r"C:\my runs\runs.db", "file:///C:/my%20runs/runs.db?mode=ro"),
+    (r"C:\a#b\100%\what.db", "file:///C:/a%23b/100%25/what.db?mode=ro"),
+    ("C:\\caf\u00e9\\runs.db", "file:///C:/caf%C3%A9/runs.db?mode=ro"),
+    (r"\\server\share\runs.db", "file:////server/share/runs.db?mode=ro"),
+    (r"\\server\my share\a#b.db", "file:////server/my%20share/a%23b.db?mode=ro"),
+])
+def test_readonly_uri_is_correct_for_drive_and_unc_paths(path, uri):
+    from pathlib import PureWindowsPath
+
+    from MainStoinker.engine.store import _readonly_uri
+    assert _readonly_uri(PureWindowsPath(path)) == uri  # type: ignore[arg-type]
+
+
+def test_readonly_uri_for_posix_path():
+    from pathlib import PurePosixPath
+
+    from MainStoinker.engine.store import _readonly_uri
+    assert _readonly_uri(PurePosixPath("/tmp/a b.db")) == "file:///tmp/a%20b.db?mode=ro"  # type: ignore[arg-type]
+
+
+def test_schema_version_is_kept_for_both_open_paths(db):
+    with open_store(str(db), env=NO_ENV) as store:
+        assert store.schema_version == SCHEMA_VERSION
+    with open_store_readonly(str(db), env=NO_ENV) as store:
+        assert store.schema_version == SCHEMA_VERSION
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA user_version=1")
+    conn.close()
+    with open_store_readonly(str(db), env=NO_ENV) as store:
+        assert store.schema_version == 1
