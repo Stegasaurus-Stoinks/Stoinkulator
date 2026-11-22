@@ -80,6 +80,8 @@ uv pip install --python .venv\Scripts\python.exe -e .
   New code takes its dependencies as arguments.
 - New and rewritten modules must pass `ruff --select E,F,W,I,B` and carry type
   hints on public functions.
+- Algos must treat the price frame passed to `update` as read-only; copy it
+  (`df.copy()`) before modifying it.
 - Keep changes scoped to the task. Do not reformat or rename legacy files you
   are not otherwise changing.
 

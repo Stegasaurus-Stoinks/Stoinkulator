@@ -1,6 +1,10 @@
 """BarStore: frame-identical to the legacy Ticker history, and no aliasing."""
 from __future__ import annotations
 
+import dataclasses
+import datetime
+import gc
+import logging
 import time
 import warnings
 from collections.abc import Callable
@@ -194,7 +198,8 @@ def test_view_equals_legacy_ticker_on_real_data_across_a_reallocation(feed: CsvB
 
 def test_reallocations_are_logarithmic(feed: CsvBarFeed) -> None:
     store = BarStore(feed.warmup("AAPL"))
-    for bar in synthetic_bars(100_000):
+    bar = synthetic_bars(1)[0]
+    for _ in range(100_000):
         store.append(bar)
     assert len(store) == 100_000 + 390
     assert 1 <= store._growths <= 20
@@ -296,7 +301,7 @@ def _outcome(op: Callable[[pd.DataFrame], None], frame: pd.DataFrame) -> str:
 
 
 @pytest.mark.parametrize("op", MUTATIONS, ids=lambda f: f.__name__)
-def test_views_do_not_share_writable_memory_with_the_store(
+def test_same_bar_mutations_match_concat_reference_and_leave_store_unchanged(
     op: Callable[[pd.DataFrame], None], feed: CsvBarFeed
 ) -> None:
     warmup = feed.warmup("AAPL")
@@ -344,6 +349,45 @@ def _time_appends(rows: int, appends: int) -> float:
     return time.perf_counter() - started
 
 
+def test_consecutive_views_share_the_store_buffers_until_a_growth(feed: CsvBarFeed) -> None:
+    # Structural form of "append cost does not depend on history length": no copy of the
+    # history per bar, and a growth (a copy) only when the buffers are full.
+    store = BarStore(feed.warmup("AAPL"), _initial_capacity=1000)
+    bars = synthetic_bars(5)
+    store.append(bars[0])
+    previous = store.view()["close"].values
+    for bar in bars[1:]:
+        store.append(bar)
+        current = store.view()["close"].values
+        assert np.shares_memory(previous, current)
+        assert np.shares_memory(current, store._buffers["close"])
+        previous = current
+    assert store._growths == 0
+    # filling the buffers forces exactly one growth, after which new views leave the old memory
+    while len(store._buffers["close"]) > len(store):
+        store.append(bars[0])
+    store.append(bars[1])
+    assert store._growths == 1
+    assert not np.shares_memory(previous, store.view()["close"].values)
+
+
+def _time_appends(rows: int, appends: int) -> float:
+    bar = synthetic_bars(1)[0]
+    seed = pd.DataFrame({
+        "date": pd.Series(pd.date_range("2020-01-01", periods=rows, freq="min")).astype("datetime64[us]"),
+        "time": np.arange(rows, dtype="int64"),
+        "open": np.full(rows, 100.0), "high": np.full(rows, 101.0), "low": np.full(rows, 99.0),
+        "close": np.full(rows, 100.5), "volume": np.full(rows, 5, dtype="int64"),
+    })
+    store = BarStore(seed)
+    started = time.perf_counter()
+    for _ in range(appends):
+        store.append(bar)
+        store.view()
+    return time.perf_counter() - started
+
+
+@pytest.mark.slow
 def test_append_cost_is_flat_in_history_length() -> None:
     small, large = _time_appends(1_000, 20_000), _time_appends(200_000, 20_000)
     # the legacy concat append is >10x slower at 200k rows than at 1k; linear storage is ~1x
@@ -367,40 +411,290 @@ def test_store_dtypes_after_warmup_and_appends(feed: CsvBarFeed) -> None:
         store.append(make_bar(count))
 
 
-def test_date_unit_follows_the_finest_unit_seen_like_concat(feed: CsvBarFeed) -> None:
-    store, reference = BarStore(feed.warmup("AAPL")), ConcatReference(feed.warmup("AAPL"))
-    for i, unit in enumerate(["s", "ms", "us", "ns", "s", "us"]):
-        bar = Bar(pd.Timestamp("2032-01-01 09:30:00").as_unit(unit) + pd.Timedelta(minutes=i),
-                  i, 1.0, 2.0, 0.5, 1.5, 3)
-        store.append(bar)
-        reference.append(bar)
-        assert_identical(store.view(), reference.view())
 
 
-def test_timezone_aware_bar_date_is_rejected(feed: CsvBarFeed) -> None:
-    store = BarStore(feed.warmup("AAPL"))
-    bar = Bar(pd.Timestamp("2032-01-01 09:30:00", tz="UTC"), 1, 1.0, 2.0, 0.5, 1.5, 3)
-    with pytest.raises(ValueError, match="timezone-naive"):
-        store.append(bar)
-    assert len(store) == 390
+# --- read-only contract for returned frames ---
+
+READONLY_ERRORS = (ValueError, TypeError)
 
 
-@pytest.mark.parametrize("kind", ["untyped_empty", "extra_column", "int32_volume"])
-def test_non_feed_shaped_warmup_keeps_concat_behaviour(kind: str) -> None:
-    if kind == "untyped_empty":
-        warmup = pd.DataFrame(columns=list(COLUMNS))
-    elif kind == "extra_column":
-        warmup = pd.DataFrame({**{c: [] for c in COLUMNS}, "x": []})
-    else:
-        warmup = pd.DataFrame({
-            "date": pd.to_datetime(["2029-12-31 09:30"]).as_unit("us"), "time": [1],
-            "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
-            "volume": np.array([1], dtype="int32"),
-        })
+def _held_iloc_float(df: pd.DataFrame) -> None:
+    df.iloc[0, 3] = -1.0
+
+
+def _held_iloc_int(df: pd.DataFrame) -> None:
+    df.iloc[0, 1] = 7
+
+
+def _held_iloc_date(df: pd.DataFrame) -> None:
+    df.iloc[0, 0] = pd.Timestamp("1999-01-01")
+
+
+def _held_at(df: pd.DataFrame) -> None:
+    df.at[0, "close"] = -1.0
+
+
+def _held_update(df: pd.DataFrame) -> None:
+    df.update(pd.DataFrame({"close": [5.0]}))
+
+
+def _held_fillna_inplace(df: pd.DataFrame) -> None:
+    df.fillna(0, inplace=True)
+
+
+def _held_loc_augmented(df: pd.DataFrame) -> None:
+    df.loc[0:5, "close"] += 1
+
+
+HELD_WRITES: list[Callable[[pd.DataFrame], None]] = [
+    _held_iloc_float, _held_iloc_int, _held_iloc_date, _held_at, _held_update,
+    _held_fillna_inplace, _held_loc_augmented,
+]
+
+
+@pytest.mark.parametrize("op", HELD_WRITES, ids=lambda f: f.__name__)
+def test_held_view_cannot_be_written_in_place_after_next_append(
+    op: Callable[[pd.DataFrame], None], feed: CsvBarFeed
+) -> None:
+    warmup = feed.warmup("AAPL")
+    bars = synthetic_bars(2)
     store, reference = BarStore(warmup), ConcatReference(warmup)
+    store.append(bars[0])
+    reference.append(bars[0])
+    held = store.view()
+    held_before = held.copy(deep=True)
+    store.append(bars[1])  # the store drops its cached frame: `held` is now the only reference
+    reference.append(bars[1])
+    gc.collect()
+    raw_before = {name: buffer.tobytes() for name, buffer in store._buffers.items()}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(READONLY_ERRORS):
+            op(held)
+    # the failed write changed nothing: not a partial write into the shared buffers ...
+    assert {name: buffer.tobytes() for name, buffer in store._buffers.items()} == raw_before
+    # ... not the held frame, and not what the store hands out next
+    assert_identical(held, held_before)
+    assert_identical(store.view(), reference.view())
+
+
+@pytest.mark.parametrize("op", HELD_WRITES, ids=lambda f: f.__name__)
+def test_copy_of_held_view_is_freely_writable(op: Callable[[pd.DataFrame], None], feed: CsvBarFeed) -> None:
+    warmup = feed.warmup("AAPL")
+    bars = synthetic_bars(3)
+    store, reference = BarStore(warmup), ConcatReference(warmup)
+    store.append(bars[0])
+    reference.append(bars[0])
+    held = store.view()
+    held_before = held.copy(deep=True)
+    store.append(bars[1])
+    reference.append(bars[1])
+    gc.collect()
+    mine = held.copy()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        op(mine)  # must not raise
+    assert_identical(held, held_before)
+    assert_identical(store.view(), reference.view())
+    store.append(bars[2])
+    reference.append(bars[2])
+    assert_identical(store.view(), reference.view())
+    assert_identical(held, held_before)
+
+
+# --- append validates the whole bar first ---
+
+GOOD = Bar(pd.Timestamp("2032-01-03 09:30:00").as_unit("us"), 1_960_000_000, 1.5, 2.5, 0.5, 2.0, 100)
+
+BAD_FIELDS: list[tuple[str, object]] = [
+    ("date", "2032-01-03 09:30:00"),
+    ("date", None),
+    ("date", 1_960_000_000),
+    ("date", pd.NaT),
+    ("date", np.datetime64("NaT", "us")),
+    ("date", pd.Timestamp("2032-01-03 09:30:00", tz="UTC")),
+    ("date", datetime.datetime(2032, 1, 3, 9, 30, tzinfo=datetime.UTC)),
+    ("date", pd.Timestamp("2032-01-03 09:30:00.000000001")),  # nanosecond digits into a us buffer
+    ("time", 1.5),
+    ("time", 1_960_000_000.0),
+    ("time", float("nan")),
+    ("time", None),
+    ("time", "5"),
+    ("time", True),
+    ("time", np.float64(1.0)),
+    ("time", 2**63),
+    ("volume", 1.5),
+    ("volume", 100.0),
+    ("volume", float("nan")),
+    ("volume", None),
+    ("volume", "5"),
+    ("volume", False),
+    ("volume", -(2**63) - 1),
+    *[
+        (price, bad)
+        for price in ("open", "high", "low", "close")
+        for bad in (float("nan"), float("inf"), float("-inf"), np.float64("nan"), None, "1.0", True)
+    ],
+]
+
+
+@pytest.mark.parametrize(("field", "value"), BAD_FIELDS, ids=lambda v: repr(v)[:30])
+def test_append_rejects_bad_bar_and_leaves_store_untouched(
+    field: str, value: object, feed: CsvBarFeed
+) -> None:
+    warmup = feed.warmup("AAPL")
+    # capacity == length: the store is full, so a rejected bar must not even trigger a growth
+    store, reference = BarStore(warmup, _initial_capacity=len(warmup)), ConcatReference(warmup)
+    store.append(GOOD)
+    reference.append(GOOD)
+    store.view()  # build the cached frame
+    frame_before = store._frame
+    raw_before = {name: buffer.tobytes() for name, buffer in store._buffers.items()}
+    dtypes_before = {name: buffer.dtype for name, buffer in store._buffers.items()}
+    growths_before = store._growths
+    with pytest.raises((TypeError, ValueError), match=field):
+        store.append(dataclasses.replace(GOOD, **{field: value}))
+    assert len(store) == len(reference)
+    assert store._frame is frame_before
+    assert store._growths == growths_before
+    assert {name: buffer.dtype for name, buffer in store._buffers.items()} == dtypes_before
+    assert {name: buffer.tobytes() for name, buffer in store._buffers.items()} == raw_before
+    assert_identical(store.view(), reference.view())
+    follow_up = dataclasses.replace(GOOD, time=GOOD.time + 60)
+    store.append(follow_up)
+    reference.append(follow_up)
+    assert_identical(store.view(), reference.view())
+
+
+ACCEPTED_BARS = {
+    "timestamp": GOOD,
+    "datetime": dataclasses.replace(GOOD, date=datetime.datetime(2032, 1, 3, 9, 30)),
+    "datetime64_us": dataclasses.replace(GOOD, date=np.datetime64("2032-01-03T09:30:00", "us")),
+    "datetime64_s": dataclasses.replace(GOOD, date=np.datetime64("2032-01-03T09:30:00")),
+    "timestamp_s": dataclasses.replace(GOOD, date=pd.Timestamp("2032-01-03 09:30:00").as_unit("s")),
+    "timestamp_ms": dataclasses.replace(GOOD, date=pd.Timestamp("2032-01-03 09:30:00").as_unit("ms")),
+    "timestamp_ns_lossless": dataclasses.replace(
+        GOOD, date=pd.Timestamp("2032-01-03 09:30:00").as_unit("ns")
+    ),
+    "numpy_ints": dataclasses.replace(GOOD, time=np.int64(GOOD.time), volume=np.int32(100)),
+    "numpy_floats": dataclasses.replace(
+        GOOD, open=np.float64(1.5), high=np.float32(2.5), low=np.float64(0.5), close=np.float32(2.0)
+    ),
+    "int_prices": dataclasses.replace(GOOD, open=1, high=3, low=0, close=2),
+}
+
+
+@pytest.mark.parametrize("name", list(ACCEPTED_BARS))
+def test_append_accepts_equivalent_representations(name: str, feed: CsvBarFeed) -> None:
+    bar = ACCEPTED_BARS[name]
+    plain = Bar(
+        pd.Timestamp("2032-01-03 09:30:00").as_unit("us"), int(bar.time), float(bar.open), float(bar.high),
+        float(bar.low), float(bar.close), int(bar.volume),
+    )
+    store, reference = BarStore(feed.warmup("AAPL")), ConcatReference(feed.warmup("AAPL"))
+    store.append(bar)
+    reference.append(plain)
+    assert_identical(store.view(), reference.view())
+    assert list(store.view().dtypes.astype(str)) == EXPECTED_DTYPES
+
+
+def test_ns_bar_with_sub_microsecond_digits_is_rejected_and_us_bar_still_fine(feed: CsvBarFeed) -> None:
+    store = BarStore(feed.warmup("AAPL"))
+    lossy = dataclasses.replace(GOOD, date=pd.Timestamp("2032-01-03 09:30:00.000000500"))
+    with pytest.raises(ValueError, match="date"):
+        store.append(lossy)
+    assert len(store) == 390
+    store.append(GOOD)
+    assert len(store) == 391
+
+
+def test_date_buffer_keeps_the_warmup_unit(feed: CsvBarFeed) -> None:
+    warmup = feed.warmup("AAPL")
+    warmup["date"] = warmup["date"].astype("datetime64[ns]")
+    store = BarStore(warmup)
+    store.append(GOOD)  # a coarser (us) bar is converted to the buffer's ns unit
+    assert store.view()["date"].dtype == np.dtype("datetime64[ns]")
+    assert store.view()["date"].iloc[-1] == GOOD.date
+    too_late = dataclasses.replace(GOOD, date=pd.Timestamp("2300-01-01").as_unit("s"))  # outside ns range
+    with pytest.raises(ValueError, match="date"):
+        store.append(too_late)
+    assert len(store) == 391
+
+
+# --- warm-ups that are not feed-shaped fall back to concat, loudly ---
+
+
+def _int32_volume() -> pd.DataFrame:
+    return pd.DataFrame({
+        "date": pd.to_datetime(["2029-12-31 09:30"]).as_unit("us"), "time": [1],
+        "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+        "volume": np.array([1], dtype="int32"),
+    })
+
+
+def _float_volume() -> pd.DataFrame:
+    frame = _int32_volume()
+    frame["volume"] = frame["volume"].astype("float64")
+    return frame
+
+
+def _named_index() -> pd.DataFrame:
+    frame = _int32_volume().astype({"volume": "int64"})
+    frame.index.name = "row"
+    return frame
+
+
+def _named_columns() -> pd.DataFrame:
+    frame = _int32_volume().astype({"volume": "int64"})
+    frame.columns.name = "fields"
+    return frame
+
+
+def _no_duplicate_labels() -> pd.DataFrame:
+    frame = _int32_volume().astype({"volume": "int64"})
+    frame.flags.allows_duplicate_labels = False
+    return frame
+
+
+def _shifted_index() -> pd.DataFrame:
+    frame = _int32_volume().astype({"volume": "int64"})
+    frame.index = pd.RangeIndex(5, 6)
+    return frame
+
+
+FALLBACK_CASES: dict[str, tuple[Callable[[], pd.DataFrame], str]] = {
+    "untyped_empty": (lambda: pd.DataFrame(columns=list(COLUMNS)), "column 'date' has dtype object"),
+    "extra_column": (lambda: pd.DataFrame({**{c: [] for c in COLUMNS}, "x": []}), "columns are"),
+    "int32_volume": (_int32_volume, "column 'volume' has dtype int32"),
+    "float_volume": (_float_volume, "column 'volume' has dtype float64"),
+    "named_index": (_named_index, "named 'row'"),
+    "named_columns": (_named_columns, "named 'fields'"),
+    "no_duplicate_labels": (_no_duplicate_labels, "duplicate labels"),
+    "shifted_index": (_shifted_index, "index"),
+}
+
+
+@pytest.mark.parametrize("kind", list(FALLBACK_CASES))
+def test_non_feed_shaped_warmup_keeps_concat_behaviour_and_warns(
+    kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    make, reason = FALLBACK_CASES[kind]
+    warmup = make()
+    with caplog.at_level(logging.WARNING, logger="MainStoinker.engine.bars"):
+        store = BarStore(warmup)
+    warnings_logged = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_logged) == 1
+    assert reason in warnings_logged[0].getMessage()
+    reference = ConcatReference(warmup)
     assert_frame_equal(store.view(), reference.view(), check_dtype=True, check_exact=True)
     for bar in synthetic_bars(3):
         store.append(bar)
         reference.append(bar)
         assert_frame_equal(store.view(), reference.view(), check_dtype=True, check_exact=True)
         assert len(store) == len(reference)
+
+
+def test_feed_shaped_warmup_does_not_warn(feed: CsvBarFeed, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="MainStoinker.engine.bars"):
+        BarStore(feed.warmup("AAPL"))
+    assert not caplog.records
