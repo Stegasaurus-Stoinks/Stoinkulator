@@ -822,3 +822,97 @@ def test_help_mentions_the_mode_key_and_the_stale_ledger_rule(capsys):
     assert '"mode": "backtest" (default) or "paper"' in text
     assert "not available yet" in text
     assert "deletes a ledger.json left in --out" in text
+
+
+# ---- B7 review carry-over: write order, mode key spelling, duplicate keys --------------
+
+
+@pytest.mark.parametrize("fills", ["legacy", "realistic"])
+def test_stale_ledger_removed_before_trades_json_is_written(env, monkeypatch, fills):
+    env.setup(ema_config(), ["AAPL"], rows=300)
+    assert env.run("--fills", "realistic") == 0
+    stale = (env.out / "ledger.json").read_bytes()
+    seen: list[tuple[str, bool]] = []
+    real = cli.write_json_atomic
+
+    def spy(path, payload):
+        seen.append((path.name, (env.out / "ledger.json").exists()))
+        return real(path, payload)
+
+    monkeypatch.setattr(cli, "write_json_atomic", spy)
+    assert env.run("--fills", fills) == 0
+    # trades.json is written with no ledger.json beside it; a ledger.json comes last
+    assert seen[0] == ("trades.json", False)
+    assert [name for name, _ in seen] == (
+        ["trades.json"] if fills == "legacy" else ["trades.json", "ledger.json"])
+    assert (env.out / "ledger.json").exists() == (fills == "realistic")
+    if fills == "realistic":
+        assert (env.out / "ledger.json").read_bytes() == stale  # same data, rewritten
+
+
+@pytest.mark.parametrize("fills", ["legacy", "realistic"])
+def test_failed_write_never_leaves_a_ledger_from_another_run(env, monkeypatch, fills):
+    env.setup(ema_config(), ["AAPL"], rows=300)
+    assert env.run("--fills", "realistic") == 0
+    old_trades = env.trades_bytes()
+
+    def refuse(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "write_json_atomic", refuse)
+    with pytest.raises(OSError, match="disk full"):
+        env.run("--fills", fills)
+    assert not (env.out / "ledger.json").exists()
+    assert env.trades_bytes() == old_trades  # the old trades.json is untouched, not half-written
+
+
+@pytest.mark.parametrize("key", [" mode", "mode ", "\tMODE\n", " Mode ", "mode "])
+def test_mode_key_with_whitespace_is_an_error(env, capsys, key):
+    config = [{"ID": "EMACrossing", "data": [{**EMA, key: "live"}]}]
+    with pytest.raises(CliError, match="must be spelled"):
+        validate_algo_config(config)
+    env.setup(config, ["AAPL"], rows=50)
+    assert env.run() == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and len(err.strip().splitlines()) == 1
+    assert not env.out.exists()
+
+
+def test_exact_mode_key_and_unrelated_keys_still_accepted():
+    config = [{"ID": "EMACrossing", "data": [{**EMA, "mode": "paper", "modes": 1, "model": 2}]}]
+    assert validate_algo_config(config)[0]["data"][0]["mode"] == "paper"
+
+
+DUPLICATES = {
+    "mode_in_a_config": (
+        '[{"ID": "EMACrossing", "data": [{"idname": "AAPL-10/30EMA", "ticker": "AAPL", '
+        '"mode": "live", "mode": "paper"}]}]', "'mode'"),
+    "id_in_an_entry": (
+        '[{"ID": "EMACrossing", "ID": "FVG", "data": []}]', "'ID'"),
+    "key_in_a_nested_object": (
+        '[{"ID": "EMACrossing", "data": [{"idname": "a", "ticker": "AAPL", '
+        '"opts": {"x": 1, "x": 2}}]}]', "'x'"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(DUPLICATES))
+def test_duplicate_json_keys_in_the_config_are_an_error(env, capsys, case):
+    text, key = DUPLICATES[case]
+    env.setup(ema_config(), ["AAPL"], rows=50)
+    env.algos.write_text(text, encoding="utf-8")
+    assert env.run() == 2
+    captured = capsys.readouterr()
+    assert captured.err == f"error: duplicate key {key} in the algo config\n"
+    assert captured.out == "" and not env.out.exists()
+
+
+def test_duplicate_json_keys_message_is_ascii_safe(env, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=50)
+    env.algos.write_text('[{"ID": "E", "data": [], "\\u2603": 1, "\\u2603": 2}]', encoding="utf-8")
+    assert env.run() == 2
+    assert capsys.readouterr().err == "error: duplicate key '\\u2603' in the algo config\n"
+
+
+def test_distinct_keys_and_repeated_values_are_fine(env):
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=300)
+    assert env.run() == 0
