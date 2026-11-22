@@ -456,6 +456,7 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # 2: indicator series (tables only; nothing existing is altered)
     (
         """CREATE TABLE algo_series (
+            id INTEGER PRIMARY KEY,
             run_id INTEGER NOT NULL,
             algo TEXT NOT NULL,
             name TEXT NOT NULL,
@@ -464,13 +465,10 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             UNIQUE (run_id, algo, name),
             FOREIGN KEY (run_id, algo) REFERENCES algos(run_id, idname) ON DELETE CASCADE)""",
         """CREATE TABLE algo_series_points (
-            run_id INTEGER NOT NULL,
-            algo TEXT NOT NULL,
-            name TEXT NOT NULL,
+            series_id INTEGER NOT NULL REFERENCES algo_series(id) ON DELETE CASCADE,
             time TEXT NOT NULL,
             value REAL NOT NULL,
-            FOREIGN KEY (run_id, algo) REFERENCES algos(run_id, idname) ON DELETE CASCADE)""",
-        "CREATE INDEX idx_series_points ON algo_series_points (run_id, algo, name, time)",
+            PRIMARY KEY (series_id, time)) WITHOUT ROWID""",
     ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -501,6 +499,8 @@ def _from_e4(value: int) -> Decimal:
 
 
 def _finite(value: Any) -> float:
+    if isinstance(value, (bool, str, bytes)) or type(value).__name__ in ("bool", "bool_"):
+        raise StoreError(f"series value {value!r} is not a number")
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -508,6 +508,44 @@ def _finite(value: Any) -> float:
     if not math.isfinite(number):
         raise StoreError(f"series value {value!r} is not finite")
     return number
+
+
+def _text(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise StoreError(f"{what} {value!r} must be a non-empty string")
+    return value
+
+
+def _series_time(value: Any) -> str:
+    """Text of a series point time: a naive `datetime` that is not NaT.
+
+    `pd.NaT` is a `datetime` subclass that is unequal to itself and has no real
+    ISO text; it is refused here without importing pandas.
+    """
+    if not isinstance(value, datetime) or value != value:
+        raise StoreError(f"series time {value!r} must be a datetime (not NaT)")
+    if value.tzinfo is not None:
+        raise StoreError(f"series time {value!r} must be naive (data time)")
+    return value.isoformat()
+
+
+def _series_position(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or abs(value) > _INT64_MAX:
+        raise StoreError(f"series position {value!r} must be a 64-bit integer")
+    return value
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _data_file(entry: Any) -> list[Any]:
+    ok = (isinstance(entry, (tuple, list)) and len(entry) == 3
+          and isinstance(entry[0], str) and isinstance(entry[1], str)
+          and _SHA256.fullmatch(entry[1]) is not None
+          and isinstance(entry[2], int) and not isinstance(entry[2], bool) and entry[2] >= 0)
+    if not ok:
+        raise StoreError(f"data file {entry!r} must be (symbol, sha256 hex, size >= 0)")
+    return list(entry)
 
 
 def _opt_from_e4(value: int | None) -> Decimal | None:
@@ -550,11 +588,14 @@ def _dumps(value: Any, what: str) -> str:
 
 
 def _dt(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise StoreError(f"stored time {value!r} cannot be read") from exc
 
 
 def _opt_dt(value: str | None) -> datetime | None:
-    return None if value is None else datetime.fromisoformat(value)
+    return None if value is None else _dt(value)
 
 
 @dataclass
@@ -761,7 +802,7 @@ class SqliteStore:
             "symbols": list(data.symbols),
             "first_bar": None if data.first_bar is None else data.first_bar.isoformat(),
             "last_bar": None if data.last_bar is None else data.last_bar.isoformat(),
-            "files": [[symbol, sha, size] for symbol, sha, size in data.files],
+            "files": [_data_file(entry) for entry in data.files],
         }, "data")
         config_json = _dumps(dict(meta.config), "config")
         with self._tx() as conn:
@@ -903,11 +944,14 @@ class SqliteStore:
         but must belong to a declared series. Every value must be a finite
         number; NaN and infinity are refused and nothing is written.
         """
-        info_rows = [(run_id, i.account, i.name, i.draw_type, int(i.position)) for i in infos]
-        point_rows: list[tuple[Any, ...]] = []
+        info_rows = [
+            (run_id, _text(i.account, "series account"), _text(i.name, "series name"),
+             _text(i.draw_type, "series draw_type"), _series_position(i.position))
+            for i in infos]
+        point_rows: list[tuple[str, str, str, float]] = []
         for p in points:
-            value = _finite(p.value)
-            point_rows.append((run_id, p.account, p.name, p.time.isoformat(), value))
+            point_rows.append((_text(p.account, "series account"), _text(p.name, "series name"),
+                               _series_time(p.time), _finite(p.value)))
         with self._tx() as conn:
             if self._schema_version < 2:
                 raise StoreError("this database has no series tables (schema version 1)")
@@ -915,14 +959,19 @@ class SqliteStore:
             conn.executemany(
                 "INSERT INTO algo_series (run_id, algo, name, draw_type, position)"
                 " VALUES (?,?,?,?,?)", info_rows)
-            known = {(a, n) for a, n in conn.execute(
-                "SELECT algo, name FROM algo_series WHERE run_id=?", (run_id,))}
-            for _, algo, name, _, _ in point_rows:
-                if (algo, name) not in known:
+            ids = {(a, n): i for i, a, n in conn.execute(
+                "SELECT id, algo, name FROM algo_series WHERE run_id=?", (run_id,))}
+            rows = []
+            for algo, name, time_text, value in point_rows:
+                if (algo, name) not in ids:
                     raise StoreError(f"series {name!r} of {algo!r} was not declared")
-            conn.executemany(
-                "INSERT INTO algo_series_points (run_id, algo, name, time, value)"
-                " VALUES (?,?,?,?,?)", point_rows)
+                rows.append((ids[(algo, name)], time_text, value))
+            try:
+                conn.executemany(
+                    "INSERT INTO algo_series_points (series_id, time, value) VALUES (?,?,?)",
+                    rows)
+            except sqlite3.IntegrityError as exc:
+                raise StoreError(f"a series point is already stored for that time: {exc}") from exc
 
     @staticmethod
     def _require_run(conn: sqlite3.Connection, run_id: int, *, running: bool = False) -> None:
@@ -950,21 +999,26 @@ class SqliteStore:
         tables are not queried.
         """
         conn = self._db()
-        sql = "SELECT name, time, value FROM algo_series_points WHERE run_id=? AND algo=?"
-        args: list[Any] = [run_id, algo]
+        sql = "SELECT time, value FROM algo_series_points WHERE series_id=?"
+        bounds: list[str] = []
         if start is not None:
             sql += " AND time >= ?"
-            args.append(start.isoformat())
+            bounds.append(start.isoformat())
         if end is not None:
             sql += " AND time <= ?"
-            args.append(end.isoformat())
-        sql += " ORDER BY name, time, rowid"
+            bounds.append(end.isoformat())
+        sql += " ORDER BY time"
         try:
             self._require_run(conn, run_id)
             if self._schema_version < 2:
                 return ()
-            return tuple(SeriesPoint(algo, r[0], _dt(r[1]), r[2])
-                         for r in conn.execute(sql, args))
+            out: list[SeriesPoint] = []
+            for series_id, name in conn.execute(
+                    "SELECT id, name FROM algo_series WHERE run_id=? AND algo=? ORDER BY name",
+                    (run_id, algo)).fetchall():
+                out.extend(SeriesPoint(algo, name, _dt(t), v)
+                           for t, v in conn.execute(sql, (series_id, *bounds)))
+            return tuple(out)
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
 
@@ -1035,7 +1089,7 @@ class SqliteStore:
                 SeriesInfo(r[0], r[1], r[2], r[3])
                 for r in conn.execute(
                     "SELECT algo, name, draw_type, position FROM algo_series WHERE run_id=?"
-                    " ORDER BY position, rowid", (run_id,)))
+                    " ORDER BY position, id", (run_id,)))
         return RunData(self._summary(row[:8]), json.loads(row[8]), algos, orders, fills, trips,
                        equity, ignored, series)
 
