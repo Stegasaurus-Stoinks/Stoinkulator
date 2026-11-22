@@ -41,6 +41,8 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\ruff.exe check .                      # legacy defect set
 .venv\Scripts\ruff.exe check tests MainStoinker/engine MainStoinker/__main__.py --select E,F,W,I,B   # new-code set
 .venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS.json --data OfflineData --out OUTDIR   # offline backtest -> OUTDIR/trades.json
+.venv\Scripts\python.exe -m MainStoinker runs --db DB [--json]              # list the runs stored by `backtest --db` (read-only)
+.venv\Scripts\python.exe -m MainStoinker report RUN --db DB [--json]        # per-algo and total statistics of one stored run
 ```
 
 ## Layout

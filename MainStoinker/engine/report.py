@@ -37,7 +37,9 @@ def ledger_document(
     accounts: dict[str, Any] = {}
     total_capital = Decimal("0.0000")
     for idname in idnames:
-        info = next(a for a in ledger.accounts if a.idname == idname)
+        info = next((a for a in ledger.accounts if a.idname == idname), None)
+        if info is None:
+            raise ValueError(f"unknown idname {idname!r}: the ledger has no such account")
         total_capital += info.capital
         trips = [t for t in ledger.round_trips if t.account == idname]
         accounts[idname] = {

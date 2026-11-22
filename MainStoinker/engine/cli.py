@@ -1,6 +1,12 @@
 """Command line: run an offline backtest and write the trades to a file.
 
     python -m MainStoinker backtest --algos ALGOS.json --data DIR --out DIR
+    python -m MainStoinker runs --db SPEC [--json]
+    python -m MainStoinker report RUN --db SPEC [--json]
+
+`runs` and `report` only read a stored database (see `cli_report`): they need
+no algos or data, never create a database, and exit 2 with one line on any
+problem (no `--db`, no such file, unknown run, a database that cannot be read).
 
 This is a backtest-only tool. It builds a `CsvBarFeed`, one simulated broker
 per algo (a `SimBroker`, or with `--fills realistic` a `PaperBroker` reporting
@@ -112,6 +118,7 @@ from pathlib import Path
 from typing import Any
 
 from .algos import close_algo_logs, load_algo
+from .cli_report import ReportError, run_report_command, run_runs_command
 from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
 from .feed import CsvBarFeed
@@ -363,6 +370,31 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument(
         "--quiet", action="store_true", help="discard the algos' stdout prints during the run"
     )
+    epilog = ("exit codes: 0 success; 2 bad argument, unknown run, or a database that does not "
+              "exist or cannot be read. Only reads; never creates a database.")
+    runs = sub.add_parser(
+        "runs",
+        help="list the runs stored in a database",
+        description=("List the stored runs, oldest first (times are UTC; a run still marked "
+                     "running shows as incomplete)."),
+        epilog=epilog,
+    )
+    runs.add_argument("--db", default=None, metavar="SPEC",
+                      help="the database file (or sqlite:///path); it must exist")
+    runs.add_argument("--json", action="store_true", help="machine-readable output")
+    rep = sub.add_parser(
+        "report",
+        help="print the statistics of one stored run",
+        description=("Print one stored run: per algo and for the whole account the trades, "
+                     "wins, win rate, net, commission, average win and loss, largest drawdown "
+                     "and final equity."),
+        epilog=epilog,
+    )
+    rep.add_argument("run", metavar="RUN", help="the run id (see `runs`)")
+    rep.add_argument("--db", default=None, metavar="SPEC",
+                     help="the database file (or sqlite:///path); it must exist")
+    rep.add_argument("--json", action="store_true",
+                     help="machine-readable output (money as 4-decimal strings)")
     return parser
 
 
@@ -750,7 +782,11 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     try:
         if args.command == "backtest":
             return run_backtest_command(args, env=env)
-    except CliError as exc:
+        if args.command == "runs":
+            return run_runs_command(args.db, as_json=args.json, env=env)
+        if args.command == "report":
+            return run_report_command(args.db, args.run, as_json=args.json, env=env)
+    except (CliError, ReportError) as exc:
         _report("error: " + str(exc))
         return 2
     except RunStoreError as exc:
