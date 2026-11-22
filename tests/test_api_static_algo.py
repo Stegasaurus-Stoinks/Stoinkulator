@@ -138,8 +138,8 @@ def test_candle_pure_helpers_with_node(node_workdir: Path) -> None:
                                 "size": 1, "id": "1:entry", "text": ""}  # a long enters on an up arrow below
     assert by_id["2:entry"]["position"] == "aboveBar" and by_id["2:entry"]["shape"] == "arrowDown"  # a short
     assert by_id["1:exit"]["shape"] == "circle" and by_id["1:exit"]["color"] == "#00ff00"  # a win
-    assert by_id["1:exit"]["text"] == "target" and by_id["1:exit"]["position"] == "aboveBar"
-    assert by_id["2:exit"]["color"] == "#ff0000" and by_id["2:exit"]["text"] == "stop"  # a loss
+    assert by_id["1:exit"]["text"] == "+ target" and by_id["1:exit"]["position"] == "aboveBar"
+    assert by_id["2:exit"]["color"] == "#ff0000" and by_id["2:exit"]["text"] == "- stop"  # a loss
     assert by_id["2:exit"]["position"] == "belowBar"
     assert by_id["3:exit"]["color"] == "#888888" and by_id["3:exit"]["text"] == "end"  # break even
     # trade 3 entered the day before: only its exit is on this chart; trade 4 is another day: nothing
@@ -147,7 +147,7 @@ def test_candle_pure_helpers_with_node(node_workdir: Path) -> None:
     # the selected trade is larger and numbered; the others are fainter
     picked = {m["id"]: m for m in out["picked"]}
     assert picked["2:entry"]["size"] == 2 and picked["2:entry"]["text"] == "#2"
-    assert picked["2:exit"]["size"] == 2 and picked["2:exit"]["text"] == "#2 stop"
+    assert picked["2:exit"]["size"] == 2 and picked["2:exit"]["text"] == "#2 - stop"
     assert picked["2:exit"]["color"] == "#ff0000" and picked["2:entry"]["color"] == "#0000ff"
     assert picked["1:entry"]["size"] == 1 and picked["1:entry"]["color"] == "rgba(0, 0, 255, 0.55)"
     assert picked["1:exit"]["color"] == "rgba(0, 255, 0, 0.55)"
@@ -459,7 +459,7 @@ const links = find(container, (c) => c.tag === "A").map((a) => a.getAttribute("h
 const dayLabel = () => byClass(container, "day-label")[0].textContent;
 const dayButtons = () => find(byClass(container, "day-control")[0], (c) => c.tag === "BUTTON");
 const out = { firstQueries, hasRun, heading, links, label0: dayLabel(),
-  prevDisabled0: dayButtons()[0].disabled, nextDisabled0: dayButtons()[1].disabled, rowButtons: rowButtons(container).length };
+  prevDisabled0: dayButtons()[0].getAttribute("aria-disabled"), nextDisabled0: dayButtons()[1].getAttribute("aria-disabled"), rowButtons: rowButtons(container).length };
 
 // the first bars request is still pending: select trade 2, which was made on another day
 rowButtons(container)[1].fire("click");
@@ -488,12 +488,18 @@ out.sameDay = { bars: barsRequests().length === countBefore, refocused: candle.v
   markers: markerApis[0].log.at(-1).map((m) => [m.id, m.size]) };
 
 // the day control: the first day of the run cannot go back; next loads the next day
-const before = dayButtons()[0].disabled;
+const before = dayButtons()[0].getAttribute("aria-disabled");
+dayButtons()[0].fire("click"); // ignored: no request
+const ignored = barsRequests().length;
 dayButtons()[1].fire("click");
-out.next = { prevWasDisabled: before, bars: barsRequests().length, query: barsRequests().at(-1).query, label: dayLabel() };
+// next first asks for up to 7 calendar days after the shown day (inside the run's range), then shows the day found
+out.search = { bars: barsRequests().length, query: barsRequests().at(-1).query, label: dayLabel() };
 barsRequests().at(-1).answer(barsFor("2024-01-03"));
 await tick();
-out.afterNext = { prevDisabled: dayButtons()[0].disabled, markerIds: markerApis[0].log.at(-1).map((m) => m.id) };
+out.next = { prevWasDisabled: before, ignored, bars: barsRequests().length, query: barsRequests().at(-1).query, label: dayLabel() };
+barsRequests().at(-1).answer(barsFor("2024-01-03"));
+await tick();
+out.afterNext = { prevDisabled: dayButtons()[0].getAttribute("aria-disabled"), markerIds: markerApis[0].log.at(-1).map((m) => m.id) };
 
 // the navigation ends: both charts are removed and a queued scheme change reaches nothing
 const stale = schemeListeners.slice();
@@ -515,7 +521,7 @@ console.log(JSON.stringify(out));
     assert out["heading"] == "EMA/1, run 1"
     assert out["links"] == ["#/run/1", "#/"]
     assert out["label0"] == f"{day1} (data time)"
-    assert out["prevDisabled0"] is True and out["nextDisabled0"] is False  # the run starts on that day
+    assert out["prevDisabled0"] == "true" and out["nextDisabled0"] == "false"  # the run starts on that day
     assert out["rowButtons"] == 2
     after = out["afterSelect"]
     assert after["bars"] == 2 and after["firstAborted"] is True  # exactly one new request; the older one aborted
@@ -527,16 +533,18 @@ console.log(JSON.stringify(out));
     assert loaded["barsRequests"] == 2 and loaded["series"] == 3
     # only trade 2 is on this day: its markers are the selected, numbered ones
     assert loaded["markers"] == [["2:entry", 2, "#2", "arrowDown", "aboveBar"],
-                                 ["2:exit", 2, "#2 stop", "circle", "belowBar"]]
+                                 ["2:exit", 2, "#2 - stop", "circle", "belowBar"]]
     assert loaded["focus"] == [{"from": seconds(f"{day3} 09:30:00"), "to": seconds(f"{day3} 09:32:00")}]
     assert out["toDayOne"]["bars"] == 3
     assert out["toDayOne"]["query"]["start"] == f"{day1} 00:00:00"
     assert out["sameDay"]["bars"] is True and out["sameDay"]["refocused"] is True  # no request on the same day
     assert out["sameDay"]["markers"] == [["1:entry", 2], ["1:exit", 2]]
-    assert out["next"] == {"prevWasDisabled": True, "bars": 4,
+    assert out["search"] == {"bars": 4, "label": f"{day1} (data time)",
+                             "query": {"symbol": "AAPL", "start": f"{day3} 00:00:00", "end": "2024-01-05 23:59:59"}}
+    assert out["next"] == {"prevWasDisabled": "true", "ignored": 3, "bars": 5,
                            "query": {"symbol": "AAPL", "start": f"{day3} 00:00:00", "end": f"{day3} 23:59:59"},
                            "label": f"{day3} (data time)"}
-    assert out["afterNext"]["prevDisabled"] is False
+    assert out["afterNext"]["prevDisabled"] == "false"
     assert out["afterNext"]["markerIds"] == ["2:entry", "2:exit"]  # trade 1 is not on this day
     end = out["end"]
     assert end["removed"] == [1, 1] and end["listenersAfter"] == 0
@@ -651,3 +659,281 @@ console.log(JSON.stringify(result));
     assert any("This run failed" in w for w in parts["warning"]) and parts["badge"] == ["badge failed:failed"]
     assert any("incomplete" in w for w in out["incomplete"]["warning"])
     assert out["incomplete"]["badge"] == ["incomplete"]
+
+
+# --- D15 review fixes: selection off the shown day, trades over days, day stepping, focus, signs, refit ---
+
+
+def test_selection_on_another_day_fades_nothing_and_spans_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "candles_selection", """
+import { buildMarkers, convertBars, focusSpanRange, resultSign } from "./js/charts/candles.js";
+import { buildTradeRows, exitNote, nearestBarDay, stepWindow } from "./js/views/algo.js";
+const bars = ["09:30", "09:31", "09:32", "09:33"].map((m) => ({ time: "2024-01-02 " + m + ":00", open: 1, high: 2, low: 1, close: 1 }));
+const times = convertBars(bars).map((b) => b.time);
+const trades = [
+  { key: 1, number: 1, side: "long", entry_time: "2024-01-02 09:31:00", exit_time: "2024-01-02 09:32:00", net: "2.0000", exit_reason: "stop" },
+  { key: 2, number: 2, side: "long", entry_time: "2024-01-03 09:31:00", exit_time: "2024-01-03 09:35:00", net: "-1.0000", exit_reason: "target" },
+  { key: 3, number: 3, side: "short", entry_time: "2024-01-02 09:33:00", exit_time: "2024-01-04 09:31:00", net: "0.0000", exit_reason: "algo_exit" },
+];
+const theme = { accent: "#0000ff", pos: "#00ff00", neg: "#ff0000", muted: "#888888", text: "#000000" };
+const summarize = (list) => list.map((m) => [m.id, m.size, m.color, m.text]);
+const rows = buildTradeRows(trades);
+console.log(JSON.stringify({
+  plain: summarize(buildMarkers(trades, times, null, theme)),
+  elsewhere: summarize(buildMarkers(trades, times, 2, theme)), // selected trade is not on this day
+  overnight: summarize(buildMarkers(trades, times, 3, theme)), // entry here, exit on another day
+  signs: [resultSign("1.5"), resultSign("-0.0001"), resultSign("0.0000"), resultSign(null), resultSign("x")],
+  span: [focusSpanRange(times, times[1], times[2]), focusSpanRange(times, times[2], times[1]), focusSpanRange([], 1, 2),
+    focusSpanRange(times, "a", 2), focusSpanRange(times, times[0] - 99999, times[0] - 99000)],
+  exits: [exitNote(rows[2], "2024-01-02"), exitNote(rows[2], "2024-01-04"), exitNote(rows[0], "2024-01-02"), exitNote(null, "2024-01-02"), exitNote(rows[2], null)],
+  rows: rows.map((r) => [r.entryDay, r.exitDay]),
+  window: [stepWindow("2024-01-05", 1, "2024-01-02", "2024-01-15"), stepWindow("2024-01-05", -1, "2024-01-02", "2024-01-15"),
+    stepWindow("2024-01-09", -1, "2024-01-02", "2024-01-15"), stepWindow("2024-01-15", 1, "2024-01-02", "2024-01-15"),
+    stepWindow("2024-01-02", -1, "2024-01-02", "2024-01-15"), stepWindow("2024-01-14", 1, "2024-01-02", "2024-01-15"),
+    stepWindow("2024-01-05", 1, null, null), stepWindow("bad", 1, null, null)],
+  nearest: [nearestBarDay([{ time: "2024-01-08 09:30:00" }, { time: "2024-01-09 09:30:00" }], 1),
+    nearestBarDay([{ time: "2024-01-08 09:30:00" }, { time: "2024-01-09 09:30:00" }], -1), nearestBarDay([], 1),
+    nearestBarDay([{ time: "x" }, null], 1), nearestBarDay(null, -1)],
+}));
+""")
+    assert isinstance(out, dict)
+    t = [seconds(f"2024-01-02 09:3{i}:00") for i in range(4)]
+    assert [m[0] for m in out["plain"]] == ["1:entry", "1:exit", "3:entry"]
+    # the selection is on another day: nothing is faded, nothing is enlarged
+    assert out["elsewhere"] == [[m[0], 1, m[2], ""] if m[0] != "1:exit" else [m[0], 1, m[2], m[3]] for m in out["plain"]]
+    assert all(not m[2].startswith("rgba") for m in out["elsewhere"])
+    # an overnight trade selected on its entry day: its entry is highlighted, the others fade
+    over = {m[0]: m for m in out["overnight"]}
+    assert over["3:entry"][1] == 2 and over["3:entry"][3] == "#3" and over["1:entry"][2].startswith("rgba")
+    assert [out["plain"][1][3]] == ["+ stop"]
+    assert out["signs"] == ["+", "-", "", "", ""]
+    assert out["span"][0] == {"from": t[0], "to": t[3]}  # the margin is clamped to the bars
+    assert out["span"][1] == out["span"][0] and out["span"][2] is None and out["span"][3] is None and out["span"][4] is None
+    assert out["exits"] == [{"text": "Exits on 2024-01-04.", "day": "2024-01-04"}, None, None, None, None]
+    assert out["rows"] == [["2024-01-02", "2024-01-02"], ["2024-01-03", "2024-01-03"], ["2024-01-02", "2024-01-04"]]
+    # day stepping: at most 7 calendar days (the route's limit), inside the run's bar range
+    w = out["window"]
+    assert w[0] == {"start": "2024-01-06 00:00:00", "end": "2024-01-12 23:59:59"}
+    assert w[1] == {"start": "2024-01-02 00:00:00", "end": "2024-01-04 23:59:59"}
+    assert w[2] == {"start": "2024-01-02 00:00:00", "end": "2024-01-08 23:59:59"}
+    assert w[3] is None and w[4] is None
+    assert w[5] == {"start": "2024-01-15 00:00:00", "end": "2024-01-15 23:59:59"}
+    assert w[6] == {"start": "2024-01-06 00:00:00", "end": "2024-01-12 23:59:59"} and w[7] is None
+    assert out["nearest"] == ["2024-01-08", "2024-01-09", None, None, None]
+
+
+def test_candle_legend_shows_profit_and_loss_in_their_colours_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "candles_legend", FAKE_DOM + FAKE_LIB + """
+const { createCandleChart, MARKER_LEGEND } = await import("./js/charts/candles.js");
+const box = document.createElement("div");
+createCandleChart(box, { ctx: { onCleanup() {} } });
+const items = byClass(box, "marker-key")[0].children.map((li) => [li.children[0].className, li.textContent]);
+console.log(JSON.stringify({ items, n: MARKER_LEGEND.length }));
+""")
+    assert isinstance(out, dict)
+    classes = [item[0] for item in out["items"]]
+    assert classes == ["marker-shape", "marker-shape", "marker-shape pos", "marker-shape neg"]  # real colours, by class
+    assert "+" in out["items"][2][1] and "-" in out["items"][3][1]
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    assert ".marker-shape.pos { color: var(--pos); }" in css and ".marker-shape.neg { color: var(--neg); }" in css
+
+
+def test_the_chart_refits_on_resize_unless_the_user_zoomed_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "candles_refit", FAKE_DOM + FAKE_LIB + """
+const create = LightweightCharts.createChart;
+LightweightCharts.createChart = (el, options) => {
+  const chart = create(el, options);
+  const handlers = [];
+  let width = 800;
+  const scale = chart.timeScale;
+  chart.handlers = handlers;
+  chart.resize = (w) => { width = w; handlers.slice().forEach((f) => f()); };
+  chart.timeScale = () => ({ ...scale(), width: () => width,
+    subscribeSizeChange: (f) => handlers.push(f), unsubscribeSizeChange: (f) => { const i = handlers.indexOf(f); if (i >= 0) handlers.splice(i, 1); } });
+  return chart;
+};
+const { createCandleChart } = await import("./js/charts/candles.js");
+const cleanups = [];
+const box = document.createElement("div");
+const handle = createCandleChart(box, { ctx: { onCleanup: (f) => cleanups.push(f) } });
+const chart = charts[0];
+const canvas = byClass(box, "chart-canvas")[0];
+const bars = ["09:30", "09:31", "09:32"].map((m) => ({ time: "2024-01-02 " + m + ":00", open: 1, high: 2, low: 1, close: 1 }));
+const log = {};
+let w = 800;
+const resize = () => { w += 100; chart.resize(w); return chart.fits; };
+handle.setBars(bars);
+log.fitted = chart.fits;
+log.resized = resize(); // not zoomed: fits again
+chart.resize(w); log.sameWidth = chart.fits; // a height-only change: nothing
+canvas.fire("pointerdown", { buttons: 1, clientX: 0, clientY: 0 });
+canvas.fire("pointermove", { buttons: 1, clientX: 3, clientY: 0 });
+log.smallDrag = resize(); // 3 px is not a zoom: fits again
+canvas.fire("pointermove", { buttons: 1, clientX: 5, clientY: 0 });
+log.bigDrag = resize(); // more than 4 px with a button down: the user moved the chart
+handle.setBars(bars);
+log.refitByBars = chart.fits; // new bars fit again and clear the state
+log.afterBars = resize();
+canvas.fire("pointerup", {});
+canvas.fire("pointermove", { buttons: 0, clientX: 90, clientY: 0 }); // no button: nothing
+log.hover = resize();
+canvas.fire("touchstart", { touches: [{}] });
+log.oneFinger = resize();
+canvas.fire("touchstart", { touches: [{}, {}] });
+log.twoFingers = resize();
+handle.setBars(bars);
+canvas.fire("wheel", {});
+log.wheel = resize() - chart.fits;
+handle.setBars(bars);
+const beforeFocus = resize();
+handle.focusTime("2024-01-02 09:31:00");
+log.focus = resize() === beforeFocus; // a focus is the user's view too
+handle.setBars([]); // nothing to fit
+log.empty = chart.fits;
+chart.resize(5000);
+log.emptyResize = chart.fits === log.empty;
+cleanups.forEach((f) => f());
+log.handlers = chart.handlers.length;
+log.listeners = Object.values(canvas.listeners).flat().length > 0; // the fake keeps them: removal is only on real elements
+console.log(JSON.stringify(log));
+""")
+    assert isinstance(out, dict)
+    assert out["fitted"] == 1 and out["resized"] == 2 and out["sameWidth"] == 2
+    assert out["smallDrag"] == 3 and out["bigDrag"] == 3  # the big drag stops the refit
+    assert out["refitByBars"] == 4 and out["afterBars"] == 5
+    assert out["hover"] == 6 and out["oneFinger"] == 7 and out["twoFingers"] == 7
+    assert out["wheel"] == 0 and out["focus"] is True and out["emptyResize"] is True
+    assert out["handlers"] == 0
+
+
+def test_day_buttons_stay_focusable_at_the_ends_and_step_to_the_nearest_day_with_bars(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "algo_view_steps", VIEW_SOURCE + """
+const range = { first_bar: "2024-01-02T09:30:00", last_bar: "2024-01-15T16:00:00" };
+const friday = [trade({ entry_time: "2024-01-05 09:31:00", exit_time: "2024-01-05 09:32:00" })];
+install({ "/api/runs/1": ok(doc({}, range)), "/api/runs/1/trades": ok({ trades: friday }), "/api/runs/1/equity": ok(equity) });
+const { container, done } = await open();
+barsRequests()[0].answer(barsFor("2024-01-05"));
+await done;
+const buttons = () => find(byClass(container, "day-control")[0], (c) => c.tag === "BUTTON");
+const dayLabel = () => byClass(container, "day-label")[0].textContent;
+const note = () => { const n = byClass(container, "day-note")[0]; return [n.hidden === true, n.textContent]; };
+const out = { start: barsRequests()[0].query.start, label: dayLabel() };
+const next = (n) => barsRequests()[n].query;
+// Next from Friday: one request for the 7 days after it; Monday is the nearest day with bars
+buttons()[1].fire("click");
+out.search = { count: barsRequests().length, query: next(1), note: note() };
+barsRequests()[1].answer({ symbol: "AAPL", available: true, reason: null, bars: [...barsFor("2024-01-08").bars, ...barsFor("2024-01-10").bars] });
+await tick();
+out.shown = { count: barsRequests().length, query: next(2), label: dayLabel() };
+barsRequests()[2].answer(barsFor("2024-01-08"));
+await tick();
+out.landed = { label: dayLabel(), note: note() };
+// Previous: the 7 days before it inside the run's range; the last day with bars there is shown
+buttons()[0].fire("click");
+out.back = { query: next(3) };
+barsRequests()[3].answer({ symbol: "AAPL", available: true, reason: null, bars: [...barsFor("2024-01-02").bars, ...barsFor("2024-01-05").bars] });
+await tick();
+out.backShown = { query: next(4), label: dayLabel() };
+barsRequests()[4].answer(barsFor("2024-01-05"));
+await tick();
+// Next again, but there are no bars in the week: say so and stay
+const before = barsRequests().length;
+buttons()[1].fire("click");
+barsRequests()[before].answer({ symbol: "AAPL", available: true, reason: null, bars: [] });
+await tick();
+out.none = { requests: barsRequests().length - before, label: dayLabel(), note: note() };
+// the data is not available: its reason is shown, still on the same day
+buttons()[1].fire("click");
+barsRequests().at(-1).answer({ symbol: "AAPL", available: false, reason: "missing", bars: [] });
+await tick();
+out.missing = { label: dayLabel(), note: note() };
+// a newer press aborts a search in flight
+buttons()[0].fire("click");
+const first = barsRequests().at(-1);
+buttons()[1].fire("click");
+out.abort = { aborted: first.aborted, count: barsRequests().length };
+console.log(JSON.stringify(out));
+""")
+    assert isinstance(out, dict)
+    assert out["start"] == "2024-01-05 00:00:00" and out["label"] == "2024-01-05 (data time)"
+    assert out["search"]["count"] == 2
+    assert out["search"]["query"] == {"symbol": "AAPL", "start": "2024-01-06 00:00:00", "end": "2024-01-12 23:59:59"}
+    assert out["search"]["note"][0] is False and "Looking for the next day" in out["search"]["note"][1]
+    assert out["shown"]["count"] == 3 and out["shown"]["query"]["start"] == "2024-01-08 00:00:00"
+    assert out["shown"]["query"]["end"] == "2024-01-08 23:59:59" and out["shown"]["label"] == "2024-01-08 (data time)"
+    assert out["landed"] == {"label": "2024-01-08 (data time)", "note": [True, ""]}
+    assert out["back"]["query"] == {"symbol": "AAPL", "start": "2024-01-02 00:00:00", "end": "2024-01-07 23:59:59"}
+    assert out["backShown"]["query"]["start"] == "2024-01-05 00:00:00" and out["backShown"]["label"] == "2024-01-05 (data time)"
+    assert out["none"]["requests"] == 1 and out["none"]["label"] == "2024-01-05 (data time)"
+    assert out["none"]["note"][0] is False and "No next day with bars" in out["none"]["note"][1]
+    assert "Staying on 2024-01-05" in out["none"]["note"][1]
+    assert out["missing"]["label"] == "2024-01-05 (data time)" and "data folder" in out["missing"]["note"][1]
+    assert out["abort"]["aborted"] is True and out["abort"]["count"] >= 2
+
+
+def test_day_buttons_use_aria_disabled_and_ignore_activation_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "algo_view_focus", VIEW_SOURCE + """
+install({ "/api/runs/1": ok(doc()), "/api/runs/1/trades": ok({ trades: TRADES }), "/api/runs/1/equity": ok(equity) });
+const { container, done } = await open();
+barsRequests()[0].answer(barsFor("2024-01-02"));
+await done;
+const [previous, next] = find(byClass(container, "day-control")[0], (c) => c.tag === "BUTTON");
+previous.focus();
+const count = barsRequests().length;
+const click = previous.fire("click");
+console.log(JSON.stringify({ disabledAttr: [previous.hasAttribute("disabled"), next.hasAttribute("disabled")],
+  aria: [previous.getAttribute("aria-disabled"), next.getAttribute("aria-disabled")],
+  focused: document.activeElement === previous, requests: barsRequests().length - count }));
+""")
+    assert isinstance(out, dict)
+    assert out["disabledAttr"] == [False, False] and out["aria"] == ["true", "false"]
+    assert out["focused"] is True and out["requests"] == 0
+
+
+def test_a_trade_over_two_days_and_the_focus_span_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "algo_view_overnight", VIEW_SOURCE + """
+const late = (day, ms) => ms.map((m) => ({ time: day + " " + m + ":00", open: 10, high: 12, low: 9, close: 11, volume: 5 }));
+const trades = [
+  trade({ entry_time: "2024-01-02 15:59:00", exit_time: "2024-01-03 09:31:00", net: "-2.0000", exit_reason: "stop" }),
+  trade({ entry_time: "2024-01-02 15:50:00", exit_time: "2024-01-02 15:52:00" }),
+];
+install({ "/api/runs/1": ok(doc()), "/api/runs/1/trades": ok({ trades }), "/api/runs/1/equity": ok(equity) });
+const { container, done } = await open();
+const minutes = []; for (let m = 30; m < 60; m += 1) minutes.push("15:" + m);
+barsRequests()[0].answer({ symbol: "AAPL", available: true, reason: null, bars: late("2024-01-02", [...minutes, "16:00"]) });
+await done;
+const candle = charts[1];
+const dayNote = () => { const n = byClass(container, "day-note")[0]; return [n.hidden === true, n.textContent]; };
+const markerIds = () => markerApis[0].log.at(-1).map((m) => m.id + ":" + m.size);
+const out = { before: dayNote() };
+// the overnight trade: entry here, exit on the next day, with a note and a button
+rowButtons(container)[0].fire("click");
+out.selected = { note: dayNote(), buttons: find(byClass(container, "day-note")[0], (c) => c.tag === "BUTTON").map((b) => b.textContent),
+  markers: markerIds(), visible: candle.visible.at(-1), requests: barsRequests().length };
+// the trade that is over within the day: zoomed from its entry to its exit with a margin, no note
+rowButtons(container)[1].fire("click");
+out.span = { visible: candle.visible.at(-1), note: dayNote() };
+// back to the overnight trade, then press the button: the next day, the exit marker, no note, nothing faded
+rowButtons(container)[0].fire("click");
+find(byClass(container, "day-note")[0], (c) => c.tag === "BUTTON")[0].fire("click");
+out.toExit = { requests: barsRequests().length, query: barsRequests().at(-1).query.start };
+barsRequests().at(-1).answer(barsFor("2024-01-03"));
+await tick();
+out.exitDay = { markers: markerIds(), note: dayNote(), visible: candle.visible.at(-1) };
+console.log(JSON.stringify(out));
+""")
+    assert isinstance(out, dict)
+    assert out["before"][0] is True
+    selected = out["selected"]
+    assert selected["note"][0] is False and selected["note"][1].startswith("Exits on 2024-01-03.")
+    assert selected["buttons"] == ["Show 2024-01-03"]
+    assert selected["markers"] == ["2:entry:1", "2:exit:1", "1:entry:2"]  # by time; the entry highlighted, the rest faded
+    assert selected["requests"] == 1  # the entry day is shown already
+    # the exit is on another day: an hour around the entry, kept inside the day's bars
+    assert selected["visible"] == {"from": seconds("2024-01-02 15:30:00"), "to": seconds("2024-01-02 16:00:00")}
+    span = out["span"]
+    assert span["visible"] == {"from": seconds("2024-01-02 15:45:00"), "to": seconds("2024-01-02 15:57:00")}
+    assert span["note"][0] is True
+    assert out["toExit"] == {"requests": 2, "query": "2024-01-03 00:00:00"}
+    exit_day = out["exitDay"]
+    assert exit_day["markers"] == ["1:exit:2"] and exit_day["note"][0] is True  # not faded; no note on the exit day
