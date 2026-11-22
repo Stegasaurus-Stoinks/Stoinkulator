@@ -119,9 +119,8 @@ def test_one_bound_422(client: TestClient) -> None:
         assert client.get("/api/runs/1/bars", params={"symbol": "AAPL", **params}).status_code == 422
 
 
-@pytest.mark.parametrize("bound", [
-    "2024-01-02T09:30:00Z", "2024-01-02T09:30:00+01:00", "2024-01-02T09:30:00-05:00",
-    "2024-01-02", "20240102", "not a time", "2024-13-45T09:30:00", ""])
+@pytest.mark.parametrize("bound", [  # one per kind; tests/test_api_windows.py owns the full rules
+    "2024-01-02T09:30:00+01:00", "2024-01-02", "not a time", "2024-01-02T24:00", ""])
 def test_timezone_or_malformed_bound_422(client: TestClient, bound: str) -> None:
     for params in ({"start": bound, "end": "2024-01-03T09:30:00"},
                    {"start": "2024-01-02T09:30:00", "end": bound}):
@@ -205,3 +204,53 @@ def test_response_contains_no_path(tmp_path: Path, data_dir: Path) -> None:
     for text in texts:
         assert data_dir.name not in text and str(tmp_path) not in text
         assert "offlinedata" not in text and "\\\\" not in text
+
+
+def _custom_run(tmp_path: Path, data_dir: Path, rows: list[tuple[str, str, str]]) -> TestClient:
+    """Replace the AAPL file with `rows` of (date text, close text, volume text); one run over it."""
+    lines = [",date,time,open,high,low,close,volume"]
+    for n, (stamp, close, volume) in enumerate(rows):
+        lines.append(f"{n},{stamp},{n},100.5,101.5,99.5,{close},{volume}")
+    offline_data_path(data_dir, "AAPL").write_text("\n".join(lines) + "\n")
+    store_run(tmp_path / "runs.db", data_dir)
+    return make_client(tmp_path / "runs.db")
+
+
+def _times(client: TestClient) -> list[str]:
+    response = client.get("/api/runs/1/bars", params={"symbol": "AAPL"})
+    assert response.status_code == 200
+    text = response.text.split('"bars"')[1]
+    assert "null" not in text and "NaN" not in text and "Infinity" not in text
+    return [bar["time"][11:16] for bar in response.json()["bars"]]
+
+
+@pytest.mark.parametrize("close", ["nan", "inf", "-inf"])
+def test_rows_with_a_non_finite_price_are_dropped(tmp_path: Path, data_dir: Path, close: str) -> None:
+    client = _custom_run(tmp_path, data_dir, [
+        ("2024-01-10 09:30:00", "100.5", "10"), ("2024-01-10 09:31:00", close, "10"),
+        ("2024-01-10 09:32:00", "100.5", "10")])
+    assert _times(client) == ["09:30", "09:32"]
+
+
+def test_volume_is_int_when_whole_and_the_row_is_dropped_otherwise(tmp_path: Path,
+                                                                   data_dir: Path) -> None:
+    client = _custom_run(tmp_path, data_dir, [
+        ("2024-01-10 09:30:00", "100.5", "10.0"),       # whole float: served as int 10
+        ("2024-01-10 09:31:00", "100.5", "10.7"),       # fractional: dropped
+        ("2024-01-10 09:32:00", "100.5", "1e20"),       # out of range: dropped
+        ("2024-01-10 09:33:00", "100.5", "-5"),         # negative: dropped
+        ("2024-01-10 09:34:00", "100.5", "inf"),        # not finite: dropped
+        ("2024-01-10 09:35:00", "100.5", "")])          # missing: dropped
+    assert _times(client) == ["09:30"]
+    response = client.get("/api/runs/1/bars", params={"symbol": "AAPL"})
+    bar = response.json()["bars"][0]
+    assert bar["volume"] == 10 and isinstance(bar["volume"], int)
+    assert '"volume":10.0' not in response.text and '"volume":10}' in response.text
+
+
+def test_timezone_aware_dates_report_missing(tmp_path: Path, data_dir: Path) -> None:
+    client = _custom_run(tmp_path, data_dir, [
+        ("2024-01-10 09:30:00+00:00", "100.5", "10"), ("2024-01-10 09:31:00+00:00", "100.5", "10")])
+    response = client.get("/api/runs/1/bars", params={"symbol": "AAPL"})
+    assert response.status_code == 200
+    assert response.json() == {"symbol": "AAPL", "available": False, "reason": "missing", "bars": []}

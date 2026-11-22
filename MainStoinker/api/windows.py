@@ -14,7 +14,9 @@ from datetime import datetime, time
 MAX_WINDOW_DAYS = 7  # calendar days; seven calendar days hold at most five trading days
 
 # Date, `T` or a space, hours and minutes, optional seconds, optional 1-6 digit fraction.
-_NAIVE_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?")
+# ASCII digits only; hours 00-23 (`T24:00` is refused).
+_NAIVE_DATETIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]([01][0-9]|2[0-3]):[0-9]{2}(:[0-9]{2}(\.[0-9]{1,6})?)?")
 
 
 class WindowError(ValueError):
@@ -52,12 +54,12 @@ def parse_window(start: str | None, end: str | None, *,
         return datetime.combine(day, time.min), datetime.combine(day, time.max)
     if start is None or end is None:
         raise WindowError("start and end must be given together.")
-    lo, hi = _bound("start", start), _bound("end", end)
-    if hi < lo:
+    first, last = _bound("start", start), _bound("end", end)
+    if last < first:
         raise WindowError("end must not be before start.")
-    if (hi.date() - lo.date()).days > MAX_WINDOW_DAYS - 1:
+    if (last.date() - first.date()).days > MAX_WINDOW_DAYS - 1:
         raise WindowError(f"The window must span at most {MAX_WINDOW_DAYS} calendar days.")
-    return lo, hi
+    return first, last
 
 
 def format_time(value: datetime) -> str:
