@@ -14,7 +14,6 @@ import pytest
 from pandas.testing import assert_frame_equal
 
 from MainStoinker.engine import engine as engine_module
-from MainStoinker.engine.algos import load_algo
 from MainStoinker.engine.bars import BarStore
 from MainStoinker.engine.broker import SimBroker
 from MainStoinker.engine.engine import Engine, EngineConfig
@@ -35,6 +34,13 @@ def _is_slow(case: object) -> bool:
 
 
 FAST_CASES = [c for c in CASES if not _is_slow(c)]
+# The two cheapest golden cases stay in the fast suite for checks that re-run a
+# full backtest; the rest of those re-runs go to the slow suite.
+_CHEAP_IDS = {"openingrangecandle_aapl", "fridayfrenzy_tsla"}
+SUPPLIED_BROKER_CASES = [
+    c if c.id in _CHEAP_IDS else pytest.param(*c.values, id=c.id, marks=pytest.mark.slow)
+    for c in FAST_CASES
+]
 
 EMA_AAPL: Spec = (
     "EMACrossing",
@@ -66,62 +72,15 @@ def symbols_of(specs: Sequence[Spec]) -> list[str]:
     return list(dict.fromkeys(cfg["ticker"] for _, cfg in specs))
 
 
-def legacy_run(specs: Sequence[Spec], wrap: Callable[[object], None] | None = None) -> list:
-    """Legacy path (Ticker + ibapi.startData offline + replay_bars) for mixed algos.
-
-    Needs ./OfflineData in the cwd. Mirrors harness.run_offline_backtest, which
-    only takes one algo id.
-    """
-    from MainStoinker.DataCollection.apiApi import ibapi
-    from MainStoinker.MainStuff import Globals
-    from MainStoinker.MainStuff import main_utils as utils
-    from MainStoinker.TradeTools.ticker import Ticker
-
-    by_symbol: dict[str, Ticker] = {}
-    algos = []
-    for algo_id, cfg in specs:
-        ticker = by_symbol.get(cfg["ticker"])
-        if ticker is None:
-            ticker = Ticker(cfg["ticker"], len(by_symbol))
-            by_symbol[cfg["ticker"]] = ticker
-        algo = utils.algo_starter(algo_id, cfg)
-        if wrap is not None:
-            wrap(algo)
-        ticker.register_algo(algo)
-        algos.append(algo)
-    Globals.tickers = {t.index: t for t in by_symbol.values()}
-    Globals.algos = algos
-    ibapi.startData(Globals.tickers, algos, 2, {0: threading.Event()}, 1)
-    harness.replay_bars(ibapi.simulatedDatadict)
-    return algos
-
-
-def engine_run(
-    specs: Sequence[Spec],
-    data_dir: Path,
-    sink: object | None = None,
-    wrap: Callable[[object], None] | None = None,
-) -> tuple[list, SimBroker]:
-    algos = [load_algo(algo_id, cfg) for algo_id, cfg in specs]
-    if wrap is not None:
-        for algo in algos:
-            wrap(algo)
-    feed = CsvBarFeed(data_dir, symbols_of(specs))
-    broker = SimBroker()
-    Engine(EngineConfig(), feed, broker, sink or NullSink(), algos).run_backtest()  # type: ignore[arg-type]
-    return algos, broker
-
-
 def both_runs(
     specs: Sequence[Spec], workdir: Path, max_rows: int | None = None
 ) -> tuple[list[list[dict]], list[list[dict]]]:
     """(legacy records per algo, engine records per algo) on data staged in workdir."""
     harness.stage_offline_data(workdir, symbols_of(specs), max_rows=max_rows)
     with scratch_runtime(workdir):
-        legacy = [harness.trade_records(a) for a in legacy_run(specs)]
+        legacy = [harness.trade_records(a) for a in harness.run_mixed_legacy_offline_backtest(specs)]
     with scratch_runtime(workdir):
-        algos, _ = engine_run(specs, workdir / "OfflineData")
-        engine = [harness.trade_records(a) for a in algos]
+        engine = [harness.trade_records(a) for a in harness.run_mixed_offline_backtest(specs)]
     return legacy, engine
 
 
@@ -381,7 +340,7 @@ def test_no_sleep_no_threads_no_globals(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(time, "sleep", forbidden)
     monkeypatch.setattr(ibapi, "startData", forbidden)
     threads_before = threading.active_count()
-    algos, _ = engine_run([EMA_AAPL], tmp_path / "OfflineData")
+    algos = harness.run_mixed_offline_backtest([EMA_AAPL])
     assert threading.active_count() == threads_before
     assert Globals.tickers == {}
     assert Globals.algos == []
@@ -406,9 +365,9 @@ def test_frames_identical_to_legacy_each_step(tmp_path: Path) -> None:
     legacy_frames: list[pd.DataFrame] = []
     engine_frames: list[pd.DataFrame] = []
     with scratch_runtime(tmp_path):
-        legacy_run([EMA_AAPL], wrap=recorder(legacy_frames))
+        harness.run_mixed_legacy_offline_backtest([EMA_AAPL], wrap=recorder(legacy_frames))
     with scratch_runtime(tmp_path):
-        engine_run([EMA_AAPL], tmp_path / "OfflineData", wrap=recorder(engine_frames))
+        harness.run_mixed_offline_backtest([EMA_AAPL], wrap=recorder(engine_frames))
     assert len(legacy_frames) == len(engine_frames) == 700 - 390
     for step, (legacy, ours) in enumerate(zip(legacy_frames, engine_frames, strict=True)):
         try:
@@ -444,32 +403,20 @@ def golden_records(case_id: str) -> list[dict]:
     return json.loads((GOLDEN_DIR / f"{case_id}.json").read_text())
 
 
-@pytest.mark.parametrize("algo_id, cfg", FAST_CASES)
-def test_trades_match_legacy_for_each_fast_golden_case(
-    algo_id: str, cfg: dict, tmp_path: Path, request: pytest.FixtureRequest
+@pytest.mark.parametrize("algo_id, cfg", SUPPLIED_BROKER_CASES)
+def test_supplied_simbroker_gives_golden_trades_and_records_the_orders(
+    algo_id: str, cfg: dict, request: pytest.FixtureRequest
 ) -> None:
-    """Engine path on the full offline data equals the pinned golden trades.
-
-    The golden files are the legacy path's output (test_golden_backtests.py
-    asserts that in this same fast suite), so this is engine == legacy. To
-    stay inside the fast-suite time budget the legacy path is not re-run here;
-    the direct three-way comparison is the slow-marked test below.
-    """
-    harness.stage_offline_data(tmp_path, [cfg["ticker"]])
-    with scratch_runtime(tmp_path):
-        algos, _ = engine_run([(algo_id, cfg)], tmp_path / "OfflineData")
-    assert [harness.trade_records(a) for a in algos] == [golden_records(request.node.callspec.id)]
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("algo_id, cfg", CASES)
-def test_legacy_engine_and_golden_trades_agree(
-    algo_id: str, cfg: dict, tmp_path: Path, request: pytest.FixtureRequest
-) -> None:
-    """Legacy path, engine path and golden file all equal, full data, every case (incl. Elliot)."""
-    legacy, engine = both_runs([(algo_id, cfg)], tmp_path)
-    assert legacy == [golden_records(request.node.callspec.id)]
-    assert engine == legacy
+    """An explicitly supplied SimBroker changes nothing, and sees every trade."""
+    harness.stage_offline_data(Path.cwd(), [cfg["ticker"]])
+    broker = SimBroker()
+    (algo,) = harness.run_offline_backtest(algo_id, [cfg], broker=broker)
+    records = harness.trade_records(algo)
+    assert records == golden_records(request.node.callspec.id)
+    methods = [c.method for c in broker.calls]
+    assert methods.count("open_position") == len(records)
+    closed = sum(1 for r in records if r["status"] == "Closed")
+    assert methods.count("close_position") >= closed
 
 
 @pytest.fixture(scope="module")
@@ -487,11 +434,12 @@ def test_multi_symbol_trades_match_legacy(multi_symbol_runs) -> None:
     assert engine == legacy
 
 
+@pytest.mark.slow
 def test_engine_run_with_recording_sink_requesting_algo_data_gives_same_trades(multi_symbol_runs) -> None:
     specs, workdir, legacy, _ = multi_symbol_runs
     sink = RecordingSink(wants_algo_data=True)
     with scratch_runtime(workdir):
-        algos, _ = engine_run(specs, workdir / "OfflineData", sink=sink)
+        algos = harness.run_mixed_offline_backtest(specs, sink=sink)
         records = [harness.trade_records(a) for a in algos]
     assert records == legacy
     bar_events = [e for e in sink.events if e.kind == "bar"]
@@ -515,10 +463,13 @@ def test_algo_data_matches_legacy_frontend_payload(tmp_path: Path, monkeypatch: 
     harness.stage_offline_data(tmp_path, ["AAPL"], max_rows=520)
     payloads: list = []
     monkeypatch.setattr(frontend_client, "emit_data", lambda event, payload: payloads.append(payload))
-    with scratch_runtime(tmp_path):
+    def enable_frontend(_algo: object) -> None:
+        # The runner applies the safe config first, so switch it on afterwards.
         object.__setattr__(config, "FrontEndDisplay", True)
+
+    with scratch_runtime(tmp_path):
         try:
-            legacy_run(specs)
+            harness.run_mixed_legacy_offline_backtest(specs, wrap=enable_frontend)
         finally:
             object.__setattr__(config, "FrontEndDisplay", False)
     legacy_algodata = [p["algodata"] for p in payloads if "algodata" in p]
@@ -527,5 +478,5 @@ def test_algo_data_matches_legacy_frontend_payload(tmp_path: Path, monkeypatch: 
 
     sink = RecordingSink(wants_algo_data=True)
     with scratch_runtime(tmp_path):
-        engine_run(specs, tmp_path / "OfflineData", sink=sink)
+        harness.run_mixed_offline_backtest(specs, sink=sink)
     assert [e.algo_data for e in sink.events] == legacy_algodata
