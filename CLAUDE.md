@@ -36,7 +36,7 @@ Use the project venv (`.venv`, Python 3.14, Windows). It is uv-managed and has n
 ```
 uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
 uv pip install --python .venv\Scripts\python.exe -e .
-.venv\Scripts\python.exe -m pytest                  # fast suite, ~35 s
+.venv\Scripts\python.exe -m pytest                  # fast suite, ~30 s
 .venv\Scripts\python.exe -m pytest -m slow          # Elliot golden + legacy-path parity, several min
 .venv\Scripts\ruff.exe check .                      # legacy defect set
 .venv\Scripts\ruff.exe check tests MainStoinker/engine --select E,F,W,I,B   # new-code set

@@ -34,6 +34,13 @@ def _is_slow(case: object) -> bool:
 
 
 FAST_CASES = [c for c in CASES if not _is_slow(c)]
+# The two cheapest golden cases stay in the fast suite for checks that re-run a
+# full backtest; the rest of those re-runs go to the slow suite.
+_CHEAP_IDS = {"openingrangecandle_aapl", "fridayfrenzy_tsla"}
+SUPPLIED_BROKER_CASES = [
+    c if c.id in _CHEAP_IDS else pytest.param(*c.values, id=c.id, marks=pytest.mark.slow)
+    for c in FAST_CASES
+]
 
 EMA_AAPL: Spec = (
     "EMACrossing",
@@ -396,7 +403,7 @@ def golden_records(case_id: str) -> list[dict]:
     return json.loads((GOLDEN_DIR / f"{case_id}.json").read_text())
 
 
-@pytest.mark.parametrize("algo_id, cfg", FAST_CASES)
+@pytest.mark.parametrize("algo_id, cfg", SUPPLIED_BROKER_CASES)
 def test_supplied_simbroker_gives_golden_trades_and_records_the_orders(
     algo_id: str, cfg: dict, request: pytest.FixtureRequest
 ) -> None:
