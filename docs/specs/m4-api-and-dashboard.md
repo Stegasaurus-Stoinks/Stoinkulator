@@ -211,26 +211,71 @@ invisible to another. A plain folder in the user profile has no such problem.
   reference is served. Each dashboard task is also checked by hand in a
   browser against the two stored runs, with a screenshot in the pull request.
 
+## Corrections from the task split (2026-11-22)
+
+The task divider checked this spec against the code. Where the text above
+differs, these apply:
+
+- **Times.** Bar, trade, order, equity and series times are stored as the
+  data's wall-clock time with no zone recorded. The API returns them as
+  stored, without a zone, and the dashboard labels them "data time". Only a
+  run's start and end are UTC.
+- **Readers never write.** `runs`, `report` and `serve` open the database
+  strictly read-only: no migration, no journal-mode switch. Only `backtest`
+  upgrades a database to schema 2, and older code then refuses that file.
+- **Series capture.** `AlgoData` covers every bar including warm-up, but its
+  `time` column is not reliable. Rows are matched to bars by position, and an
+  algo whose frame does not match the bar count is skipped with a warning.
+  Any draw type is stored; unknown ones are drawn as a line.
+- **Stop and target lines.** Legacy-fill runs have no stop or target orders,
+  so they draw the algo's own `StopPrice` and `tp` columns. Realistic runs
+  draw the order events and hide those columns by default.
+- **Data fingerprints.** Each stored backtest records a sha256 and size per
+  data file, so the bars route can say whether a file changed since the run.
+  Runs stored earlier are served as "unverified".
+- **Bars and series windows.** Default: the trading day of the run's last
+  bar. At most 5 trading days or 10,000 bars per request.
+- **Equity.** The stored series holds a point only where equity changed; the
+  API returns it as a step series. Thinning keeps, per bucket, the last,
+  lowest and highest point, plus the first point and the peak and trough of
+  the largest drawdown.
+- **Errors.** A 503 carries a fixed message, because store errors contain
+  the database path.
+- **Where `serve` lives.** In `MainStoinker/api/`, reached from
+  `MainStoinker/__main__.py`, so the engine never imports the API. The web
+  packages are in `requirements-web.txt`, which `requirements-dev.txt`
+  includes.
+- **Compare.** The route accepts 2 to 5 runs; the view shows 2.
+- **Chart library.** Lightweight Charts 5.x, one file from the npm registry,
+  committed unchanged with its licence and checksum. Its logo stays on the
+  chart.
+
 ## Phases
 
-**Phase A, stored runs (this spec).** Rough task list; the task divider
-produces the final split:
+**Phase A, stored runs (this spec).** Tasks D1 to D17, GitHub issues 77 to
+93:
 
-- C1. `serve` command, dependencies, health route, safety refusals,
-  `STOINK_DB`.
-- C2. Runs and run-detail routes.
-- C3. Trades, orders and equity routes, with thinning.
-- C4. Bars route.
-- C5. Schema version 2 and capture of the indicator series at the end of a
-  run.
-- C6. Series route.
-- C7. Compare route.
-- C8. Dashboard shell and runs view.
-- C9. Run overview.
-- C10. Algo detail with the candle chart and trade markers.
-- C11. Indicator overlays and stop and target lines on the chart.
-- C12. Compare view.
-- C13. Issue 20 and the database-location hint.
+- D1. Read-only store access and `STOINK_DB`.
+- D2. Store schema version 2: indicator series tables and data fingerprints.
+- D3. Capture of indicator series and fingerprints at the end of a stored
+  backtest.
+- D4. Shared documents for `runs --json` and `report --json`.
+- D5. Public bar-file reader, window filter and fingerprint.
+- D6. `serve` command, web dependencies, health route, safety refusals.
+- D7. Runs and run-detail routes.
+- D8. Trades, orders and equity routes, with thinning.
+- D9. Bars route.
+- D10. Series route.
+- D11. Compare route.
+- D12. Dashboard shell, chart library and runs view.
+- D13. Run overview.
+- D14. Algo detail with the candle chart and trade markers.
+- D15. Indicator overlays, stop and target lines, legend.
+- D16. Compare view.
+- D17. Front-end address from the environment (issue 20).
+
+Order: D1, D5, D17 first; then D2, D4, D6; then D3 and the routes D7 to D11
+with D12; then D13; then D14 and D16; then D15.
 
 **Phase B, with the live side.** Live updates (server-sent events), paper and
 live runs side by side, open positions, the account view from the broker, and
@@ -249,3 +294,9 @@ a login if the dashboard is ever reached from another machine.
    trades appear on the chart with no visible reason. See "Indicator series".
 5. **Database location: `%USERPROFILE%\Stoinkulator\runs.db` (owner,
    2026-11-22),** set once through `STOINK_DB`.
+6. **Task split D1 to D17: approved (owner, 2026-11-22),** with the
+   corrections above and the chart library download.
+7. **Dashboard pull requests merge on green CI (owner, 2026-11-22)** once
+   screenshots against the stored runs are in the pull request.
+8. **D17 does not wait for the owner (owner, 2026-11-22).** The planner
+   checks that only the front-end address changes in `Globals.py`.
