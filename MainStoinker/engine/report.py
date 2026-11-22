@@ -6,9 +6,70 @@ This module must not import anything from `MainStoinker.*` outside
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from typing import Any
 
-from .ledger import Ledger
+from .ledger import IGNORED_KINDS, Ledger
+from .paper_broker import CostModel
+from .stats import account_summary, fmt4, round_trip_record
+
+
+def ledger_document(
+    ledger: Ledger,
+    idnames: Sequence[str],
+    *,
+    fills: str,
+    costs: CostModel,
+    capital: Decimal,
+    cancelled_entries: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """The `ledger.json` content: fill model, costs, capital, total and per-algo results.
+
+    Every number comes from `stats`. Per algo: `symbol`, `summary` (the shape
+    of `stats.account_summary`) and `round_trips` (`stats.round_trip_record`,
+    in the order the ledger closed them). The top-level `summary` is the same
+    shape over all accounts, with the total equity series and the summed
+    starting capital. `cancelled_entries` maps idname to the broker's count
+    (missing means 0). Algos appear in `idnames` order.
+    """
+    cancelled = cancelled_entries or {}
+    accounts: dict[str, Any] = {}
+    total_capital = Decimal("0.0000")
+    for idname in idnames:
+        info = next(a for a in ledger.accounts if a.idname == idname)
+        total_capital += info.capital
+        trips = [t for t in ledger.round_trips if t.account == idname]
+        accounts[idname] = {
+            "symbol": info.symbol,
+            "summary": account_summary(
+                trips,
+                ledger.equity(idname),
+                info.capital,
+                equity_series=[p.equity for p in ledger.equity_points if p.account == idname],
+                ignored_events={k: ledger.ignored_count(k, idname) for k in IGNORED_KINDS},
+                cancelled_entries=cancelled.get(idname, 0),
+            ),
+            "round_trips": [round_trip_record(t) for t in trips],
+        }
+    return {
+        "fills": fills,
+        "costs": {
+            "commission_per_share": fmt4(costs.commission_per_share),
+            "commission_minimum": fmt4(costs.commission_minimum),
+            "slippage_per_share": fmt4(costs.slippage_per_share),
+        },
+        "capital": fmt4(capital),
+        "summary": account_summary(
+            ledger.round_trips,
+            ledger.equity(),
+            total_capital,
+            equity_series=[p.equity for p in ledger.equity_points if p.account is None],
+            ignored_events={k: ledger.ignored_count(k) for k in IGNORED_KINDS},
+            cancelled_entries=sum(cancelled.get(i, 0) for i in idnames),
+        ),
+        "accounts": accounts,
+    }
 
 
 def trade_records(algo: Any) -> list[dict[str, Any]]:
