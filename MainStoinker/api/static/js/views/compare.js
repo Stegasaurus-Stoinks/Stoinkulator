@@ -1,7 +1,7 @@
 // The compare view: two stored runs side by side. Follows the view contract in main.js.
 //
 // Exports: render, METRICS, decimalDifference, integerDifference, percentPointDifference, headerRows,
-// comparisonWarnings, buildStatRows, equityNote. Everything but render is pure (no DOM, no chart library)
+// comparisonWarnings, algoSets, capitalsComparable, buildStatRows, equityNote. Everything but render is pure (no DOM, no chart library)
 // so node can test it.
 //
 // The route gives 2 to 5 run ids (routes.js); this view shows the first two, called A and B, and says so
@@ -19,6 +19,8 @@ import {
 } from "../format.js";
 import { runHash, runsHash } from "../routes.js";
 import { dataTable } from "../table.js";
+// These four helpers should move to a shared module (they are not overview-specific); they stay here until
+// the other open PR that edits the shared files has merged.
 import { displayStatus, runDurationSeconds, settingRows, statusNotes } from "./overview.js";
 
 const DASH = "-";
@@ -92,11 +94,18 @@ function durationText(run) {
   return seconds === null ? DASH : formatDuration(seconds);
 }
 
-function sameDecimal(a, b) {
+const SAME = "same";
+const DIFFERS = "differs";
+const SKIPPED = "skipped"; // not compared: one side has no value
+
+// Two stored decimals: both missing is the same, exactly one missing is not compared (a legacy run stores no
+// capital or costs; that is not a difference of settings), both present is equal or different.
+function decimalState(a, b) {
   const aMissing = parseDecimal(a) === null;
   const bMissing = parseDecimal(b) === null;
-  if (aMissing || bMissing) return aMissing === bMissing && text(a) === text(b);
-  return /^0(\.0*)?$/.test(decimalDifference(a, b));
+  if (aMissing && bMissing) return text(a) === text(b) ? SAME : DIFFERS;
+  if (aMissing || bMissing) return SKIPPED;
+  return /^0(\.0*)?$/.test(decimalDifference(a, b)) ? SAME : DIFFERS;
 }
 
 function costOf(run, field) {
@@ -118,22 +127,25 @@ function symbolsKey(run) {
   return Array.isArray(run.symbols) ? [...run.symbols].sort().join(",") : "";
 }
 
-// One entry per line of the header table. `shown(run)` is the text, `same(a, b)` whether the two runs agree,
-// `unfair` the kind of difference that makes a comparison unfair (a warning), if any.
+const eq = (x, y) => (x === y ? SAME : DIFFERS);
+
+// One entry per line of the header table. `shown(run)` is the text, `state(a, b)` SAME, DIFFERS or SKIPPED,
+// `unfair` the kind of difference that makes a comparison unfair (a warning), if any. A field with
+// `compared: false` is never compared (the start time and the duration always differ between two runs).
 const HEADER_FIELDS = [
-  { key: "status", label: "Status", shown: (r) => displayStatus(r), same: (a, b) => displayStatus(a) === displayStatus(b) },
-  { key: "kind", label: "Kind", shown: (r) => text(r.kind), same: (a, b) => text(a.kind) === text(b.kind) },
-  { key: "fills", label: "Fill model", shown: fillText, same: (a, b) => text(a.fills) === text(b.fills), unfair: "fills" },
-  { key: "started", label: "Start (UTC)", shown: (r) => formatUtc(r.started_at), same: (a, b) => formatUtc(a.started_at) === formatUtc(b.started_at) },
-  { key: "duration", label: "Duration", shown: durationText, same: (a, b) => durationText(a) === durationText(b) },
-  { key: "version", label: "Code version", shown: (r) => shortVersion(r.code_version), same: (a, b) => text(a.code_version) === text(b.code_version) },
-  { key: "capital", label: "Capital per algo", shown: (r) => settingValue(r, "Capital per algo"), same: (a, b) => sameDecimal(a.capital, b.capital), unfair: "capital" },
-  { key: "commission", label: "Commission per share", shown: (r) => settingValue(r, "Commission per share"), same: (a, b) => sameDecimal(costOf(a, "commission_per_share"), costOf(b, "commission_per_share")), unfair: "costs" },
-  { key: "minimum", label: "Minimum per order", shown: (r) => settingValue(r, "Minimum per order"), same: (a, b) => sameDecimal(costOf(a, "commission_minimum"), costOf(b, "commission_minimum")), unfair: "costs" },
-  { key: "slippage", label: "Slippage per share", shown: (r) => settingValue(r, "Slippage per share"), same: (a, b) => sameDecimal(costOf(a, "slippage_per_share"), costOf(b, "slippage_per_share")), unfair: "costs" },
-  { key: "range", label: "Bar range", shown: (r) => settingValue(r, "Bar range"), same: (a, b) => normalTime(a.first_bar) === normalTime(b.first_bar) && normalTime(a.last_bar) === normalTime(b.last_bar), unfair: "range" },
-  { key: "symbols", label: "Symbols", shown: (r) => settingValue(r, "Symbols"), same: (a, b) => symbolsKey(a) === symbolsKey(b), unfair: "symbols" },
-  { key: "folder", label: "Data folder", shown: (r) => settingValue(r, "Data folder"), same: (a, b) => text(a.data_directory) === text(b.data_directory) },
+  { key: "status", label: "Status", shown: (r) => displayStatus(r), state: (a, b) => eq(displayStatus(a), displayStatus(b)) },
+  { key: "kind", label: "Kind", shown: (r) => text(r.kind), state: (a, b) => eq(text(a.kind), text(b.kind)) },
+  { key: "fills", label: "Fill model", shown: fillText, state: (a, b) => eq(text(a.fills), text(b.fills)), unfair: "fills" },
+  { key: "started", label: "Start (UTC)", shown: (r) => formatUtc(r.started_at), compared: false },
+  { key: "duration", label: "Duration", shown: durationText, compared: false },
+  { key: "version", label: "Code version", shown: (r) => shortVersion(r.code_version), state: (a, b) => eq(text(a.code_version), text(b.code_version)) },
+  { key: "capital", label: "Capital per algo", shown: (r) => settingValue(r, "Capital per algo"), state: (a, b) => decimalState(a.capital, b.capital), unfair: "capital" },
+  { key: "commission", label: "Commission per share", shown: (r) => settingValue(r, "Commission per share"), state: (a, b) => decimalState(costOf(a, "commission_per_share"), costOf(b, "commission_per_share")), unfair: "costs" },
+  { key: "minimum", label: "Minimum per order", shown: (r) => settingValue(r, "Minimum per order"), state: (a, b) => decimalState(costOf(a, "commission_minimum"), costOf(b, "commission_minimum")), unfair: "costs" },
+  { key: "slippage", label: "Slippage per share", shown: (r) => settingValue(r, "Slippage per share"), state: (a, b) => decimalState(costOf(a, "slippage_per_share"), costOf(b, "slippage_per_share")), unfair: "costs" },
+  { key: "range", label: "Bar range", shown: (r) => settingValue(r, "Bar range"), state: (a, b) => eq(normalTime(a.first_bar) + "|" + normalTime(a.last_bar), normalTime(b.first_bar) + "|" + normalTime(b.last_bar)), unfair: "range" },
+  { key: "symbols", label: "Symbols", shown: (r) => settingValue(r, "Symbols"), state: (a, b) => eq(symbolsKey(a), symbolsKey(b)), unfair: "symbols" },
+  { key: "folder", label: "Data folder", shown: (r) => settingValue(r, "Data folder"), state: (a, b) => eq(text(a.data_directory), text(b.data_directory)) },
 ];
 
 function settingValue(run, label) {
@@ -141,27 +153,71 @@ function settingValue(run, label) {
   return found ? found[1] : DASH;
 }
 
-// The lines of the header table: [{key, label, a, b, differs, unfair}], `a` and `b` being display text.
+// The lines of the header table: [{key, label, a, b, differs, compared, unfair}], `a` and `b` being display
+// text. `compared` is false for a row that is not compared (start, duration, or a value one run lacks);
+// such a row never `differs`.
 export function headerRows(runA, runB) {
-  return HEADER_FIELDS.map((field) => ({
-    key: field.key,
-    label: field.label,
-    a: field.shown(runA),
-    b: field.shown(runB),
-    differs: !field.same(runA, runB),
-    unfair: field.unfair || null,
-  }));
+  return HEADER_FIELDS.map((field) => {
+    const state = field.compared === false ? SKIPPED : field.state(runA, runB);
+    return {
+      key: field.key,
+      label: field.label,
+      a: field.shown(runA),
+      b: field.shown(runB),
+      differs: state === DIFFERS,
+      compared: state !== SKIPPED,
+      unfair: field.unfair || null,
+    };
+  });
+}
+
+// The algos of each run in the /api/compare document: {onlyA, onlyB, countA, countB}, names in the document's
+// order. An algo is in a run when the document has statistics for it under that run's id.
+export function algoSets(compare, ids) {
+  const algos = recordOf(compare && compare.algos) || {};
+  const [idA, idB] = ids.map(String);
+  const has = (name, id) => recordOf(algos[name]) !== null && recordOf(algos[name][id]) !== null;
+  const names = Object.keys(algos);
+  return {
+    onlyA: names.filter((n) => has(n, idA) && !has(n, idB)),
+    onlyB: names.filter((n) => has(n, idB) && !has(n, idA)),
+    countA: names.filter((n) => has(n, idA)).length,
+    countB: names.filter((n) => has(n, idB)).length,
+  };
+}
+
+function plainCapital(equity) {
+  return equity && parseDecimal(equity.capital) !== null ? equity.capital : null;
+}
+
+// Whether final equity, drawdown and their differences are on one scale: both runs store the same capital, or
+// neither stores one and the equity route's capital agrees. Anything else: not comparable.
+export function capitalsComparable(runA, runB, equities = []) {
+  const state = decimalState(runA.capital, runB.capital);
+  if (state === SAME && parseDecimal(runA.capital) !== null) return true;
+  if (state === SKIPPED || state === DIFFERS) return false;
+  const [ea, eb] = equities;
+  return Boolean(plainCapital(ea)) && Boolean(plainCapital(eb)) && decimalState(ea.capital, eb.capital) === SAME;
+}
+
+function hasCosts(run) {
+  return ["commission_per_share", "commission_minimum", "slippage_per_share"]
+    .some((field) => parseDecimal(costOf(run, field)) !== null);
 }
 
 // Plain-language warnings, one per kind of difference that makes the comparison unfair (fill model,
-// capital, costs, bar range, symbols), then one for each run that did not complete.
-export function comparisonWarnings(runA, runB) {
+// capital, costs, bar range, symbols, different algos), a note for a run that stores no capital or cost
+// settings while the other does (not a difference), then one for each run that did not complete.
+// `options`: {algos: algoSets(...) or null, equities: [equityA | null, equityB | null]}; the equity documents
+// give the nominal capital of a run without a capital setting (equity capital divided by its number of algos).
+export function comparisonWarnings(runA, runB, { algos = null, equities = [] } = {}) {
   const rows = headerRows(runA, runB);
   const differing = (kind) => rows.filter((row) => row.differs && row.unfair === kind);
   const pair = (key) => {
     const row = rows.find((r) => r.key === key);
     return "run A: " + row.a + ", run B: " + row.b;
   };
+  const runs = [["A", runA], ["B", runB]];
   const warnings = [];
   if (differing("fills").length > 0) {
     warnings.push("The fill models differ (" + pair("fills") + "). Prices, costs and trade counts are not comparable.");
@@ -170,8 +226,26 @@ export function comparisonWarnings(runA, runB) {
     warnings.push("The capital per algo differs (" + pair("capital") + "). Final equity and drawdown are on different "
       + "scales; the chart shows profit and loss instead.");
   }
+  if (rows.find((r) => r.key === "capital").compared === false) {
+    runs.forEach(([name, run], index) => {
+      if (parseDecimal(run.capital) !== null) return;
+      const equity = equities[index];
+      const count = algos ? (index === 0 ? algos.countA : algos.countB) : 0;
+      const total = plainCapital(equity) === null ? NaN : Number(equity.capital);
+      const nominal = count > 0 && Number.isFinite(total) && run.fills === "legacy"
+        ? " (legacy fills use a nominal " + formatMoney((total / count).toFixed(2)) + " per algo)" : "";
+      warnings.push("Run " + name + " stores no capital setting" + nominal + ".");
+    });
+  }
   if (differing("costs").length > 0) {
     warnings.push("The costs differ (commission, minimum or slippage), so net and commission are not comparable.");
+  }
+  if (hasCosts(runA) !== hasCosts(runB)) {
+    runs.forEach(([name, run]) => {
+      if (hasCosts(run)) return;
+      warnings.push("Run " + name + " stores no cost settings"
+        + (run.fills === "legacy" ? " (legacy fills charge no commission)" : "") + ".");
+    });
   }
   if (differing("range").length > 0) {
     warnings.push("The bar ranges differ (" + pair("range") + "). The runs covered different periods.");
@@ -179,7 +253,12 @@ export function comparisonWarnings(runA, runB) {
   if (differing("symbols").length > 0) {
     warnings.push("The symbols differ (" + pair("symbols") + "). The runs traded different markets.");
   }
-  for (const [name, run] of [["A", runA], ["B", runB]]) {
+  if (algos && (algos.onlyA.length > 0 || algos.onlyB.length > 0)) {
+    const list = (names) => (names.length > 0 ? names.join(", ") : "none");
+    warnings.push("The runs have different algos (only in run A: " + list(algos.onlyA) + "; only in run B: "
+      + list(algos.onlyB) + "). The TOTAL rows and the equity curves then cover different algos.");
+  }
+  for (const [name, run] of runs) {
     const note = statusNotes(run);
     if (note) warnings.push("Run " + name + ": " + note);
   }
@@ -211,7 +290,7 @@ function runCell(metric, stats) {
   return { text: formatMoney(value), className: "" };
 }
 
-function diffCell(metric, statsA, statsB) {
+function diffCell(metric, statsA, statsB, colourFinal) {
   if (!statsA || !statsB) return { text: DASH, className: "" };
   const a = statsA[metric.field];
   const b = statsB[metric.field];
@@ -219,7 +298,9 @@ function diffCell(metric, statsA, statsB) {
   if (metric.type === "percent") return { text: signed(percentPointDifference(a, b)), className: "" };
   const diff = decimalDifference(a, b);
   if (diff === null) return { text: DASH, className: "" };
-  return { text: formatNet(diff), className: metric.sign || metric.key === "finalEquity" ? netClass(diff) : "" };
+  // Net is coloured by sign; final equity only when both runs are on the same capital; the rest stay neutral.
+  const coloured = metric.sign || (metric.key === "finalEquity" && colourFinal);
+  return { text: formatNet(diff), className: coloured ? netClass(diff) : "" };
 }
 
 function recordOf(value) {
@@ -236,8 +317,9 @@ function runLabel(name, run) {
 // For every algo (the algos of run A in its order, then those only in run B) and then TOTAL there are
 // three rows: run A, run B and B - A. Each row is {block, total, kind: "a" | "b" | "diff", label, cells},
 // cells being {metricKey: {text, className}}. A run without the algo has "-" everywhere, and so has the
-// difference row (no difference without both sides).
-export function buildStatRows(compare, ids, runs = []) {
+// difference row (no difference without both sides). `options.colourFinal` (default false) colours the final
+// equity difference by sign; pass it only when capitalsComparable says the runs share one capital.
+export function buildStatRows(compare, ids, runs = [], { colourFinal = false } = {}) {
   const algos = recordOf(compare && compare.algos) || {};
   const [idA, idB] = ids.map(String);
   const names = Object.keys(algos);
@@ -259,7 +341,7 @@ export function buildStatRows(compare, ids, runs = []) {
     };
     make("a", runLabel("A", runs[0]), (m) => runCell(m, a));
     make("b", runLabel("B", runs[1]), (m) => runCell(m, b));
-    make("diff", "B - A", (m) => diffCell(m, a, b));
+    make("diff", "B - A", (m) => diffCell(m, a, b, colourFinal));
   }
   return rows;
 }
@@ -295,14 +377,14 @@ export function equityNote(equities) {
 
 function headerTable(runA, runB, ids) {
   const rows = headerRows(runA, runB);
-  const mark = (row) => (row.differs ? "differs" : "");
+  const mark = (row) => (row.differs ? "differs" : row.compared ? "" : "not-compared");
   const columns = [
     { label: "Setting", cell: (row) => ({ content: row.label, className: mark(row) }) },
     { label: runLabel("A", runA) + ", run " + ids[0], cell: (row) => ({ content: row.a, className: mark(row) }) },
     { label: runLabel("B", runB) + ", run " + ids[1], cell: (row) => ({ content: row.b, className: mark(row) }) },
     {
       label: "Same or differs",
-      cell: (row) => ({ content: row.differs ? "Differs" : "Same", className: mark(row) }),
+      cell: (row) => ({ content: row.differs ? "Differs" : row.compared ? "Same" : "Not compared", className: mark(row) }),
     },
   ];
   return dataTable({ columns, rows, caption: "The two runs side by side", captionHidden: true });
@@ -379,7 +461,9 @@ export async function render(container, params, ctx) {
   const [runA, runB] = doc.runs;
   const parts = top();
 
-  const warnings = comparisonWarnings(runA, runB);
+  const equities = [equityA, equityB].map((result) => (
+    result.status === "fulfilled" && validEquity(result.value) ? result.value : null));
+  const warnings = comparisonWarnings(runA, runB, { algos: algoSets(doc, ids), equities });
   parts.push(h("section", { class: "panel", "aria-label": "Differences that matter" },
     h("h3", {}, "Before you compare"),
     warnings.length > 0
@@ -390,8 +474,6 @@ export async function render(container, params, ctx) {
     headerTable(runA, runB, ids).element));
 
   const labels = [runA, runB].map((run, index) => "Run " + "AB"[index] + " (" + text(run.fills) + ")");
-  const equities = [equityA, equityB].map((result) => (
-    result.status === "fulfilled" && validEquity(result.value) ? result.value : null));
   const chartBox = h("div", { class: "chart-box" });
   const drawable = equities.some(Boolean);
   const equityErrors = [equityA, equityB].map((result, index) => {
@@ -406,7 +488,8 @@ export async function render(container, params, ctx) {
     drawable ? h("p", { class: "muted chart-caption" }, equityNote(equities)) : null));
 
   parts.push(h("section", { "aria-label": "Statistics" }, h("h3", {}, "Statistics"),
-    statsTable(buildStatRows(doc, ids, [runA, runB])).element,
+    statsTable(buildStatRows(doc, ids, [runA, runB],
+      { colourFinal: capitalsComparable(runA, runB, equities) })).element,
     h("p", { class: "muted chart-caption" },
       "The B - A rows are exact differences of the stored figures. Win % differs in percentage points. "
       + "A dash means the run has no such algo or no figure.")));
@@ -416,8 +499,9 @@ export async function render(container, params, ctx) {
   if (drawable) {
     try {
       const chart = createEquityChart(chartBox, { ctx, relative: true }); // registers its own disposal at once
+      // colorIndex keeps each run in its own colour even when the other run's equity failed to load
       chart.setSeries(equities.map((equity, index) => (equity
-        ? { label: labels[index], points: equity.points, capital: equity.capital }
+        ? { label: labels[index], points: equity.points, capital: equity.capital, colorIndex: index }
         : null)).filter(Boolean));
     } catch (err) {
       chartBox.replaceChildren(errorPanel(err));

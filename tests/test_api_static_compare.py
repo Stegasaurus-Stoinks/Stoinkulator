@@ -125,8 +125,11 @@ def test_header_rows_mark_every_difference(compare_work: Path) -> None:
     assert by_key["fills"]["b"] == "legacy (bar-close fills, no commission)"
     assert by_key["range"]["a"] == "2024-01-02 09:30:00 to 2024-01-05 16:00:00 (data time)"
     assert by_key["started"]["a"] == "2026-11-22 17:31:13 UTC" and by_key["duration"]["a"] == "12.0 s"
-    assert differing(out["rows"]) == {"fills", "started", "duration", "capital", "commission", "minimum",
-                                      "slippage"}
+    # only a setting both runs have and that differs is marked; the legacy run's missing capital and costs,
+    # and the start time and duration (which always differ), are "not compared"
+    assert differing(out["rows"]) == {"fills"}
+    not_compared = {r["key"] for r in out["rows"] if not r["compared"]}
+    assert not_compared == {"started", "duration", "capital", "commission", "minimum", "slippage"}
     assert by_key["fills"]["unfair"] == "fills" and by_key["started"]["unfair"] is None
 
 
@@ -138,7 +141,8 @@ def test_identical_settings_give_no_warnings_and_numeric_equality(compare_work: 
     out = run_node(compare_work, "header_same", header_source(REALISTIC, other))
     assert isinstance(out, dict)
     assert out["warnings"] == []  # 100000 = 100000.0000, 0.005 = 0.0050, symbol order, "T" or space
-    assert differing(out["rows"]) == {"started"}
+    assert differing(out["rows"]) == set()  # the start time differs but is never compared
+    assert {r["key"] for r in out["rows"] if not r["compared"]} == {"started", "duration"}
 
 
 @pytest.mark.parametrize(("change", "word", "keys"), [
@@ -166,6 +170,111 @@ def test_failed_and_incomplete_runs_are_warned_about(compare_work: Path) -> None
     assert out["warnings"][0].startswith("Run A: This run failed")
     assert out["warnings"][1].startswith("Run B: This run is incomplete")
     assert "status" in differing(out["rows"])
+
+
+def warnings_source(a: dict, b: dict, options: dict) -> str:
+    return js("""
+import { comparisonWarnings } from "./js/views/compare.js";
+console.log(JSON.stringify(comparisonWarnings(__A__, __B__, __OPTIONS__)));
+""", a=a, b=b, options=options)
+
+
+TWO_ALGOS = {"onlyA": [], "onlyB": [], "countA": 2, "countB": 2}
+CAPITAL_20K = {"capital": "20000.0000"}
+
+
+def test_legacy_against_realistic_gets_notes_not_differences(compare_work: Path) -> None:
+    both = {"algos": TWO_ALGOS, "equities": [CAPITAL_20K, CAPITAL_20K]}
+    out = run_node(compare_work, "warn_legacy", warnings_source(REALISTIC, LEGACY, both))
+    assert out == [
+        "The fill models differ (run A: realistic, run B: legacy (bar-close fills, no commission)). "
+        "Prices, costs and trade counts are not comparable.",
+        "Run B stores no capital setting (legacy fills use a nominal 10,000.00 per algo).",
+        "Run B stores no cost settings (legacy fills charge no commission).",
+    ]
+    # the legacy run first: the note names run A
+    swapped = run_node(compare_work, "warn_legacy_swapped", warnings_source(LEGACY, REALISTIC, both))
+    assert isinstance(swapped, list)
+    assert "Run A stores no capital setting (legacy fills use a nominal 10,000.00 per algo)." in swapped
+    assert "Run A stores no cost settings (legacy fills charge no commission)." in swapped
+    # without a readable nominal figure no number is given, whatever the reason
+    for name, options in [("none", {}), ("no_equity", {"algos": TWO_ALGOS, "equities": [None, None]}),
+                          ("no_algos", {"algos": {**TWO_ALGOS, "countB": 0}, "equities": [CAPITAL_20K] * 2}),
+                          ("bad_capital", {"algos": TWO_ALGOS,
+                                           "equities": [CAPITAL_20K, {"capital": "n/a"}]})]:
+        source = warnings_source(REALISTIC, LEGACY, options)
+        plain = run_node(compare_work, "warn_plain_" + name, source)
+        assert isinstance(plain, list)
+        assert "Run B stores no capital setting." in plain, (name, plain)
+        assert not any("nominal" in w or "differs (run A: 100,000.00" in w for w in plain), (name, plain)
+
+
+def test_capital_and_cost_differences_need_both_sides(compare_work: Path) -> None:
+    out = run_node(compare_work, "warn_capital", warnings_source(
+        REALISTIC, {**REALISTIC, "capital": "50000.0000"}, {}))
+    assert isinstance(out, list) and len(out) == 1
+    assert out[0].startswith("The capital per algo differs (run A: 100,000.00, run B: 50,000.00)")
+    # two legacy runs: neither stores capital or costs, so there is nothing to say
+    none = run_node(compare_work, "warn_two_legacy", warnings_source(LEGACY, {**LEGACY, "run_id": 7}, {}))
+    assert none == []
+    # one cost setting missing on one side of two realistic runs: not a difference
+    partial = {**REALISTIC, "costs": {"commission_per_share": "0.0050", "commission_minimum": None,
+                                      "slippage_per_share": "0.0100"}}
+    got = run_node(compare_work, "warn_partial", warnings_source(REALISTIC, partial, {}))
+    assert got == []
+
+
+def test_different_algo_sets_are_warned_about(compare_work: Path) -> None:
+    out = run_node(compare_work, "warn_algos", js("""
+import { algoSets, comparisonWarnings } from "./js/views/compare.js";
+const doc = __DOC__;
+const sets = algoSets(doc, [3, 4]);
+const sameSets = algoSets({ algos: { X: { 3: { net: "1" }, 4: { net: "2" } } } }, [3, 4]);
+console.log(JSON.stringify({
+  sets, sameSets,
+  warnings: comparisonWarnings(doc.runs[0], { ...doc.runs[0], run_id: 4 }, { algos: sets }),
+  same: comparisonWarnings(doc.runs[0], { ...doc.runs[0], run_id: 4 }, { algos: sameSets }),
+  oneSided: comparisonWarnings(doc.runs[0], { ...doc.runs[0], run_id: 4 }, {
+    algos: { onlyA: ["MSFT"], onlyB: [], countA: 2, countB: 1 } }),
+}));
+""", doc=COMPARE_DOC))
+    assert isinstance(out, dict)
+    assert out["sets"] == {"onlyA": ["B-algo"], "onlyB": ["C-algo"], "countA": 2, "countB": 2}
+    assert out["sameSets"] == {"onlyA": [], "onlyB": [], "countA": 1, "countB": 1}
+    assert out["warnings"] == [
+        "The runs have different algos (only in run A: B-algo; only in run B: C-algo). "
+        "The TOTAL rows and the equity curves then cover different algos."]
+    assert out["same"] == []
+    assert out["oneSided"] == [
+        "The runs have different algos (only in run A: MSFT; only in run B: none). "
+        "The TOTAL rows and the equity curves then cover different algos."]
+
+
+def test_final_equity_difference_is_coloured_only_on_one_capital(compare_work: Path) -> None:
+    out = run_node(compare_work, "capital_colour", js("""
+import { buildStatRows, capitalsComparable } from "./js/views/compare.js";
+const doc = __DOC__, [a, b] = doc.runs;
+const eqs = (x, y) => [{ capital: x }, { capital: y }];
+const colour = (options) => buildStatRows(doc, [3, 4], doc.runs, options)[2].cells;
+const abs = (r) => Object.fromEntries(Object.entries(r).map(([k, c]) => [k, c.className]));
+console.log(JSON.stringify({
+  sameStored: capitalsComparable(a, { ...b, capital: "100000" }, []),
+  differStored: capitalsComparable(a, { ...b, capital: "5.0000" }, eqs("1", "1")),
+  oneStored: capitalsComparable(a, b, eqs("20000.0000", "20000.0000")),
+  bothAbsentEqual: capitalsComparable(b, { ...b }, eqs("20000.0000", "20000")),
+  bothAbsentUnequal: capitalsComparable(b, { ...b }, eqs("20000.0000", "30000.0000")),
+  bothAbsentNoEquity: capitalsComparable(b, { ...b }, [null, null]),
+  on: abs(colour({ colourFinal: true })), off: abs(colour({})),
+}));
+""", doc=COMPARE_DOC))
+    assert isinstance(out, dict)
+    assert out["sameStored"] is True and out["differStored"] is False and out["oneStored"] is False
+    assert out["bothAbsentEqual"] is True and out["bothAbsentUnequal"] is False
+    assert out["bothAbsentNoEquity"] is False
+    assert out["on"]["finalEquity"] == "pos" and out["on"]["net"] == "pos"
+    assert out["off"]["finalEquity"] == "" and out["off"]["net"] == "pos"  # net stays coloured
+    for key in ("commission", "maxDrawdown", "avgWin", "avgLoss", "trades", "wins", "winPercent"):
+        assert out["on"][key] == "" and out["off"][key] == "", key
 
 
 # --- the statistics rows -----------------------------------------------------------------------
@@ -196,7 +305,7 @@ def test_stat_rows_have_three_rows_per_block_with_exact_differences(compare_work
 import { buildStatRows, METRICS } from "./js/views/compare.js";
 const doc = __DOC__;
 const text = (row) => Object.fromEntries(Object.entries(row.cells).map(([k, c]) => [k, c.text]));
-const rows = buildStatRows(doc, [3, 4], doc.runs);
+const rows = buildStatRows(doc, [3, 4], doc.runs, { colourFinal: true });
 // the same document with the ids swapped, and a document without algos
 const swapped = buildStatRows(doc, [4, 3], [doc.runs[1], doc.runs[0]]);
 console.log(JSON.stringify({
@@ -302,6 +411,7 @@ for (const fail of ["", "doc", "bad", "down", "equity4", "equity3", "both"]) {
       .flatMap((u) => u.children.map((li) => li.textContent)),
     headers: box.all("table").map((t) => t.all("th").map((th) => th.textContent)),
     rows: box.all("table").map((t) => t.all("tbody")[0].children.map((tr) => tr.children.map((td) => td.textContent))),
+    colours: chart ? chart.series.map((s) => s.opts.color ?? s.opts.topLineColor) : null,
     differsCells: box.all("td").filter((td) => td.className.split(" ").includes("differs")).length,
   };
 }
@@ -336,7 +446,10 @@ def test_view_draws_header_chart_and_statistics(compare_work: Path) -> None:
     assert ok["headers"][1][:2] == ["Algo", "Run"]
     assert len(ok["rows"][0]) == 13 and len(ok["rows"][1]) == 12  # 13 settings; 3 algo-blocks x 3 + TOTAL x 3
     marked = sum(row[3] == "Differs" for row in ok["rows"][0])
-    assert marked >= 1 and ok["differsCells"] == 4 * marked  # the marker is text, not colour only
+    assert marked == 1 and ok["differsCells"] == 4 * marked  # the marker is text, not colour only
+    # start, duration and the legacy run's missing capital and costs say "Not compared" in the last column
+    assert sum(row[3] == "Not compared" for row in ok["rows"][0]) == 6
+    assert ok["colours"][0] != ok["colours"][2] and ok["colours"][0] == ok["colours"][1]
     # run B of the fixture is a legacy run in the header: the warning list says so
     assert any("fill models differ" in w for w in ok["warnings"])
 
@@ -363,6 +476,9 @@ def test_one_failing_equity_keeps_the_chart_with_the_other_run(compare_work: Pat
     assert rounded(four["series"][0][1]) == [0.0, -50.0, -12.345]
     assert "Run A (realistic)" in four["legend"] and "Run B" not in four["legend"]
     three = out["equity3"]
+    # run B drawn alone keeps run B's colour, not the first colour
+    assert three["colours"] == out["ok"]["colours"][2:] and three["colours"][0] != out["ok"]["colours"][0]
+    assert four["colours"] == out["ok"]["colours"][:2]
     assert three["errors"] == ["The equity of run A (run 3) could not be loaded. Error 500: equity 3 broke"]
     assert rounded(three["series"][0][1]) == [0.0, 40.0] and "Run B (legacy)" in three["legend"]
     both = out["both"]
@@ -423,15 +539,30 @@ sizeHandlers[0](); out.afterResize = fits(); // the width changed: fitted again
 // the user zooms: a resize leaves the view alone
 canvas.fire("wheel", {});
 sizeHandlers[0](); out.afterZoom = fits();
-// a pointer that moves with no button pressed is not a zoom; a dragged one is
-canvas.fire("pointermove", { buttons: 0 });
 handle.setSeries([{ label: "A", points: pts, capital: "100.0000" }]); // new data: whole series again
 out.afterNewData = fits();
-canvas.fire("pointermove", { buttons: 0 });
+// a hover, a click with a little jitter (4 px or less) and a one-finger touch are not zooms
+canvas.fire("pointermove", { buttons: 0, clientX: 50, clientY: 50 });
 sizeHandlers[0](); out.afterHover = fits();
-canvas.fire("pointermove", { buttons: 1 });
+canvas.fire("pointerdown", { buttons: 1, clientX: 10, clientY: 10 });
+canvas.fire("pointermove", { buttons: 1, clientX: 14, clientY: 10 }); // exactly 4 px
+canvas.fire("pointermove", { buttons: 1, clientX: 13, clientY: 12 });
+canvas.fire("pointerup", { buttons: 0 });
+sizeHandlers[0](); out.afterClick = fits();
+canvas.fire("touchstart", { touches: [{}] });
+canvas.fire("touchmove", { touches: [{}] }); // one finger scrolling the page
+sizeHandlers[0](); out.afterOneFinger = fits();
+// a button-down move without a recorded press is no drag either
+canvas.fire("pointermove", { buttons: 1, clientX: 400, clientY: 400 });
+sizeHandlers[0](); out.afterStray = fits();
+// a pointer dragged more than 4 px with a button down is
+canvas.fire("pointerdown", { buttons: 1, clientX: 10, clientY: 10 });
+canvas.fire("pointermove", { buttons: 1, clientX: 30, clientY: 10 });
 sizeHandlers[0](); out.afterDrag = fits();
-canvas.fire("touchmove", {});
+handle.setSeries([{ label: "A", points: pts, capital: "100.0000" }]);
+out.afterNewData2 = fits();
+canvas.fire("touchmove", { touches: [{}, {}] }); // two fingers: pinch
+sizeHandlers[0](); out.afterPinch = fits();
 handle.dispose(); handle.dispose();
 sizeHandlers.length === 0 || (out.leaked = sizeHandlers.length);
 out.afterDispose = sizeHandlers.length;
@@ -442,9 +573,50 @@ console.log(JSON.stringify(out));
     assert out["subscribed"] == 1 and out["beforeData"] == 0
     assert out["afterData"] == 1 and out["afterResize"] == 2
     assert out["afterZoom"] == 2  # the user's own zoom is not fought
-    assert out["afterNewData"] == 3 and out["afterHover"] == 4 and out["afterDrag"] == 4
+    assert out["afterNewData"] == 3 and out["afterHover"] == 4
+    assert out["afterClick"] == 5 and out["afterOneFinger"] == 6 and out["afterStray"] == 7
+    assert out["afterDrag"] == 7  # the drag stopped the refit
+    assert out["afterNewData2"] == 8 and out["afterPinch"] == 8  # new data refits; a pinch stops it again
     assert out["afterDispose"] == 0 and "leaked" not in out  # the size listener is removed with the chart
     assert out["cleanups"] >= 1  # the disposal is registered with ctx at creation
+
+
+def test_equity_chart_sets_a_tiny_min_bar_spacing_beside_the_theme_options(compare_work: Path) -> None:
+    out = run_node(compare_work, "equity_spacing", FAKE_DOM + FAKE_CHART_LIB + """
+const { createEquityChart, EQUITY_MIN_BAR_SPACING } = await import("./js/charts/equity.js");
+const { chartOptions, readTheme } = await import("./js/charts/theme.js");
+createEquityChart(document.createElement("div"), { ctx: { onCleanup() {} } });
+const created = globalThis.lastChart.options;
+console.log(JSON.stringify({ created: created.timeScale, constant: EQUITY_MIN_BAR_SPACING,
+  theme: chartOptions(readTheme(globalThis)).timeScale, autoSize: created.autoSize }));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    assert out["constant"] == 0.01 and out["autoSize"] is True
+    # the theme's own timeScale options are all still there, plus the minimum; the shared theme has no minimum
+    assert "minBarSpacing" not in out["theme"] and out["theme"]["timeVisible"] is True
+    assert out["created"] == {**out["theme"], "minBarSpacing": 0.01}
+
+
+def test_equity_chart_colour_index_picks_the_theme_colour_of_that_index(compare_work: Path) -> None:
+    out = run_node(compare_work, "equity_colour_index", FAKE_DOM + FAKE_CHART_LIB + """
+const { createEquityChart } = await import("./js/charts/equity.js");
+const pts = [{ time: "2024-01-02 09:30:00", equity: "1.0000" }, { time: "2024-01-02 09:31:00", equity: "2.0000" }];
+const handle = createEquityChart(document.createElement("div"), { ctx: { onCleanup() {} } });
+const colours = (list) => { handle.setSeries(list); return globalThis.lastChart.series.map((s) => s.opts.color ?? s.opts.topLineColor); };
+const entry = (extra) => ({ label: "X", points: pts, capital: "1.0000", ...extra });
+console.log(JSON.stringify({
+  position: colours([entry({}), entry({})]), alone: colours([entry({})]),
+  aloneAsB: colours([entry({ colorIndex: 1 })]), bothIndexed: colours([entry({ colorIndex: 0 }), entry({ colorIndex: 1 })]),
+  invalid: colours([entry({ colorIndex: 7 })]), hex: colours([entry({ colorIndex: 1, color: "#abcdef" })]),
+}));
+""")  # noqa: E501
+    assert isinstance(out, dict)
+    first, second = out["position"][0], out["position"][2]
+    assert first != second and out["alone"] == [first, first]
+    assert out["aloneAsB"] == [second, second]  # run B alone keeps run B's colour
+    assert out["bothIndexed"] == [first, first, second, second]
+    assert out["invalid"] == [first, first]  # only 0 and 1 are accepted
+    assert out["hex"][0] == "#abcdef"  # an explicit colour still wins
 
 
 def test_equity_chart_without_size_events_still_works(compare_work: Path) -> None:

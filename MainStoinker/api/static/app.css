@@ -221,6 +221,11 @@ tbody tr:first-child td.cmp-start { border-top: none; }
 td.cmp-diff { background: var(--surface-2); font-style: italic; }
 td.cmp-a, td.cmp-b { font-weight: 400; }
 td.cmp-a.total, td.cmp-b.total, td.cmp-diff.total { font-weight: 600; }
+.table-wrap td.not-compared, .table-wrap th.not-compared { color: var(--muted); }
+/* In the TOTAL block (td.total, further down, shades every total cell alike) the B - A row stays distinct:
+   the Run A and Run B rows sit on the plain surface, the difference row is shaded and italic. */
+.table-wrap td.cmp-a.total, .table-wrap td.cmp-b.total { background: var(--surface); }
+.table-wrap td.cmp-diff.total { background: var(--surface-2); font-style: italic; }
 
 /* Run overview and charts */
 .view h3 { margin: 0 0 8px; font-size: 15px; }

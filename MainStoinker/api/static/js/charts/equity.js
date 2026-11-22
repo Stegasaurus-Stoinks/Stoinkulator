@@ -23,7 +23,9 @@
 // describeSeries(list)            -> text for the chart's accessible label: per entry the start equity,
 //                    final equity and largest drawdown (or "no equity points stored").
 // createEquityChart(element, {ctx, lib, view, relative}) -> {setSeries(list), dispose()}
-//     list: [{label, points, capital, color?}], one or two entries (more are drawn too). `color`, when
+//     list: [{label, points, capital, color?, colorIndex?}], one or two entries (more are drawn too).
+//     `colorIndex` (0 or 1) picks the theme colour of that index instead of the entry's position, so a run
+//     drawn alone keeps its colour and follows theme changes. `color`, when
 //     given, must be a #rgb / #rrggbb colour or one of the theme's own colours (it reaches a style
 //     attribute); anything else is ignored in favour of the theme colour of that series.
 //     `relative` (default false): draw each series as profit and loss from zero (see buildChartData), for
@@ -108,6 +110,12 @@ export function describeSeries(list) {
 
 const PRICE_FORMAT = { type: "price", precision: 2, minMove: 0.01 };
 
+// The library's default minimum bar spacing is 0.5 px, so a long series cannot be fitted into a narrow chart.
+// 0.01 px lets 5,000 points (the equity route's default) fit in 50 px.
+export const EQUITY_MIN_BAR_SPACING = 0.01;
+// A pointer dragged farther than this (px) with a button down counts as the user scrolling the chart.
+const DRAG_PIXELS = 4;
+
 export function createEquityChart(
   element, { ctx, lib = globalThis.LightweightCharts, view = globalThis, relative = false } = {}) {
   if (!lib || typeof lib.createChart !== "function") throw new Error("The chart library is not loaded.");
@@ -116,23 +124,43 @@ export function createEquityChart(
   const legend = h("div", { class: "chart-legend" });
   const note = h("p", { class: "chart-note muted", role: "status", hidden: true }, EMPTY_NOTE);
   const canvas = h("div", { class: "chart-canvas", role: "img", "aria-label": describeSeries([]) });
-  const chart = lib.createChart(canvas, { autoSize: true, ...chartOptions(readTheme(view)) });
+  const options = chartOptions(readTheme(view));
+  // Merged into the theme's timeScale options (not replacing them). Not in the shared theme: the candle chart
+  // uses the same options and must keep the library's default minimum.
+  options.timeScale = { ...options.timeScale, minBarSpacing: EQUITY_MIN_BAR_SPACING };
+  const chart = lib.createChart(canvas, { autoSize: true, ...options });
 
   // The chart sizes itself (autoSize) and keeps its bar spacing when the width changes, so after a resize
   // the time scale would show only the last part of the series. The library tells the time scale when its
   // size changed (subscribeSizeChange): then, and after every setSeries, the whole series is fitted, unless
-  // the user has zoomed or scrolled (wheel, touch or a dragged pointer on the chart) since the last
-  // setSeries, whose new data is fitted again.
+  // the user has zoomed or scrolled since the last setSeries, whose new data is fitted again. Zooming or
+  // scrolling is: a wheel event on the chart, a touch with two or more fingers, or a pointer dragged more
+  // than DRAG_PIXELS with a button down. A click, a hover or a one-finger vertical scroll is not.
   let userAdjusted = false;
   let sizeHandler = null;
+  let pressed = null; // where the pointer went down
   const timeScale = chart.timeScale();
   const markAdjusted = () => {
     userAdjusted = true;
   };
+  const markPinch = (event) => {
+    if (event && event.touches && event.touches.length >= 2) userAdjusted = true;
+  };
   canvas.addEventListener("wheel", markAdjusted, { passive: true });
-  canvas.addEventListener("touchmove", markAdjusted, { passive: true });
+  canvas.addEventListener("touchstart", markPinch, { passive: true });
+  canvas.addEventListener("touchmove", markPinch, { passive: true });
+  canvas.addEventListener("pointerdown", (event) => {
+    pressed = event ? { x: Number(event.clientX) || 0, y: Number(event.clientY) || 0 } : null;
+  });
+  const release = () => {
+    pressed = null;
+  };
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
   canvas.addEventListener("pointermove", (event) => {
-    if (event && event.buttons) userAdjusted = true;
+    if (!event || !event.buttons || !pressed) return;
+    const moved = Math.hypot((Number(event.clientX) || 0) - pressed.x, (Number(event.clientY) || 0) - pressed.y);
+    if (moved > DRAG_PIXELS) userAdjusted = true;
   });
   function fitWhole() {
     if (disposed || userAdjusted || drawn.length === 0) return;
@@ -167,7 +195,9 @@ export function createEquityChart(
   element.append(legend, note, canvas);
 
   function colorOf(entry, index, theme) {
-    return isThemeOrHexColor(entry.color, theme) ? entry.color : seriesColor(theme, index);
+    if (isThemeOrHexColor(entry.color, theme)) return entry.color;
+    const fixed = entry.colorIndex === 0 || entry.colorIndex === 1 ? entry.colorIndex : index;
+    return seriesColor(theme, fixed);
   }
 
   function clearSeries() {
