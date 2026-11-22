@@ -6,17 +6,20 @@ This is a backtest-only tool. It builds a `CsvBarFeed`, one simulated broker
 per algo (a `SimBroker`, or with `--fills realistic` a `PaperBroker` reporting
 to a `Ledger`; see `modes.build_router`), a `NullSink` and an `Engine`. There
 is no live subcommand and no option that selects a feed or a real broker.
-An algo config object may carry `"mode"`: `backtest` (default) or `paper`,
-both simulated; `"live"` is refused during validation with exit code 2,
-before anything is built. This module never imports or references `ibapi`,
+Each config object in an entry's `"data"` may carry `"mode"`: `backtest`
+(default) or `paper`, both simulated; `"live"` (in any case) is refused during
+validation with exit code 2, before anything is built. `"mode"` on the entry
+itself, or spelled in another case, is an error. This module never imports or references `ibapi`,
 `apiApi`, the socket.io client, `Globals` or the legacy entry script.
 (Loading an algo imports its module, which pulls legacy modules in
 transitively; that happens only while a run is in progress.)
 
 Fills: `--fills legacy` (default) fills at the bar close with no costs and
-writes `trades.json` exactly as before. `--fills realistic` uses the paper
-broker's fill model and costs, writes `trades.json` from the ledger (same
-shape) and adds `ledger.json` (round trips, commission, net, final equity).
+writes `trades.json` exactly as before and removes a `ledger.json` left in
+`--out` by an earlier realistic run (only that file name). `--fills realistic`
+uses the paper broker's fill model and costs, writes `trades.json` from the
+ledger (same shape) and adds `ledger.json`: per algo a `summary` and the
+`round_trips`, in the format of `engine/stats.py` (see `tests/golden_paper`).
 `--capital` and the cost options only apply to realistic fills; giving one
 with legacy fills is an error rather than being silently ignored.
 
@@ -49,12 +52,15 @@ from .algos import close_algo_logs, load_algo
 from .engine import Engine, EngineConfig
 from .feed import CsvBarFeed
 from .ledger import Ledger
-from .modes import DEFAULT_MODE, ModeError, build_router, ledger_document, parse_mode
+from .modes import DEFAULT_MODE, ModeError, build_router, parse_mode
 from .paper_broker import CostModel
-from .report import ledger_trade_records, trade_records
+from .report import ledger_document, ledger_trade_records, trade_records
 from .sink import NullSink
 
 _SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+_MONEY = re.compile(_NUMBER)
+_NEGATIVE_MONEY = re.compile("-" + _NUMBER)
 LOG_NAME = "backtest.log"
 TRADES_NAME = "trades.json"
 LEDGER_NAME = "ledger.json"
@@ -88,9 +94,12 @@ def validate_algo_config(parsed: object) -> list[dict[str, Any]]:
     lacks "ID" / "data"; an ID that is not a plain identifier; "data" not a
     list; a config that is not an object or lacks a string "idname" /
     "ticker"; a ticker that cannot be a file-name part; a "mode" that is not
-    a string or not `backtest` / `paper` (`live` gets its own message: not
-    available yet); a duplicate idname; no configs at all. Does not check
-    that the algo exists. Nothing is built here.
+    a string or not `backtest` / `paper` (`live`, also as `Live` or ` live `,
+    gets its own message: not available yet); a "mode" key on the entry
+    instead of on a config, or a config key that is "mode" in another case;
+    a duplicate idname; no configs at all. Does not check that the algo
+    exists. Nothing is built here. User-supplied values in messages go
+    through `ascii()` so a message can always be written to any stream.
     """
     if not isinstance(parsed, list):
         raise CliError("algo config must be a JSON list of {ID, data} entries")
@@ -106,31 +115,39 @@ def validate_algo_config(parsed: object) -> list[dict[str, Any]]:
             raise CliError(f'algo config entry {i} is missing "ID"')
         if "data" not in entry:
             raise CliError(f'algo config entry {i} is missing "data"')
+        if "mode" in entry:
+            raise CliError(
+                f'algo config entry {i}: "mode" belongs on each config in "data", '
+                "not next to ID and data"
+            )
         algo_id, data = entry["ID"], entry["data"]
         if not isinstance(algo_id, str) or not algo_id.isidentifier() or algo_id.startswith("_"):
             raise CliError(
-                f"invalid algo id {algo_id!r} in entry {i}: "
+                f"invalid algo id {ascii(algo_id)} in entry {i}: "
                 "must be a Python identifier not starting with '_'"
             )
         if not isinstance(data, list):
-            raise CliError(f'"data" of algo {algo_id!r} (entry {i}) must be a list')
+            raise CliError(f'"data" of algo {ascii(algo_id)} (entry {i}) must be a list')
         for j, cfg in enumerate(data):
-            where = f"algo {algo_id!r} config {j}"
+            where = f"algo {ascii(algo_id)} config {j}"
             if not isinstance(cfg, dict):
                 raise CliError(f"{where} is not a JSON object")
+            for key in cfg:
+                if key != "mode" and isinstance(key, str) and key.lower() == "mode":
+                    raise CliError(f'{where}: key {ascii(key)} must be spelled "mode" (lower case)')
             for key in ("idname", "ticker"):
                 if key not in cfg:
                     raise CliError(f'{where} is missing "{key}"')
                 if not isinstance(cfg[key], str) or not cfg[key]:
                     raise CliError(f'{where}: "{key}" must be a non-empty string')
             if not _SYMBOL.fullmatch(cfg["ticker"]):
-                raise CliError(f"{where}: invalid ticker {cfg['ticker']!r}")
+                raise CliError(f"{where}: invalid ticker {ascii(cfg['ticker'])}")
             try:
                 parse_mode(cfg["idname"], cfg.get("mode", DEFAULT_MODE))
             except ModeError as exc:
                 raise CliError(str(exc)) from exc
             if cfg["idname"] in seen:
-                raise CliError(f"duplicate idname {cfg['idname']!r}: idnames must be unique")
+                raise CliError(f"duplicate idname {ascii(cfg['idname'])}: idnames must be unique")
             seen.add(cfg["idname"])
             total += 1
         entries.append({"ID": algo_id, "data": list(data)})
@@ -172,7 +189,10 @@ def build_parser() -> argparse.ArgumentParser:
             "connects to a broker. Relative paths are relative to the directory the "
             "command was started in. While the run is in progress the working "
             "directory is --out, so side files written by legacy code (tradey.txt) "
-            "land there and nothing is written to the starting directory."
+            "land there and nothing is written to the starting directory. Each config "
+            'in an algo\'s "data" may set "mode": "backtest" (default) or "paper" '
+            "(both simulated); \"live\" is not available yet and is refused. A legacy-fills "
+            "run deletes a ledger.json left in --out by an earlier realistic run."
         ),
     )
     bt.add_argument(
@@ -186,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="DIR",
         help="output directory (created if missing); gets trades.json "
-        "(and ledger.json with --fills realistic)",
+        "(and ledger.json with --fills realistic; legacy fills remove a stale one)",
     )
     bt.add_argument(
         "--warmup-days", type=int, default=2, metavar="N", help="days of warm-up history (default 2)"
@@ -286,22 +306,32 @@ def _load_algos(entries: Sequence[Mapping[str, Any]], log_path: Path | None, alg
 def parse_money(text: str, flag: str, *, positive: bool = False) -> Decimal:
     """Parse a money option from its text (never through float).
 
-    Raises `CliError` for text that is not a number, a non-finite value, a
-    negative value (or zero when `positive`), a value finer than 0.0001 (it
-    would round away in the ledger) or an absurdly large one.
+    Only plain decimal text is accepted: ASCII digits with an optional
+    fraction and an optional exponent (`10`, `0.005`, `.5`, `1e3`); no sign, no
+    spaces, no underscores, no `nan` / `inf`, no other Unicode digits. Raises
+    `CliError` for anything else, for zero when `positive`, for a value finer
+    than 0.0001 (it would round away in the ledger) or an absurdly large one.
+    A negative number gets its own message.
     """
+    shown = ascii(text)
+    if _NEGATIVE_MONEY.fullmatch(text):
+        raise CliError(f"{flag} must not be negative or carry a sign (including -0), got {shown}")
+    if not _MONEY.fullmatch(text):
+        raise CliError(f"{flag} must be a plain decimal number such as 0.005, got {shown}")
     try:
-        value = Decimal(text.strip())
-    except InvalidOperation:
-        raise CliError(f"{flag} must be a number, got {text!r}") from None
-    if not value.is_finite():
-        raise CliError(f"{flag} must be a finite number, got {text!r}")
-    if value < 0 or (positive and value == 0):
-        raise CliError(f"{flag} must be {'greater than' if positive else 'at least'} 0, got {text!r}")
+        value = Decimal(text)
+    except InvalidOperation:  # pragma: no cover - the pattern only lets valid text through
+        raise CliError(f"{flag} must be a number, got {shown}") from None
+    if positive and value == 0:
+        raise CliError(f"{flag} must be greater than 0, got {shown}")
     if value > _LARGEST:
-        raise CliError(f"{flag} is too large: {text!r}")
-    if value != value.quantize(_FINEST):
-        raise CliError(f"{flag} must have at most 4 decimal places, got {text!r}")
+        raise CliError(f"{flag} is too large: {shown}")
+    try:
+        finer = value != value.quantize(_FINEST)
+    except InvalidOperation:  # an exponent so small the quantum is out of range
+        finer = True
+    if finer:
+        raise CliError(f"{flag} must have at most 4 decimal places, got {shown}")
     return value
 
 
@@ -333,8 +363,14 @@ def parse_fill_options(args: argparse.Namespace) -> tuple[CostModel, Decimal]:
     return costs, capital
 
 
-def run_backtest_command(args: argparse.Namespace) -> int:
-    """Execute the parsed `backtest` command. Raises `CliError` for input problems."""
+def run_backtest_command(args: argparse.Namespace, *, attach_ledger: bool = False) -> int:
+    """Execute the parsed `backtest` command. Raises `CliError` for input problems.
+
+    `attach_ledger` (internal seam, not reachable from the command line) books
+    a ledger even for a legacy-fills run. Which file is written never depends
+    on it: legacy fills write `trades.json` from the algos' own trades and no
+    `ledger.json`, realistic fills write both from the ledger.
+    """
     # Resolve everything against the starting directory, before any chdir.
     algos_path = Path(args.algos).resolve()
     data_dir = Path(args.data).resolve()
@@ -362,8 +398,7 @@ def run_backtest_command(args: argparse.Namespace) -> int:
 
     realistic = args.fills == "realistic"
     idnames = [cfg["idname"] for entry in entries for cfg in entry["data"]]
-    # Legacy fills attach no ledger: the output is written from the algos' own trades.
-    ledger = Ledger() if realistic else None
+    ledger = Ledger() if (realistic or attach_ledger) else None
     try:
         router = build_router(entries, fills=args.fills, costs=costs, capital=capital,
                               ledger=ledger)
@@ -372,38 +407,54 @@ def run_backtest_command(args: argparse.Namespace) -> int:
 
     algos: list = []
     summary: dict[str, str] = {}
+    removed_stale = False
     try:
         with _working_directory(out_dir), _maybe_quiet(args.quiet):
             _load_algos(entries, log_path, algos)
             engine = Engine(EngineConfig(), feed, router, NullSink(), algos,
                             ledger=ledger, end_commission=router.end_commission)
             engine.run_backtest()
-            if ledger is None:
+            if realistic:
+                assert ledger is not None
+                result = {idname: ledger_trade_records(ledger, idname) for idname in idnames}
+            else:
                 result = {
                     idname: trade_records(algo)
                     for idname, algo in zip(idnames, algos, strict=True)
                 }
-            else:
-                result = {idname: ledger_trade_records(ledger, idname) for idname in idnames}
     finally:
         close_algo_logs(algos)
 
     write_json_atomic(trades_path, result)
-    if ledger is not None:
-        document = ledger_document(ledger, idnames, costs=costs, capital=capital)
+    if realistic:
+        assert ledger is not None
+        document = ledger_document(
+            ledger, idnames, fills=args.fills, costs=costs, capital=capital,
+            cancelled_entries={i: router.cancelled_entries(i) for i in idnames},
+        )
         write_json_atomic(ledger_path, document)
         summary = {
             idname: (f"net {acct['summary']['net']}, commission {acct['summary']['commission']}, "
                      f"final equity {acct['summary']['final_equity']}")
             for idname, acct in document["accounts"].items()
         }
+    else:
+        # A legacy run leaves no ledger.json behind, so a file from an earlier
+        # realistic run into this directory cannot be mistaken for this run's.
+        removed_stale = ledger_path.exists() or ledger_path.is_symlink()
+        try:
+            ledger_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise CliError(f"cannot remove stale {ledger_path}: {exc}") from exc
     print(f"replayed {bar_count} bars for {', '.join(feed.symbols())}")
     for idname, records in result.items():
         extra = f" ({summary[idname]})" if idname in summary else ""
         print(f"{idname}: {len(records)} trades{extra}")
     print(f"wrote {trades_path}")
-    if ledger is not None:
+    if realistic:
         print(f"wrote {ledger_path}")
+    if removed_stale:
+        print(f"removed stale {ledger_path} (left by an earlier realistic run)")
     return 0
 
 
@@ -414,7 +465,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "backtest":
             return run_backtest_command(args)
     except CliError as exc:
-        print("error: " + " ".join(str(exc).split()), file=sys.stderr)
+        message = "error: " + " ".join(str(exc).split())
+        # Values from the config are shown through ascii(); paths and OS messages
+        # are not, so never let an unencodable character turn this into a traceback.
+        encoding = getattr(sys.stderr, "encoding", None) or "ascii"
+        print(message.encode(encoding, "backslashreplace").decode(encoding), file=sys.stderr)
         return 2
     raise AssertionError(f"unhandled command {args.command!r}")  # pragma: no cover
 

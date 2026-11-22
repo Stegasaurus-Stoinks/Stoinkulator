@@ -415,12 +415,12 @@ def test_realistic_fills_trades_json_from_ledger(env):
     assert records and set(records[0]) == legacy_keys - {"status"}
     doc = env.ledger()
     trips = doc["accounts"][EMA["idname"]]["round_trips"]
-    assert len(trips) == len(records) == doc["accounts"][EMA["idname"]]["summary"]["trades"]
+    assert len(trips) == len(records) == doc["accounts"][EMA["idname"]]["summary"]["trade_count"]
     # the records come from the ledger's fills: ids, volumes and open prices agree
     assert [r["id"] for r in records] == [f"{EMA['idname']}{i}" for i in range(len(records))]
     for record, trip in zip(records, trips, strict=True):
         assert record["openTime"] == trip["entry_time"]
-        assert record["volume"] == trip["quantity"]
+        assert record["volume"] == Decimal(trip["quantity"])
         assert record["direction"] == (1 if trip["side"] == "long" else 0)
         if not trip["synthetic"]:
             assert record["closeTime"] == trip["exit_time"]
@@ -438,8 +438,11 @@ def test_ledger_json_shape(env):
     assert doc["capital"] == "10000.0000"
     assert doc["costs"] == {"commission_per_share": "0.0050", "commission_minimum": "1.0000",
                             "slippage_per_share": "0.0000"}
-    assert list(doc["summary"]) == ["trades", "net", "commission", "final_equity"]
+    summary_keys = ["trade_count", "wins", "commission", "net", "final_equity", "max_drawdown",
+                    "ignored_events", "cancelled_entries", "synthetic_closes"]
+    assert sorted(doc["summary"]) == sorted(summary_keys)
     account = doc["accounts"][EMA["idname"]]
+    assert sorted(account["summary"]) == sorted(summary_keys)
     assert list(account) == ["symbol", "summary", "round_trips"]
     assert account["symbol"] == "AAPL"
     trip = account["round_trips"][0]
@@ -478,14 +481,14 @@ def test_multi_algo_realistic_run(env, capsys):
         "MSFT-functest": "MSFT", "AAPL-10/30EMA": "AAPL", "MSFT-10/30EMA": "MSFT"}
     for idname in ids:
         account = doc["accounts"][idname]
-        assert account["summary"]["trades"] == len(trades[idname]) == len(account["round_trips"])
+        assert account["summary"]["trade_count"] == len(trades[idname]) == len(account["round_trips"])
         assert all(t["entry_time"] for t in account["round_trips"])
         net = sum(Decimal(t["net"]) for t in account["round_trips"])
         assert Decimal(account["summary"]["final_equity"]) == Decimal("5000") + net
     assert sum(len(v) for v in trades.values()) > 2
     assert any(len(doc["accounts"][i]["round_trips"]) > 0 for i in ("MSFT-functest",))
     total = doc["summary"]
-    assert total["trades"] == sum(a["summary"]["trades"] for a in doc["accounts"].values())
+    assert total["trade_count"] == sum(a["summary"]["trade_count"] for a in doc["accounts"].values())
     assert Decimal(total["net"]) == sum(Decimal(a["summary"]["net"]) for a in doc["accounts"].values())
     assert Decimal(total["final_equity"]) == Decimal("15000") + Decimal(total["net"])
     out = capsys.readouterr().out
@@ -493,26 +496,6 @@ def test_multi_algo_realistic_run(env, capsys):
     # each account trades its own symbol only
     for idname, symbol in (("AAPL-10/30EMA", "AAPL"), ("MSFT-10/30EMA", "MSFT")):
         assert {r["symbol"] for r in trades[idname]} <= {symbol}
-
-
-# reference values (trades, net, commission) with the default costs and 10000 capital,
-# as in tests/golden_paper.
-REFERENCE = {
-    "ema": ([{"ID": "EMACrossing", "data": [EMA]}], ["AAPL"], EMA["idname"], (35, "-57.3000", "70.0000")),
-    "fvg": ([{"ID": "FVG", "data": [FVG]}], ["AAPL"], FVG["idname"], (42, "-94.6000", "84.0000")),
-}
-
-
-@pytest.mark.parametrize("key", ["ema", "fvg"])
-def test_realistic_run_matches_paper_reference(tmp_path_factory, key):
-    algos, symbols, idname, (trades, net, commission) = REFERENCE[key]
-    env = full_run(tmp_path_factory, f"{key}-realistic", algos, symbols, "--fills", "realistic")
-    summary = env.ledger()["accounts"][idname]["summary"]
-    assert summary["trades"] == trades
-    assert summary["net"] == net
-    assert summary["commission"] == commission
-    assert Decimal(summary["final_equity"]) == Decimal("10000") + Decimal(net)
-    assert len(env.trades()[idname]) == trades
 
 
 # ---- verification additions: refusal everywhere, golden pins, multi-algo, hand-computed costs ----
@@ -582,24 +565,20 @@ def test_refused_config_leaves_no_state_for_the_next_run(env, capsys):
 @pytest.mark.skipif(not any(GOLDEN_PAPER.glob("*.json")), reason="tests/golden_paper not merged yet")
 @pytest.mark.parametrize("case", sorted(FAST_CASES))
 def test_realistic_cli_output_matches_golden_paper(tmp_path_factory, case):
+    """`ledger.json` shares its numbers and format with the golden: its per-algo
+    `summary` and `round_trips` equal the golden's `summary` and `trades` exactly."""
     cfg = FAST_CASES[case][1]
     env = single_realistic(tmp_path_factory, case)
     golden = json.loads((GOLDEN_PAPER / f"{case}.json").read_text())
-    account = env.ledger()["accounts"][cfg["idname"]]
-    summary, expected = account["summary"], golden["summary"]
-    assert summary["trades"] == expected["trade_count"]
-    for key in ("net", "commission", "final_equity"):
-        assert Decimal(summary[key]) == Decimal(expected[key]), key
-    assert len(account["round_trips"]) == len(golden["trades"])
-    for trip, want in zip(account["round_trips"], golden["trades"], strict=True):
-        assert set(trip) == set(want)
-        for key, value in want.items():
-            if key in ("side", "exit_reason", "entry_time", "exit_time", "synthetic"):
-                assert trip[key] == value, key
-            else:
-                assert Decimal(trip[key]) == Decimal(value), key
+    doc = env.ledger()
+    account = doc["accounts"][cfg["idname"]]
+    assert account["summary"] == golden["summary"]
+    assert account["round_trips"] == golden["trades"]
+    assert doc["summary"] == golden["summary"]  # one algo: the total is the algo
+    assert doc["capital"] == golden["capital"] and doc["costs"] == golden["costs"]
+    assert account["symbol"] == golden["ticker"]
     records = env.trades()[cfg["idname"]]
-    assert len(records) == expected["trade_count"]
+    assert len(records) == golden["summary"]["trade_count"]
     assert all("status" not in record for record in records)
 
 
@@ -618,10 +597,10 @@ def test_multi_algo_run_equals_the_single_algo_runs(tmp_path_factory):
         assert doc["accounts"][idname] == single.ledger()["accounts"][idname]
         assert trades[idname] == single.trades()[idname]
         assert legacy_trades[idname] == json.loads((GOLDEN / f"{case}.json").read_text())
-        total_trades += doc["accounts"][idname]["summary"]["trades"]
+        total_trades += doc["accounts"][idname]["summary"]["trade_count"]
         total_net += Decimal(doc["accounts"][idname]["summary"]["net"])
     assert list(doc["accounts"]) == [FAST_CASES[c][1]["idname"] for c in cases]
-    assert doc["summary"]["trades"] == total_trades
+    assert doc["summary"]["trade_count"] == total_trades
     assert Decimal(doc["summary"]["net"]) == total_net
     assert Decimal(doc["summary"]["final_equity"]) == Decimal(10000 * len(cases)) + total_net
 
@@ -669,3 +648,177 @@ def test_slippage_worsens_market_and_stop_fills_only(tmp_path_factory, case):
             assert move == -sign * penny, before["exit_reason"]
             expected_cost = 2 * penny
         assert Decimal(before["net"]) - Decimal(after["net"]) == expected_cost * Decimal(before["quantity"])
+
+
+# ---- review fixes: stale ledger, output source, mode keys, ascii, money, router ----
+
+
+def test_legacy_run_removes_a_stale_ledger_json(env, capsys):
+    env.setup(ema_config(), ["AAPL"])
+    assert env.run("--fills", "realistic") == 0
+    assert (env.out / "ledger.json").exists()
+    (env.out / "keep.txt").write_text("not ours", encoding="utf-8")
+    capsys.readouterr()
+    assert env.run() == 0
+    assert not (env.out / "ledger.json").exists()
+    assert (env.out / "keep.txt").read_text(encoding="utf-8") == "not ours"
+    assert "removed stale" in capsys.readouterr().out
+    assert "status" in env.trades()[EMA["idname"]][0]  # the legacy shape
+    # nothing to remove: no message, no error
+    assert env.run("--fills", "legacy") == 0
+    assert "removed stale" not in capsys.readouterr().out
+    # and a realistic run afterwards writes it again
+    assert env.run("--fills", "realistic") == 0
+    assert (env.out / "ledger.json").exists()
+
+
+def _parse(env, *extra: str):
+    return cli.build_parser().parse_args(
+        ["backtest", "--algos", str(env.algos), "--data", str(env.data), "--out", str(env.out),
+         "--quiet", *extra])
+
+
+def test_output_source_follows_the_fill_model_not_the_ledger(env, monkeypatch):
+    """With a ledger attached to a legacy run (B8 will do that for every run),
+    `trades.json` still comes from the algos' own trades and no `ledger.json`
+    is written; the bytes equal the committed legacy golden."""
+    attached: list[Ledger] = []
+
+    class SpyLedger(Ledger):
+        def __init__(self) -> None:
+            super().__init__()
+            attached.append(self)
+
+    monkeypatch.setattr(cli, "Ledger", SpyLedger)
+    env.setup(ema_config(), ["AAPL"], rows=None)
+    assert cli.run_backtest_command(_parse(env), attach_ledger=True) == 0
+    assert len(attached) == 1 and attached[0].accounts  # a ledger really was attached
+    golden = json.loads((GOLDEN / "emacrossing_aapl.json").read_text())
+    assert env.trades_bytes() == (json.dumps({EMA["idname"]: golden}, indent=1) + "\n").encode()
+    assert not (env.out / "ledger.json").exists()
+    # a realistic run through the same seam still writes both, from the ledger
+    assert cli.run_backtest_command(_parse(env, "--fills", "realistic"), attach_ledger=True) == 0
+    assert "status" not in env.trades()[EMA["idname"]][0]
+    assert (env.out / "ledger.json").exists()
+
+
+def test_ledger_json_carries_the_actual_fill_model(env, monkeypatch):
+    env.setup(ema_config(), ["AAPL"], rows=200)
+    seen: list[str] = []
+    real = cli.ledger_document
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["fills"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "ledger_document", spy)
+    assert env.run("--fills", "realistic") == 0
+    assert seen == ["realistic"] == [env.ledger()["fills"]]
+
+
+def test_mode_on_the_entry_is_an_error():
+    config = [{"ID": "EMACrossing", "mode": "paper", "data": [EMA]}]
+    with pytest.raises(CliError, match='"mode" belongs on each config in "data"'):
+        validate_algo_config(config)
+
+
+@pytest.mark.parametrize("key", ["Mode", "MODE", "mOdE"])
+def test_mode_key_in_another_case_is_an_error(env, capsys, key):
+    config = [{"ID": "EMACrossing", "data": [{**EMA, key: "live"}]}]
+    with pytest.raises(CliError, match="must be spelled"):
+        validate_algo_config(config)
+    env.setup(config, ["AAPL"], rows=50)
+    assert env.run() == 2
+    assert capsys.readouterr().err.startswith("error: ")
+    assert not env.out.exists()
+
+
+@pytest.mark.parametrize("value", ["Live", " live ", "LIVE", "live\n", "\tLive"])
+def test_live_variants_get_the_live_refusal(value):
+    with pytest.raises(modes.ModeError) as info:
+        modes.parse_mode("a", value)
+    assert "is not available yet (needs the live broker" in str(info.value)
+    assert "unknown mode" not in str(info.value)
+
+
+@pytest.mark.parametrize("value", ["Paper", " paper", "BACKTEST", "backtest "])
+def test_other_variants_stay_unknown_modes(value):
+    with pytest.raises(modes.ModeError, match="unknown mode"):
+        modes.parse_mode("a", value)
+
+
+@pytest.mark.parametrize("config", [
+    ema_config(mode="☃"),
+    ema_config(mode="live☃"),
+    [{"ID": "EMACrossing", "data": [{**EMA, "ticker": "AA☃"}]}],
+    [{"ID": "EMACrossing", "data": [{**EMA, "idname": "☃"}, {**EMA, "idname": "☃"}]}],
+    [{"ID": "EMACrossing", "data": [{**EMA, "idname": "☃", "mode": "turbo"}]}],
+    [{"ID": "☃", "data": [EMA]}],
+    [{"ID": "EMACrossing", "data": [{**EMA, "MODE☃": 2, "Mode": 3}]}],
+])
+def test_error_messages_survive_a_cp1252_stderr(env, monkeypatch, config):
+    import io
+
+    env.setup(config, ["AAPL"], rows=50)
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    monkeypatch.setattr("sys.stderr", stream)
+    assert env.run() == 2  # no UnicodeEncodeError
+    stream.flush()
+    text = raw.getvalue().decode("cp1252")
+    assert text.startswith("error: ") and "☃" not in text
+    with pytest.raises(CliError) as info:
+        validate_algo_config(config)
+    str(info.value).encode("cp1252")  # the message itself is encodable
+
+
+def test_unicode_message_values_are_shown_escaped():
+    with pytest.raises(modes.ModeError, match=r"unknown mode '\\u2603'"):
+        modes.parse_mode("a", "☃")
+
+
+@pytest.mark.parametrize("text", [
+    "-0", "-1", "+1", "1_000", "1 000", " 1", "1 ", "1\n", "", ".", "1.", "e5", "1e", "0x10",
+    "٣", "1٣", "１", "nan", "inf", "Infinity", "1,5", "1/2", "--1", "1e+",
+])
+def test_parse_money_rejects_anything_but_plain_decimals(text):
+    with pytest.raises(CliError, match="--x"):
+        cli.parse_money(text, "--x")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("0", "0"), ("10", "10"), ("0.005", "0.005"), (".5", "0.5"), ("1e3", "1000"), ("1E+3", "1000"),
+    ("0.0001", "0.0001"), ("5e-1", "0.5"), ("0.50", "0.50"),
+])
+def test_parse_money_accepts_plain_decimals(text, expected):
+    assert cli.parse_money(text, "--x") == Decimal(expected)
+
+
+def test_parse_money_extreme_exponents_are_errors_not_crashes():
+    with pytest.raises(CliError, match="4 decimal"):
+        cli.parse_money("1e-999999999999", "--x")
+    with pytest.raises(CliError, match="too large"):
+        cli.parse_money("1e999999999999", "--x")
+    with pytest.raises(CliError, match="greater than 0"):
+        cli.parse_money("0", "--capital", positive=True)
+
+
+def test_router_keeps_modes_and_factories_are_read_only():
+    entries = validate_algo_config([
+        {"ID": "EMACrossing", "data": [EMA, {**EMA_MSFT, "mode": "paper"}]},
+    ])
+    router = modes.build_router(entries, fills="legacy", costs=CostModel(),
+                                capital=Decimal(1), ledger=None)
+    assert router.modes == {"AAPL-10/30EMA": "backtest", "MSFT-10/30EMA": "paper"}
+    with pytest.raises(TypeError):
+        modes.BROKER_FACTORIES["live"] = modes._simulated_broker  # type: ignore[index]
+    assert set(modes.BROKER_FACTORIES) == {"backtest", "paper"}
+
+
+def test_help_mentions_the_mode_key_and_the_stale_ledger_rule(capsys):
+    with pytest.raises(SystemExit):
+        main(["backtest", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert '"mode": "backtest" (default) or "paper"' in text
+    assert "not available yet" in text
+    assert "deletes a ledger.json left in --out" in text

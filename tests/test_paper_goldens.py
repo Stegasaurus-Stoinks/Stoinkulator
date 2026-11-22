@@ -32,6 +32,7 @@ import pytest
 
 from MainStoinker.engine.ledger import IGNORED_KINDS
 from MainStoinker.engine.report import ledger_trade_records
+from MainStoinker.engine.stats import account_summary, fmt4, round_trip_record
 from tests import harness
 from tests.test_golden_backtests import CASES as LEGACY_CASES
 
@@ -62,62 +63,35 @@ def equity_series_bytes(points) -> bytes:
     return "".join(f"{p.time},{_fmt(p.equity)}\n" for p in points).encode("utf-8")
 
 
-def max_drawdown(equities, capital: Decimal) -> Decimal:
-    """Peak to trough on the account equity series, starting capital counts as
-    the first peak. Zero or positive."""
-    peak = capital
-    worst = Decimal("0.0000")
-    for value in equities:
-        if value > peak:
-            peak = value
-        worst = max(worst, peak - value)
-    return worst
-
-
 def paper_golden(run: harness.PaperRun, algo_id: str) -> dict:
+    """The golden document of a run; every number comes from `engine/stats.py`
+    (the same functions `ledger.json` uses), only the equity series hash is
+    specific to this file."""
     ledger, algo = run.ledger, run.algo
     idname = algo.name
-    cent4 = Decimal("0.0001")
     trips = [t for t in ledger.round_trips if t.account == idname]
     points = [p for p in ledger.equity_points if p.account == idname]
     ignored = {kind: ledger.ignored_count(kind, idname) for kind in IGNORED_KINDS}
+    costs = run.broker.costs
     return {
         "algo": algo_id,
         "idname": idname,
         "ticker": algo.ticker,
-        "capital": _fmt(run.capital.quantize(Decimal("0.0001"))),
+        "capital": fmt4(run.capital),
         "costs": {
-            "commission_per_share": _fmt(run.broker.costs.commission_per_share.quantize(cent4)),
-            "commission_minimum": _fmt(run.broker.costs.commission_minimum.quantize(cent4)),
-            "slippage_per_share": _fmt(run.broker.costs.slippage_per_share.quantize(cent4)),
+            "commission_per_share": fmt4(costs.commission_per_share),
+            "commission_minimum": fmt4(costs.commission_minimum),
+            "slippage_per_share": fmt4(costs.slippage_per_share),
         },
-        "trades": [
-            {
-                "side": t.side,
-                "quantity": _fmt(t.quantity),
-                "entry_time": str(t.entry_time),
-                "exit_time": str(t.exit_time),
-                "entry_price": _fmt(t.entry_price),
-                "exit_price": _fmt(t.exit_price),
-                "gross": _fmt(t.gross),
-                "commission": _fmt(t.commission),
-                "net": _fmt(t.net),
-                "exit_reason": t.exit_reason,
-                "synthetic": t.synthetic,
-            }
-            for t in trips
-        ],
-        "summary": {
-            "trade_count": len(trips),
-            "wins": sum(1 for t in trips if t.net > 0),
-            "commission": _fmt(sum((t.commission for t in trips), Decimal("0.0000"))),
-            "net": _fmt(sum((t.net for t in trips), Decimal("0.0000"))),
-            "final_equity": _fmt(ledger.equity(idname)),
-            "max_drawdown": _fmt(max_drawdown((p.equity for p in points), run.capital)),
-            "ignored_events": ignored,
-            "cancelled_entries": run.broker.cancelled_entries,
-            "synthetic_closes": sum(1 for t in trips if t.synthetic),
-        },
+        "trades": [round_trip_record(t) for t in trips],
+        "summary": account_summary(
+            trips,
+            ledger.equity(idname),
+            run.capital,
+            equity_series=[p.equity for p in points],
+            ignored_events=ignored,
+            cancelled_entries=run.broker.cancelled_entries,
+        ),
         "equity_points": len(points),
         "equity_sha256": hashlib.sha256(equity_series_bytes(points)).hexdigest(),
     }
