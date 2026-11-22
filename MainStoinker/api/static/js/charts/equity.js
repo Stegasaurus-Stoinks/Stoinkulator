@@ -118,10 +118,42 @@ export function createEquityChart(
   const canvas = h("div", { class: "chart-canvas", role: "img", "aria-label": describeSeries([]) });
   const chart = lib.createChart(canvas, { autoSize: true, ...chartOptions(readTheme(view)) });
 
+  // The chart sizes itself (autoSize) and keeps its bar spacing when the width changes, so after a resize
+  // the time scale would show only the last part of the series. The library tells the time scale when its
+  // size changed (subscribeSizeChange): then, and after every setSeries, the whole series is fitted, unless
+  // the user has zoomed or scrolled (wheel, touch or a dragged pointer on the chart) since the last
+  // setSeries, whose new data is fitted again.
+  let userAdjusted = false;
+  let sizeHandler = null;
+  const timeScale = chart.timeScale();
+  const markAdjusted = () => {
+    userAdjusted = true;
+  };
+  canvas.addEventListener("wheel", markAdjusted, { passive: true });
+  canvas.addEventListener("touchmove", markAdjusted, { passive: true });
+  canvas.addEventListener("pointermove", (event) => {
+    if (event && event.buttons) userAdjusted = true;
+  });
+  function fitWhole() {
+    if (disposed || userAdjusted || drawn.length === 0) return;
+    chart.timeScale().fitContent();
+  }
+  if (typeof timeScale.subscribeSizeChange === "function") {
+    sizeHandler = fitWhole;
+    timeScale.subscribeSizeChange(sizeHandler);
+  }
+
   function dispose() {
     if (disposed) return;
     disposed = true;
     unwatch();
+    if (sizeHandler) {
+      try {
+        timeScale.unsubscribeSizeChange(sizeHandler);
+      } catch (err) {
+        // the chart is removed next anyway
+      }
+    }
     try {
       chart.remove();
     } catch (err) {
@@ -220,6 +252,7 @@ export function createEquityChart(
         // the pane sizes stay at the library's defaults
       }
       paintLegend(theme);
+      userAdjusted = false;
       chart.timeScale().fitContent();
     }
   }
