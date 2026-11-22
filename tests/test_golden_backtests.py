@@ -44,6 +44,18 @@ CASES = [
         id="elliot_msft",
         marks=pytest.mark.slow,
     ),
+    pytest.param(
+        "Elliot",
+        {"idname": "elliot-aapl", "ticker": "AAPL", "order": 10, "trailingStopDelta": 0.10},
+        id="elliot_aapl",
+        marks=pytest.mark.slow,
+    ),
+    pytest.param(
+        "Elliot",
+        {"idname": "elliot-tsla", "ticker": "TSLA", "order": 10, "trailingStopDelta": 0.10},
+        id="elliot_tsla",
+        marks=pytest.mark.slow,
+    ),
 ]
 
 
