@@ -23,6 +23,11 @@ Still in concept mode...
 
 '''
 
+# End-of-day cut-off as (hour, minute), in the data's LOCAL time (US Pacific; the session
+# runs 06:30-12:59). Five minutes before the session end; confirmed by the repo owner.
+# A trade still open on a bar after this minute is closed, and nothing is opened at or after it.
+END_OF_DAY_CUTOFF = (12, 55)
+
 class Algo(ParentAlgo):
     def __init__(self, algoConfigData):
         super().__init__(algoConfigData)
@@ -50,6 +55,9 @@ class Algo(ParentAlgo):
         self.lowerbound = 0
         self.tp = 0
 
+        #calendar date of the trading day being worked on (a bar from another date resets the algo)
+        self.tradingDay = None
+
         self.inTrade = False
         
 
@@ -73,6 +81,13 @@ class Algo(ParentAlgo):
         # print(str(self.ticker) + " : " + str(self.curStockData['close']))
 
         
+        #new calendar day (the bar's own date): start over BEFORE processing this bar,
+        #which then acts as the first candle of the new day
+        if self.curStockData['date'].date() != self.tradingDay:
+            if self.tradingDay is not None:
+                self.new_day()
+            self.tradingDay = self.curStockData['date'].date()
+
         #initState
         if self.TradeState.current_state_value == 'initState':
             #check if new data received is really new data and first candle is fully closed
@@ -107,7 +122,7 @@ class Algo(ParentAlgo):
             if self.curStockData['close'] > self.upperbound or self.curStockData['close'] < self.lowerbound:
                 print('detected a potential break...')
                 #check to make sure candle stradled the bounds and didnt gap across bounds
-                if self.curStockData['open'] > self.lowerbound or self.curStockData['open'] < self.upperbound:
+                if self.curStockData['open'] > self.lowerbound and self.curStockData['open'] < self.upperbound:
                     print('breakout confirmed')
 
                     #breakout direction:
@@ -137,10 +152,13 @@ class Algo(ParentAlgo):
             if ((time_difference.total_seconds() / 60) > self.retestTimeout):
                 print("Retest took too long")
                 self.TradeState.retesttimout()
+            elif self.curStockData['date'] >= self.end_of_day():
+                print("End of day reached before a retest, done for the day")
+                self.TradeState.retesttimout()
 
             #if down direction, check for retest is high of candle is above lowerbound and close is below range
             wiggleroom = 0.05
-            if self.direction == 'down':
+            if self.TradeState.current_state_value == 'breakoutState' and self.direction == 'down':
                 if self.curStockData['high'] >= self.lowerbound-wiggleroom and self.curStockData['close'] < self.lowerbound:
                     print('retest completed')
                     self.entertrade()
@@ -150,7 +168,7 @@ class Algo(ParentAlgo):
                     print('retest failed, trade conditions invalid')
                     self.TradeState.retestfailed()
 
-            if self.direction == 'up':
+            if self.TradeState.current_state_value == 'breakoutState' and self.direction == 'up':
                 if self.curStockData['low'] <= self.upperbound+wiggleroom and self.curStockData['close'] > self.upperbound:
                     print('retest completed')
                     self.entertrade()
@@ -174,8 +192,16 @@ class Algo(ParentAlgo):
                 self.inTrade = False
                 self.TradeState.closeout()
 
-            if self.trade.check_tp(self.curStockData):
+            elif self.trade.check_tp(self.curStockData):
                 self.logger.debug("***received true from check_tp***")
+                self.inTrade = False
+                self.TradeState.closeout()
+
+            #End of day trade closing (same rule as EMACrossing: from the first bar after the cut-off)
+            elif self.curStockData['date'] > self.end_of_day():
+                self.logger.info("***end of day close position***")
+                self.trade.close_position(self.curStockData['close'],self.curStockData['date'])
+                print("Closing position based on end of day")
                 self.inTrade = False
                 self.TradeState.closeout()
 
@@ -198,6 +224,29 @@ class Algo(ParentAlgo):
         self.AlgoData['time'] = StockData['time']
 
         self.curAlgoData = self.AlgoData.iloc[-1]
+
+
+    def end_of_day(self):
+        #cut-off minute on the current bar's date
+        return self.curStockData['date'].replace(hour=END_OF_DAY_CUTOFF[0], minute=END_OF_DAY_CUTOFF[1], second=0, microsecond=0)
+
+
+    def new_day(self):
+        #a trade should already have been closed at the end of the previous day, but if the data
+        #ended early (short session) close it now, at this bar, before forgetting about it
+        if self.inTrade:
+            self.logger.warning("trade still open at the start of a new trading day, closing it at this bar's close")
+            self.close_trade()
+
+        #fresh state machine (back to init) and per-day values, trade history (self.trades) is kept
+        self.TradeState = AlgoLogic()
+        self.firstcandletime = 0
+        self.upperbound = 0
+        self.lowerbound = 0
+        self.tp = 0
+        self.direction = None
+        self.breakout_time = None
+        self.inTrade = False
 
 
     def entertrade(self):
