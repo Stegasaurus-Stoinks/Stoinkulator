@@ -486,298 +486,7 @@ def test_relative_db_path_is_relative_to_the_start_directory(env, capsys):
 # ---- code version -----------------------------------------------------------------
 
 
-class Done:
-    def __init__(self, stdout: bytes = b"", returncode: int = 0) -> None:
-        self.stdout, self.returncode = stdout, returncode
-
-
-GIT = "/usr/bin/git"  # never executed: the fake runner answers
-
-
-def fake_git(sha: bytes, tree: bytes = b"", others: bytes = b"", top: str = "/nowhere",
-             calls: list | None = None):
-    def runner(args, **kwargs):
-        if calls is not None:
-            calls.append((args, kwargs))
-        assert args[:3] == [GIT, "-c", "core.fsmonitor=false"], args
-        words = args[3:]
-        if words == ["rev-parse", "HEAD"]:
-            return Done(sha + b"\n")
-        if words == ["rev-parse", "--show-toplevel"]:
-            return Done(top.encode() + b"\n")
-        if words[0] == "ls-tree":
-            return Done(tree)
-        if words[0] == "ls-files":
-            return Done(others)
-        raise AssertionError(args)
-
-    return runner
-
-
-def version_of(tmp_path, **kwargs) -> str:
-    return cli.current_code_version(tmp_path, run=fake_git(VERSION.encode(), **kwargs), git=GIT)
-
-
-def blob_of(data: bytes) -> str:
-    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
-
-
-def tracked(name: str, committed: bytes) -> bytes:
-    """One `git ls-tree -r -l -z` record for a file whose HEAD content is `committed`."""
-    return f"100644 blob {blob_of(committed)} {len(committed):>7}\t{name}\0".encode()
-
-
-def test_code_version_clean(tmp_path):
-    assert version_of(tmp_path, top=str(tmp_path)) == VERSION
-
-
-def test_code_version_dirty_suffix_and_the_git_commands_asked(tmp_path):
-    (tmp_path / "x.py").write_bytes(b"changed\n")
-    committed = tracked("x.py", b"original\n")
-    calls: list = []
-    version = version_of(tmp_path, tree=committed, top=str(tmp_path), calls=calls)
-    assert version.startswith(VERSION + "-dirty:") and len(version.split("-dirty:")[1]) == 12
-    # read-only plumbing only (never diff / status / diff-index, which can refresh the index and
-    # run filters), no shell, in the given directory, with a timeout, with fsmonitor off and
-    # optional locks (index refresh writes) off
-    assert [c[0][3:5] for c in calls] == [["rev-parse", "HEAD"], ["rev-parse", "--show-toplevel"],
-                                          ["ls-tree", "-r"], ["ls-files", "--others"]]
-    assert "--exclude-standard" in calls[3][0]
-    for args, kwargs in calls:
-        assert isinstance(args, list) and not kwargs.get("shell")
-        assert kwargs["cwd"] == str(tmp_path) and 0 < kwargs["timeout"] <= 60
-        assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
-        assert not {"GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"} & set(kwargs["env"])
-        assert not {"diff", "diff-index", "diff-files", "status"} & set(args)
-    (tmp_path / "x.py").write_bytes(b"changed again\n")  # different content, different suffix
-    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) != version
-    (tmp_path / "x.py").write_bytes(b"original\n")  # back to HEAD's content: clean
-    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
-    (tmp_path / "x.py").write_bytes(b"original\r\n")  # a CRLF checkout of the same text: clean
-    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
-
-
-def test_code_version_defaults_to_the_package_directory():
-    calls: list = []
-    cli.current_code_version(run=fake_git(VERSION.encode(), calls=calls), git=GIT)
-    assert calls[0][1]["cwd"] == str(Path(cli.__file__).resolve().parent)
-
-
-def test_code_version_resolves_git_once_with_which(tmp_path, monkeypatch):
-    seen: list[str] = []
-    monkeypatch.setattr(cli.shutil, "which", lambda name: seen.append(name) or "/x/git")
-    calls: list = []
-
-    def runner(args, **kwargs):
-        calls.append(args)
-        return Done(b"", 1)
-
-    cli.current_code_version(tmp_path, run=runner)
-    assert seen == ["git"] and calls and all(c[0] == "/x/git" for c in calls)
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
-    assert cli.current_code_version(tmp_path, run=lambda *a, **k: 1 / 0) == "unknown"
-
-
-def test_code_version_dirty_for_an_untracked_file_by_name_and_content(tmp_path):
-    (tmp_path / "new_algo.py").write_text("one\n")
-    names = b"new_algo.py\0"
-    first = version_of(tmp_path, others=names, top=str(tmp_path))
-    assert first.startswith(VERSION + "-dirty:")
-    (tmp_path / "new_algo.py").write_text("two\n")  # content counts
-    second = version_of(tmp_path, others=names, top=str(tmp_path))
-    assert second.startswith(VERSION + "-dirty:") and second != first
-    (tmp_path / "other.py").write_text("two\n")  # and so does the name
-    assert version_of(tmp_path, others=b"other.py\0", top=str(tmp_path)) != second
-
-
-def test_code_version_large_file_counts_by_name_and_size_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_MAX_HASHED_FILE", 8)
-    big = tmp_path / "big.bin"
-    names = b"big.bin\0"
-    big.write_bytes(b"a" * 20)
-    first = version_of(tmp_path, others=names, top=str(tmp_path))
-    big.write_bytes(b"b" * 20)  # same size: not read
-    assert version_of(tmp_path, others=names, top=str(tmp_path)) == first
-    big.write_bytes(b"b" * 21)  # new size
-    assert version_of(tmp_path, others=names, top=str(tmp_path)) != first
-
-
-def test_code_version_deleted_tracked_file_is_dirty(tmp_path):
-    gone = tracked("gone.py", b"x\n")
-    assert version_of(tmp_path, tree=gone, top=str(tmp_path)).startswith(VERSION + "-dirty:")
-
-
-def test_code_version_large_tracked_file_is_compared_by_size_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_MAX_HASHED_FILE", 8)
-    big = tmp_path / "big.bin"
-    big.write_bytes(b"a" * 20)
-    committed = tracked("big.bin", b"a" * 20)
-    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
-    big.write_bytes(b"b" * 20)  # same size, over the bound: not looked at
-    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
-    big.write_bytes(b"b" * 21)
-    assert version_of(tmp_path, tree=committed, top=str(tmp_path)).startswith(VERSION + "-dirty:")
-
-
-@pytest.mark.parametrize("failure", [
-    FileNotFoundError("git"), PermissionError("no"), OSError("broken"),
-    subprocess.TimeoutExpired("git", 15), subprocess.SubprocessError("x"),
-])
-def test_code_version_unknown_when_git_is_unavailable(tmp_path, failure):
-    def runner(args, **kwargs):
-        raise failure
-
-    assert cli.current_code_version(tmp_path, run=runner, git=GIT) == "unknown"
-
-
-@pytest.mark.parametrize("sha, code", [(b"", 128), (b"fatal", 128), (b"abc123", 0), (b"", 0),
-                                       (b"zz" * 20, 0)])
-def test_code_version_unknown_for_a_non_repository_or_odd_output(tmp_path, sha, code):
-    assert cli.current_code_version(
-        tmp_path, run=lambda args, **kw: Done(sha, code), git=GIT) == "unknown"
-
-
-@pytest.mark.parametrize("failing", ["--show-toplevel", "ls-tree", "ls-files"])
-def test_code_version_unknown_when_a_listing_fails(tmp_path, failing):
-    def runner(args, **kwargs):
-        if failing in args:
-            return Done(b"", 1)
-        return Done(VERSION.encode(), 0) if args[3] == "rev-parse" else Done(b"", 0)
-
-    assert cli.current_code_version(tmp_path, run=runner, git=GIT) == "unknown"
-
-
-def real_repo(tmp_path: Path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-
-    def git(*words: str) -> str:
-        done = subprocess.run(
-            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
-             "-c", "commit.gpgsign=false", *words],
-            cwd=repo, capture_output=True, text=True, check=True, timeout=60)
-        return done.stdout.strip()
-
-    git("init", "-q")
-    return repo, git
-
-
-needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
-
-
-@needs_git
-def test_code_version_with_a_real_repository(tmp_path):
-    repo, git = real_repo(tmp_path)
-    (repo / "a.txt").write_text("one\n")
-    (repo / ".gitignore").write_text("ignored.txt\n")
-    git("add", "a.txt", ".gitignore")
-    git("commit", "-q", "-m", "first")
-    head = git("rev-parse", "HEAD")
-    assert cli.current_code_version(repo) == head
-    (repo / "sub").mkdir()
-    assert cli.current_code_version(repo / "sub") == head  # any folder inside the repository
-    (repo / "ignored.txt").write_text("ignored\n")  # ignored files do not count
-    assert cli.current_code_version(repo) == head
-    (repo / "a.txt").write_text("two\n")
-    dirty = cli.current_code_version(repo)
-    assert dirty.startswith(head + "-dirty:") and len(dirty) == len(head) + 7 + 12
-    (repo / "a.txt").write_text("three\n")
-    assert cli.current_code_version(repo) not in (head, dirty)
-    git("checkout", "--", "a.txt")
-    assert cli.current_code_version(repo) == head
-    # a new, uncommitted file is not a clean commit; its content and name are part of the hash
-    (repo / "new_algo.py").write_text("print(1)\n")
-    untracked = cli.current_code_version(repo)
-    assert untracked.startswith(head + "-dirty:")
-    (repo / "new_algo.py").write_text("print(2)\n")
-    assert cli.current_code_version(repo) not in (head, untracked)
-    (repo / "new_algo.py").unlink()
-    assert cli.current_code_version(repo) == head
-    (repo / "a.txt").unlink()  # a deleted tracked file
-    assert cli.current_code_version(repo).startswith(head + "-dirty:")
-
-
-def run_git_marked(repo: Path, tmp_path: Path):
-    """A repository whose *.txt files go through a `clean` filter that leaves a marker file."""
-    marker = tmp_path / "filter-ran"
-    script = tmp_path / "clean.py"
-    script.write_text("import sys\nopen(sys.argv[1], 'w').write('ran')\n"
-                      "sys.stdout.buffer.write(sys.stdin.buffer.read())\n")
-    command = f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}" "{marker.as_posix()}"'
-    return marker, command
-
-
-@needs_git
-def test_code_version_leaves_the_index_alone_and_runs_no_filter(tmp_path):
-    repo, git = real_repo(tmp_path)
-    marker, command = run_git_marked(repo, tmp_path)
-    (repo / ".gitattributes").write_text("*.txt filter=probe\n")
-    (repo / "a.txt").write_text("one\n")
-    (repo / "b.txt").write_text("two\n")
-    git("add", ".")
-    git("commit", "-q", "-m", "first")
-    git("config", "filter.probe.clean", command)  # only now: committing needs no filter
-    head = git("rev-parse", "HEAD")
-    index = repo / ".git" / "index"
-
-    # stat-dirty but unchanged: same bytes, new mtime (the case where `git diff` would run the
-    # filter to compare content, and rewrite the refreshed index)
-    stamp = (repo / "a.txt").stat().st_mtime_ns + 5_000_000_000
-    os.utime(repo / "a.txt", ns=(stamp, stamp))
-    before = index.read_bytes()
-    assert cli.current_code_version(repo) == head  # unchanged content is not dirty
-    assert index.read_bytes() == before and not marker.exists()
-    assert not (repo / ".git" / "index.lock").exists()
-
-    # really modified, plus an untracked file
-    (repo / "b.txt").write_text("changed\n")
-    (repo / "c.txt").write_text("brand new\n")
-    dirty = cli.current_code_version(repo)
-    assert dirty.startswith(head + "-dirty:")
-    assert index.read_bytes() == before and not marker.exists()
-    assert not (repo / ".git" / "index.lock").exists()
-
-    # control: the filter really would have run (and the index rewritten) under `git diff HEAD`
-    subprocess.run(["git", "diff", "HEAD"], cwd=repo, capture_output=True, check=True,
-                   timeout=60)
-    assert marker.exists(), "the probe filter never ran: this test would prove nothing"
-
-
-@needs_git
-def test_code_version_touched_crlf_checkout_is_still_clean(tmp_path):
-    repo, git = real_repo(tmp_path)
-    git("config", "core.autocrlf", "true")
-    (repo / "a.txt").write_bytes(b"one\r\ntwo\r\n")
-    git("add", "a.txt")
-    git("commit", "-q", "-m", "first")
-    stamp = (repo / "a.txt").stat().st_mtime_ns + 5_000_000_000
-    os.utime(repo / "a.txt", ns=(stamp, stamp))
-    assert cli.current_code_version(repo) == git("rev-parse", "HEAD")
-    (repo / "a.txt").write_bytes(b"one\r\nthree\r\n")
-    assert "-dirty:" in cli.current_code_version(repo)
-
-
-@needs_git
-def test_a_commit_can_run_while_the_version_is_computed(tmp_path):
-    """The version takes no index lock, so it cannot collide with a concurrent commit."""
-    repo, git = real_repo(tmp_path)
-    (repo / "a.txt").write_text("one\n")
-    git("add", "a.txt")
-    git("commit", "-q", "-m", "first")
-    (repo / "a.txt").write_text("two\n")
-    (repo / ".git" / "index.lock").write_bytes(b"")  # another git process holds the lock
-    version = cli.current_code_version(repo)
-    assert version.startswith(git("rev-parse", "HEAD") + "-dirty:")
-    assert (repo / ".git" / "index.lock").exists()  # and ours did not remove it
-
-
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
-def test_code_version_unknown_outside_a_repository(tmp_path):
-    probe = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True,
-                           timeout=60)
-    if probe.returncode == 0:
-        pytest.skip("the temporary directory is inside a repository on this machine")
-    assert cli.current_code_version(tmp_path) == "unknown"
+# (the code-version computation itself is tested in test_codeversion.py)
 
 
 def test_code_version_is_stored_and_computed_once_per_run(env, db, monkeypatch):
@@ -1150,6 +859,156 @@ def read_runs(db: Path):
         return store.list_runs()
     finally:
         store.close()
+
+
+# ---- a locked database ------------------------------------------------------------
+
+
+def hold_write_lock(db: Path) -> sqlite3.Connection:
+    other = sqlite3.connect(db, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    return other
+
+
+@pytest.fixture
+def short_wait(monkeypatch):
+    """The command opens its store with a 0.2 s lock wait instead of 10 s."""
+    real = cli.open_store
+    monkeypatch.setattr(cli, "open_store",
+                        lambda spec, *, env: real(spec, env=env, busy_timeout=0.2))
+
+
+def test_a_locked_database_at_begin_run_is_exit_3_one_line_no_traceback(env, db, short_wait,
+                                                                        capsys):
+    env.setup(ema_config(), ["AAPL"], rows=300)
+    open_store(str(db), env=os.environ).close()  # exists and is migrated
+    other = hold_write_lock(db)
+    try:
+        assert run(env, "--db", str(db)) == 3
+        err = capsys.readouterr().err
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert err.startswith("error: could not record the run: ") and "locked" in err
+    assert len(err.splitlines()) == 1 and "Traceback" not in err
+    assert not env.out.exists()  # nothing ran, and the directory made for it is gone
+    assert read_runs(db) == ()
+    db.unlink()
+
+
+def test_a_locked_database_at_write_results_is_exit_3_with_the_files_in_place(
+        env, db, short_wait, monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    real_run = cli.Engine.run_backtest
+    held: list[sqlite3.Connection] = []
+
+    def run_then_lock(self):
+        real_run(self)
+        held.append(hold_write_lock(db))  # taken after begin_run, before results are stored
+
+    monkeypatch.setattr(cli.Engine, "run_backtest", run_then_lock)
+    try:
+        assert run(env, "--fills", "realistic", "--db", str(db)) == 3
+        err = capsys.readouterr().err
+    finally:
+        for other in held:
+            other.execute("ROLLBACK")
+            other.close()
+    assert err.startswith("error: run finished but could not be stored: ") and "locked" in err
+    assert len(err.splitlines()) == 1 and "Traceback" not in err
+    assert sorted(p.name for p in env.out.glob("*.json")) == ["ledger.json", "trades.json"]
+    assert [r.status for r in read_runs(db)] == ["running"]  # honest: it could not be marked
+    db.unlink()
+
+
+# ---- the output directory and the stale ledger ------------------------------------
+
+
+def test_out_below_a_file_is_refused_before_the_database_exists(env, db, tmp_path, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    (tmp_path / "plain").write_text("a file")
+    env.out = tmp_path / "plain" / "out"
+    assert run(env, "--db", str(db)) == 2
+    assert "not a directory" in one_line_error(capsys)
+    assert not db.exists() and not db.parent.exists()
+
+
+def test_out_that_cannot_be_made_is_exit_2_and_records_no_run(env, db, monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    real_mkdir = Path.mkdir
+
+    def mkdir(self, *a, **kw):
+        if self == env.out:
+            raise PermissionError("denied")
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    assert run(env, "--db", str(db)) == 2
+    assert "cannot create output directory" in one_line_error(capsys)
+    assert not env.out.exists()
+    monkeypatch.undo()
+    assert read_runs(db) == ()  # an empty database is what this case leaves
+    db.unlink()
+
+
+def test_out_made_by_a_run_that_could_not_be_recorded_is_removed(env, db, tmp_path,
+                                                                 monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    env.out = tmp_path / "a" / "b" / "out"
+    monkeypatch.setattr(store_module.SqliteStore, "begin_run",
+                        lambda self, meta: (_ for _ in ()).throw(StoreError("locked")))
+    assert run(env, "--db", str(db)) == 3
+    assert capsys.readouterr().err == "error: could not record the run: locked\n"
+    assert not (tmp_path / "a").exists()  # every folder this run made, as far as it is empty
+    db.unlink()
+
+
+def test_an_existing_out_directory_is_kept_when_the_run_could_not_be_recorded(
+        env, db, monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    env.out.mkdir()
+    (env.out / "keep.txt").write_text("mine")
+    monkeypatch.setattr(store_module.SqliteStore, "begin_run",
+                        lambda self, meta: (_ for _ in ()).throw(StoreError("locked")))
+    assert run(env, "--db", str(db)) == 3
+    assert (env.out / "keep.txt").read_text() == "mine"
+    env.out.joinpath("keep.txt").unlink()
+    monkeypatch.undo()
+    db.unlink()
+    capsys.readouterr()
+
+
+def test_a_stale_ledger_that_cannot_be_removed_is_exit_2_and_stores_nothing(env, db, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=300)
+    stale = env.out / "ledger.json"
+    stale.mkdir(parents=True)  # unlink refuses a directory (a non-empty one on every platform)
+    (stale / "x").write_text("x")
+    assert run(env, "--db", str(db)) == 2
+    assert "cannot remove stale" in one_line_error(capsys)
+    assert read_runs(db) == ()  # the documented outcome: no run row at all
+    assert not (env.out / "trades.json").exists()
+    db.unlink()
+
+
+# ---- --quiet is exactly what it was -----------------------------------------------
+
+
+def test_quiet_without_db_prints_only_the_result_lines_in_a_fresh_process(env):
+    """Legacy algo modules print when they are imported ("initializing socket connection").
+    In-process tests cannot see that (the modules are already imported), so run the real
+    command in a fresh interpreter."""
+    env.setup(ema_config(), ["AAPL"], rows=300)
+    done = subprocess.run(
+        [sys.executable, "-m", "MainStoinker", "backtest", "--algos", str(env.algos),
+         "--data", str(env.data), "--out", str(env.out), "--quiet"],
+        cwd=env.start, env={**os.environ, "PYTHONPATH": str(REPO)}, capture_output=True,
+        text=True, timeout=300)
+    assert done.returncode == 0, done.stderr
+    lines = done.stdout.splitlines()
+    assert len(lines) == 3, done.stdout
+    assert lines[0].startswith("replayed ") and lines[1].startswith(f"{EMA['idname']}: ")
+    assert lines[2] == f"wrote {env.out.resolve() / 'trades.json'}"
+    assert list(env.start.iterdir()) == []  # and nothing written to the start directory
 
 
 # ---- housekeeping -----------------------------------------------------------------

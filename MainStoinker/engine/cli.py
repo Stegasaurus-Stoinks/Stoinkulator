@@ -34,7 +34,8 @@ schema, not a database, an unsupported scheme) is an input error too. So a bad
 input stores nothing and creates no `--out` directory. (Constructing the algos
 still happens inside the run, in `--out`, because legacy constructors write
 side files into the working directory; an error raised by a constructor is
-therefore a failed run.) The run is recorded with `begin_run` (kind
+therefore a failed run.) Then `--out` is created and a stale `ledger.json` in
+it removed; then the run is recorded with `begin_run` (kind
 `backtest`, the fill model, the code version, the validated config and the data
 directory, symbols and first / last replayed bar), the algos with
 `write_algos`; after the engine has finished the output files are written,
@@ -48,12 +49,36 @@ opened and no file is created. `trades.json` and `ledger.json` are the same
 with and without `--db`.
 
 The code version stored with a run is `<HEAD sha>` for a clean checkout and
-`<HEAD sha>-dirty:<12 hex>` otherwise (see `current_code_version`): changed
-tracked files and untracked, non-ignored files both make a tree dirty.
+`<HEAD sha>-dirty:<12 hex>` otherwise (see `codeversion.current_code_version`):
+changed tracked files, files staged but not in HEAD and untracked,
+non-ignored files anywhere in the repository all make a tree dirty.
 
-Output files: a stale `ledger.json` is removed before `trades.json` is written
-(both fill models) and a realistic run writes `ledger.json` last, so a failure
-never leaves a ledger from another run next to new trades.
+Output files: a stale `ledger.json` is removed before anything is recorded or
+run (both fill models; a failure to remove it is an input error, nothing is
+stored) and a realistic run writes `ledger.json` last, so a failure never
+leaves a ledger from another run next to new trades.
+
+What is left behind, by where the command stops (the order is: input checks and
+a cheap test that `--out` can be made; open the database; make `--out`; remove
+the stale ledger; `begin_run` / `write_algos`; run; write the files; store the
+results; `end_run`). Without `--db` the database column does not apply.
+
+    stops at                          exit   --out             database
+    --------------------------------  -----  ----------------  --------------------------
+    input error; out is or is under   2      not created       not created
+      a file; database refused
+    --out cannot be made (a           2      not created       an empty database, if this
+      permission problem)                                        run created the file
+    stale ledger.json cannot be       2      stays (it was     no run row
+      removed                                  there)
+    begin_run fails                   3      removed if this   no run row
+                                               run made it and
+                                               it is empty
+    write_algos fails                 3      as above          run row `failed`
+    constructor, engine or output     trace  stays (side       run row `failed`
+      file write fails                back     files, files)
+    write_results or end_run fails    3      files in place    `failed`, or `running` if
+                                                                 end_run itself failed
 
 Working directory: legacy code writes side files (`tradey.txt`) into the
 current directory. For the duration of the run the working directory is
@@ -73,15 +98,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import importlib
 import json
 import logging
 import os
 import re
-import shutil
-import stat
-import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -91,6 +112,7 @@ from pathlib import Path
 from typing import Any
 
 from .algos import close_algo_logs, load_algo
+from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
 from .feed import CsvBarFeed
 from .ledger import Ledger
@@ -476,165 +498,48 @@ def parse_fill_options(args: argparse.Namespace) -> tuple[CostModel, Decimal]:
     return costs, capital
 
 
-_GIT_TIMEOUT = 15
-_MAX_HASHED_FILE = 5 * 1024 * 1024  # a larger file contributes its name and size only
-_CHUNK = 1024 * 1024
-# Variables that would point git somewhere other than the checkout it is run in.
-_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+def _check_out_creatable(out_dir: Path) -> None:
+    """Refuse an `--out` that cannot be a directory, without creating anything.
 
-
-def _blob_ids(algorithm: str, path: Path, link: bool) -> set[str]:
-    """The git object ids the file's bytes would have as a blob, without running filters.
-
-    Two candidates: the raw bytes, and the bytes with CRLF turned into LF (what
-    `core.autocrlf` / `text` attributes store for a file checked out with CRLF).
-    The caller has checked the file is at most `_MAX_HASHED_FILE`.
+    `out_dir` is a file, or a file stands where one of its missing parents would
+    go. (A permission problem only shows when the directory is made.)
     """
-    if link:
-        data = os.fsencode(os.readlink(path))
-    else:
-        with open(path, "rb") as handle:
-            data = handle.read()
-    ids = set()
-    for body in (data, data.replace(b"\r\n", b"\n")):
-        digest = hashlib.new(algorithm)
-        digest.update(b"blob %d\0" % len(body))
-        digest.update(body)
-        ids.add(digest.hexdigest())
-    return ids
+    probe = out_dir
+    while not os.path.lexists(probe) and probe.parent != probe:
+        probe = probe.parent
+    if os.path.lexists(probe) and not probe.is_dir():
+        raise CliError(f"cannot create output directory {out_dir}: {probe} is not a directory")
 
 
-def _feed(digest: Any, path: Path, link: bool) -> None:
-    """Stream a file's bytes (or a link's target) into `digest`."""
-    if link:
-        digest.update(os.fsencode(os.readlink(path)))
-        return
-    with open(path, "rb") as handle:
-        while chunk := handle.read(_CHUNK):
-            digest.update(chunk)
+def _make_out_dir(out_dir: Path) -> list[Path]:
+    """Create `out_dir` and missing parents; return the ones made, deepest first.
 
-
-def _kind(path: Path) -> tuple[str, int]:
-    """('file' | 'link' | 'other' | 'missing', size) of a path, without following links."""
+    On failure whatever was made here is removed again and `CliError` raised.
+    """
+    missing: list[Path] = []
+    probe = out_dir
+    while not os.path.lexists(probe) and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    made: list[Path] = []
     try:
-        info = path.lstat()
-    except OSError:
-        return "missing", 0
-    if stat.S_ISLNK(info.st_mode):
+        for folder in reversed(missing):
+            folder.mkdir()
+            made.insert(0, folder)
+        out_dir.mkdir(exist_ok=True)
+    except OSError as exc:
+        _remove_new_dirs(made)
+        raise CliError(f"cannot create output directory {out_dir}: {exc}") from exc
+    return made
+
+
+def _remove_new_dirs(made: Sequence[Path]) -> None:
+    """Remove directories this run made, deepest first, as far as they are still empty."""
+    for folder in made:
         try:
-            return "link", len(os.fsencode(os.readlink(path)))
+            folder.rmdir()
         except OSError:
-            return "missing", 0
-    if stat.S_ISREG(info.st_mode):
-        return "file", info.st_size
-    return "other", 0
-
-
-def current_code_version(
-    repo: Path | None = None,
-    *,
-    run: Callable[..., Any] = subprocess.run,
-    git: str | None = None,
-) -> str:
-    """The git revision of the code: `<HEAD sha>`, with `-dirty:<12 hex>` when modified.
-
-    `repo` is a directory inside the repository (default: the folder of this
-    package). The tree counts as modified when a tracked file differs from
-    HEAD (content or deleted) or an untracked, non-ignored file exists; the
-    suffix is the first 12 hex digits of a sha256 over those files, sorted by
-    path: for each its path, kind, size and (up to 5 MB, streamed) bytes. A
-    file over 5 MB contributes its path and size only (and is compared with
-    HEAD by size only). Returns `"unknown"` when git is missing or too slow,
-    `repo` is not in a repository, or the output is not a commit id.
-
-    Reading the version must not change the checkout, so git is only asked
-    read-only questions that never use the index's stat data, never `git
-    diff` / `git status` / `diff-index` (those refresh and may rewrite
-    `.git/index`, take `index.lock` and run `clean` filters; `diff-index` does
-    so for any file whose mtime is not older than the index, the "racy"
-    case): `rev-parse HEAD`, `rev-parse --show-toplevel`, `ls-tree -r -l HEAD`
-    (HEAD's blob ids and sizes) and `ls-files --others --exclude-standard`
-    (names only). Every call passes `-c core.fsmonitor=false` and runs with
-    `GIT_OPTIONAL_LOCKS=0`. Tracked files are compared with HEAD here: the
-    hash git would give the file's bytes, as they are and with CRLF read as LF
-    (a checkout under `core.autocrlf`), is looked up among HEAD's blobs. No
-    other conversion is attempted, so a file that a custom filter changes
-    counts as modified, and a file mode change alone is not noticed. The git
-    executable is
-    resolved once with `shutil.which` (`git` overrides it for tests). Git is
-    run directly (no shell) with an explicit working directory and a timeout;
-    called per run, never at import time. `run` is injectable for tests.
-    """
-    exe = git if git is not None else shutil.which("git")
-    if not exe:
-        return "unknown"
-    where = Path(__file__).resolve().parent if repo is None else Path(repo)
-    child_env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECTS}
-    child_env["GIT_OPTIONAL_LOCKS"] = "0"
-
-    def ask(*words: str) -> bytes | None:
-        try:
-            done = run([exe, "-c", "core.fsmonitor=false", *words], cwd=str(where),
-                       env=child_env, capture_output=True, stdin=subprocess.DEVNULL,
-                       timeout=_GIT_TIMEOUT, check=False)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return done.stdout if done.returncode == 0 else None
-
-    head = ask("rev-parse", "HEAD")
-    sha = "" if head is None else head.decode("ascii", "replace").strip()
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
-        return "unknown"
-    top = ask("rev-parse", "--show-toplevel")
-    tree = ask("ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD")
-    others = ask("ls-files", "--others", "--exclude-standard", "--full-name", "-z")
-    if top is None or tree is None or others is None:
-        return "unknown"
-    root = Path(os.fsdecode(top).rstrip("\r\n"))
-    algorithm = "sha1" if len(sha) == 40 else "sha256"
-
-    # (path as git prints it, tag, absolute path): T tracked and changed, D tracked and
-    # deleted, U untracked.
-    found: list[tuple[bytes, bytes, Path]] = []
-    for record in tree.split(b"\0"):
-        if not record:
-            continue
-        header, tab, name = record.partition(b"\t")
-        parts = header.split()
-        if not tab or len(parts) != 4:
-            return "unknown"
-        _mode, otype, blob, blob_size = parts
-        if otype != b"blob":
-            continue  # a submodule is not part of this checkout's files
-        path = root / os.fsdecode(name)
-        kind, size = _kind(path)
-        if kind == "missing":
-            found.append((name, b"D", path))
-            continue
-        try:
-            if kind in ("file", "link") and max(size, int(blob_size)) <= _MAX_HASHED_FILE:
-                same = blob.decode("ascii") in _blob_ids(algorithm, path, kind == "link")
-            else:  # too big to hash: name and size are all that is compared
-                same = kind == "file" and size == int(blob_size)
-        except (OSError, ValueError):
-            same = False
-        if not same:
-            found.append((name, b"T", path))
-    found.extend((name, b"U", root / os.fsdecode(name)) for name in others.split(b"\0") if name)
-    if not found:
-        return sha
-
-    digest = hashlib.sha256()
-    for name, tag, path in sorted(found, key=lambda item: (item[0], item[1])):
-        kind, size = _kind(path) if tag != b"D" else ("missing", 0)
-        digest.update(tag + b"\0" + name + b"\0" + kind.encode() + b"\0" + b"%d" % size + b"\0")
-        if kind in ("file", "link") and size <= _MAX_HASHED_FILE:
-            try:
-                _feed(digest, path, kind == "link")
-            except OSError:
-                digest.update(b"unreadable")
-        digest.update(b"\0")
-    return f"{sha}-dirty:{digest.hexdigest()[:12]}"
+            return
 
 
 def _db_display(spec: str) -> str:
@@ -671,7 +576,10 @@ def run_backtest_command(
     costs, capital = parse_fill_options(args)
 
     entries = read_algo_config(algos_path)
-    check_algos_importable(entries)
+    # Importing an algo runs legacy import-time code that prints to stdout; with
+    # --quiet that stays hidden, as it always was (it used to happen in the run).
+    with _maybe_quiet(args.quiet):
+        check_algos_importable(entries)
     if not data_dir.is_dir():
         raise CliError(f"data directory not found: {data_dir}")
     try:
@@ -698,9 +606,10 @@ def run_backtest_command(
     except ModeError as exc:
         raise CliError(str(exc)) from exc
 
-    # Every input problem is behind us, the algo ids included. The store comes
-    # next, before the output directory is touched, so a refused database leaves
-    # nothing behind.
+    # Every input problem is behind us, the algo ids included, and so is the
+    # cheap check that `--out` can be created. The store comes next, before the
+    # output directory is touched, so a refused database leaves nothing behind.
+    _check_out_creatable(out_dir)
     store = None
     db_shown = ""
     if args.db is not None:
@@ -710,16 +619,25 @@ def run_backtest_command(
             raise CliError(str(exc)) from exc
         db_shown = _db_display(args.db)
     try:
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise CliError(f"cannot create output directory {out_dir}: {exc}") from exc
         trades_path = out_dir / TRADES_NAME
         ledger_path = out_dir / LEDGER_NAME
         log_path = out_dir / LOG_NAME if args.log else None
         run_id: int | None = None
         engine_done = False
+        engine_started = False
+        created_dirs: list[Path] = []
+        removed_stale = False
         try:
+            created_dirs = _make_out_dir(out_dir)
+            # A ledger.json from an earlier run into this directory must never sit
+            # beside this run's trades.json. It goes now, before anything is recorded,
+            # so a file that cannot be removed is an input error that stores nothing;
+            # a realistic run writes its own ledger.json last.
+            removed_stale = ledger_path.exists() or ledger_path.is_symlink()
+            try:
+                ledger_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise CliError(f"cannot remove stale {ledger_path}: {exc}") from exc
             if store is not None:
                 run_id = store.begin_run(RunMeta(
                     kind="backtest",
@@ -745,6 +663,7 @@ def run_backtest_command(
                     for entry in entries for cfg in entry["data"]
                 ])
             algos: list = []
+            engine_started = True
             try:
                 with _working_directory(out_dir), _maybe_quiet(args.quiet):
                     _load_algos(entries, log_path, algos)
@@ -777,13 +696,6 @@ def run_backtest_command(
                              f"final equity {acct['summary']['final_equity']}")
                     for idname, acct in document["accounts"].items()
                 }
-            # A ledger.json from an earlier run into this directory must never sit
-            # beside this run's trades.json: remove it first, write the new one last.
-            removed_stale = ledger_path.exists() or ledger_path.is_symlink()
-            try:
-                ledger_path.unlink(missing_ok=True)
-            except OSError as exc:
-                raise CliError(f"cannot remove stale {ledger_path}: {exc}") from exc
             write_json_atomic(trades_path, result)
             if document is not None:
                 write_json_atomic(ledger_path, document)
@@ -801,6 +713,8 @@ def run_backtest_command(
                 )
                 store.end_run(run_id, "completed")
         except BaseException as exc:
+            if not engine_started:
+                _remove_new_dirs(created_dirs)  # nothing ran: leave no empty --out behind
             if store is not None and run_id is not None:
                 # Whatever goes wrong here must not hide the error being handled.
                 with contextlib.suppress(Exception):

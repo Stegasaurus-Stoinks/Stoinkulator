@@ -969,6 +969,74 @@ def test_failed_rollback_does_not_hide_the_original_error(db):
         real.execute("ROLLBACK")  # tidy up the transaction the failed rollback left open
 
 
+def test_failed_begin_is_a_store_error_and_leaves_store_usable(db):
+    with SqliteStore(db) as store:
+        real = store._conn
+        flaky = _FlakyConn(real, fail={"BEGIN IMMEDIATE"})
+        store._conn = flaky
+        with pytest.raises(StoreError, match="transaction") as info:
+            store.begin_run(meta())
+        assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+        assert not real.in_transaction
+        flaky.fail.clear()
+        run_id = store.begin_run(meta())
+        assert [r.run_id for r in store.list_runs()] == [run_id]
+
+
+def hold_write_lock(db: Path) -> sqlite3.Connection:
+    """A second connection that holds the database's write lock until closed."""
+    other = sqlite3.connect(db, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    return other
+
+
+def test_a_locked_database_is_a_store_error_for_begin_run_and_write_results(db):
+    import time
+
+    with SqliteStore(db, busy_timeout=0.2) as store:
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos())
+        other = hold_write_lock(db)
+        try:
+            started = time.monotonic()
+            with pytest.raises(StoreError, match="locked") as info:
+                store.begin_run(meta())
+            assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+            with pytest.raises(StoreError, match="locked"):
+                write_all(store, run_id, build_ledger())
+            with pytest.raises(StoreError, match="locked"):
+                store.end_run(run_id, "failed")
+            assert time.monotonic() - started < 5  # a short wait, not the default ten seconds
+        finally:
+            other.execute("ROLLBACK")
+            other.close()
+        # the connection is usable again and nothing half-written is there
+        assert [r.status for r in store.list_runs()] == ["running"]
+        assert store.load_run(run_id).fills == ()
+        write_all(store, run_id, build_ledger())
+        store.end_run(run_id, "completed")
+        assert store.load_run(run_id).summary.status == "completed"
+
+
+def test_opening_waits_no_longer_than_the_given_busy_timeout(db):
+    import time
+
+    SqliteStore(db).close()  # created and migrated
+    other = hold_write_lock(db)
+    try:
+        started = time.monotonic()
+        store = SqliteStore(db, busy_timeout=0.2)  # nothing to migrate: opens fine
+        try:
+            with pytest.raises(StoreError):
+                store.begin_run(meta())
+        finally:
+            store.close()
+        assert time.monotonic() - started < 5
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+
+
 @pytest.mark.parametrize("spec", ["file:x.db?mode=memory", "file:x.db", "sqlite:x.db",
                                   "mysql://h/db", "sqlite:///file:x.db"])
 def test_unsupported_scheme_refused_without_creating_a_file(tmp_path, monkeypatch, spec):
