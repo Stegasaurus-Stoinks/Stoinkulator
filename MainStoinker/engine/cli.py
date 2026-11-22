@@ -23,6 +23,63 @@ ledger (same shape) and adds `ledger.json`: per algo a `summary` and the
 `--capital` and the cost options only apply to realistic fills; giving one
 with legacy fills is an error rather than being silently ignored.
 
+Storing runs: `--db SPEC` (a SQLite file path or `sqlite:///path`, see
+`store.open_store`; `:memory:` is refused, nothing durable would be stored)
+keeps each run in a database, for both fill models (a ledger is attached to
+every run). Every input check comes first, including that each algo id can be
+imported (`check_algos_importable`: an unknown id or a module that fails to
+import is an input error). Then the store is opened, before anything is
+written or run; any `StoreError` while opening (a OneDrive folder, a newer
+schema, not a database, an unsupported scheme) is an input error too. So a bad
+input stores nothing and creates no `--out` directory. (Constructing the algos
+still happens inside the run, in `--out`, because legacy constructors write
+side files into the working directory; an error raised by a constructor is
+therefore a failed run.) Then `--out` is created and a stale `ledger.json` in
+it removed; then the run is recorded with `begin_run` (kind
+`backtest`, the fill model, the code version, the validated config and the data
+directory, symbols and first / last replayed bar), the algos with
+`write_algos`; after the engine has finished the output files are written,
+then the ledger's records go in with one `write_results`, then
+`end_run("completed")`. A storage failure therefore never discards a finished
+run's `trades.json` / `ledger.json`. An exception during the run, including a
+failure writing the output files, attempts `end_run("failed")` and is
+re-raised unchanged. Legacy runs store `SimBroker`'s cost-free fills with
+capital 10,000; the run's `fills` column says so. Without `--db` nothing is
+opened and no file is created. `trades.json` and `ledger.json` are the same
+with and without `--db`.
+
+The code version stored with a run is `<HEAD sha>` for a clean checkout and
+`<HEAD sha>-dirty:<12 hex>` otherwise (see `codeversion.current_code_version`):
+changed tracked files, files staged but not in HEAD and untracked,
+non-ignored files anywhere in the repository all make a tree dirty.
+
+Output files: a stale `ledger.json` is removed before anything is recorded or
+run (both fill models; a failure to remove it is an input error, nothing is
+stored) and a realistic run writes `ledger.json` last, so a failure never
+leaves a ledger from another run next to new trades.
+
+What is left behind, by where the command stops (the order is: input checks and
+a cheap test that `--out` can be made; open the database; make `--out`; remove
+the stale ledger; `begin_run` / `write_algos`; run; write the files; store the
+results; `end_run`). Without `--db` the database column does not apply.
+
+    stops at                          exit   --out             database
+    --------------------------------  -----  ----------------  --------------------------
+    input error; out is or is under   2      not created       not created
+      a file; database refused
+    --out cannot be made (a           2      not created       an empty database, if this
+      permission problem)                                        run created the file
+    stale ledger.json cannot be       2      stays (it was     no run row
+      removed                                  there)
+    begin_run fails                   3      removed if this   no run row
+                                               run made it and
+                                               it is empty
+    write_algos fails                 3      as above          run row `failed`
+    constructor, engine or output     trace  stays (side       run row `failed`
+      file write fails                back     files, files)
+    write_results or end_run fails    3      files in place    `failed`, or `running` if
+                                                                 end_run itself failed
+
 Working directory: legacy code writes side files (`tradey.txt`) into the
 current directory. For the duration of the run the working directory is
 changed to `--out`, so such files land there and nothing is written to the
@@ -30,25 +87,32 @@ directory the command was started from. All paths are resolved to absolute
 paths before the change.
 
 Exit codes: 0 success; 2 usage or input error (one line on stderr, no
-traceback). Any other exception propagates with its traceback.
+traceback); 3 the store failed after it was opened (one line on stderr, no
+traceback): `run finished but could not be stored: ...` when the engine had
+finished (the output files are already written and stay in place), otherwise
+`could not record the run: ...`. Any other exception propagates with its
+traceback.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import logging
 import os
 import re
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from .algos import close_algo_logs, load_algo
+from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
 from .feed import CsvBarFeed
 from .ledger import Ledger
@@ -56,6 +120,8 @@ from .modes import DEFAULT_MODE, ModeError, build_router, parse_mode
 from .paper_broker import CostModel
 from .report import ledger_document, ledger_trade_records, trade_records
 from .sink import NullSink
+from .stats import fmt4
+from .store import AlgoMeta, DataMeta, RunMeta, StoreError, open_store
 
 _SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
@@ -84,6 +150,18 @@ class CliError(Exception):
     """A usage or input problem; the message is shown as one line, exit code 2."""
 
 
+class RunStoreError(Exception):
+    """The store failed after it was opened; one line, exit code 3.
+
+    `finished` is True when the engine had already finished (the output files
+    are written), False when the run could not even be recorded.
+    """
+
+    def __init__(self, message: str, *, finished: bool) -> None:
+        super().__init__(message)
+        self.finished = finished
+
+
 def validate_algo_config(parsed: object) -> list[dict[str, Any]]:
     """Check the parsed `Algo_config.json` shape and return it normalised.
 
@@ -96,7 +174,9 @@ def validate_algo_config(parsed: object) -> list[dict[str, Any]]:
     "ticker"; a ticker that cannot be a file-name part; a "mode" that is not
     a string or not `backtest` / `paper` (`live`, also as `Live` or ` live `,
     gets its own message: not available yet); a "mode" key on the entry
-    instead of on a config, or a config key that is "mode" in another case;
+    instead of on a config, or a config key that is "mode" in another case or
+    with surrounding whitespace (duplicate JSON keys are refused earlier, by
+    `read_algo_config`);
     a duplicate idname; no configs at all. Does not check that the algo
     exists. Nothing is built here. User-supplied values in messages go
     through `ascii()` so a message can always be written to any stream.
@@ -133,7 +213,7 @@ def validate_algo_config(parsed: object) -> list[dict[str, Any]]:
             if not isinstance(cfg, dict):
                 raise CliError(f"{where} is not a JSON object")
             for key in cfg:
-                if key != "mode" and isinstance(key, str) and key.lower() == "mode":
+                if key != "mode" and isinstance(key, str) and key.strip().lower() == "mode":
                     raise CliError(f'{where}: key {ascii(key)} must be spelled "mode" (lower case)')
             for key in ("idname", "ticker"):
                 if key not in cfg:
@@ -161,6 +241,20 @@ def config_symbols(entries: Sequence[Mapping[str, Any]]) -> list[str]:
     return list(dict.fromkeys(cfg["ticker"] for entry in entries for cfg in entry["data"]))
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """`object_pairs_hook` that refuses a key given twice in one JSON object.
+
+    `json` would otherwise keep the last value silently, so a config could
+    carry `"mode": "live"` and `"mode": "paper"` and only the second would count.
+    """
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise CliError(f"duplicate key {ascii(key)} in the algo config")
+        seen[key] = value
+    return seen
+
+
 def read_algo_config(path: Path) -> list[dict[str, Any]]:
     """Read and validate an algo config file; every problem is a `CliError`."""
     try:
@@ -168,7 +262,7 @@ def read_algo_config(path: Path) -> list[dict[str, Any]]:
     except (OSError, UnicodeDecodeError) as exc:
         raise CliError(f"cannot read algos file {path}: {exc}") from exc
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except ValueError as exc:
         raise CliError(f"algos file {path} is not valid JSON: {exc}") from exc
     return validate_algo_config(parsed)
@@ -193,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
             'in an algo\'s "data" may set "mode": "backtest" (default) or "paper" '
             "(both simulated); \"live\" is not available yet and is refused. A legacy-fills "
             "run deletes a ledger.json left in --out by an earlier realistic run."
+        ),
+        epilog=(
+            "exit codes: 0 success; 2 usage or input error (nothing is stored, nothing is "
+            "written to --out); 3 the database failed after it was opened (the run could "
+            "not be recorded, or it finished and its output files were written but it "
+            "could not be stored)"
         ),
     )
     bt.add_argument(
@@ -249,6 +349,16 @@ def build_parser() -> argparse.ArgumentParser:
             "finite, with at most 4 decimals"
         ),
     )
+    bt.add_argument(
+        "--db",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "also store the run in this SQLite database (a file path or sqlite:///path; "
+            "created if missing). A path inside a OneDrive folder is refused. Without "
+            "--db nothing is stored and no database file is created"
+        ),
+    )
     bt.add_argument("--log", action="store_true", help="write algo logs to <out>/backtest.log")
     bt.add_argument(
         "--quiet", action="store_true", help="discard the algos' stdout prints during the run"
@@ -301,6 +411,31 @@ def _load_algos(entries: Sequence[Mapping[str, Any]], log_path: Path | None, alg
                 if exc.__cause__ is not None or str(exc).startswith("invalid algo id"):
                     raise CliError(str(exc)) from exc
                 raise
+
+
+def check_algos_importable(entries: Sequence[Mapping[str, Any]]) -> None:
+    """Raise `CliError` unless every algo id's module imports and has an `Algo` class.
+
+    Done before the store is opened and before `--out` exists, so a typo in an
+    algo id is an input error that stores nothing. It only imports (the same
+    module name `load_algo` uses); constructing the algos waits until the run
+    is in `--out`, because legacy constructors write side files into the
+    working directory.
+    """
+    for algo_id in dict.fromkeys(entry["ID"] for entry in entries):
+        module_name = f"MainStoinker.Algos.{algo_id}.{algo_id}_Algo"
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            missing = exc.name
+            if missing is None or module_name == missing or module_name.startswith(missing + "."):
+                raise CliError(f"unknown algo {algo_id!r}: cannot import {module_name}") from exc
+            raise CliError(f"algo {algo_id!r} cannot be imported: {exc}") from exc
+        except Exception as exc:
+            raise CliError(
+                f"algo {algo_id!r} cannot be imported: {type(exc).__name__}: {exc}") from exc
+        if not hasattr(module, "Algo"):
+            raise CliError(f"algo {algo_id!r}: {module_name} has no class 'Algo'")
 
 
 def parse_money(text: str, flag: str, *, positive: bool = False) -> Decimal:
@@ -363,13 +498,71 @@ def parse_fill_options(args: argparse.Namespace) -> tuple[CostModel, Decimal]:
     return costs, capital
 
 
-def run_backtest_command(args: argparse.Namespace, *, attach_ledger: bool = False) -> int:
+def _check_out_creatable(out_dir: Path) -> None:
+    """Refuse an `--out` that cannot be a directory, without creating anything.
+
+    `out_dir` is a file, or a file stands where one of its missing parents would
+    go. (A permission problem only shows when the directory is made.)
+    """
+    probe = out_dir
+    while not os.path.lexists(probe) and probe.parent != probe:
+        probe = probe.parent
+    if os.path.lexists(probe) and not probe.is_dir():
+        raise CliError(f"cannot create output directory {out_dir}: {probe} is not a directory")
+
+
+def _make_out_dir(out_dir: Path) -> list[Path]:
+    """Create `out_dir` and missing parents; return the ones made, deepest first.
+
+    On failure whatever was made here is removed again and `CliError` raised.
+    """
+    missing: list[Path] = []
+    probe = out_dir
+    while not os.path.lexists(probe) and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    made: list[Path] = []
+    try:
+        for folder in reversed(missing):
+            folder.mkdir()
+            made.insert(0, folder)
+        out_dir.mkdir(exist_ok=True)
+    except OSError as exc:
+        _remove_new_dirs(made)
+        raise CliError(f"cannot create output directory {out_dir}: {exc}") from exc
+    return made
+
+
+def _remove_new_dirs(made: Sequence[Path]) -> None:
+    """Remove directories this run made, deepest first, as far as they are still empty."""
+    for folder in made:
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+
+
+def _db_display(spec: str) -> str:
+    """The database path as shown in the success line (absolute for a file)."""
+    path = spec[len("sqlite:///"):] if spec.startswith("sqlite:///") else spec
+    return path if path == ":memory:" else str(Path(path).expanduser().resolve())
+
+
+def run_backtest_command(
+    args: argparse.Namespace,
+    *,
+    attach_ledger: bool = False,
+    env: Mapping[str, str] | None = None,
+    code_version: Callable[[], str] | None = None,
+) -> int:
     """Execute the parsed `backtest` command. Raises `CliError` for input problems.
 
-    `attach_ledger` (internal seam, not reachable from the command line) books
-    a ledger even for a legacy-fills run. Which file is written never depends
-    on it: legacy fills write `trades.json` from the algos' own trades and no
-    `ledger.json`, realistic fills write both from the ledger.
+    `attach_ledger` (internal seam) books a ledger even for a legacy-fills run
+    (`--db` does this). Which file is written never depends on it: legacy
+    fills write `trades.json` from the algos' own trades and no `ledger.json`,
+    realistic fills write both from the ledger. `env` is the environment the
+    store judges OneDrive folders by (default `os.environ` at call time);
+    `code_version` replaces `current_code_version` (tests).
     """
     # Resolve everything against the starting directory, before any chdir.
     algos_path = Path(args.algos).resolve()
@@ -377,75 +570,162 @@ def run_backtest_command(args: argparse.Namespace, *, attach_ledger: bool = Fals
     out_dir = Path(args.out).resolve()
     if args.warmup_days < 0:
         raise CliError("--warmup-days must be 0 or more")
+    if args.db is not None and args.db.removeprefix("sqlite:///") == ":memory:":
+        raise CliError("--db :memory: would keep nothing once the command ends; "
+                       "give a database file")
     costs, capital = parse_fill_options(args)
 
     entries = read_algo_config(algos_path)
+    # Importing an algo runs legacy import-time code that prints to stdout; with
+    # --quiet that stays hidden, as it always was (it used to happen in the run).
+    with _maybe_quiet(args.quiet):
+        check_algos_importable(entries)
     if not data_dir.is_dir():
         raise CliError(f"data directory not found: {data_dir}")
     try:
         feed = CsvBarFeed(data_dir, config_symbols(entries), args.warmup_days)
     except (ValueError, FileNotFoundError) as exc:
         raise CliError(str(exc)) from exc
-    bar_count = sum(1 for _ in feed)
-
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise CliError(f"cannot create output directory {out_dir}: {exc}") from exc
-    trades_path = out_dir / TRADES_NAME
-    ledger_path = out_dir / LEDGER_NAME
-    log_path = out_dir / LOG_NAME if args.log else None
+    # One pass over the batches (they are in memory): count them and note the
+    # first and last replayed bar, which the stored run records.
+    bar_count = 0
+    first_bar: datetime | None = None
+    last_bar: datetime | None = None
+    for stamp, _bars in feed:
+        bar_count += 1
+        if first_bar is None:
+            first_bar = stamp
+        last_bar = stamp
 
     realistic = args.fills == "realistic"
     idnames = [cfg["idname"] for entry in entries for cfg in entry["data"]]
-    ledger = Ledger() if (realistic or attach_ledger) else None
+    ledger = Ledger() if (realistic or attach_ledger or args.db is not None) else None
     try:
         router = build_router(entries, fills=args.fills, costs=costs, capital=capital,
                               ledger=ledger)
     except ModeError as exc:
         raise CliError(str(exc)) from exc
 
-    algos: list = []
-    summary: dict[str, str] = {}
-    removed_stale = False
+    # Every input problem is behind us, the algo ids included, and so is the
+    # cheap check that `--out` can be created. The store comes next, before the
+    # output directory is touched, so a refused database leaves nothing behind.
+    _check_out_creatable(out_dir)
+    store = None
+    db_shown = ""
+    if args.db is not None:
+        try:
+            store = open_store(args.db, env=os.environ if env is None else env)
+        except StoreError as exc:
+            raise CliError(str(exc)) from exc
+        db_shown = _db_display(args.db)
     try:
-        with _working_directory(out_dir), _maybe_quiet(args.quiet):
-            _load_algos(entries, log_path, algos)
-            engine = Engine(EngineConfig(), feed, router, NullSink(), algos,
-                            ledger=ledger, end_commission=router.end_commission)
-            engine.run_backtest()
+        trades_path = out_dir / TRADES_NAME
+        ledger_path = out_dir / LEDGER_NAME
+        log_path = out_dir / LOG_NAME if args.log else None
+        run_id: int | None = None
+        engine_done = False
+        engine_started = False
+        created_dirs: list[Path] = []
+        removed_stale = False
+        try:
+            created_dirs = _make_out_dir(out_dir)
+            # A ledger.json from an earlier run into this directory must never sit
+            # beside this run's trades.json. It goes now, before anything is recorded,
+            # so a file that cannot be removed is an input error that stores nothing;
+            # a realistic run writes its own ledger.json last.
+            removed_stale = ledger_path.exists() or ledger_path.is_symlink()
+            try:
+                ledger_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise CliError(f"cannot remove stale {ledger_path}: {exc}") from exc
+            if store is not None:
+                run_id = store.begin_run(RunMeta(
+                    kind="backtest",
+                    fills=args.fills,
+                    code_version=(code_version or current_code_version)(),
+                    config={
+                        "entries": entries,
+                        "warmup_days": args.warmup_days,
+                        "capital": fmt4(capital),
+                        "costs": {
+                            "commission_per_share": fmt4(costs.commission_per_share),
+                            "commission_minimum": fmt4(costs.commission_minimum),
+                            "slippage_per_share": fmt4(costs.slippage_per_share),
+                        } if realistic else None,
+                    },
+                    data=DataMeta(source="csv", directory=str(data_dir),
+                                  symbols=tuple(feed.symbols()), first_bar=first_bar,
+                                  last_bar=last_bar),
+                ))
+                store.write_algos(run_id, [
+                    AlgoMeta(cfg["idname"], entry["ID"], cfg["ticker"], router.modes[cfg["idname"]],
+                             capital, cfg)
+                    for entry in entries for cfg in entry["data"]
+                ])
+            algos: list = []
+            engine_started = True
+            try:
+                with _working_directory(out_dir), _maybe_quiet(args.quiet):
+                    _load_algos(entries, log_path, algos)
+                    engine = Engine(EngineConfig(), feed, router, NullSink(), algos,
+                                    ledger=ledger, end_commission=router.end_commission)
+                    engine.run_backtest()
+                    engine_done = True
+                    if realistic:
+                        assert ledger is not None
+                        result = {i: ledger_trade_records(ledger, i) for i in idnames}
+                    else:
+                        result = {
+                            idname: trade_records(algo)
+                            for idname, algo in zip(idnames, algos, strict=True)
+                        }
+            finally:
+                close_algo_logs(algos)
+
+            summary: dict[str, str] = {}
+            document = None
             if realistic:
                 assert ledger is not None
-                result = {idname: ledger_trade_records(ledger, idname) for idname in idnames}
-            else:
-                result = {
-                    idname: trade_records(algo)
-                    for idname, algo in zip(idnames, algos, strict=True)
+                document = ledger_document(
+                    ledger, idnames, fills=args.fills, costs=costs, capital=capital,
+                    cancelled_entries={i: router.cancelled_entries(i) for i in idnames},
+                )
+                summary = {
+                    idname: (f"net {acct['summary']['net']}, "
+                             f"commission {acct['summary']['commission']}, "
+                             f"final equity {acct['summary']['final_equity']}")
+                    for idname, acct in document["accounts"].items()
                 }
+            write_json_atomic(trades_path, result)
+            if document is not None:
+                write_json_atomic(ledger_path, document)
+            # The output files are done; only now is the run stored, so a storage
+            # failure cannot take a finished run's files away.
+            if store is not None:
+                assert run_id is not None and ledger is not None
+                store.write_results(
+                    run_id,
+                    order_events=ledger.orders,
+                    fills=ledger.fills,
+                    round_trips=ledger.round_trips,
+                    equity=ledger.equity_points,
+                    ignored_events=ledger.ignored_events,
+                )
+                store.end_run(run_id, "completed")
+        except BaseException as exc:
+            if not engine_started:
+                _remove_new_dirs(created_dirs)  # nothing ran: leave no empty --out behind
+            if store is not None and run_id is not None:
+                # Whatever goes wrong here must not hide the error being handled.
+                with contextlib.suppress(Exception):
+                    store.end_run(run_id, "failed")
+            if isinstance(exc, StoreError):
+                raise RunStoreError(str(exc), finished=engine_done) from exc
+            raise
     finally:
-        close_algo_logs(algos)
+        if store is not None:
+            store.close()
 
-    write_json_atomic(trades_path, result)
-    if realistic:
-        assert ledger is not None
-        document = ledger_document(
-            ledger, idnames, fills=args.fills, costs=costs, capital=capital,
-            cancelled_entries={i: router.cancelled_entries(i) for i in idnames},
-        )
-        write_json_atomic(ledger_path, document)
-        summary = {
-            idname: (f"net {acct['summary']['net']}, commission {acct['summary']['commission']}, "
-                     f"final equity {acct['summary']['final_equity']}")
-            for idname, acct in document["accounts"].items()
-        }
-    else:
-        # A legacy run leaves no ledger.json behind, so a file from an earlier
-        # realistic run into this directory cannot be mistaken for this run's.
-        removed_stale = ledger_path.exists() or ledger_path.is_symlink()
-        try:
-            ledger_path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise CliError(f"cannot remove stale {ledger_path}: {exc}") from exc
     print(f"replayed {bar_count} bars for {', '.join(feed.symbols())}")
     for idname, records in result.items():
         extra = f" ({summary[idname]})" if idname in summary else ""
@@ -453,23 +733,38 @@ def run_backtest_command(args: argparse.Namespace, *, attach_ledger: bool = Fals
     print(f"wrote {trades_path}")
     if realistic:
         print(f"wrote {ledger_path}")
-    if removed_stale:
+    elif removed_stale:
         print(f"removed stale {ledger_path} (left by an earlier realistic run)")
+    if run_id is not None:
+        print(f"stored run {run_id} in {db_shown}")
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point. Returns the exit code; argparse errors and `--help` raise `SystemExit`."""
+def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+    """Entry point. Returns the exit code; argparse errors and `--help` raise `SystemExit`.
+
+    `env` is the environment the store judges OneDrive folders by; None means
+    `os.environ` when the command runs.
+    """
     args = build_parser().parse_args(argv)
     try:
         if args.command == "backtest":
-            return run_backtest_command(args)
+            return run_backtest_command(args, env=env)
     except CliError as exc:
-        message = "error: " + " ".join(str(exc).split())
-        # Values from the config are shown through ascii(); paths and OS messages
-        # are not, so never let an unencodable character turn this into a traceback.
-        encoding = getattr(sys.stderr, "encoding", None) or "ascii"
-        print(message.encode(encoding, "backslashreplace").decode(encoding), file=sys.stderr)
+        _report("error: " + str(exc))
         return 2
+    except RunStoreError as exc:
+        what = ("run finished but could not be stored" if exc.finished
+                else "could not record the run")
+        _report(f"error: {what}: {exc}")
+        return 3
     raise AssertionError(f"unhandled command {args.command!r}")  # pragma: no cover
+
+
+def _report(message: str) -> None:
+    """One line on stderr. Values from the config are shown through ascii(); paths and
+    OS messages are not, so never let an unencodable character turn this into a traceback."""
+    line = " ".join(message.split())
+    encoding = getattr(sys.stderr, "encoding", None) or "ascii"
+    print(line.encode(encoding, "backslashreplace").decode(encoding), file=sys.stderr)
 

@@ -258,6 +258,61 @@ def test_newer_schema_refused(db):
     db.unlink()
 
 
+def test_newer_schema_refusal_does_not_modify_the_file(db):
+    """The switch to WAL rewrites the file header, so a newer database is refused first."""
+    import hashlib
+
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE t (x)")
+    con.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    con.close()
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    with pytest.raises(StoreError, match="newer"):
+        SqliteStore(db)
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert sorted(p.name for p in db.parent.iterdir()) == [db.name]  # no -wal / -shm left behind
+    db.unlink()
+
+
+class FlakyWal:
+    """Stands in for a connection: `PRAGMA journal_mode=WAL` fails with the given errors first."""
+
+    def __init__(self, *errors: str) -> None:
+        self.errors = list(errors)
+        self.calls = 0
+
+    def execute(self, sql: str):
+        self.calls += 1
+        if self.errors:
+            raise sqlite3.OperationalError(self.errors.pop(0))
+
+
+def test_wal_switch_retries_a_transient_disk_io_error():
+    from MainStoinker.engine.store import _enable_wal
+
+    conn = FlakyWal("disk I/O error")
+    _enable_wal(conn, wait=5.0)  # type: ignore[arg-type]
+    assert conn.calls == 2
+
+
+def test_wal_switch_gives_up_on_a_persistent_disk_io_error_after_the_deadline():
+    from MainStoinker.engine.store import _enable_wal
+
+    conn = FlakyWal(*["disk I/O error"] * 1000)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        _enable_wal(conn, wait=0.05)  # type: ignore[arg-type]
+    assert conn.calls > 1
+
+
+def test_wal_switch_raises_other_errors_at_once():
+    from MainStoinker.engine.store import _enable_wal
+
+    conn = FlakyWal("attempt to write a readonly database")
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        _enable_wal(conn, wait=5.0)  # type: ignore[arg-type]
+    assert conn.calls == 1
+
+
 def test_not_a_database_refused(db):
     db.write_text("this is not sqlite" * 50)
     with pytest.raises(StoreError):
@@ -912,6 +967,74 @@ def test_failed_rollback_does_not_hide_the_original_error(db):
             store.write_algos(run_id, algos()[:1])  # duplicate; then ROLLBACK fails too
         store._conn = real
         real.execute("ROLLBACK")  # tidy up the transaction the failed rollback left open
+
+
+def test_failed_begin_is_a_store_error_and_leaves_store_usable(db):
+    with SqliteStore(db) as store:
+        real = store._conn
+        flaky = _FlakyConn(real, fail={"BEGIN IMMEDIATE"})
+        store._conn = flaky
+        with pytest.raises(StoreError, match="transaction") as info:
+            store.begin_run(meta())
+        assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+        assert not real.in_transaction
+        flaky.fail.clear()
+        run_id = store.begin_run(meta())
+        assert [r.run_id for r in store.list_runs()] == [run_id]
+
+
+def hold_write_lock(db: Path) -> sqlite3.Connection:
+    """A second connection that holds the database's write lock until closed."""
+    other = sqlite3.connect(db, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    return other
+
+
+def test_a_locked_database_is_a_store_error_for_begin_run_and_write_results(db):
+    import time
+
+    with SqliteStore(db, busy_timeout=0.2) as store:
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos())
+        other = hold_write_lock(db)
+        try:
+            started = time.monotonic()
+            with pytest.raises(StoreError, match="locked") as info:
+                store.begin_run(meta())
+            assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+            with pytest.raises(StoreError, match="locked"):
+                write_all(store, run_id, build_ledger())
+            with pytest.raises(StoreError, match="locked"):
+                store.end_run(run_id, "failed")
+            assert time.monotonic() - started < 5  # a short wait, not the default ten seconds
+        finally:
+            other.execute("ROLLBACK")
+            other.close()
+        # the connection is usable again and nothing half-written is there
+        assert [r.status for r in store.list_runs()] == ["running"]
+        assert store.load_run(run_id).fills == ()
+        write_all(store, run_id, build_ledger())
+        store.end_run(run_id, "completed")
+        assert store.load_run(run_id).summary.status == "completed"
+
+
+def test_opening_waits_no_longer_than_the_given_busy_timeout(db):
+    import time
+
+    SqliteStore(db).close()  # created and migrated
+    other = hold_write_lock(db)
+    try:
+        started = time.monotonic()
+        store = SqliteStore(db, busy_timeout=0.2)  # nothing to migrate: opens fine
+        try:
+            with pytest.raises(StoreError):
+                store.begin_run(meta())
+        finally:
+            store.close()
+        assert time.monotonic() - started < 5
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
 
 
 @pytest.mark.parametrize("spec", ["file:x.db?mode=memory", "file:x.db", "sqlite:x.db",

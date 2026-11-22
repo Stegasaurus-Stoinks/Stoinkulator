@@ -483,7 +483,9 @@ def _utc_now() -> datetime:
 
 def _enable_wal(conn: sqlite3.Connection, wait: float = 10.0) -> None:
     """Switch to WAL. The switch needs an exclusive lock and fails at once, ignoring
-    the busy timeout, when another opener holds it; retry until it is free."""
+    the busy timeout, when another opener holds it; retry until it is free. A
+    transient "disk I/O error" (seen on Windows right after a writer was killed
+    hard) is retried the same way; any other error raises at once."""
     deadline = time.monotonic() + wait
     while True:
         try:
@@ -491,7 +493,8 @@ def _enable_wal(conn: sqlite3.Connection, wait: float = 10.0) -> None:
             return
         except sqlite3.OperationalError as exc:
             text = str(exc).lower()
-            if ("locked" not in text and "busy" not in text) or time.monotonic() >= deadline:
+            transient = "locked" in text or "busy" in text or "disk i/o error" in text
+            if not transient or time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
 
@@ -508,11 +511,15 @@ class SqliteStore:
 
     A path inside a OneDrive folder is refused here too. `env` is the
     environment that judgement uses; None means `os.environ` at call time.
+    `busy_timeout` is how many seconds a statement waits for another
+    connection's lock (default 10); when it runs out the operation raises
+    `StoreError` and the connection stays usable.
     """
 
     def __init__(self, path: str | os.PathLike[str], *,
                  clock: Callable[[], datetime] = _utc_now,
-                 env: Mapping[str, str] | None = None) -> None:
+                 env: Mapping[str, str] | None = None,
+                 busy_timeout: float = 10.0) -> None:
         self._clock = clock
         self._equity_state: dict[tuple[int, str | None], _EquityState] = {}
         self._path = str(path)
@@ -525,12 +532,15 @@ class SqliteStore:
                 raise StoreError(f"cannot create the folder for {self._path}: {exc}") from exc
         try:
             self._conn: sqlite3.Connection | None = sqlite3.connect(
-                self._path, isolation_level=None, timeout=10.0)
+                self._path, isolation_level=None, timeout=busy_timeout)
         except sqlite3.Error as exc:
             raise StoreError(f"cannot open database {self._path}: {exc}") from exc
         try:
             self._conn.execute("PRAGMA foreign_keys=ON")
-            _enable_wal(self._conn)
+            # A newer database is refused before anything is written to it: the
+            # switch to WAL rewrites the file header.
+            self._refuse_newer(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            _enable_wal(self._conn, busy_timeout)
             self._migrate()
         except StoreError:
             self.close()
@@ -548,8 +558,14 @@ class SqliteStore:
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction. Any `sqlite3.Error` from BEGIN, the body or COMMIT
+        (a locked database, a full disk) is raised as `StoreError` with the original
+        as `__cause__`; the transaction is rolled back and the connection stays usable."""
         conn = self._db()
-        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise StoreError(f"cannot start a transaction: {exc}") from exc
         try:
             yield conn
         except BaseException as exc:
@@ -563,6 +579,12 @@ class SqliteStore:
             _rollback(conn)
             raise StoreError(f"commit failed: {exc}") from exc
 
+    @staticmethod
+    def _refuse_newer(version: int) -> None:
+        if version > SCHEMA_VERSION:
+            raise StoreError(f"database schema version {version} is newer than this code "
+                             f"understands ({SCHEMA_VERSION}); update the program")
+
     def _migrate(self) -> None:
         conn = self._db()
         if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
@@ -570,9 +592,7 @@ class SqliteStore:
         with self._tx():
             # Re-read inside the write lock: another process may have migrated.
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > SCHEMA_VERSION:
-                raise StoreError(f"database schema version {version} is newer than this code "
-                                 f"understands ({SCHEMA_VERSION}); update the program")
+            self._refuse_newer(version)
             for step in range(version, SCHEMA_VERSION):
                 for statement in MIGRATIONS[step]:
                     conn.execute(statement)
@@ -811,13 +831,13 @@ class SqliteStore:
                        equity, ignored)
 
 
-def open_store(spec: str, *, env: Mapping[str, str]) -> Store:
+def open_store(spec: str, *, env: Mapping[str, str], busy_timeout: float = 10.0) -> Store:
     """Open the store named by `spec`. Only SQLite file paths are supported now.
 
     `env` is the environment to judge cloud-synced folders by (pass
     `os.environ`). `spec` is a file path, or `sqlite:///path`; `:memory:` gives
-    a private in-memory database. Another database can be added by recognising
-    its URL scheme here.
+    a private in-memory database. `busy_timeout` is the lock wait in seconds.
+    Another database can be added by recognising its URL scheme here.
     """
     if spec.startswith("sqlite:///"):
         spec = spec[len("sqlite:///"):]
@@ -827,4 +847,5 @@ def open_store(spec: str, *, env: Mapping[str, str]) -> Store:
     if found and len(found.group(1)) > 1:  # a single letter is a Windows drive
         raise StoreError(f"unsupported database {found.group(1)!r}; "
                          "only SQLite file paths are supported")
-    return SqliteStore(Path(spec).expanduser() if spec != ":memory:" else spec, env=env)
+    return SqliteStore(Path(spec).expanduser() if spec != ":memory:" else spec, env=env,
+                       busy_timeout=busy_timeout)
