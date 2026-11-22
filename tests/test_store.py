@@ -28,6 +28,7 @@ from MainStoinker.engine.store import (
     expand_equity,
     is_cloud_synced,
     open_store,
+    open_store_readonly,
 )
 
 D = Decimal
@@ -464,9 +465,117 @@ def test_onedrive_path_refused(tmp_path, key):
     target = root / "Documents" / "runs.db"  # neither folder nor file exists
     assert is_cloud_synced(target, env)
     assert is_cloud_synced(root, env)
-    with pytest.raises(StoreError, match=r"LOCALAPPDATA%\\Stoinkulator\\runs.db"):
+    with pytest.raises(StoreError, match=r"USERPROFILE%\\Stoinkulator\\runs.db"):
         open_store(str(target), env=env)
     assert not root.exists()  # refused before anything was created
+
+
+def test_cloud_refusal_suggests_userprofile(tmp_path):
+    env = {"OneDrive": str(tmp_path / "OneDrive")}
+    target = tmp_path / "OneDrive" / "runs.db"
+    for opener in (open_store, open_store_readonly):
+        with pytest.raises(StoreError) as info:
+            opener(str(target), env=env)
+        assert r"%USERPROFILE%\Stoinkulator\runs.db" in str(info.value)
+
+
+# ---- read-only access ---------------------------------------------------------------
+
+
+def test_readonly_open_cannot_write(db):
+    with SqliteStore(db) as w:
+        run_id, led = stored_run(w)
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        assert len(store.list_runs()) == 1
+        with pytest.raises(StoreError):
+            store.begin_run(meta())
+        with pytest.raises(StoreError):
+            store.write_algos(run_id, algos())
+        with pytest.raises(StoreError):
+            write_all(store, run_id, led)
+        with pytest.raises(StoreError):
+            store.end_run(run_id, "completed")
+        with pytest.raises(sqlite3.OperationalError):
+            store._conn.execute("INSERT INTO runs (started_at, status, kind, fills, config_json,"
+                                " data_json, code_version) VALUES ('x','running','k','f','{}','{}','')")
+    finally:
+        store.close()
+    with SqliteStore(db) as check:
+        assert len(check.list_runs()) == 1
+
+
+def test_readonly_open_does_not_migrate_or_create(db, tmp_path):
+    missing = tmp_path / "nope" / "runs.db"
+    with pytest.raises(StoreError, match="does not exist"):
+        open_store_readonly(str(missing), env=NO_ENV)
+    assert not missing.exists() and not missing.parent.exists()
+    # a v1 file: build it the old way, then compare bytes after reading
+    with SqliteStore(db) as w:
+        stored_run(w)
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.close()
+    before = db.read_bytes()
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        runs = store.list_runs()
+        store.load_run(runs[0].run_id)
+    finally:
+        store.close()
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in db.parent.iterdir()) == [db.name]
+
+
+def test_readonly_newer_schema_refused(db):
+    with SqliteStore(db):
+        pass
+    con = sqlite3.connect(db)
+    con.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    con.close()
+    before = db.read_bytes()
+    with pytest.raises(StoreError, match="newer"):
+        open_store_readonly(str(db), env=NO_ENV)
+    assert db.read_bytes() == before
+
+
+def test_readonly_reads_wal_db_without_wal_and_shm_files(db):
+    with SqliteStore(db) as w:
+        stored_run(w)
+    assert not Path(str(db) + "-wal").exists() and not Path(str(db) + "-shm").exists()
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        assert len(store.list_runs()) == 1
+    finally:
+        store.close()
+
+
+def test_readonly_sees_committed_run_while_writer_open(db):
+    writer = SqliteStore(db)
+    try:
+        run_id = writer.begin_run(meta())
+        reader = open_store_readonly(str(db), env=NO_ENV)
+        try:
+            assert [r.status for r in reader.list_runs()] == ["running"]
+            writer.write_algos(run_id, algos())
+            assert [a.idname for a in reader.load_run(run_id).algos] == ["a1", "a2"]
+        finally:
+            reader.close()
+    finally:
+        writer.close()
+
+
+def test_readonly_path_with_spaces_and_hash(tmp_path):
+    folder = tmp_path / "my runs #1 %20 x"
+    folder.mkdir()
+    path = folder / "r&d 100% #2.db"
+    with SqliteStore(path) as w:
+        stored_run(w)
+    store = open_store_readonly(str(path), env=NO_ENV)
+    try:
+        assert len(store.list_runs()) == 1
+    finally:
+        store.close()
 
 
 def test_not_cloud_synced_cases(tmp_path):

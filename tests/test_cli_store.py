@@ -476,6 +476,21 @@ def test_db_in_a_new_folder_and_sqlite_url_form(env, tmp_path, capsys):
     assert stored(target).summary.status == "completed"
 
 
+def test_backtest_uses_stoink_db(env, tmp_path, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    target = tmp_path / "named" / "env.db"
+    assert run(env, environ={"STOINK_DB": str(target)}) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == f"stored run 1 in {target.resolve()}"
+    assert stored(target).summary.status == "completed"
+    # the flag wins, and an empty value is unset
+    other = tmp_path / "flag.db"
+    assert run(env, "--db", str(other), environ={"STOINK_DB": str(target)}) == 0
+    assert stored(other).summary.run_id == 1 and len(read_runs(target)) == 1
+    capsys.readouterr()
+    assert run(env, environ={"STOINK_DB": ""}) == 0
+    assert "stored run" not in capsys.readouterr().out
+
+
 def test_relative_db_path_is_relative_to_the_start_directory(env, capsys):
     env.setup(ema_config(), ["AAPL"], rows=900)
     assert run(env, "--db", "rel.db") == 0

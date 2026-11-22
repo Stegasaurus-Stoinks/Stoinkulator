@@ -70,7 +70,7 @@ from .ledger import (
 
 RunStatus = Literal["running", "completed", "failed"]
 CLOUD_ENV_VARS: tuple[str, ...] = ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")
-SUGGESTED_PATH = r"%LOCALAPPDATA%\Stoinkulator\runs.db"
+SUGGESTED_PATH = r"%USERPROFILE%\Stoinkulator\runs.db"
 _SCALE = Decimal(10000)
 _QUANT = Decimal("0.0001")
 _INT64_MAX = 2**63 - 1
@@ -519,10 +519,15 @@ class SqliteStore:
     def __init__(self, path: str | os.PathLike[str], *,
                  clock: Callable[[], datetime] = _utc_now,
                  env: Mapping[str, str] | None = None,
-                 busy_timeout: float = 10.0) -> None:
+                 busy_timeout: float = 10.0,
+                 readonly: bool = False) -> None:
         self._clock = clock
+        self._readonly = readonly
         self._equity_state: dict[tuple[int, str | None], _EquityState] = {}
         self._path = str(path)
+        if readonly:
+            self._open_readonly(busy_timeout, os.environ if env is None else env)
+            return
         if self._path != ":memory:":
             file = Path(self._path).expanduser()
             _refuse_cloud(file, os.environ if env is None else env)
@@ -549,6 +554,34 @@ class SqliteStore:
             self.close()
             raise StoreError(f"cannot use database {self._path}: {exc}") from exc
 
+    def _open_readonly(self, busy_timeout: float, env: Mapping[str, str]) -> None:
+        """Open an existing file with `mode=ro`: no folder, no WAL switch, no migration."""
+        if self._path == ":memory:":
+            raise StoreError("an in-memory database holds nothing to read")
+        file = Path(self._path).expanduser()
+        _refuse_cloud(file, env)
+        try:
+            if not file.is_file():
+                raise StoreError(f"database {self._path} does not exist")
+            uri = file.resolve().as_uri() + "?mode=ro"
+            self._conn: sqlite3.Connection | None = sqlite3.connect(
+                uri, uri=True, isolation_level=None, timeout=busy_timeout)
+        except OSError as exc:
+            raise StoreError(f"cannot open database {self._path}: {exc}") from exc
+        except sqlite3.Error as exc:
+            raise StoreError(f"cannot open database {self._path}: {exc}") from exc
+        try:
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            self._refuse_newer(version)
+            if version < 1:
+                raise StoreError(f"{self._path} is not a run database (schema version 0)")
+        except StoreError:
+            self.close()
+            raise
+        except sqlite3.Error as exc:
+            self.close()
+            raise StoreError(f"cannot use database {self._path}: {exc}") from exc
+
     # --- plumbing ---------------------------------------------------------
 
     def _db(self) -> sqlite3.Connection:
@@ -562,6 +595,8 @@ class SqliteStore:
         (a locked database, a full disk) is raised as `StoreError` with the original
         as `__cause__`; the transaction is rolled back and the connection stays usable."""
         conn = self._db()
+        if self._readonly:
+            raise StoreError("the store was opened read-only")
         try:
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
@@ -849,3 +884,24 @@ def open_store(spec: str, *, env: Mapping[str, str], busy_timeout: float = 10.0)
                          "only SQLite file paths are supported")
     return SqliteStore(Path(spec).expanduser() if spec != ":memory:" else spec, env=env,
                        busy_timeout=busy_timeout)
+
+
+def open_store_readonly(spec: str, *, env: Mapping[str, str],
+                        busy_timeout: float = 10.0) -> Store:
+    """Open an existing database for reading only; never writes to the file.
+
+    No folder is created, the journal mode is not switched and no migration
+    runs. A missing file or a schema newer than this code raises `StoreError`;
+    every schema from 1 to `SCHEMA_VERSION` is accepted as is. Write methods
+    raise `StoreError`. `spec` as for `open_store`.
+    """
+    if spec.startswith("sqlite:///"):
+        spec = spec[len("sqlite:///"):]
+    if not spec.strip():
+        raise StoreError("empty database path")
+    found = _SCHEME.match(spec)
+    if found and len(found.group(1)) > 1:
+        raise StoreError(f"unsupported database {found.group(1)!r}; "
+                         "only SQLite file paths are supported")
+    return SqliteStore(Path(spec).expanduser() if spec != ":memory:" else spec, env=env,
+                       busy_timeout=busy_timeout, readonly=True)

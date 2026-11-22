@@ -362,8 +362,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SPEC",
         help=(
             "also store the run in this SQLite database (a file path or sqlite:///path; "
-            "created if missing). A path inside a OneDrive folder is refused. Without "
-            "--db nothing is stored and no database file is created"
+            "created if missing). A path inside a OneDrive folder is refused. Defaults to "
+            "the STOINK_DB environment variable; without either nothing is stored and no "
+            "database file is created"
         ),
     )
     bt.add_argument("--log", action="store_true", help="write algo logs to <out>/backtest.log")
@@ -380,7 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=epilog,
     )
     runs.add_argument("--db", default=None, metavar="SPEC",
-                      help="the database file (or sqlite:///path); it must exist")
+                      help="the database file (or sqlite:///path); it must exist. "
+                           "Defaults to the STOINK_DB environment variable")
     runs.add_argument("--json", action="store_true", help="machine-readable output")
     rep = sub.add_parser(
         "report",
@@ -392,7 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rep.add_argument("run", metavar="RUN", help="the run id (see `runs`)")
     rep.add_argument("--db", default=None, metavar="SPEC",
-                     help="the database file (or sqlite:///path); it must exist")
+                     help="the database file (or sqlite:///path); it must exist. "
+                          "Defaults to the STOINK_DB environment variable")
     rep.add_argument("--json", action="store_true",
                      help="machine-readable output (money as 4-decimal strings)")
     return parser
@@ -779,6 +782,8 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     `os.environ` when the command runs.
     """
     args = build_parser().parse_args(argv)
+    if args.db is None:  # STOINK_DB from the injected environment; empty counts as unset
+        args.db = (os.environ if env is None else env).get("STOINK_DB") or None
     try:
         if args.command == "backtest":
             return run_backtest_command(args, env=env)
