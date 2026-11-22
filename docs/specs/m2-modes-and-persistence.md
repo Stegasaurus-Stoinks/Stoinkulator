@@ -1,7 +1,6 @@
 # Milestone 2 spec: results you can trust and keep
 
-Status: approved by the owner on 2026-11-21, except the choice of database
-(decision 1), which is still open. See "Decisions" at the end.
+Status: approved by the owner on 2026-11-21. See "Decisions" at the end.
 
 ## Goal
 
@@ -151,9 +150,9 @@ dashboard shows comes from the store. So:
 
 ## Decisions
 
-1. **Database: open.** SQLite file is the working assumption; the owner has
-   asked what it is for and has not yet chosen. Only the store task depends on
-   this.
+1. **Database: SQLite, approved (2026-11-21).** One file, Python's standard
+   library, no server. The store sits behind one interface so another database
+   can be added later.
 2. **Order of milestones: approved (2026-11-21).** Dashboard before the live
    side, as listed above.
 3. **Fill model defaults: approved (2026-11-21).** Entry at the next bar's
