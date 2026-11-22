@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from MainStoinker.api.routes_compare import last_folder_name
+from MainStoinker.api.routes_runs import last_folder_name
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.run_documents import report_document
 from MainStoinker.engine.store import RunMeta, SqliteStore, Store
@@ -112,16 +112,17 @@ def test_non_integer_run_422(compare_db: Path, runs: str) -> None:
     assert response.json() == {"detail": "invalid parameter: query.runs"}
 
 
-@pytest.mark.parametrize(("directory", "shown"), [
-    (r"C:\Users\someone\data\OfflineData", "OfflineData"),
-    ("C:/Users/someone/data/OfflineData/", "OfflineData"),
-    ("/home/someone/bars", "bars"),
-    ("", "-"),
-    ("C:\\", "-"),
-    ("/", "-"),
-])
-def test_last_folder_name(directory: str, shown: str) -> None:
-    assert last_folder_name(directory) == shown
+@pytest.mark.parametrize("runs", ["9" * 5000 + ",1", "1," + "9" * 5000, "9" * 19 + ",1", "1,2," + "0" * 19])
+def test_too_long_run_id_422(compare_db: Path, runs: str) -> None:
+    response = make_client(compare_db).get("/api/compare", params={"runs": runs})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid parameter: query.runs"}
+
+
+def test_eighteen_digit_unknown_run_404(compare_db: Path) -> None:
+    response = make_client(compare_db).get("/api/compare?runs=1," + "9" * 18)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "no run " + "9" * 18}
 
 
 def test_empty_or_root_directory_shows_dash_and_no_path_leaks(compare_db: Path, tmp_path: Path) -> None:
@@ -195,9 +196,15 @@ def test_schema_1_database_can_be_compared(compare_db: Path, tmp_path: Path) -> 
     assert response.json() == make_client(compare_db).get("/api/compare?runs=1,2").json()
 
 
-@pytest.mark.parametrize("query", ["runs=1&runs=2", "runs=1,2&runs=3", "runs=%2B1,2", "runs=1,2,%20",
-                                   "runs=%EF%BC%91,2"])
-def test_repeated_or_signed_runs_parameter_422(compare_db: Path, query: str) -> None:
+@pytest.mark.parametrize("query", ["runs=1&runs=2", "runs=1,2&runs=3", "runs=1,2&runs=1,2", "runs=1,2&runs="])
+def test_repeated_runs_parameter_422(compare_db: Path, query: str) -> None:
+    response = make_client(compare_db).get("/api/compare?" + query)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid parameter: query.runs"}
+
+
+@pytest.mark.parametrize("query", ["runs=%2B1,2", "runs=1,2,%20", "runs=%EF%BC%91,2"])
+def test_signed_runs_parameter_422(compare_db: Path, query: str) -> None:
     response = make_client(compare_db).get("/api/compare?" + query)
     assert response.status_code == 422
     assert response.json() == {"detail": "invalid parameter: query.runs"}

@@ -8,7 +8,6 @@ directory is returned (`-` when there is none); no absolute path is ever sent.
 
 from __future__ import annotations
 
-from pathlib import PureWindowsPath
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -16,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 
 from MainStoinker.api.db import with_store
 from MainStoinker.api.errors import NotFound
+from MainStoinker.api.routes_runs import last_folder_name
 from MainStoinker.engine.run_documents import report_document
 from MainStoinker.engine.store import Store
 
@@ -23,6 +23,7 @@ router = APIRouter()
 
 MIN_RUNS = 2
 MAX_RUNS = 5
+MAX_DIGITS = 18  # a longer part is never a run id (and `int()` refuses thousands of digits)
 
 
 def _invalid() -> RequestValidationError:
@@ -32,17 +33,12 @@ def _invalid() -> RequestValidationError:
 def parse_run_ids(text: str) -> list[int]:
     """`"1,2"` to `[1, 2]`: 2 to 5 distinct plain integers, else a validation error (422)."""
     parts = text.split(",")
-    if not all(p.isascii() and p.isdigit() for p in parts):
+    if not all(p.isascii() and p.isdigit() and len(p) <= MAX_DIGITS for p in parts):
         raise _invalid()
     ids = [int(p) for p in parts]
     if not MIN_RUNS <= len(ids) <= MAX_RUNS or len(set(ids)) != len(ids):
         raise _invalid()
     return ids
-
-
-def last_folder_name(directory: str) -> str:
-    """The last folder name of a stored (Windows or POSIX) directory; `-` if there is none."""
-    return PureWindowsPath(directory).name or "-"
 
 
 def _compare(store: Store, ids: list[int]) -> dict[str, Any]:
@@ -68,5 +64,7 @@ def _compare(store: Store, ids: list[int]) -> dict[str, Any]:
 
 @router.get("/api/compare")
 async def compare(request: Request, runs: str = Query(...)) -> dict[str, Any]:
+    if len(request.query_params.getlist("runs")) != 1:
+        raise _invalid()  # a repeated parameter is ambiguous: no "last one wins"
     ids = parse_run_ids(runs)
     return await with_store(request, lambda store: _compare(store, ids))
