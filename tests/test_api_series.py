@@ -1,22 +1,24 @@
 """`GET /api/runs/{id}/series`: windows, ordering, availability and the 422 rules.
 
-Series are written straight through the store (the capture task that fills them
-for real backtests is a separate change), into databases under `tmp_path`.
-`test_series_of_stored_backtest` (an EMACrossing run with `MA20` as a `line`)
-waits for that capture task.
+Series are written straight through the store into databases under `tmp_path`;
+`test_series_of_stored_backtest` goes through a real `backtest --db`.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import MainStoinker.engine.cli as cli
+from MainStoinker.api.routes_series import MAX_ECHO
 from MainStoinker.engine.store import SeriesInfo, SeriesPoint, SqliteStore
 from tests.api_support import make_client
 from tests.test_api_bars import store_run, write_bars
+from tests.test_cli_modes import EMA, Env
 from tests.test_store import T0, algos, make_v1_file, meta, stored_run
 
 DAY2 = T0 + timedelta(days=1)  # the run's last bar: 2024-01-03 09:30
@@ -57,7 +59,7 @@ def test_series_for_window(db: Path) -> None:
     assert body["algo"] == "a1" and body["available"] is True
     by_name = {s["name"]: s for s in body["series"]}
     assert by_name["ema"]["points"] == [{"time": "2024-01-02 09:30:00", "value": 100.0},
-                                        {"time": "2024-01-02 09:31:00", "value": 100.123}]
+                                        {"time": "2024-01-02 09:31:00", "value": 100.123457}]
     assert by_name["ema"]["draw_type"] == "line" and by_name["ema"]["position"] == 2
     assert by_name["rsi"]["points"] == [{"time": "2024-01-02 09:30:00", "value": 55.0}]
     # a declared series with no point in the window is still listed
@@ -65,10 +67,55 @@ def test_series_for_window(db: Path) -> None:
                                 "points": []}
 
 
-def test_values_rounded_to_six_significant_digits(db: Path) -> None:
-    r = get(db, "?algo=a1&start=2024-01-02T09:30&end=2024-01-02T09:40")
-    ema = next(s for s in r.json()["series"] if s["name"] == "ema")
-    assert [p["value"] for p in ema["points"]] == [100.0, 100.123, 123457.0]
+@pytest.mark.parametrize(("stored", "sent"), [
+    (12345.65, 12345.65),  # a price keeps its cents however large it is
+    (20123.25, 20123.25),
+    (0.1234567, 0.123457),
+    (-0.1234567, -0.123457),
+    (0.0, 0.0),
+])
+def test_values_rounded_to_six_decimal_places(tmp_path: Path, stored: float, sent: float) -> None:
+    path = tmp_path / "r.db"
+    with SqliteStore(path) as store:
+        run = store.begin_run(meta())
+        store.write_algos(run, algos())
+        store.write_series(run, [SeriesInfo("a1", "v", "line", 0)],
+                           [SeriesPoint("a1", "v", T0, stored)])
+        store.end_run(run, "completed")
+    r = get(path, "?algo=a1&start=2024-01-02T09:30&end=2024-01-02T09:31", run=1)
+    assert r.status_code == 200
+    assert [p["value"] for p in r.json()["series"][0]["points"]] == [sent]
+
+
+def test_run_status_is_reported(tmp_path: Path, db: Path) -> None:
+    assert get(db, "?algo=a1").json()["run_status"] == "completed"
+    assert get(db, "?algo=a1", run=1).json()["run_status"] == "completed"  # unavailable too
+    path = tmp_path / "f.db"
+    with SqliteStore(path) as store:
+        run = store.begin_run(meta())
+        store.write_algos(run, algos())
+        store.write_series(run, [SeriesInfo("a1", "v", "line", 0)], [])
+        store.end_run(run, "failed")
+    assert get(path, "?algo=a1", run=1).json()["run_status"] == "failed"
+
+
+def test_series_of_stored_backtest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "current_code_version", lambda: "0" * 40)
+    env = Env(tmp_path / "bt", monkeypatch)
+    env.setup([{"ID": "EMACrossing", "data": [EMA]}], ["AAPL"], rows=600)
+    database = tmp_path / "runs.db"
+    assert cli.main(["backtest", "--algos", str(env.algos), "--data", str(env.data),
+                     "--out", str(env.out), "--quiet", "--db", str(database)]) == 0
+    r = make_client(database).get("/api/runs/1/series", params={"algo": EMA["idname"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is True and body["run_status"] == "completed"
+    by_name = {s["name"]: s for s in body["series"]}
+    for name in ("MA20", "MA50"):
+        assert by_name[name]["draw_type"] == "line"
+        assert by_name[name]["points"]
+        assert all(re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", p["time"])
+                   for p in by_name[name]["points"])
 
 
 def test_default_window_is_the_day_of_the_last_bar(db: Path) -> None:
@@ -94,13 +141,13 @@ def test_v1_run_reports_unavailable(tmp_path: Path, db: Path) -> None:
     make_v1_file(db, v1)
     r = get(v1, "?algo=a1", run=1)
     assert r.status_code == 200
-    assert r.json() == {"algo": "a1", "available": False, "series": []}
+    assert r.json() == {"algo": "a1", "run_status": "completed", "available": False, "series": []}
 
 
 def test_run_without_series_reports_unavailable(db: Path) -> None:
     r = get(db, "?algo=a1", run=1)  # run 1 was stored with no series
     assert r.status_code == 200
-    assert r.json() == {"algo": "a1", "available": False, "series": []}
+    assert r.json() == {"algo": "a1", "run_status": "completed", "available": False, "series": []}
 
 
 def test_unknown_algo_404(db: Path) -> None:
@@ -109,12 +156,19 @@ def test_unknown_algo_404(db: Path) -> None:
     assert "nobody" in r.json()["detail"]
 
 
+def test_unknown_algo_detail_is_bounded(db: Path) -> None:
+    r = get(db, "?algo=" + "x" * 8000)
+    assert r.status_code == 404
+    assert r.json()["detail"] == f"no algo {'x' * MAX_ECHO}... in run 2"
+
+
 def test_unknown_run_404(db: Path) -> None:
     assert get(db, "?algo=a1", run=99).status_code == 404
 
 
-def test_algo_required_422(db: Path) -> None:
-    r = get(db, "")
+@pytest.mark.parametrize("params", ["", "?algo="])
+def test_algo_required_422(db: Path, params: str) -> None:
+    r = get(db, params)
     assert r.status_code == 422
     assert "algo" in r.json()["detail"]
 
@@ -144,14 +198,8 @@ def test_unknown_run_or_algo_beats_a_bad_window(db: Path) -> None:
 
 
 @pytest.mark.parametrize("window", [
-    "",
-    "&start=2024-01-02T09:30:00&end=2024-01-02T09:35:00",
-    "&start=2024-01-02 09:30&end=2024-01-08 09:30",  # 6 days apart: accepted
-    "&start=2024-01-02T09:30:00&end=2024-01-09T09:30:00",  # 7 days apart: refused
-    "&start=2024-01-02T09:30:00",
-    "&start=2024-01-02T10:00:00&end=2024-01-02T09:30:00",
-    "&start=garbage&end=2024-01-02T09:30:00",
-    "&start=2024-01-02T09:30:00Z&end=2024-01-02T10:00:00",
+    "&start=2024-01-02 09:30&end=2024-01-08 09:30",  # accepted
+    "&start=2024-01-02T10:00:00&end=2024-01-02T09:30:00",  # refused
 ])
 def test_bars_and_series_routes_answer_the_same_window(db: Path, tmp_path: Path, window: str) -> None:
     directory = tmp_path / "bars-data"

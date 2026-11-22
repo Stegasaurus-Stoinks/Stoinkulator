@@ -20,11 +20,17 @@ from MainStoinker.engine.store import Store
 
 router = APIRouter()
 
-SIGNIFICANT_DIGITS = 6
+DECIMAL_PLACES = 6
+MAX_ECHO = 64
+
+
+def _echo(value: str) -> str:
+    """At most `MAX_ECHO` characters of a client-supplied value, cut with an ellipsis."""
+    return value if len(value) <= MAX_ECHO else value[:MAX_ECHO] + "..."
 
 
 def _round(value: float) -> float:
-    return float(f"{value:.{SIGNIFICANT_DIGITS}g}")
+    return round(value, DECIMAL_PLACES)
 
 
 def _series(store: Store, run_id: int, algo: str,
@@ -33,24 +39,25 @@ def _series(store: Store, run_id: int, algo: str,
         raise NotFound(f"no run {run_id}")
     run = store.load_run(run_id)
     if algo not in {a.idname for a in run.algos}:
-        raise NotFound(f"no algo {algo!r} in run {run_id}")
+        raise NotFound(f"no algo {_echo(algo)} in run {run_id}")
     try:
         lo, hi = parse_window(start, end, default_day=run.summary.data.last_bar)
     except WindowError as error:
         raise HTTPException(422, str(error)) from None
+    status = run.summary.status
     infos = sorted((s for s in run.series if s.account == algo),
                    key=lambda s: (s.position, s.name))
     if not infos:
-        return {"algo": algo, "available": False, "series": []}
+        return {"algo": algo, "run_status": status, "available": False, "series": []}
     by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for p in store.load_series(run_id, algo, lo, hi):
         by_name[p.name].append({"time": format_time(p.time), "value": _round(p.value)})
-    return {"algo": algo, "available": True,
+    return {"algo": algo, "run_status": status, "available": True,
             "series": [{"name": s.name, "draw_type": s.draw_type, "position": s.position,
                         "points": by_name.get(s.name, [])} for s in infos]}
 
 
 @router.get("/api/runs/{run_id}/series")
-async def series(request: Request, run_id: int, algo: str = Query(...),
+async def series(request: Request, run_id: int, algo: str = Query(..., min_length=1),
                  start: str | None = None, end: str | None = None) -> dict[str, Any]:
     return await with_store(request, lambda store: _series(store, run_id, algo, start, end))
