@@ -1,6 +1,7 @@
 # Milestone 1 spec: core seams
 
-Status: draft for owner approval. Input to the task-divider once approved.
+Status: Phase A approved by the owner on 2026-11-21. Phase B is deferred until
+the owner can run a paper-trading session. See "Decisions" at the end.
 
 ## Goal
 
@@ -153,18 +154,17 @@ FunctionTest trade with stop and take-profit, and a clean shutdown.
 - No new third-party dependencies.
 - The three guards from issue 10 stay in force. The port guard moves with the
   connection code and keeps its tests.
-- `dev` and `master` stay frozen.
+- `dev` and `master` stay frozen until the owner merges `revival` into `master`.
 
-## Decisions for the owner
+## Decisions
 
-1. **Do Phase B now or later?** Phase A delivers fast, repeatable backtests
-   and touches nothing that reaches the broker. Phase B rewires live trading
-   and needs your paper-trading session. Recommendation: approve Phase A now
-   and start Phase B only when you have time to run that session.
-2. **Package name.** Keep `MainStoinker` and add `MainStoinker/engine/`, or
-   rename the package. Recommendation: keep it; renaming touches every import
-   for no functional gain.
-3. **Justin.** Phase A changes `trade.py`, `ticker.py`, `ParentAlgo.py` and
-   `main_utils.py`, which are also changed on `dev`. The longer `revival` and
-   `dev` diverge, the harder the eventual merge. He should know before Phase A
-   starts.
+Made by the owner on 2026-11-21:
+
+1. **Phase A now, Phase B later.** Phase A (the backtest side) is approved.
+   Phase B (the live side) starts only when the owner has time to run the
+   paper-trading session it needs.
+2. **Package name.** Keep `MainStoinker`; new code goes in
+   `MainStoinker/engine/`.
+3. **Branches.** `dev` stays untouched. `revival` is expected to merge
+   directly into `master` when the work is done, so keeping `revival`
+   mergeable with `dev` is not a goal.
