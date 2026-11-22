@@ -77,10 +77,8 @@ def test_every_public_method_with_broker_never_touches_ibapi(live_watched, direc
     broker = SimBroker()
 
     trade = make_trade(direction, broker=broker)
-    with pytest.raises(AttributeError):
-        trade.in_position()  # no status/position on a simulated open: known defect
-    with pytest.raises(AttributeError):
-        trade.get_status()
+    assert trade.in_position() is True  # issue 5: open sets status/position
+    assert trade.get_status() == "Open"
     trade.set_stopDelta(1.5)
     trade.set_stopLossType("Fixed")
     assert trade.check_stoploss(bar(100 + 0.1 * sign)) == 1
@@ -88,16 +86,15 @@ def test_every_public_method_with_broker_never_touches_ibapi(live_watched, direc
     assert trade.check_stoploss(bar(100 + 5 * sign)) == 1  # trailing move
     trade.create_tp(100 + 9 * sign, 10)
     assert trade.check_tp(bar(100 + 5 * sign)) == 0
-    with pytest.raises(TypeError):
-        trade.update_tp(100 + 10 * sign)  # known defect: create_tp needs quantity
+    trade.update_tp(100 + 10 * sign)  # issue 7: quantity defaults to volume
+    assert trade.tp == 100 + 10 * sign
     assert trade.check_tp(bar(100 + 9 * sign, high=111, low=89)) == 1
     trade.close_position(100 + 6 * sign, bar(100)["date"])
     assert trade.in_position() is False
     assert trade.get_status() == "Closed"
-    assert trade.get_profit() == 6 * sign
+    assert trade.get_profit() == 60  # issue 4: (6 * sign) * sign * volume 10
     trade.get_stats()
-    with pytest.raises(AttributeError):
-        trade.to_json()
+    assert trade.to_json()["profit"] == 60  # issue 3 and 4
 
     stopped = make_trade(direction, broker=broker)
     assert stopped.check_stoploss(bar(100 - 3 * sign)) == 0

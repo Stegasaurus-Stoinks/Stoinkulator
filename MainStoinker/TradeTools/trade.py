@@ -56,7 +56,16 @@ class Trade:
 
         
     def fake_open(self):
+        self.position = True
+        self.status = "Open"
         print("Open Fake Trade")
+
+    def _pnl(self):
+        """(close - open) * volume, sign flipped for a short (direction falsy)."""
+        pnl = (self.closePrice - self.openPrice) * self.volume
+        if not self.direction:
+            pnl = -pnl
+        return pnl
 
     def open_position(self):
         #call funtion to open order through api
@@ -276,8 +285,10 @@ class Trade:
         return result
     
 
-    def update_tp(self, tp):
-        self.create_tp(tp)
+    def update_tp(self, tp, quantity=None):
+        if quantity is None:
+            quantity = self.volume
+        self.create_tp(tp, quantity)
 
 
 
@@ -302,11 +313,9 @@ class Trade:
 
     def get_stats(self, Fulldisplay = True):
 
-        PL = self.closePrice - self.openPrice
-        if self.direction == "DOWN":
-            PL = PL*(-1)
+        PL = self._pnl()
         duration = self.closeTime - self.openTime
-        
+
         f = open("tradey.txt", "a")
         f.write("---------Trade Stats---------\n")
         f.write(str("Open Price: "+str(self.openPrice)+"\n"))
@@ -334,7 +343,7 @@ class Trade:
 
         
         else:
-            print("Trade ", self.ID)
+            print("Trade ", self.tradeID)
             print("Profit: ",PL)
 
         d = dict(); 
@@ -349,17 +358,14 @@ class Trade:
 
 
     def get_profit(self):
-        PL = self.closePrice - self.openPrice
-        if self.direction == "DOWN":
-            PL = PL*(-1)
-        return PL
+        return self._pnl()
 
 
     #returns a dictionary object of all data needed to recreate the trade object
     def to_json(self):
         if self.status == 'Closed':
             duration = self.closeTime - self.openTime
-            profit = self.closePrice - self.openPrice
+            profit = self._pnl()
 
         else:
             self.closePrice = float('nan')
@@ -367,10 +373,13 @@ class Trade:
             duration = float('nan')
             profit = float('nan')
 
+        stop_order = getattr(self, "stopOrder", None)
+        stoplossID = stop_order.orderId if stop_order is not None else None
+
         data = {
             'symbol' : self.symbol,
             'ID' : self.tradeID,
-            'stoplossID' : self.stopOrder.orderId,
+            'stoplossID' : stoplossID,
             'volume' : self.volume,
             'openPrice' : self.openPrice,
             'openTime' : self.openTime,

@@ -382,11 +382,11 @@ def test_tp_then_stop_on_same_bar_sends_two_closes_short(fake):
 def test_update_tp_raises_type_error(fake):
     trade = make_trade(LONG)
     fake.calls.clear()
-    # PINS CURRENT BEHAVIOUR: update_tp calls create_tp(tp) without the
-    # required quantity, so it can never work.
-    with pytest.raises(TypeError):
-        trade.update_tp(103.0)
-    assert fake.calls == []
+    # Issue 7 fix: update_tp passes the trade volume as the default quantity,
+    # so it now creates the TP order (same sequence as create_tp(103.0, 10)).
+    trade.update_tp(103.0)
+    assert trade.tp == 103.0
+    assert fake.calls == [GET_ID, take_profit(102, "SELL", 103.0)]
 
 
 def test_limit_entry_and_close_use_open_price_as_limit(fake):
@@ -623,7 +623,7 @@ def test_to_json_closed_live_trade(fake):
         "closePrice": 100.5,
         "closeTime": close_time,
         "duration": pd.Timedelta(minutes=1),
-        "profit": 0.5,
+        "profit": 5.0,  # issue 4: (100.5 - 100.0) * volume 10 (was 0.5 per share)
     }
 
 
@@ -646,10 +646,10 @@ def test_non_live_lifecycle_sends_nothing(
 ):
     assert config.LiveTrading is False
     trade = make_trade(direction)
-    # Same as the simulated path in test_trade_sim.py: no status/position until
-    # a close (a known defect, xfail there), and no stopOrder.
-    assert not hasattr(trade, "status")
-    assert not hasattr(trade, "position")
+    # Same as the simulated path in test_trade_sim.py: status/position are set
+    # on open (issue 5), and there is no stopOrder.
+    assert trade.status == "Open"
+    assert trade.position is True
     assert not hasattr(trade, "stopOrder")
 
     trade.set_stopLossType("Fixed")

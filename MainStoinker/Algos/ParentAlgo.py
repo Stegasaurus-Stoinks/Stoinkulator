@@ -135,8 +135,8 @@ class ParentAlgo:
         avgLoss = 0
         print("Total Trades Placed: ", len(self.trades))
         for trade in self.trades:
-            trade.getStats(FullPrint)
-            tempProfit = trade.getProfit()
+            trade.get_stats(FullPrint)
+            tempProfit = trade.get_profit()
             totalProfit += tempProfit
             if tempProfit > 0:
                 winningTrades += 1
@@ -145,14 +145,15 @@ class ParentAlgo:
             else:
                 avgLoss += tempProfit
             
-        avgWin = avgWin/winningTrades
+        if winningTrades:
+            avgWin = avgWin/winningTrades
         try:
             avgLoss = avgLoss/(len(self.trades)-winningTrades)
 
         except ZeroDivisionError:
             avgLoss = 0
 
-        winRate = winningTrades/len(self.trades) * 100
+        winRate = winningTrades/len(self.trades) * 100 if self.trades else 0
         
         print("Total Profit: $", round(totalProfit, 3))
         print("Number of Trades: ",len(self.trades))
