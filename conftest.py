@@ -1,6 +1,17 @@
 """Repository-level pytest fixtures (no project imports here)."""
 
+import os
+
 import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Remove `STOINK_DB` for the whole session, before anything is collected.
+
+    Session-scoped helpers (such as the stored runs built by `tests/api_support.py`)
+    start before any per-test fixture, so the fixture below is not enough alone.
+    """
+    os.environ.pop("STOINK_DB", None)
 
 
 @pytest.fixture(autouse=True)

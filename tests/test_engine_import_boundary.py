@@ -21,6 +21,7 @@ FORBIDDEN_PREFIXES = (
     "MainStoinker.Algos",
     "MainStoinker.Util.SocketIO_Client",
     "MainStoinker.NeatTools",
+    "MainStoinker.api",
     "ibapi",
 )
 
@@ -30,14 +31,12 @@ FORBIDDEN_PREFIXES = (
 ALLOWED_FUNCTION_LEVEL_IMPORTS: set[str] = set()
 
 
-def _is_forbidden(module: str) -> bool:
-    return any(module == p or module.startswith(p + ".") for p in FORBIDDEN_PREFIXES)
+def _is_forbidden(module: str, prefixes: tuple[str, ...] = FORBIDDEN_PREFIXES) -> bool:
+    return any(module == p or module.startswith(p + ".") for p in prefixes)
 
 
-def _is_outside_engine(module: str) -> bool:
-    return module.startswith("MainStoinker") and not (
-        module == ENGINE_PACKAGE or module.startswith(ENGINE_PACKAGE + ".")
-    )
+def _is_outside_engine(module: str, own: str = ENGINE_PACKAGE) -> bool:
+    return module.startswith("MainStoinker") and not (module == own or module.startswith(own + "."))
 
 
 def _resolve_relative(package: str, level: int, module: str | None) -> str:
@@ -46,11 +45,18 @@ def _resolve_relative(package: str, level: int, module: str | None) -> str:
     return ".".join([*base, module] if module else base)
 
 
-def find_violations(source: str, filename: str, package: str = ENGINE_PACKAGE) -> list[str]:
+def find_violations(
+    source: str,
+    filename: str,
+    package: str = ENGINE_PACKAGE,
+    forbidden: tuple[str, ...] = FORBIDDEN_PREFIXES,
+    own_package: str = ENGINE_PACKAGE,
+) -> list[str]:
     """Return 'filename:line: message' for each forbidden import in source.
 
     `package` is the dotted package the file lives in, used to resolve
-    relative imports.
+    relative imports. `forbidden` and `own_package` let another package (the
+    API) reuse this checker: a relative import leaving `own_package` is refused.
     """
     tree = ast.parse(source, filename=filename)
     found: list[str] = []
@@ -71,7 +77,9 @@ def find_violations(source: str, filename: str, package: str = ENGINE_PACKAGE) -
                 # `from MainStoinker import MainStuff` imports a submodule.
                 names += [f"{base}.{a.name}" for a in child.names if a.name != "*"]
             for name in names:
-                bad = _is_forbidden(name) or (relative and _is_outside_engine(name))
+                bad = _is_forbidden(name, forbidden) or (
+                    relative and _is_outside_engine(name, own_package)
+                )
                 allowed = depth > 0 and f"{filename}:{name}" in ALLOWED_FUNCTION_LEVEL_IMPORTS
                 if bad and not allowed:
                     found.append(f"{filename}:{child.lineno}: forbidden import of {name}")
@@ -108,6 +116,8 @@ def test_checker_catches_violations():
     )
     assert find_violations("from ..Util import SocketIO_Client\n", "x.py")
     assert find_violations("from .. import TradeTools\n", "x.py")
+    assert find_violations("import MainStoinker.api.app\n", "x.py")
+    assert find_violations("from MainStoinker import api\n", "x.py")
     assert find_violations("from ..Util.broker_guard import x\n", "x.py")
     # allowed: stdlib, third party, and engine-internal imports
     ok = "import pandas\nfrom .broker import Broker\nfrom MainStoinker.engine import x\n"
