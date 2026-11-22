@@ -54,7 +54,7 @@ class FVG:
                 
             if self.Status == "TESTED":
                 if self.checkifinrange(currentData['close']) or currentData['low'] < self.upperbound:
-                    self.Status == "RETESTED"
+                    self.Status = "RETESTED"
 
         #if down candles formed the FVG    
         else:
@@ -70,7 +70,7 @@ class FVG:
                     return self.Status
             if self.Status == "TESTED":
                 if self.checkifinrange(currentData['close']) or currentData['high'] > self.lowerbound:
-                    self.Status == "RETESTED"
+                    self.Status = "RETESTED"
             
 
     def checkifinrange(self, value):
