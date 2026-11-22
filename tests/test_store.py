@@ -1188,3 +1188,38 @@ def test_windows_drive_letter_paths_are_plain_paths(tmp_path, sep):
         assert store.list_runs() == ()
     with open_store("sqlite:///" + spec, env=NO_ENV) as store:
         assert store.list_runs() == ()
+
+
+@pytest.mark.parametrize(("path", "uri"), [
+    (r"C:\Users\me\runs.db", "file:///C:/Users/me/runs.db?mode=ro"),
+    (r"C:\my runs\runs.db", "file:///C:/my%20runs/runs.db?mode=ro"),
+    (r"C:\a#b\100%\what.db", "file:///C:/a%23b/100%25/what.db?mode=ro"),
+    ("C:\\caf\u00e9\\runs.db", "file:///C:/caf%C3%A9/runs.db?mode=ro"),
+    (r"\\server\share\runs.db", "file:////server/share/runs.db?mode=ro"),
+    (r"\\server\my share\a#b.db", "file:////server/my%20share/a%23b.db?mode=ro"),
+])
+def test_readonly_uri_is_correct_for_drive_and_unc_paths(path, uri):
+    from pathlib import PureWindowsPath
+
+    from MainStoinker.engine.store import _readonly_uri
+    assert _readonly_uri(PureWindowsPath(path)) == uri  # type: ignore[arg-type]
+
+
+def test_readonly_uri_for_posix_path():
+    from pathlib import PurePosixPath
+
+    from MainStoinker.engine.store import _readonly_uri
+    assert _readonly_uri(PurePosixPath("/tmp/a b.db")) == "file:///tmp/a%20b.db?mode=ro"  # type: ignore[arg-type]
+
+
+def test_schema_version_is_kept_for_both_open_paths(db):
+    with open_store(str(db), env=NO_ENV) as store:
+        assert store.schema_version == SCHEMA_VERSION
+    with open_store_readonly(str(db), env=NO_ENV) as store:
+        assert store.schema_version == SCHEMA_VERSION
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA user_version=1")
+    conn.close()
+    with open_store_readonly(str(db), env=NO_ENV) as store:
+        assert store.schema_version == 1

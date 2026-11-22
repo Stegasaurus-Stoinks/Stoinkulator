@@ -8,6 +8,10 @@
 no algos or data, never create a database, and exit 2 with one line on any
 problem (no `--db`, no such file, unknown run, a database that cannot be read).
 
+`--db` defaults to the environment variable `STOINK_DB` (a store spec, set once
+per machine) for `backtest`, `runs` and `report`; the flag wins, and an empty or
+blank `STOINK_DB` counts as unset.
+
 This is a backtest-only tool. It builds a `CsvBarFeed`, one simulated broker
 per algo (a `SimBroker`, or with `--fills realistic` a `PaperBroker` reporting
 to a `Ledger`; see `modes.build_router`), a `NullSink` and an `Engine`. There
@@ -778,8 +782,9 @@ def run_backtest_command(
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     """Entry point. Returns the exit code; argparse errors and `--help` raise `SystemExit`.
 
-    `env` is the environment the store judges OneDrive folders by; None means
-    `os.environ` when the command runs.
+    `env` is the environment the store judges OneDrive folders by and where
+    `STOINK_DB` (the default for a missing `--db`; blank counts as unset) is
+    looked up; None means `os.environ` when the command runs.
     """
     args = build_parser().parse_args(argv)
     if args.db is None:  # STOINK_DB from the injected environment; blank counts as unset

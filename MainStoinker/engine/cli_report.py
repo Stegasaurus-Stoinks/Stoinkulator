@@ -3,7 +3,7 @@
     python -m MainStoinker runs --db SPEC [--json]
     python -m MainStoinker report RUN --db SPEC [--json]
 
-Both only read. They go through `store.open_store`, `Store.list_runs` and
+Both only read. They go through `store.open_store_readonly`, `Store.list_runs` and
 `Store.load_run` (no SQL here) and compute with `stats`; they need no algos,
 no data directory, no ledger, no git and never create a database: a missing
 file is an error. Every problem is a `ReportError` (the caller prints one line

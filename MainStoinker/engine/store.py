@@ -58,6 +58,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from urllib.parse import quote
 
 from .ledger import (
     AccountInfo,
@@ -79,6 +80,21 @@ _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 
 class StoreError(Exception):
     """Anything that stops the store from doing what was asked."""
+
+
+def _readonly_uri(path: Path) -> str:
+    """SQLite `file:` URI (with `?mode=ro`) for an absolute path; pure, no I/O.
+
+    Separators become `/` and everything but `/` and `:` is percent-encoded,
+    so `#`, `%`, `?`, spaces and non-ASCII stay part of the file name. A drive
+    path gives `file:///C:/a/b.db`; a UNC path `\\\\server\\share\\b.db` gives
+    `file:////server/share/b.db` (empty authority, which SQLite accepts where
+    `Path.as_uri()`'s `file://server/...` is rejected); a POSIX path gives
+    `file:///tmp/b.db`.
+    """
+    text = str(path).replace("\\", "/")
+    prefix = "file://" if text.startswith("/") else "file:///"
+    return prefix + quote(text, safe="/:") + "?mode=ro"
 
 
 # --- plain records ------------------------------------------------------------
@@ -523,6 +539,7 @@ class SqliteStore:
                  readonly: bool = False) -> None:
         self._clock = clock
         self._readonly = readonly
+        self._schema_version = 0
         self._equity_state: dict[tuple[int, str | None], _EquityState] = {}
         self._path = str(path)
         if readonly:
@@ -547,6 +564,7 @@ class SqliteStore:
             self._refuse_newer(self._conn.execute("PRAGMA user_version").fetchone()[0])
             _enable_wal(self._conn, busy_timeout)
             self._migrate()
+            self._schema_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         except StoreError:
             self.close()
             raise
@@ -565,7 +583,7 @@ class SqliteStore:
                 raise StoreError(f"database {self._path} does not exist")
             if not file.is_file():
                 raise StoreError(f"database {self._path} is not a file")
-            uri = file.resolve().as_uri() + "?mode=ro"
+            uri = _readonly_uri(file.resolve())
             self._conn: sqlite3.Connection | None = sqlite3.connect(
                 uri, uri=True, isolation_level=None, timeout=busy_timeout)
         except OSError as exc:
@@ -577,12 +595,22 @@ class SqliteStore:
             self._refuse_newer(version)
             if version < 1:
                 raise StoreError(f"{self._path} is not a run database (schema version 0)")
+            self._schema_version = version
         except StoreError:
             self.close()
             raise
         except sqlite3.Error as exc:
             self.close()
             raise StoreError(f"cannot use database {self._path}: {exc}") from exc
+
+    @property
+    def schema_version(self) -> int:
+        """The database's schema version as read when the store was opened.
+
+        A writable store has migrated first, so it is `SCHEMA_VERSION`; a
+        read-only store reports whatever the file holds (1 to `SCHEMA_VERSION`).
+        """
+        return self._schema_version
 
     # --- plumbing ---------------------------------------------------------
 
