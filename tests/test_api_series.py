@@ -16,6 +16,7 @@ import pytest
 
 from MainStoinker.engine.store import SeriesInfo, SeriesPoint, SqliteStore
 from tests.api_support import make_client
+from tests.test_api_bars import store_run, write_bars
 from tests.test_store import T0, algos, make_v1_file, meta, stored_run
 
 DAY2 = T0 + timedelta(days=1)  # the run's last bar: 2024-01-03 09:30
@@ -55,10 +56,10 @@ def test_series_for_window(db: Path) -> None:
     body = r.json()
     assert body["algo"] == "a1" and body["available"] is True
     by_name = {s["name"]: s for s in body["series"]}
-    assert by_name["ema"]["points"] == [{"time": "2024-01-02T09:30:00", "value": 100.0},
-                                        {"time": "2024-01-02T09:31:00", "value": 100.123}]
+    assert by_name["ema"]["points"] == [{"time": "2024-01-02 09:30:00", "value": 100.0},
+                                        {"time": "2024-01-02 09:31:00", "value": 100.123}]
     assert by_name["ema"]["draw_type"] == "line" and by_name["ema"]["position"] == 2
-    assert by_name["rsi"]["points"] == [{"time": "2024-01-02T09:30:00", "value": 55.0}]
+    assert by_name["rsi"]["points"] == [{"time": "2024-01-02 09:30:00", "value": 55.0}]
     # a declared series with no point in the window is still listed
     assert by_name["empty"] == {"name": "empty", "draw_type": "segment", "position": 1,
                                 "points": []}
@@ -73,7 +74,7 @@ def test_values_rounded_to_six_significant_digits(db: Path) -> None:
 def test_default_window_is_the_day_of_the_last_bar(db: Path) -> None:
     body = get(db, "?algo=a1").json()
     ema = next(s for s in body["series"] if s["name"] == "ema")
-    assert [p["time"] for p in ema["points"]] == ["2024-01-03T09:30:00", "2024-01-03T09:31:00"]
+    assert [p["time"] for p in ema["points"]] == ["2024-01-03 09:30:00", "2024-01-03 09:31:00"]
 
 
 def test_series_order_by_position(db: Path) -> None:
@@ -85,7 +86,7 @@ def test_series_order_by_position(db: Path) -> None:
 def test_other_algos_series_are_not_mixed_in(db: Path) -> None:
     body = get(db, "?algo=a2").json()
     assert [s["name"] for s in body["series"]] == ["other"]
-    assert body["series"][0]["points"] == [{"time": "2024-01-03T09:30:00", "value": 7.0}]
+    assert body["series"][0]["points"] == [{"time": "2024-01-03 09:30:00", "value": 7.0}]
 
 
 def test_v1_run_reports_unavailable(tmp_path: Path, db: Path) -> None:
@@ -120,28 +121,45 @@ def test_algo_required_422(db: Path) -> None:
 
 @pytest.mark.parametrize("params", [
     "&start=2024-01-02T09:30:00",  # only one bound
-    "&end=2024-01-02T09:30:00",
-    "&start=2024-01-02T09:30:00&end=2024-01-09T09:30:00",  # 6 trading days
     "&start=2024-01-02T10:00:00&end=2024-01-02T09:30:00",  # end before start
-    "&start=garbage&end=2024-01-02T09:30:00",
+    "&start=garbage&end=2024-01-02T09:30:00",  # not a date-time
+    "&start=2024-01-02T09:30:00Z&end=2024-01-02T10:00:00",  # timezone
+    "&start=2024-01-02&end=2024-01-02T10:00:00",  # date only
 ])
-def test_window_rules_match_bars_route(db: Path, params: str) -> None:
-    assert get(db, "?algo=a1" + params).status_code == 422
-
-
-def test_five_trading_days_over_a_weekend_is_allowed(db: Path) -> None:
-    # Fri 2024-01-05 to Thu 2024-01-11 is five weekdays
-    r = get(db, "?algo=a1&start=2024-01-05T09:30:00&end=2024-01-11T16:00:00")
-    assert r.status_code == 200
-
-
-@pytest.mark.parametrize("bound", [
-    "2024-01-02T09:30:00Z", "2024-01-02T09:30:00+00:00", "2024-01-02T09:30:00-05:00",
-    "2024-01-02", "2024-01-02T09",
-])
-@pytest.mark.parametrize("which", ["start", "end"])
-def test_timezone_or_date_only_bound_422(db: Path, bound: str, which: str) -> None:
-    good = "2024-01-02T10:00:00"
-    start, end = (bound, good) if which == "start" else (good, bound)
-    r = get(db, f"?algo=a1&start={start.replace('+', '%2B')}&end={end.replace('+', '%2B')}")
+def test_bad_window_422_with_the_rules_message(db: Path, params: str) -> None:
+    r = get(db, "?algo=a1" + params)
     assert r.status_code == 422
+    assert isinstance(r.json()["detail"], str) and r.json()["detail"].endswith(".")
+
+
+def test_window_span_is_seven_calendar_days(db: Path) -> None:
+    assert get(db, "?algo=a1&start=2024-01-05T09:30:00&end=2024-01-11T16:00:00").status_code == 200
+    r = get(db, "?algo=a1&start=2024-01-05T09:30:00&end=2024-01-12T16:00:00")
+    assert r.status_code == 422
+
+
+def test_unknown_run_or_algo_beats_a_bad_window(db: Path) -> None:
+    assert get(db, "?algo=a1&start=garbage&end=garbage", run=99).status_code == 404
+    assert get(db, "?algo=nobody&start=garbage&end=garbage").status_code == 404
+
+
+@pytest.mark.parametrize("window", [
+    "",
+    "&start=2024-01-02T09:30:00&end=2024-01-02T09:35:00",
+    "&start=2024-01-02 09:30&end=2024-01-08 09:30",  # 6 days apart: accepted
+    "&start=2024-01-02T09:30:00&end=2024-01-09T09:30:00",  # 7 days apart: refused
+    "&start=2024-01-02T09:30:00",
+    "&start=2024-01-02T10:00:00&end=2024-01-02T09:30:00",
+    "&start=garbage&end=2024-01-02T09:30:00",
+    "&start=2024-01-02T09:30:00Z&end=2024-01-02T10:00:00",
+])
+def test_bars_and_series_routes_answer_the_same_window(db: Path, tmp_path: Path, window: str) -> None:
+    directory = tmp_path / "bars-data"
+    directory.mkdir()
+    write_bars(directory)
+    bars_db = tmp_path / "bars.db"
+    run = store_run(bars_db, directory)
+    bars = make_client(bars_db).get(f"/api/runs/{run}/bars?symbol=AAPL{window}")
+    assert get(db, "?algo=a1" + window).status_code == bars.status_code
+
+
