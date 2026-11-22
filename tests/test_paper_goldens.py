@@ -172,3 +172,64 @@ def test_ledger_is_sole_report_source(paper_run):
     assert len(closed_in_ledger) > len(legacy) - len(stale)
     assert legacy != [{k: v for k, v in r.items() if k != "status"} for r in from_ledger]
     assert len(run.ledger.round_trips) > 0
+
+
+def _walk(node):
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from _walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk(value)
+    else:
+        yield node
+
+
+@pytest.mark.parametrize("algo_id, cfg", CASES)
+def test_golden_file_is_self_consistent(algo_id, cfg, request):
+    """The committed golden agrees with itself: no floats, money as 4-decimal
+    strings, and the summary equals what the trade list adds up to."""
+    import json
+    import re
+
+    from tests.conftest import GOLDEN_PAPER_DIR
+
+    golden = json.loads((GOLDEN_PAPER_DIR / f"{request.node.callspec.id}.json").read_text(encoding="utf-8"))
+    assert not [v for v in _walk(golden) if isinstance(v, float)]
+    four = re.compile(r"^-?\d+\.\d{4}$")
+    trades, summary = golden["trades"], golden["summary"]
+    for trade in trades:
+        for key in ("quantity", "entry_price", "exit_price", "gross", "commission", "net"):
+            assert four.match(trade[key]), (key, trade[key])
+    for key in ("commission", "net", "final_equity", "max_drawdown"):
+        assert four.match(summary[key]), (key, summary[key])
+    assert summary["trade_count"] == len(trades)
+    assert summary["wins"] == sum(1 for t in trades if Decimal(t["net"]) > 0)
+    assert Decimal(summary["net"]) == sum((Decimal(t["net"]) for t in trades), Decimal(0))
+    assert Decimal(summary["commission"]) == sum((Decimal(t["commission"]) for t in trades), Decimal(0))
+    assert Decimal(summary["final_equity"]) == Decimal(golden["capital"]) + Decimal(summary["net"])
+    assert summary["synthetic_closes"] == sum(1 for t in trades if t["synthetic"])
+    for trade in trades:
+        gross = (Decimal(trade["exit_price"]) - Decimal(trade["entry_price"])) * Decimal(trade["quantity"])
+        if trade["side"] == "short":
+            gross = -gross
+        assert Decimal(trade["gross"]) == gross
+        assert Decimal(trade["net"]) == gross - Decimal(trade["commission"])
+
+
+def test_paper_backtest_twice_in_one_process_is_identical(tmp_path):
+    """No state leaks between runs: two runs of the same case give the same golden."""
+    algo_id, cfg = next(p.values for p in CASES if p.id == "fridayfrenzy_tsla")
+    results = []
+    for n in range(2):
+        workdir = tmp_path / str(n)
+        workdir.mkdir()
+        harness.stage_offline_data(workdir, [cfg["ticker"]])
+        with contextlib.chdir(workdir):
+            try:
+                run = harness.run_paper_backtest(algo_id, cfg)
+                results.append(paper_golden(run, algo_id))
+            finally:
+                harness.reset_runtime_state()
+    assert results[0] == results[1]
+    assert results[0]["summary"]["trade_count"] > 0
