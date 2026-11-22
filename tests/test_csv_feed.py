@@ -1,6 +1,7 @@
 """CsvBarFeed: parity with the legacy offline loader and strict alignment."""
 from __future__ import annotations
 
+import hashlib
 import threading
 from pathlib import Path
 
@@ -8,7 +9,16 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
-from MainStoinker.engine.feed import COLUMNS, Bar, BarFeed, CsvBarFeed
+from MainStoinker.engine.feed import (
+    COLUMNS,
+    Bar,
+    BarFeed,
+    CsvBarFeed,
+    bars_between,
+    file_fingerprint,
+    offline_data_path,
+    read_offline_bars,
+)
 from tests import harness
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -245,3 +255,113 @@ def test_csv_feed_satisfies_protocol(feed_all: CsvBarFeed) -> None:
 
 def test_non_feed_fails_protocol() -> None:
     assert not isinstance(object(), BarFeed)
+
+
+def test_read_offline_bars_equals_feed_parsing(feed_all: CsvBarFeed, batches_all: list) -> None:
+    ours = read_offline_bars(offline_data_path(DATA_DIR, "AAPL"))
+    replay = pd.DataFrame.from_records([bars["AAPL"].as_record() for _, bars in batches_all])
+    held = pd.concat([feed_all.warmup("AAPL"), replay], ignore_index=True)
+    assert_frame_equal(ours, held, check_dtype=True, check_index_type=True)
+
+
+def test_bars_between_inclusive_and_empty() -> None:
+    frame = read_offline_bars(offline_data_path(DATA_DIR, "AAPL"))
+    start, end = frame["date"].iloc[10], frame["date"].iloc[19]
+    window = bars_between(frame, start.to_pydatetime(), end.to_pydatetime())
+    assert len(window) == 10
+    assert window["date"].iloc[0] == start and window["date"].iloc[-1] == end
+    assert isinstance(window.index, pd.RangeIndex)
+    assert list(window.columns) == list(COLUMNS)
+    last = frame["date"].iloc[-1]
+    assert bars_between(frame, last + pd.Timedelta(days=1), last + pd.Timedelta(days=2)).empty
+    assert bars_between(frame, end, start).empty
+
+
+def test_file_fingerprint_stable_and_changes_with_content(tmp_path: Path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"abc" * 1_000_000)
+    first = file_fingerprint(path)
+    assert first == file_fingerprint(path)
+    assert first[1] == 3_000_000 and len(first[0]) == 64
+    assert first[0] == hashlib.sha256(b"abc" * 1_000_000).hexdigest()
+    path.write_bytes(b"abd" * 1_000_000)
+    assert file_fingerprint(path)[0] != first[0]
+
+
+@pytest.mark.parametrize(
+    "symbol", ["", "..", "../AAPL", "A/B", "A\\B", ".AAPL", "AAPL\n", "A B", "/etc"]
+)
+def test_offline_data_path_rejects_bad_symbol(symbol: str, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid symbol"):
+        offline_data_path(tmp_path, symbol)
+
+
+def test_offline_data_path_good_symbol(tmp_path: Path) -> None:
+    assert offline_data_path(tmp_path, "BRK.B") == tmp_path / "_BRK.B_offlinedata_"
+
+
+def _write_bars(path: Path, rows: list[str]) -> Path:
+    path.write_text("date,time,open,high,low,close,volume\n" + "".join(r + "\n" for r in rows))
+    return path
+
+
+def test_read_offline_bars_rejects_empty_and_header_only(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError):
+        read_offline_bars(empty)
+    with pytest.raises(ValueError, match="no rows"):
+        read_offline_bars(_write_bars(tmp_path / "hdr", []))
+    with pytest.raises(FileNotFoundError):
+        read_offline_bars(tmp_path / "missing")
+
+
+def test_bars_between_boundaries(tmp_path: Path) -> None:
+    single = read_offline_bars(_write_bars(tmp_path / "one", ["2024-01-02 09:30:00,x,1,2,1,2,5"]))
+    at = single["date"].iloc[0].to_pydatetime()
+    one_s = pd.Timedelta(seconds=1)
+    assert len(bars_between(single, at, at)) == 1
+    assert bars_between(single, at - 2 * one_s, at - one_s).empty
+    frame = read_offline_bars(offline_data_path(DATA_DIR, "AAPL"))
+    dates = frame["date"]
+    # bounds strictly between bars select the bars inside, not the neighbours
+    window = bars_between(
+        frame,
+        (dates.iloc[5] + pd.Timedelta(seconds=30)).to_pydatetime(),
+        (dates.iloc[9] + pd.Timedelta(seconds=30)).to_pydatetime(),
+    )
+    assert list(window["date"]) == list(dates.iloc[6:10])
+    # the window is a copy: mutating it leaves the source untouched
+    before = frame.copy()
+    window.loc[:, "close"] = -1.0
+    assert_frame_equal(frame, before)
+    # a window wider than the data returns every bar
+    wide = bars_between(frame, dates.iloc[0].to_pydatetime() - pd.Timedelta(days=9),
+                        dates.iloc[-1].to_pydatetime() + pd.Timedelta(days=9))
+    assert_frame_equal(wide, frame)
+
+
+def test_file_fingerprint_empty_missing_and_chunk_boundary(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    assert file_fingerprint(empty) == (hashlib.sha256(b"").hexdigest(), 0)
+    with pytest.raises(FileNotFoundError):
+        file_fingerprint(tmp_path / "missing")
+    for size in ((1 << 20) - 1, 1 << 20, (1 << 20) + 1, 2 * (1 << 20) + 7):
+        blob = bytes(range(256)) * (size // 256) + b"z" * (size % 256)
+        path = tmp_path / f"f{size}"
+        path.write_bytes(blob)
+        assert file_fingerprint(path) == (hashlib.sha256(blob).hexdigest(), size)
+
+
+@pytest.mark.parametrize("symbol", ["aapl", "A" * 300, "BRK-B", "A..B", "X1"])
+def test_offline_data_path_stays_in_directory(symbol: str, tmp_path: Path) -> None:
+    path = offline_data_path(tmp_path, symbol)
+    assert path.parent == tmp_path
+    assert path.name == f"_{symbol}_offlinedata_"
+
+
+@pytest.mark.parametrize("symbol", ["_x", "-x", "A:B", "A\x00", "\u00e9", None])
+def test_offline_data_path_rejects_more_bad_symbols(symbol: object, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid symbol"):
+        offline_data_path(tmp_path, symbol)  # type: ignore[arg-type]
