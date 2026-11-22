@@ -83,7 +83,10 @@ def algo_starter(algo, data):
     filename = "." + str(algo) + "_Algo"
     print("Opening " + filename)
     AlgoClass = getattr(importlib.import_module(filename,"MainStoinker.Algos."+str(algo)),'Algo')
-    return AlgoClass(data)
+    algo_obj = AlgoClass(data)
+    # ParentAlgo only fetches the logger; the legacy file/stream handlers are attached here.
+    create_logger(algo_obj.logger.name)
+    return algo_obj
 
 
 
