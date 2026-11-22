@@ -3,10 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Stoinkulator</title>
+<link rel="stylesheet" href="app.css">
+<script src="vendor/lightweight-charts/lightweight-charts.standalone.production.js"></script>
+<script type="module" src="js/main.js"></script>
 </head>
 <body>
-<h1>Stoinkulator</h1>
-<p>The dashboard is not built yet. The API is at <code>/api/health</code>.</p>
+<header class="app-header">
+  <h1 class="brand"><a href="#/">Stoinkulator</a></h1>
+  <nav class="nav" aria-label="Main">
+    <a href="#/" data-nav="runs">Runs</a>
+  </nav>
+  <p id="health" class="health" role="status" aria-live="polite">Checking the database...</p>
+</header>
+<main id="app" class="app-main" tabindex="-1">
+  <p class="muted">Loading...</p>
+</main>
+<footer class="app-footer">
+  <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">Charts by TradingView Lightweight Charts</a>
+</footer>
 </body>
 </html>
