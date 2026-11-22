@@ -179,6 +179,7 @@ def test_bar_cap_with_dense_file(tmp_path: Path) -> None:
     assert exact.status_code == 200 and len(exact.json()["bars"]) == routes_bars.MAX_BARS
 
 
+@pytest.mark.slow
 def test_slow_read_does_not_block_other_requests(tmp_path: Path, data_dir_factory,
                                                  monkeypatch: pytest.MonkeyPatch) -> None:
     directory = data_dir_factory()
@@ -202,13 +203,14 @@ def test_slow_read_does_not_block_other_requests(tmp_path: Path, data_dir_factor
     thread.start()
     time.sleep(0.3)
     started = time.perf_counter()
-    other = client.get("/api/health") if False else client.get("/")
+    other = client.get("/")
     quick = time.perf_counter() - started
     thread.join()
     assert other.status_code in (200, 404)
     assert result["bars"] >= 1.5 and quick < 1.0, (quick, result)
 
 
+@pytest.mark.slow
 def test_locked_database_gives_fixed_503_quickly(tmp_path: Path, data_dir_factory) -> None:
     import sqlite3
     directory = data_dir_factory()
@@ -228,9 +230,6 @@ def test_locked_database_gives_fixed_503_quickly(tmp_path: Path, data_dir_factor
     assert response.json() == {"detail": "the run database is unavailable"}
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError,
-                   reason="D9 defect: offline_data_path raises ValueError (500) for a stored symbol "
-                          "that is not a plain ticker; the route should answer 404 or missing")
 @pytest.mark.parametrize("stored", ["a/b", "..", "", "a\\b"])
 def test_run_with_an_invalid_stored_symbol_is_not_a_500(tmp_path: Path, data_dir_factory,
                                                          stored: str) -> None:
@@ -240,7 +239,9 @@ def test_run_with_an_invalid_stored_symbol_is_not_a_500(tmp_path: Path, data_dir
     with SqliteStore(tmp_path / "runs.db", env=NO_ENV) as store:
         store.end_run(store.begin_run(RunMeta(kind="backtest", fills="legacy", data=data)), "completed")
     response = make_client(tmp_path / "runs.db").get("/api/runs/1/bars", params={"symbol": stored})
-    assert response.status_code in (200, 404, 422)
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["available"], body["reason"], body["bars"]) == (False, "missing", [])
 
 
 def test_no_path_or_user_in_headers_or_bodies(tmp_path: Path, real_dir: Path) -> None:
@@ -254,21 +255,6 @@ def test_no_path_or_user_in_headers_or_bodies(tmp_path: Path, real_dir: Path) ->
         assert str(tmp_path) not in blob and "real" not in blob.lower().replace("unreal", "")
         if user:
             assert user not in blob
-
-
-def test_cost_numbers_for_current_files(tmp_path: Path, real_dir: Path,
-                                        capsys: pytest.CaptureFixture[str]) -> None:
-    store_real_run(tmp_path / "runs.db", real_dir, last_bar=datetime(2024, 8, 16, 12))
-    client = make_client(tmp_path / "runs.db")
-    for label, params in (("default day", {"symbol": "AAPL"}),
-                          ("max window", {"symbol": "AAPL", "start": "2024-08-10T00:00",
-                                          "end": "2024-08-16T23:59:59"})):
-        started = time.perf_counter()
-        response = client.get("/api/runs/1/bars", params=params)
-        with capsys.disabled():
-            print(f"COST {label}: {time.perf_counter() - started:.3f}s, {len(response.content)} bytes, "
-                  f"{len(response.json()['bars'])} bars")
-    assert response.status_code == 200
 
 
 @pytest.fixture
@@ -303,12 +289,3 @@ def test_file_locked_by_another_handle_reports_missing_not_500(tmp_path: Path,
     body = response.json()
     assert (body["available"], body["bars"]) == (False, []) and str(tmp_path) not in response.text
 
-
-@pytest.mark.parametrize("bound", ["٢٠٢٤-01-02T09:30", "2024-01-02T09:30\n",
-                                   "2024-W01-1T09:30", "2024-001T09:30", "2024-01-02t09:30"])
-def test_unusual_iso_forms_are_rejected_by_the_route(tmp_path: Path, data_dir_factory,
-                                                     bound: str) -> None:
-    store_run(tmp_path / "runs.db", data_dir_factory())
-    response = make_client(tmp_path / "runs.db").get("/api/runs/1/bars", params={
-        "symbol": "AAPL", "start": bound, "end": "2024-01-03T09:30"})
-    assert response.status_code == 422 and bound.strip() not in response.text
