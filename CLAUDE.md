@@ -39,7 +39,7 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m pytest                  # fast suite, ~20 s
 .venv\Scripts\python.exe -m pytest -m slow          # Elliot golden, ~3 min
 .venv\Scripts\ruff.exe check .                      # legacy defect set
-.venv\Scripts\ruff.exe check tests --select E,F,W,I,B   # new-code set
+.venv\Scripts\ruff.exe check tests MainStoinker/engine --select E,F,W,I,B   # new-code set
 ```
 
 ## Layout
@@ -52,6 +52,8 @@ uv pip install --python .venv\Scripts\python.exe -e .
   (orders, stop, take-profit).
 - `MainStoinker/Algos/<Name>/<Name>_Algo.py` each exposes `class Algo(ParentAlgo)`;
   loaded by name from `MainStuff/Algo_config.json`.
+- `MainStoinker/engine/` new engine package: `Broker` protocol, `SimBroker`; imports nothing legacy
+  (enforced by `tests/test_engine_import_boundary.py`).
 - `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.
 
