@@ -26,7 +26,19 @@ SQLite details (stdlib `sqlite3` only):
   time grid exactly. The compressor keeps per-run state in the store object,
   so `write_results` may be called repeatedly (each record exactly once) and
   `end_run` flushes the final point of every series.
-- A database file is refused inside a OneDrive folder (`is_cloud_synced`).
+- A database file is refused inside a OneDrive folder (`is_cloud_synced`),
+  by the OneDrive environment variables and by any path component whose name
+  starts with "OneDrive". `SqliteStore` itself applies the refusal, so it
+  cannot be bypassed by constructing the store directly.
+- Opening a fresh file from several threads or processes at once is safe:
+  the switch to WAL and the migration wait for each other.
+
+Writing a completed run: write the equity series once, after `ledger.finish`.
+`finish` replaces the points of the last bar, so equity written before it and
+again after it would be stored twice. `order_events`, `trades` and
+`ignored_events` are not de-duplicated either (only fills have a key); give
+each record exactly once. A reader of a `running` run sees equity only up to
+the last stored change, not up to the latest bar.
 
 A `SqliteStore` belongs to the thread that made it (sqlite3's rule).
 """
@@ -35,13 +47,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+import time
 from bisect import bisect_right
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -59,6 +73,8 @@ CLOUD_ENV_VARS: tuple[str, ...] = ("OneDrive", "OneDriveCommercial", "OneDriveCo
 SUGGESTED_PATH = r"%LOCALAPPDATA%\Stoinkulator\runs.db"
 _SCALE = Decimal(10000)
 _QUANT = Decimal("0.0001")
+_INT64_MAX = 2**63 - 1
+_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 
 
 class StoreError(Exception):
@@ -232,13 +248,19 @@ class NullStore:
 
 
 def is_cloud_synced(path: str | os.PathLike[str], env: Mapping[str, str]) -> bool:
-    """True if `path` is inside a OneDrive folder named by `env`.
+    """True if `path` is inside a OneDrive folder.
 
-    Looks at `OneDrive`, `OneDriveCommercial` and `OneDriveConsumer`
-    (variable names case-insensitive), compares resolved paths and works when
-    the file or its folders do not exist yet.
+    Two independent checks on the resolved path (works when the file or its
+    folders do not exist yet, and with a `\\\\?\\` prefix): it lies inside a
+    folder named by `OneDrive`, `OneDriveCommercial` or `OneDriveConsumer` in
+    `env` (names case-insensitive), or one of its folders is named like
+    "OneDrive..." (case-insensitive). The second check works without any
+    environment variable, e.g. in a scheduled task or service account.
     """
-    target = _norm(Path(path))
+    clean = _clean(Path(path))
+    if any(part.lower().startswith("onedrive") for part in Path(clean).parts[1:]):
+        return True
+    target = os.path.normcase(clean)
     wanted = {n.lower() for n in CLOUD_ENV_VARS}
     for name, value in env.items():
         if name.lower() in wanted and value.strip():
@@ -248,8 +270,23 @@ def is_cloud_synced(path: str | os.PathLike[str], env: Mapping[str, str]) -> boo
     return False
 
 
+def _clean(path: Path) -> str:
+    text = str(path.resolve(strict=False))
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[8:]
+    if text.startswith("\\\\?\\"):
+        return text[4:]
+    return text
+
+
 def _norm(path: Path) -> str:
-    return os.path.normcase(str(path.resolve(strict=False)))
+    return os.path.normcase(_clean(path))
+
+
+def _refuse_cloud(path: Path, env: Mapping[str, str]) -> None:
+    if is_cloud_synced(path, env):
+        raise StoreError(f"{path} is inside a OneDrive folder; sync can corrupt a database "
+                         f"while it is written. Use {SUGGESTED_PATH} instead.")
 
 
 # --- SQLite -------------------------------------------------------------------
@@ -357,10 +394,18 @@ SCHEMA_VERSION = len(MIGRATIONS)
 
 
 def _to_e4(value: Decimal | int | str) -> int:
-    scaled = Decimal(value) * _SCALE
-    whole = scaled.to_integral_value()
+    try:
+        number = Decimal(value)
+        if not number.is_finite():
+            raise StoreError(f"{value} is not a finite number")
+        scaled = number * _SCALE
+        whole = scaled.to_integral_value()
+    except InvalidOperation as exc:
+        raise StoreError(f"{value!r} is not a number") from exc
     if scaled != whole:
         raise StoreError(f"{value} has more than 4 decimal places")
+    if abs(whole) > _INT64_MAX:
+        raise StoreError(f"{value} is too large to store")
     return int(whole)
 
 
@@ -386,11 +431,18 @@ def _tuplify(value: Any) -> Any:
 
 def _encode_ref(ref: Any) -> str:
     """broker_ref as JSON text. int, str, None and tuples of them come back equal;
-    anything else is stored as its `repr` string."""
-    try:
-        return json.dumps(_listify(ref))
-    except TypeError:
-        return json.dumps(repr(ref))
+    anything else cannot be read back as it was and raises `StoreError`."""
+    _check_ref(ref)
+    return json.dumps(_listify(ref))
+
+
+def _check_ref(ref: Any) -> None:
+    if isinstance(ref, tuple):
+        for item in ref:
+            _check_ref(item)
+    elif ref is not None and not isinstance(ref, (int, str)):
+        raise StoreError(f"broker ref {ref!r} of type {type(ref).__name__} cannot be stored; "
+                         "use an int, a str, None or a tuple of those")
 
 
 def _decode_ref(text: str) -> Any:
@@ -429,16 +481,48 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _enable_wal(conn: sqlite3.Connection, wait: float = 10.0) -> None:
+    """Switch to WAL. The switch needs an exclusive lock and fails at once, ignoring
+    the busy timeout, when another opener holds it; retry until it is free."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            text = str(exc).lower()
+            if ("locked" not in text and "busy" not in text) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass  # the caller is already handling the original error
+
+
 class SqliteStore:
-    """Runs in one SQLite file. Create it with `open_store` or directly."""
+    """Runs in one SQLite file. Create it with `open_store` or directly.
+
+    A path inside a OneDrive folder is refused here too. `env` is the
+    environment that judgement uses; None means `os.environ` at call time.
+    """
 
     def __init__(self, path: str | os.PathLike[str], *,
-                 clock: Callable[[], datetime] = _utc_now) -> None:
+                 clock: Callable[[], datetime] = _utc_now,
+                 env: Mapping[str, str] | None = None) -> None:
         self._clock = clock
         self._equity_state: dict[tuple[int, str | None], _EquityState] = {}
         self._path = str(path)
         if self._path != ":memory:":
-            Path(self._path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            file = Path(self._path).expanduser()
+            _refuse_cloud(file, os.environ if env is None else env)
+            try:
+                file.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise StoreError(f"cannot create the folder for {self._path}: {exc}") from exc
         try:
             self._conn: sqlite3.Connection | None = sqlite3.connect(
                 self._path, isolation_level=None, timeout=10.0)
@@ -446,7 +530,7 @@ class SqliteStore:
             raise StoreError(f"cannot open database {self._path}: {exc}") from exc
         try:
             self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            _enable_wal(self._conn)
             self._migrate()
         except StoreError:
             self.close()
@@ -469,12 +553,15 @@ class SqliteStore:
         try:
             yield conn
         except BaseException as exc:
-            conn.execute("ROLLBACK")
+            _rollback(conn)
             if isinstance(exc, sqlite3.Error):
                 raise StoreError(str(exc)) from exc
             raise
-        else:
+        try:
             conn.execute("COMMIT")
+        except sqlite3.Error as exc:
+            _rollback(conn)
+            raise StoreError(f"commit failed: {exc}") from exc
 
     def _migrate(self) -> None:
         conn = self._db()
@@ -547,6 +634,11 @@ class SqliteStore:
         Give each record once: a repeated fill id raises `StoreError`. Algos
         must have been written first. Equity points per series must arrive in
         time order, also across calls; only the changed ones are stored.
+
+        For a completed run write equity once, after `ledger.finish` (which
+        replaces points). `order_events`, `trades` and `ignored_events` are
+        not de-duplicated. A reader of a running run sees equity only up to
+        the last stored change.
         """
         saved = {k: replace(v) for k, v in self._equity_state.items()}
         try:
@@ -729,12 +821,10 @@ def open_store(spec: str, *, env: Mapping[str, str]) -> Store:
     """
     if spec.startswith("sqlite:///"):
         spec = spec[len("sqlite:///"):]
-    if "://" in spec:
-        raise StoreError(f"unsupported database {spec.split('://', 1)[0]!r}; "
-                         "only SQLite file paths are supported")
     if not spec.strip():
         raise StoreError("empty database path")
-    if spec != ":memory:" and is_cloud_synced(Path(spec).expanduser(), env):
-        raise StoreError(f"{spec} is inside a OneDrive folder; sync can corrupt a database "
-                         f"while it is written. Use {SUGGESTED_PATH} instead.")
-    return SqliteStore(Path(spec).expanduser() if spec != ":memory:" else spec)
+    found = _SCHEME.match(spec)
+    if found and len(found.group(1)) > 1:  # a single letter is a Windows drive
+        raise StoreError(f"unsupported database {found.group(1)!r}; "
+                         "only SQLite file paths are supported")
+    return SqliteStore(Path(spec).expanduser() if spec != ":memory:" else spec, env=env)

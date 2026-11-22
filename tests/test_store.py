@@ -415,16 +415,55 @@ def test_onedrive_path_refused(tmp_path, key):
 
 
 def test_not_cloud_synced_cases(tmp_path):
-    root = tmp_path / "OneDrive"
+    root = tmp_path / "Cloud"
     env = {"OneDrive": str(root)}
-    assert not is_cloud_synced(tmp_path / "OneDrive2" / "runs.db", env)
+    assert not is_cloud_synced(tmp_path / "Cloud2" / "runs.db", env)
     assert not is_cloud_synced(tmp_path / "other" / "runs.db", env)
     assert not is_cloud_synced(root / "runs.db", NO_ENV)
     assert not is_cloud_synced(root / "runs.db", {"OneDrive": ""})
     assert not is_cloud_synced(root / "runs.db", {"Other": str(root)})
     # a path that climbs out of the folder is judged after resolving
     assert not is_cloud_synced(root / ".." / "runs.db", env)
-    assert is_cloud_synced(tmp_path / "x" / ".." / "OneDrive" / "runs.db", env)
+    assert is_cloud_synced(tmp_path / "x" / ".." / "Cloud" / "runs.db", env)
+
+
+@pytest.mark.parametrize("folder", ["OneDrive", "onedrive", "OneDrive - Corp", "ONEDRIVE2"])
+def test_onedrive_named_folder_refused_without_env(tmp_path, folder):
+    target = tmp_path / folder / "sub" / "runs.db"
+    assert is_cloud_synced(target, NO_ENV)
+    with pytest.raises(StoreError, match="OneDrive"):
+        open_store(str(target), env=NO_ENV)
+    with pytest.raises(StoreError, match="OneDrive"):
+        SqliteStore(target, env=NO_ENV)
+    assert not (tmp_path / folder).exists()
+    assert not is_cloud_synced(tmp_path / "Dropbox" / "runs.db", NO_ENV)
+    assert not is_cloud_synced(tmp_path / "myonedrive" / "runs.db", NO_ENV)  # only a prefix
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the extended-length prefix is Windows only")
+def test_onedrive_guard_handles_extended_length_prefix(tmp_path):
+    named = "\\\\?\\" + str(tmp_path / "OneDrive" / "runs.db")
+    assert is_cloud_synced(named, NO_ENV)
+    root = tmp_path / "Cloud"
+    assert is_cloud_synced("\\\\?\\" + str(root / "runs.db"), {"OneDrive": str(root)})
+    assert is_cloud_synced(root / "runs.db", {"OneDrive": "\\\\?\\" + str(root)})
+    assert not is_cloud_synced("\\\\?\\" + str(tmp_path / "Other" / "runs.db"), NO_ENV)
+
+
+def test_direct_construction_applies_the_cloud_refusal(tmp_path, monkeypatch):
+    root = tmp_path / "Cloud"
+    env = {"OneDrive": str(root)}
+    with pytest.raises(StoreError, match="OneDrive"):
+        SqliteStore(root / "runs.db", env=env)
+    assert not root.exists()
+    # the default env is os.environ, read when the store is made
+    monkeypatch.setenv("OneDrive", str(root))
+    with pytest.raises(StoreError, match="OneDrive"):
+        SqliteStore(root / "runs.db")
+    assert not root.exists()
+    monkeypatch.delenv("OneDrive")
+    with SqliteStore(root / "runs.db") as store:
+        assert store.list_runs() == ()
 
 
 def test_open_store_variants(tmp_path):
@@ -711,7 +750,7 @@ def test_onedrive_trailing_slash_relative_and_dotdot(tmp_path, monkeypatch):
     env = {"OneDrive": str(root) + "/"}
     assert is_cloud_synced(root / "runs.db", env)
     assert is_cloud_synced(root / "a" / ".." / "runs.db", env)
-    assert not is_cloud_synced(root / ".." / "OneDrive2" / "runs.db", env)
+    assert not is_cloud_synced(root / ".." / "Dropbox2" / "runs.db", env)
     root.mkdir()
     monkeypatch.chdir(root)
     assert is_cloud_synced("runs.db", env)  # relative to the working folder
@@ -754,19 +793,142 @@ def test_store_module_has_no_module_level_mutable_state():
     assert leaked == []
 
 
-@pytest.mark.xfail(strict=True, raises=OverflowError,
-                   reason="a value beyond SQLite's INTEGER range escapes as OverflowError, "
-                          "not StoreError")
-def test_value_too_large_for_sqlite_is_a_store_error(db):
+@pytest.mark.parametrize("value", ["1E+30", "-1E+30", "922337203685477.5808", "Infinity",
+                                   "-Infinity"])
+def test_value_too_large_for_sqlite_is_a_store_error(db, value):
     with SqliteStore(db) as store:
         run_id = store.begin_run(meta())
         with pytest.raises(StoreError):
-            store.write_algos(run_id, [AlgoMeta("z", "X", "AAPL", "backtest", D("1E+30"))])
+            store.write_algos(run_id, [AlgoMeta("z", "X", "AAPL", "backtest", D(value))])
+        assert store.load_run(run_id).algos == ()
+        # the largest storable value still works
+        store.write_algos(run_id, [AlgoMeta("z", "X", "AAPL", "backtest",
+                                            D("922337203685477.5807"))])
 
 
-@pytest.mark.xfail(strict=True, raises=FileExistsError,
-                   reason="a path whose parent is a file escapes as FileExistsError")
+def test_nan_is_refused_with_an_accurate_message(db):
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta())
+        for nan in ("NaN", "sNaN"):
+            with pytest.raises(StoreError) as info:
+                store.write_algos(run_id, [AlgoMeta("z", "X", "AAPL", "backtest", D(nan))])
+            assert "decimal places" not in str(info.value)
+            assert "finite" in str(info.value) or "number" in str(info.value)
+
+
 def test_parent_that_is_a_file_is_a_store_error(tmp_path):
     (tmp_path / "afile").write_text("x")
     with pytest.raises(StoreError):
         SqliteStore(tmp_path / "afile" / "runs.db")
+
+
+def test_first_open_from_many_threads_at_once(tmp_path):
+    import threading
+
+    n = 8
+    for attempt in range(6):
+        path = tmp_path / f"fresh{attempt}.db"
+        barrier = threading.Barrier(n)
+        errors: list[BaseException] = []
+
+        def opener(path=path, barrier=barrier, errors=errors) -> None:
+            try:
+                barrier.wait()
+                store = SqliteStore(path, env=NO_ENV)
+                try:
+                    assert store.list_runs() == ()
+                finally:
+                    store.close()
+            except BaseException as exc:  # noqa: BLE001 - collected and asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=opener) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        assert errors == []
+        con = sqlite3.connect(path)
+        try:
+            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1
+            assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        finally:
+            con.close()
+
+
+@pytest.mark.parametrize("ref", [1.5, b"x", ["a"], ("a", [1]), ("a", object()), {"k": 1},
+                                 Decimal(1)])
+def test_unrepresentable_broker_ref_refused(db, ref):
+    led = Ledger()
+    rec = led.open_account("a1", "AAPL", 1000)
+    rec.order_placed(ref, time=T0, side="buy", quantity=1, order_type="market")
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos()[:1])
+        with pytest.raises(StoreError, match="broker ref"):
+            write_all(store, run_id, led)
+        assert store.load_run(run_id).order_events == ()
+
+
+class _FlakyConn:
+    """Wraps a connection and fails chosen statements, to reach error paths."""
+
+    def __init__(self, real, fail=()):
+        self.real, self.fail = real, set(fail)
+
+    def execute(self, sql, *args):
+        if sql in self.fail:
+            raise sqlite3.OperationalError(f"disk I/O error on {sql}")
+        return self.real.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        return self.real.executemany(sql, *args)
+
+    def close(self):
+        self.real.close()
+
+
+def test_failed_commit_rolls_back_and_leaves_store_usable(db):
+    with SqliteStore(db) as store:
+        real = store._conn
+        flaky = _FlakyConn(real, fail={"COMMIT"})
+        store._conn = flaky
+        with pytest.raises(StoreError, match="commit"):
+            store.begin_run(meta())
+        assert not real.in_transaction  # rolled back, not left open
+        flaky.fail.clear()
+        assert store.list_runs() == ()
+        run_id = store.begin_run(meta())
+        assert [r.run_id for r in store.list_runs()] == [run_id]
+
+
+def test_failed_rollback_does_not_hide_the_original_error(db):
+    with SqliteStore(db) as store:
+        real = store._conn
+        store._conn = _FlakyConn(real, fail={"ROLLBACK"})
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos()[:1])
+        with pytest.raises(StoreError, match="UNIQUE"):
+            store.write_algos(run_id, algos()[:1])  # duplicate; then ROLLBACK fails too
+        store._conn = real
+        real.execute("ROLLBACK")  # tidy up the transaction the failed rollback left open
+
+
+@pytest.mark.parametrize("spec", ["file:x.db?mode=memory", "file:x.db", "sqlite:x.db",
+                                  "mysql://h/db", "sqlite:///file:x.db"])
+def test_unsupported_scheme_refused_without_creating_a_file(tmp_path, monkeypatch, spec):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(StoreError, match="unsupported"):
+        open_store(spec, env=NO_ENV)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters are Windows paths")
+@pytest.mark.parametrize("sep", ["\\", "/"])
+def test_windows_drive_letter_paths_are_plain_paths(tmp_path, sep):
+    spec = str(tmp_path / "runs.db").replace("\\", sep)
+    assert spec[1] == ":"
+    with open_store(spec, env=NO_ENV) as store:
+        assert store.list_runs() == ()
+    with open_store("sqlite:///" + spec, env=NO_ENV) as store:
+        assert store.list_runs() == ()
