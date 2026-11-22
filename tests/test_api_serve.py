@@ -7,6 +7,7 @@ server would have started. Every database is under `tmp_path`.
 from __future__ import annotations
 
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +42,7 @@ def started(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         calls.append({"app": app, **kwargs})
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(serve, "_port_free", lambda host, port: True)  # no real socket either
     return calls
 
 
@@ -52,17 +54,31 @@ def one_line_error(capsys: pytest.CaptureFixture[str]) -> str:
     return captured.err
 
 
-def _runpy_program(argv: list[str], *, block_web: bool) -> str:
-    block = "sys.modules['fastapi'] = sys.modules['uvicorn'] = None\n" if block_web else ""
-    return ("import runpy, sys\n" + block +
+NEVER_LISTEN = 99  # exit status of the stub that stands in for `uvicorn.run`
+
+
+def _runpy_program(argv: list[str], *, block_web: bool, block_only: str = "") -> str:
+    """The program a subprocess runs. Whenever the web packages are present, `uvicorn.run` is
+    replaced by a stub that exits with `NEVER_LISTEN`, so no regression of the production code
+    can make this process listen on a port."""
+    if block_web:
+        setup = "sys.modules['fastapi'] = sys.modules['uvicorn'] = None\n"
+    else:
+        setup = ("import uvicorn\n"
+                 f"uvicorn.run = lambda *a, **k: sys.exit({NEVER_LISTEN})\n")
+    if block_only:  # a broken install of one dependency, the web packages themselves present
+        setup += f"sys.modules[{block_only!r}] = None\n"
+    return ("import runpy, sys\n" + setup +
             f"sys.argv = {['MainStoinker', *argv]!r}\n"
             "runpy.run_module('MainStoinker', run_name='__main__', alter_sys=True)\n")
 
 
-def _run_module(argv: list[str], *, block_web: bool) -> subprocess.CompletedProcess[str]:
+def _run_module(argv: list[str], *, block_web: bool,
+                block_only: str = "") -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k != "STOINK_DB"}
-    return subprocess.run([sys.executable, "-c", _runpy_program(argv, block_web=block_web)],
-                          cwd=REPO, env=env, capture_output=True, text=True, timeout=300)
+    return subprocess.run(
+        [sys.executable, "-c", _runpy_program(argv, block_web=block_web, block_only=block_only)],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
 
 
 def test_backtest_runs_and_report_work_without_web_deps(tmp_path: Path) -> None:
@@ -91,8 +107,51 @@ def test_serve_without_web_deps_exit_2_one_line(db: Path) -> None:
 def test_serve_dispatches_from_main_module(db: Path) -> None:
     """Through `python -m MainStoinker`: a refusal that happens before the server starts."""
     done = _run_module(["serve", "--db", str(db), "--host", "0.0.0.0"], block_web=False)
-    assert done.returncode == 2
+    assert done.returncode == 2  # not NEVER_LISTEN: the refusal came before the server call
     assert "--allow-remote" in done.stderr
+
+
+def test_serve_dispatch_reaches_the_server_call_with_the_stub(db: Path) -> None:
+    """Proves the stub is what stops the process: an allowed host gets as far as `uvicorn.run`."""
+    done = _run_module(["serve", "--db", str(db), "--port", "8750"], block_web=False)
+    assert done.returncode == NEVER_LISTEN, done.stderr
+
+
+def test_serve_with_a_broken_web_install_is_exit_2_one_line(db: Path) -> None:
+    """fastapi and uvicorn are found but loading them fails (here starlette): no traceback."""
+    done = _run_module(["serve", "--db", str(db)], block_web=False, block_only="starlette")
+    assert done.returncode == 2
+    assert done.stdout == ""
+    lines = done.stderr.strip().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("error: ")
+    assert "requirements-web.txt" in lines[0]
+    assert "Traceback" not in done.stderr
+
+
+def test_serve_port_in_use_exit_2_one_line(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    called: list[object] = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: called.append(a))
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen()
+    port = holder.getsockname()[1]
+    try:
+        assert serve.main(["--db", str(db), "--port", str(port)], env=NO_ENV) == 2
+    finally:
+        holder.close()
+    assert "already in use" in one_line_error(capsys)
+    assert called == []
+    # released again: once the other socket is gone the same port starts the server
+    assert serve.main(["--db", str(db), "--port", str(port)], env=NO_ENV) == 0
+    assert len(called) == 1
+
+
+def test_serve_passes_allow_remote_to_the_app(db: Path, started: list[dict[str, Any]]) -> None:
+    assert serve.main(["--db", str(db)], env=NO_ENV) == 0
+    assert serve.main(["--db", str(db), "--host", "0.0.0.0", "--allow-remote"], env=NO_ENV) == 0
+    assert started[0]["app"].user_middleware and not started[1]["app"].user_middleware
 
 
 def test_serve_defaults(db: Path, started: list[dict[str, Any]]) -> None:

@@ -14,8 +14,12 @@ def _serve(argv: list[str]) -> int:
         print(f"error: serve needs the web packages ({', '.join(missing)} missing): "
               "install requirements-web.txt", file=sys.stderr)
         return 2
-    from MainStoinker.api.serve import main as serve_main
-
+    try:
+        from MainStoinker.api.serve import main as serve_main
+    except ImportError as exc:  # a broken install (starlette, pydantic, ...): not a traceback
+        print(f"error: serve could not load the web packages ({type(exc).__name__}): "
+              "reinstall requirements-web.txt", file=sys.stderr)
+        return 2
     return serve_main(argv)
 
 

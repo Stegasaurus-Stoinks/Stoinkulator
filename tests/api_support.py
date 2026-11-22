@@ -32,4 +32,5 @@ def stored_run_database(
 
 def make_client(db: str | Path, env: Mapping[str, str] | None = None) -> TestClient:
     """A client for an app over `db`; `env` defaults to an empty environment, never `os.environ`."""
-    return TestClient(create_app(str(db), NO_ENV if env is None else env))
+    app = create_app(str(db), NO_ENV if env is None else env)
+    return TestClient(app, base_url="http://127.0.0.1:8750")  # the Host the API accepts by default

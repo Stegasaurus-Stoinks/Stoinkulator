@@ -7,19 +7,23 @@ is shared with the other store tests); the app is never given `os.environ`.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import Depends
-from fastapi.routing import APIRoute
+from fastapi import APIRouter, Request, WebSocket
+from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.routing import Mount, Route
 
 import MainStoinker.api.db as api_db
 from MainStoinker.api import API_VERSION
 from MainStoinker.api.app import create_app
-from MainStoinker.api.db import get_store
+from MainStoinker.api.db import API_BUSY_TIMEOUT, with_store
 from MainStoinker.api.errors import UNAVAILABLE, NotFound
 from MainStoinker.engine.store import (
     SCHEMA_VERSION,
@@ -101,17 +105,133 @@ def flat_routes(routes: Iterable[Any]) -> list[Any]:
     return flat
 
 
-def test_only_get_routes_exist(full_db: Path) -> None:
+def route_problems(app: Any) -> list[str]:
+    """An allowlist: every route is a GET/HEAD `APIRoute`, or the single static mount."""
+    problems: list[str] = []
+    mounts = 0
+    for route in flat_routes(app.routes):
+        if isinstance(route, APIRoute):
+            if not set(route.methods) <= {"GET", "HEAD"}:
+                problems.append(f"{route.path}: methods {sorted(route.methods)}")
+        elif isinstance(route, Mount) and route.path == "" and isinstance(route.app, StaticFiles):
+            mounts += 1
+        else:
+            problems.append(f"{getattr(route, 'path', '?')}: {type(route).__name__}")
+    if mounts != 1:
+        problems.append(f"expected exactly one static mount at /, found {mounts}")
+    return problems
+
+
+def middleware_stack(app: Any) -> list[tuple[type, dict[str, Any]]]:
+    return [(m.cls, dict(m.kwargs)) for m in app.user_middleware]
+
+
+def test_only_get_routes_and_the_intended_middleware_exist(full_db: Path) -> None:
     app = make_client(full_db).app
-    routes = flat_routes(app.routes)  # type: ignore[attr-defined]
-    api = [r for r in routes if isinstance(r, APIRoute)]
-    assert any(r.path == "/api/health" for r in api)
-    for route in routes:
-        methods = getattr(route, "methods", None)  # the static mount has none
-        if methods is not None:
-            assert set(methods) <= {"GET", "HEAD"}, (route.path, methods)
+    assert route_problems(app) == []
+    assert any(isinstance(r, APIRoute) and r.path == "/api/health" for r in flat_routes(app.routes))
     paths = app.openapi()["paths"]  # type: ignore[attr-defined]
     assert paths and all(set(m) == {"get"} for m in paths.values())
+    assert middleware_stack(app) == [
+        (TrustedHostMiddleware, {"allowed_hosts": ["127.0.0.1", "localhost", "[::1]"],
+                                 "www_redirect": False})]  # no CORS, no sessions, nothing else
+    remote = create_app(str(full_db), NO_ENV, allow_remote=True)
+    assert route_problems(remote) == [] and middleware_stack(remote) == []
+
+
+def test_route_allowlist_rejects_websockets_mounts_and_other_routes(full_db: Path) -> None:
+    def fresh() -> Any:
+        return create_app(str(full_db), NO_ENV)
+
+    async def socket(websocket: WebSocket) -> None:  # pragma: no cover - never called
+        await websocket.accept()
+
+    ws_app = fresh()
+    ws_app.router.routes.insert(0, APIWebSocketRoute("/api/ws", socket))
+    assert any("APIWebSocketRoute" in p for p in route_problems(ws_app))
+
+    plain = fresh()
+    plain.router.routes.insert(0, Route("/api/x", lambda request: None, methods=["POST"]))
+    assert any("Route" in p for p in route_problems(plain))
+
+    post = fresh()
+    post.add_api_route("/api/y", lambda: {}, methods=["POST"])
+    assert any("POST" in p for p in route_problems(post))
+
+    extra = fresh()
+    extra.mount("/files", StaticFiles(directory=str(full_db.parent)), name="files")
+    assert route_problems(extra)
+
+    # a router included the way the real ones are, but carrying a websocket
+    router = APIRouter()
+    router.add_api_websocket_route("/api/ws2", socket)
+    nested = fresh()
+    nested.include_router(router)
+    assert any("WebSocket" in p for p in route_problems(nested))
+
+
+HOSTILE = "evil.example"
+
+
+@pytest.mark.parametrize("target", ["/api/health", "/", "/index.html", "/nothing"])
+def test_foreign_host_header_is_400_with_nothing_sensitive(full_db: Path, target: str) -> None:
+    client = make_client(full_db)
+    for host in (HOSTILE, "evil.example:8750", "127.0.0.1.evil.example", "localhost.evil.example",
+                 "[::2]", "0.0.0.0", ""):
+        response = client.get(target, headers={"Host": host})
+        assert response.status_code == 400, (target, host)
+        assert response.text == "Invalid host header"
+        assert str(full_db.parent) not in response.text and "run_count" not in response.text
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8750", "localhost:8750", "[::1]:8750", "LOCALHOST:1",
+                                  "127.0.0.1", "localhost", "[::1]"])
+def test_local_host_headers_are_served(full_db: Path, host: str) -> None:
+    client = make_client(full_db)
+    assert client.get("/api/health", headers={"Host": host}).status_code == 200
+    assert client.get("/", headers={"Host": host}).status_code == 200
+
+
+def test_allow_remote_turns_the_host_check_off(full_db: Path) -> None:
+    client = TestClient(create_app(str(full_db), NO_ENV, allow_remote=True),
+                        base_url="http://evil.example")
+    for host in (HOSTILE, "evil.example:8750", "0.0.0.0:8750", "127.0.0.1:8750"):
+        assert client.get("/api/health", headers={"Host": host}).status_code == 200
+        assert client.get("/", headers={"Host": host}).status_code == 200
+
+
+def test_with_store_opens_runs_and_closes_on_one_worker_thread(
+    full_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, int] = {}
+    real = api_db.open_store_readonly
+
+    def spy(spec: str, **kwargs: object) -> Store:
+        seen["open"] = threading.get_ident()
+        store = real(spec, **kwargs)  # type: ignore[arg-type]
+        close = store.close
+
+        def closing() -> None:
+            seen["close"] = threading.get_ident()
+            close()
+
+        store.close = closing  # type: ignore[method-assign]
+        return store
+
+    monkeypatch.setattr(api_db, "open_store_readonly", spy)
+    client = make_client(full_db)
+
+    async def probe(request: Request) -> dict[str, int]:
+        def query(store: Store) -> dict[str, int]:
+            seen["query"] = threading.get_ident()
+            return {"runs": len(store.list_runs())}
+
+        seen["loop"] = threading.get_ident()
+        return await with_store(request, query)
+
+    add_route(client, "/api/_threads", probe)
+    assert client.get("/api/_threads").json() == {"runs": 1}
+    assert seen["open"] == seen["query"] == seen["close"] != seen["loop"]
 
 
 @pytest.mark.parametrize("method", ["post", "put", "delete", "patch"])
@@ -137,13 +257,16 @@ def test_api_cannot_write_database(full_db: Path, tmp_path: Path) -> None:
     copy = copy_database(full_db, tmp_path / "ro.db")
     client = make_client(copy)
 
-    async def probe(store: Store = Depends(get_store)) -> dict[str, str]:  # noqa: B008
+    def attempt_write(store: Store) -> dict[str, str]:
         assert isinstance(store, SqliteStore)
         try:
             store._db().execute("INSERT INTO runs DEFAULT VALUES")
         except sqlite3.Error as exc:
             return {"raised": type(exc).__name__, "message": str(exc)}
         return {"raised": ""}
+
+    async def probe(request: Request) -> dict[str, str]:
+        return await with_store(request, attempt_write)
 
     add_route(client, "/api/_probe", probe)
 
@@ -164,9 +287,11 @@ def test_connection_is_closed_after_each_request(
     full_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     opened: list[Store] = []
+    timeouts: list[object] = []
     real = api_db.open_store_readonly
 
     def spy(spec: str, **kwargs: object) -> Store:
+        timeouts.append(kwargs.get("busy_timeout"))
         store = real(spec, **kwargs)  # type: ignore[arg-type]
         opened.append(store)
         return store
@@ -175,7 +300,7 @@ def test_connection_is_closed_after_each_request(
     client = make_client(full_db)
     for _ in range(3):
         assert client.get("/api/health").status_code == 200
-    assert len(opened) == 3
+    assert len(opened) == 3 and timeouts == [API_BUSY_TIMEOUT] * 3 and API_BUSY_TIMEOUT <= 2.0
     for store in opened:
         with pytest.raises(StoreError, match="closed"):
             store.list_runs()
