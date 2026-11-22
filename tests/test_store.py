@@ -5,7 +5,11 @@ nothing depends on (or touches) the real OneDrive or the repo.
 """
 
 import ast
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -518,3 +522,251 @@ def test_store_module_imports_no_pandas_or_legacy():
 def test_no_database_files_in_repo():
     repo = Path(__file__).resolve().parent.parent
     assert not list(repo.glob("*.db")) and not list((repo / "MainStoinker").rglob("*.db"))
+
+
+# --- added by the tester: gaps found while verifying ---------------------------
+
+
+def test_real_backtests_roundtrip_through_the_store(db):
+    """Real engine runs (a plain one and one with an end-of-data close) stored and reloaded."""
+    from tests import harness
+
+    cases = [
+        ("EMACrossing", {"idname": "AAPL-ema", "ticker": "AAPL", "short": "10", "long": "30"}),
+        ("Elliot", {"idname": "elliot-msft", "ticker": "MSFT", "order": 10,
+                    "trailingStopDelta": 0.10}),
+    ]
+    synthetic_seen = False
+    for n, (algo_id, cfg) in enumerate(cases):
+        harness.stage_offline_data(Path.cwd(), [cfg["ticker"]])
+        led = Ledger()
+        harness.run_offline_backtest(algo_id, [cfg], ledger=led)
+        path = db.parent / f"real{n}.db"
+        with SqliteStore(path) as store:
+            run_id = store.begin_run(meta())
+            store.write_algos(run_id, [AlgoMeta(a.idname, algo_id, a.symbol, "backtest", a.capital)
+                                       for a in led.accounts])
+            write_all(store, run_id, led)
+            store.end_run(run_id, "completed")
+        with SqliteStore(path) as store:  # a fresh connection: nothing from the writer's memory
+            data = store.load_run(run_id)
+        assert led.round_trips and led.fills
+        assert data.accounts() == led.accounts
+        assert data.order_events == led.orders
+        assert data.fills == led.fills
+        assert data.round_trips == led.round_trips
+        assert data.ignored_events == led.ignored_events
+        for account in [None, *[a.idname for a in led.accounts]]:
+            full = [p for p in led.equity_points if p.account == account]
+            assert expand_equity(data.equity_series(account), [p.time for p in full]) == full
+        assert len(data.equity) < len(led.equity_points)
+        synthetic_seen |= any(f.synthetic for f in data.fills)
+        harness.reset_runtime_state()
+    assert synthetic_seen  # Elliot MSFT ends with an open trade
+
+
+def test_sql_sum_of_net_equals_decimal_sum(db):
+    led = build_ledger()
+    with SqliteStore(db) as store:
+        stored_run(store, led)
+    con = sqlite3.connect(db)
+    try:
+        total = con.execute("SELECT SUM(net_e4) FROM trades").fetchone()[0]
+    finally:
+        con.close()
+    assert Decimal(total) / 10000 == sum(t.net for t in led.round_trips)
+    assert any(t.net < 0 for t in led.round_trips)  # the sum includes a loss
+
+
+def test_large_and_tiny_values_roundtrip(db):
+    big = D("9999999999999.9999")
+    pts = [EquityPoint(T0 + timedelta(minutes=i), "a1", v, D(0), D(0), D(0), v)
+           for i, v in enumerate([big, -big, D("0.0001"), D("-0.0001"), D(5), D("1.50000")])]
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos())
+        store.write_results(run_id, equity=pts)
+        store.end_run(run_id, "completed")
+        got = store.load_run(run_id).equity
+    assert got == tuple(pts)
+    assert got[-1].cash.as_tuple().exponent == -4
+
+
+def test_results_written_in_chunks_equal_one_write(db):
+    led = build_ledger()
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos())
+        orders, fills, trips = list(led.orders), list(led.fills), list(led.round_trips)
+        ignored, equity = list(led.ignored_events), list(led.equity_points)
+        for i in range(0, max(len(orders), len(fills), len(equity)), 2):
+            store.write_results(run_id, order_events=orders[i:i + 2], fills=fills[i:i + 2],
+                                round_trips=trips[i:i + 2], ignored_events=ignored[i:i + 2],
+                                equity=equity[i:i + 2])
+        store.end_run(run_id, "completed")
+        data = store.load_run(run_id)
+    assert data.order_events == led.orders and data.fills == led.fills
+    assert data.round_trips == led.round_trips and data.ignored_events == led.ignored_events
+    for account in (None, "a1", "a2"):
+        full = [p for p in led.equity_points if p.account == account]
+        assert expand_equity(data.equity_series(account), [p.time for p in full]) == full
+
+
+def test_failed_equity_write_does_not_corrupt_compressor_state(db):
+    """A write that fails after the compressor saw a changed point must not lose it on retry."""
+    def pt(minute: int, value: str) -> EquityPoint:
+        return EquityPoint(T0 + timedelta(minutes=minute), "a1", D(1000), D(0), D(0), D(0),
+                           D(value))
+    bad = EquityPoint(T0 + timedelta(minutes=3), "a1", D("1.00001"), D(0), D(0), D(0), D(1))
+    good = [pt(0, "1000"), pt(1, "1000")]
+    retry = [pt(2, "1500"), pt(3, "1500"), pt(4, "1500")]
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta())
+        store.write_algos(run_id, algos())
+        store.write_results(run_id, equity=good)
+        with pytest.raises(StoreError):
+            store.write_results(run_id, equity=[retry[0], bad])
+        assert len(store.load_run(run_id).equity) == 1  # the failed call stored nothing
+        store.write_results(run_id, equity=retry)  # the same points again
+        store.end_run(run_id, "completed")
+        stored = store.load_run(run_id).equity_series("a1")
+    full = good + retry
+    assert expand_equity(stored, [p.time for p in full]) == full
+
+
+def test_failed_run_keeps_what_was_written(db):
+    with SqliteStore(db) as store:
+        run_id, led = stored_run(store)  # completed; make a second, failed one
+        run2 = store.begin_run(meta())
+        store.write_algos(run2, algos())
+        write_all(store, run2, led)
+        store.end_run(run2, "failed")
+        summaries = {s.run_id: s for s in store.list_runs()}
+        assert summaries[run2].status == "failed" and summaries[run2].ended_at is not None
+        assert store.load_run(run2).fills == led.fills
+        assert store.load_run(run_id).summary.status == "completed"
+
+
+def test_pandas_timestamps_come_back_as_equal_datetimes(db):
+    pd = pytest.importorskip("pandas")
+    stamps = [pd.Timestamp("2024-01-02 09:30"), pd.Timestamp("2024-01-02 09:31:00.123456")]
+    pts = [EquityPoint(t, "a1", D(i), D(0), D(0), D(0), D(i)) for i, t in enumerate(stamps, 1)]
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(RunMeta("backtest", "legacy", data=DataMeta(first_bar=stamps[0])))
+        store.write_algos(run_id, algos())
+        store.write_results(run_id, equity=pts)
+        store.end_run(run_id, "completed")
+        data = store.load_run(run_id)
+    assert [p.time for p in data.equity] == stamps
+    assert all(type(p.time) is datetime for p in data.equity)
+    assert data.summary.data.first_bar == stamps[0]
+
+
+def test_repeated_runs_in_one_process_do_not_leak_state(tmp_path):
+    led = build_ledger()
+    first = None
+    for n in range(3):
+        with SqliteStore(tmp_path / f"r{n}.db") as store:
+            run_id, _ = stored_run(store, led)
+            data = store.load_run(run_id)
+        assert run_id == 1  # every file starts fresh
+        rows = (data.order_events, data.fills, data.round_trips, data.equity,
+                data.ignored_events)
+        first = first or rows
+        assert rows == first
+
+
+def test_reader_in_another_process_sees_running_run(db):
+    script = db.parent / "reader.py"
+    script.write_text(
+        "import sys\n"
+        "from MainStoinker.engine.store import SqliteStore\n"
+        "with SqliteStore(sys.argv[1]) as s:\n"
+        "    (run,) = s.list_runs()\n"
+        "    data = s.load_run(run.run_id)\n"
+        "    print(run.status, len(data.algos), len(data.fills))\n",
+        encoding="utf-8")
+    repo = Path(__file__).resolve().parent.parent
+    led = build_ledger()
+    with SqliteStore(db) as writer:  # still open and the run still running
+        run_id = writer.begin_run(meta())
+        writer.write_algos(run_id, algos())
+        write_all(writer, run_id, led)
+        out = subprocess.run([sys.executable, str(script), str(db)], cwd=repo,
+                             capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.split() == ["running", "2", str(len(led.fills))]
+        writer.end_run(run_id, "completed")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows paths are case-insensitive")
+def test_onedrive_match_ignores_path_case_on_windows(tmp_path):
+    root = tmp_path / "OneDrive"
+    assert is_cloud_synced(Path(str(root).upper()) / "runs.db", {"OneDrive": str(root)})
+    assert is_cloud_synced(root / "runs.db", {"OneDrive": str(root).lower()})
+
+
+def test_onedrive_trailing_slash_relative_and_dotdot(tmp_path, monkeypatch):
+    root = tmp_path / "OneDrive"
+    env = {"OneDrive": str(root) + "/"}
+    assert is_cloud_synced(root / "runs.db", env)
+    assert is_cloud_synced(root / "a" / ".." / "runs.db", env)
+    assert not is_cloud_synced(root / ".." / "OneDrive2" / "runs.db", env)
+    root.mkdir()
+    monkeypatch.chdir(root)
+    assert is_cloud_synced("runs.db", env)  # relative to the working folder
+    monkeypatch.chdir(tmp_path)
+    assert not is_cloud_synced("runs.db", env)
+
+
+def test_onedrive_refusal_covers_sqlite_url_and_spares_memory(tmp_path):
+    root = tmp_path / "OneDrive"
+    env = {"OneDriveConsumer": str(root)}
+    with pytest.raises(StoreError, match="OneDrive"):
+        open_store("sqlite:///" + str(root / "runs.db"), env=env)
+    assert not root.exists()
+    with open_store(":memory:", env={"OneDrive": ":memory:"}) as store:
+        assert store.list_runs() == ()
+    with open_store("sqlite:///:memory:", env=env) as store:
+        assert store.list_runs() == ()
+
+
+def test_real_environment_refuses_a_path_under_this_machines_onedrive():
+    roots = [os.environ[k] for k in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")
+             if os.environ.get(k)]
+    if not roots:
+        pytest.skip("no OneDrive on this machine")
+    folder = Path(roots[0]) / "zz_stoink_store_test_never_created"
+    try:
+        with pytest.raises(StoreError, match="OneDrive"):
+            open_store(str(folder / "runs.db"), env=os.environ)
+        assert not folder.exists()
+    finally:
+        if folder.exists():  # only reached if the guard failed
+            shutil.rmtree(folder)
+
+
+def test_store_module_has_no_module_level_mutable_state():
+    import MainStoinker.engine.store as mod
+
+    leaked = [n for n, v in vars(mod).items()
+              if not n.startswith("__") and isinstance(v, (list, dict, set, bytearray))]
+    assert leaked == []
+
+
+@pytest.mark.xfail(strict=True, raises=OverflowError,
+                   reason="a value beyond SQLite's INTEGER range escapes as OverflowError, "
+                          "not StoreError")
+def test_value_too_large_for_sqlite_is_a_store_error(db):
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta())
+        with pytest.raises(StoreError):
+            store.write_algos(run_id, [AlgoMeta("z", "X", "AAPL", "backtest", D("1E+30"))])
+
+
+@pytest.mark.xfail(strict=True, raises=FileExistsError,
+                   reason="a path whose parent is a file escapes as FileExistsError")
+def test_parent_that_is_a_file_is_a_store_error(tmp_path):
+    (tmp_path / "afile").write_text("x")
+    with pytest.raises(StoreError):
+        SqliteStore(tmp_path / "afile" / "runs.db")
