@@ -1,3 +1,4 @@
+import logging
 import MainStoinker.MainStuff.main_utils as utils
 import numpy as np
 import pandas as pd
@@ -19,7 +20,7 @@ class ParentAlgo:
         #dont think i want this in the parent class
         # self.stoplossPercent = float(algoConfigData['stoplossPercent'])
         
-        self.logger = utils.create_logger("algo:"+self.name+":"+self.ticker)
+        self.logger = logging.getLogger("algo:"+self.name+":"+self.ticker)
 
 
         #Other inits/variables
