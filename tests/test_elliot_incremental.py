@@ -26,6 +26,9 @@ from MainStoinker.Algos.Elliot.ElliotImpulse import ElliotImpulse
 from tests import harness
 
 TICKERS = ["MSFT", "AAPL", "TSLA"]
+MSFT_FAST_OTHERS_SLOW = [
+    pytest.param(t, marks=() if t == "MSFT" else pytest.mark.slow) for t in TICKERS
+]
 COMPARATORS = [np.less_equal, np.greater_equal]
 
 
@@ -222,7 +225,7 @@ def test_extrema_with_continuous_random_data(order):
                 )
 
 
-@pytest.mark.parametrize("ticker", TICKERS)
+@pytest.mark.parametrize("ticker", MSFT_FAST_OTHERS_SLOW)
 def test_extrema_match_scipy_at_every_prefix_of_real_data(ticker):
     frame = real_frame(ticker)
     for column, comparator in (("low", np.less_equal), ("high", np.greater_equal), ("close", np.less_equal)):
@@ -358,7 +361,14 @@ def test_rule_break_scans_match_the_originals():
 
 # ---- whole detection ----------------------------------------------------------
 
-@pytest.mark.parametrize("ticker, rows", [("MSFT", 400), ("AAPL", 400), ("TSLA", 600)])
+@pytest.mark.parametrize(
+    "ticker, rows",
+    [
+        ("MSFT", 400),
+        pytest.param("AAPL", 400, marks=pytest.mark.slow),
+        ("TSLA", 600),
+    ],
+)
 def test_detection_matches_the_original_at_every_bar_of_real_data(ticker, rows):
     frame = real_frame(ticker, rows)
     algo = new_algo(10)

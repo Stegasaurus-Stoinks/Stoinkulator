@@ -45,6 +45,9 @@ from tests import harness
 STATE_DIR = Path(__file__).parent / "golden_state"
 UPDATE_ENV = "UPDATE_ELLIOT_STATE"
 TICKERS = ["MSFT", "AAPL", "TSLA"]
+MSFT_FAST_OTHERS_SLOW = [
+    pytest.param(t, marks=() if t == "MSFT" else pytest.mark.slow) for t in TICKERS
+]
 
 
 def elliot_cfg(ticker: str) -> dict:
@@ -213,7 +216,8 @@ def first_difference(actual: list[str], expected: list[str]) -> str | None:
 PREFIX_ROWS = 900
 
 
-@pytest.mark.parametrize("ticker", TICKERS)
+# One ticker in the fast suite; the other two run with the slow suite.
+@pytest.mark.parametrize("ticker", MSFT_FAST_OTHERS_SLOW)
 def test_elliot_state_matches_the_start_of_the_golden(ticker: str) -> None:
     state = collect_state(ticker, max_rows=PREFIX_ROWS)
     expected = json.loads(state_path(ticker).read_text(encoding="utf-8"))
