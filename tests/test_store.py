@@ -1464,3 +1464,180 @@ def test_store_protocol_declares_schema_version_and_series():
     for name in ("schema_version", "write_series", "load_series"):
         assert hasattr(Store, name)
         assert hasattr(NullStore, name) and hasattr(SqliteStore, name)
+
+
+# --- schema 2: gaps found by the tester -----------------------------------------
+
+
+def test_failed_migration_leaves_a_v1_file_untouched(db, tmp_path, monkeypatch):
+    import MainStoinker.engine.store as store_module
+
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+        expected = w.load_run(1)
+    make_v1_file(src, db)
+    broken = (*MIGRATIONS[:1], (MIGRATIONS[1][0], "CREATE TABLE boom ("))
+    monkeypatch.setattr(store_module, "MIGRATIONS", broken)
+    with pytest.raises(StoreError):
+        SqliteStore(db)
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
+    assert not tables & {"algo_series", "algo_series_points"}
+    monkeypatch.undo()
+    for _ in range(2):  # a retry migrates; opening again does nothing more
+        with SqliteStore(db) as store:
+            assert store.schema_version == 2
+            assert store.load_run(1) == expected
+
+
+def test_migrated_file_passes_integrity_and_foreign_key_checks(db, tmp_path):
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+    make_v1_file(src, db)
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points)
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        con.close()
+
+
+def test_several_writers_migrate_the_same_v1_file_at_once(tmp_path):
+    import threading
+
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+        expected = w.load_run(1)
+    n = 6
+    for attempt in range(4):
+        path = tmp_path / f"v1_{attempt}.db"
+        make_v1_file(src, path)
+        barrier = threading.Barrier(n)
+        errors: list[BaseException] = []
+
+        def opener(path=path, barrier=barrier, errors=errors) -> None:
+            try:
+                barrier.wait()
+                with SqliteStore(path, env=NO_ENV) as store:
+                    assert store.schema_version == 2
+                    assert store.load_run(1) == expected
+            except BaseException as exc:  # noqa: BLE001 - collected and asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=opener) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        assert errors == []
+
+
+def test_series_declared_twice_in_one_call_writes_nothing(db):
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        twin = SeriesInfo("a1", "ema", "line", 0)
+        with pytest.raises(StoreError):
+            store.write_series(run_id, [SeriesInfo("a1", "rsi", "line", 1), twin, twin])
+        assert store.load_run(run_id).series == ()
+
+
+def test_points_cannot_use_a_series_declared_in_another_run(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        first = running_run(store)
+        store.write_series(first, infos)
+        second = running_run(store)
+        with pytest.raises(StoreError, match="not declared"):
+            store.write_series(second, [], points[:1])
+        assert store.load_series(second, "a1") == ()
+        assert store.load_series(first, "a1") == ()
+
+
+def test_series_write_with_nothing_is_a_no_op(db):
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, [])
+        store.write_series(run_id, [], [])
+        assert store.load_run(run_id).series == ()
+        assert store.load_series(run_id, "a1") == ()
+
+
+def test_series_window_edges(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points)
+        t = lambda m: T0 + timedelta(minutes=m)  # noqa: E731
+        assert store.load_series(run_id, "a1", t(4), t(2)) == ()  # start after end
+        exact = store.load_series(run_id, "a1", t(3), t(3))
+        assert [(p.name, p.time) for p in exact] == [("ema", t(3))]
+        between = store.load_series(run_id, "a1", t(2) + timedelta(seconds=1),
+                                    t(3) + timedelta(seconds=59))
+        assert [(p.name, p.time) for p in between] == [("ema", t(3))]
+        assert store.load_series(run_id, "a1", end=t(100)) == store.load_series(run_id, "a1")
+        # sub-second times sort and compare correctly next to whole seconds
+        store.write_series(run_id, [], [
+            SeriesPoint("a2", "ema", t(1) + timedelta(microseconds=500000), 1.0),
+            SeriesPoint("a2", "ema", t(1) + timedelta(seconds=1), 2.0)])
+        got = store.load_series(run_id, "a2")
+        assert [p.value for p in got] == [7.25, 1.0, 2.0]
+        assert [p.value for p in store.load_series(run_id, "a2", t(1), t(1))] == [7.25]
+
+
+def test_duplicate_point_times_are_kept_in_insertion_order(db):
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, [SeriesInfo("a1", "ema", "line", 0)], [
+            SeriesPoint("a1", "ema", T0, 1.0), SeriesPoint("a1", "ema", T0, 2.0)])
+        assert [p.value for p in store.load_series(run_id, "a1")] == [1.0, 2.0]
+
+
+def test_series_values_are_stored_as_floats(db):
+    import numpy as np
+
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        values = [3, np.float64(2.5), np.float32(0.5), Decimal("1.25"), -0.0]
+        store.write_series(run_id, [SeriesInfo("a1", "ema", "line", 0)], [
+            SeriesPoint("a1", "ema", T0 + timedelta(minutes=i), v) for i, v in enumerate(values)])
+        got = store.load_series(run_id, "a1")
+        assert [p.value for p in got] == [3.0, 2.5, 0.5, 1.25, 0.0]
+        assert all(type(p.value) is float for p in got)
+        with pytest.raises(StoreError):
+            store.write_series(run_id, [], [SeriesPoint("a1", "ema", T0, Decimal("NaN"))])
+        with pytest.raises(StoreError):
+            store.write_series(run_id, [], [SeriesPoint("a1", "ema", T0, 10**400)])
+
+
+def test_load_run_does_not_read_series_points(db):
+    infos, points = series_fixture()
+    with SqliteStore(db) as store:
+        run_id = running_run(store)
+        store.write_series(run_id, infos, points)
+        issued: list[str] = []
+        store._db().set_trace_callback(issued.append)
+        data = store.load_run(run_id)
+        store._db().set_trace_callback(None)
+    assert len(data.series) == 3
+    assert not [q for q in issued if "algo_series_points" in q]
+
+
+def test_series_calls_on_a_closed_store_raise_store_error(db):
+    store = SqliteStore(db)
+    run_id = running_run(store)
+    store.close()
+    with pytest.raises(StoreError, match="closed"):
+        store.load_series(run_id, "a1")
+    with pytest.raises(StoreError, match="closed"):
+        store.write_series(run_id, [])
