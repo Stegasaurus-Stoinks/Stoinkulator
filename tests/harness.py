@@ -1,18 +1,26 @@
 """Headless offline-backtest harness.
 
-Drives the *existing* runtime path (Globals -> ibapi.startData offline ->
-main_utils.backtesting_data_blast) with no TWS connection, no front end and
-no wall-clock delay, so tests characterise what the system does today.
+Two runners, both with no TWS connection, no front end and no wall-clock delay:
 
-The runtime keeps its state in module globals and a frozen Config instance.
-Until milestone 1 replaces those with injectable objects, this harness resets
-them by hand. Do not copy this pattern into production code.
+- `run_offline_backtest` (and the `run_mixed_` form) drives
+  `MainStoinker.engine.Engine` over a `CsvBarFeed` reading ./OfflineData in the
+  cwd, with a `SimBroker` and `NullSink`. This is the path behind the golden
+  backtests.
+- `run_legacy_offline_backtest` (and the `run_mixed_legacy_` form) drives the
+  legacy runtime (Ticker -> ibapi.startData offline -> `replay_bars`). It is
+  kept only as a parity guard while the live entry path still uses that
+  runtime, and is removed in Phase B.
+
+The legacy runtime keeps its state in module globals and a frozen Config
+instance, which this harness resets by hand. Do not copy this pattern into
+production code.
 """
 from __future__ import annotations
 
 import logging
 import shutil
 import threading
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -70,7 +78,64 @@ def stage_offline_data(workdir: Path, symbols: list[str], max_rows: int | None =
 def run_offline_backtest(
     algo_id: str, algo_configs: list[dict], warmup_days: int = 2, *, broker=None
 ) -> list:
-    """Run algo_id over offline data for each config. Returns the algo objects.
+    """Run algo_id over offline data for each config, through the Engine.
+
+    Returns the algo objects in config order. The current working directory
+    must contain OfflineData/ (see stage_offline_data). `broker` defaults to a
+    fresh SimBroker per call (the engine refuses to run without one).
+    """
+    return run_mixed_offline_backtest(
+        [(algo_id, cfg) for cfg in algo_configs], warmup_days, broker=broker
+    )
+
+
+def run_mixed_offline_backtest(
+    specs: Sequence[tuple[str, dict]],
+    warmup_days: int = 2,
+    *,
+    broker=None,
+    sink=None,
+    wrap: Callable[[object], None] | None = None,
+) -> list:
+    """Engine run over (algo_id, cfg) pairs; algos come back in `specs` order.
+
+    `sink` defaults to NullSink. `wrap`, if given, is called on each algo after
+    it is built and before the engine takes it (to spy on `update`, say).
+    """
+    from MainStoinker.engine.algos import load_algo
+    from MainStoinker.engine.broker import SimBroker
+    from MainStoinker.engine.engine import Engine, EngineConfig
+    from MainStoinker.engine.feed import CsvBarFeed
+    from MainStoinker.engine.sink import NullSink
+
+    apply_safe_config()
+    reset_runtime_state()
+
+    algos = [load_algo(algo_id, cfg) for algo_id, cfg in specs]
+    if wrap is not None:
+        for algo in algos:
+            wrap(algo)
+    # First-appearance order, matching the legacy Ticker index order.
+    symbols = list(dict.fromkeys(cfg["ticker"] for _, cfg in specs))
+    feed = CsvBarFeed(Path.cwd() / "OfflineData", symbols, warmup_days)
+    engine = Engine(
+        EngineConfig(),
+        feed,
+        broker if broker is not None else SimBroker(),
+        sink if sink is not None else NullSink(),
+        algos,
+    )
+    engine.run_backtest()
+    return algos
+
+
+def run_legacy_offline_backtest(
+    algo_id: str, algo_configs: list[dict], warmup_days: int = 2, *, broker=None
+) -> list:
+    """Run algo_id over offline data for each config on the LEGACY runtime path.
+
+    Exists only as a parity guard for the legacy runtime, which the live entry
+    path still uses; it is removed in Phase B. Returns the algo objects.
 
     The current working directory must contain OfflineData/ (see
     stage_offline_data); the runtime also writes its log and CSV output there.
@@ -78,6 +143,20 @@ def run_offline_backtest(
     If `broker` is given it is set as `algo.broker` on every algo before the
     replay, so their trades report to it. Without it the legacy path runs.
     """
+    return run_mixed_legacy_offline_backtest(
+        [(algo_id, cfg) for cfg in algo_configs], warmup_days, broker=broker
+    )
+
+
+def run_mixed_legacy_offline_backtest(
+    specs: Sequence[tuple[str, dict]],
+    warmup_days: int = 2,
+    *,
+    broker=None,
+    wrap: Callable[[object], None] | None = None,
+) -> list:
+    """Legacy path over (algo_id, cfg) pairs. `wrap` is applied after the broker
+    is set and before the algo is registered on its Ticker."""
     from MainStoinker.DataCollection.apiApi import ibapi
     from MainStoinker.MainStuff import Globals
     from MainStoinker.MainStuff import main_utils as utils
@@ -88,7 +167,7 @@ def run_offline_backtest(
 
     by_symbol: dict[str, Ticker] = {}
     algos = []
-    for cfg in algo_configs:
+    for algo_id, cfg in specs:
         ticker = by_symbol.get(cfg["ticker"])
         if ticker is None:
             ticker = Ticker(cfg["ticker"], len(by_symbol))
@@ -96,6 +175,8 @@ def run_offline_backtest(
         algo = utils.algo_starter(algo_id, cfg)
         if broker is not None:
             algo.broker = broker
+        if wrap is not None:
+            wrap(algo)
         ticker.register_algo(algo)
         algos.append(algo)
 

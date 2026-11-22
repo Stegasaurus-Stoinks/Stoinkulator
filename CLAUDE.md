@@ -36,8 +36,8 @@ Use the project venv (`.venv`, Python 3.14, Windows). It is uv-managed and has n
 ```
 uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
 uv pip install --python .venv\Scripts\python.exe -e .
-.venv\Scripts\python.exe -m pytest                  # fast suite, ~20 s
-.venv\Scripts\python.exe -m pytest -m slow          # Elliot golden, ~3 min
+.venv\Scripts\python.exe -m pytest                  # fast suite, ~35 s
+.venv\Scripts\python.exe -m pytest -m slow          # Elliot golden + legacy-path parity, several min
 .venv\Scripts\ruff.exe check .                      # legacy defect set
 .venv\Scripts\ruff.exe check tests MainStoinker/engine --select E,F,W,I,B   # new-code set
 ```
@@ -63,6 +63,11 @@ uv pip install --python .venv\Scripts\python.exe -e .
   algo makes on the offline bars. A golden diff means trading behaviour
   changed. Regenerate with `pytest --update-golden` only when the change is
   intended, and explain the diff in the PR.
+- Golden backtests run through the engine (`harness.run_offline_backtest`:
+  `Engine` + `CsvBarFeed` + `SimBroker`). The legacy runtime path
+  (`harness.run_legacy_offline_backtest`) is compared against the same golden
+  files read-only in the slow suite (`tests/test_legacy_path_parity.py`) and
+  goes away in Phase B. Only `test_golden_backtests.py` may write goldens.
 - Known defects are recorded as `xfail(strict=True)` tests. Fixing one means
   removing its marker in the same change.
 - The runtime writes `loggy.log`, `tradey.txt` and `algo.csv` to the current
