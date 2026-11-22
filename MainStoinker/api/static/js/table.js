@@ -1,8 +1,9 @@
 // A data table builder shared by the views.
 //
-// Exports: netCell, compareValues, sortRows, nextSort, isSelectKey, dataTable.
+// Exports: netCell, compareValues, sortRows, nextSort, dataTable.
 //
-// const table = dataTable({columns, rows, caption, captionHidden, sort, rowKey, selectedKey, onSelect})
+// const table = dataTable({columns, rows, caption, captionHidden, sort, rowKey, selectedKey, onSelect,
+//                          selectLabel})
 // returns a handle {element, update({rows, selectedKey}), getSort()}:
 //   table.element   the scrollable wrapper to put in the page (the same element for the table's life);
 //   table.update()  re-renders with new rows and/or a new selectedKey (a key that is absent from the
@@ -18,10 +19,16 @@
 //            on the header button; the sorted header carries aria-sort); null sorts last.
 // sort: {column, direction} is the initial order (column is an index, direction "asc" or "desc").
 // Selection (all optional): rowKey(row) gives a row's identity (string or number; keys are compared as
-// text), selectedKey is the key of the selected row, onSelect(row) is called when a row is clicked (not
-// on a link, button or input inside it) or when Enter or Space is pressed on the focused row. With
-// onSelect every row is focusable (tabindex 0, class "selectable"). With rowKey every row carries
-// aria-selected, "true" on the selected one.
+// text), selectedKey is the key of the selected row, onSelect(row) is called when the row's button is
+// pressed, or the row is clicked with the mouse (not on a link, button or input inside it). The table
+// stays a plain table (no grid role). With onSelect, the first cell of every row holds a real
+// <button class="row-select"> around that cell's content: it is the keyboard and screen-reader way to
+// select, and it carries aria-pressed ("true" on the selected row, "false" on the others).
+// selectLabel(row) gives the button its accessible name (aria-label), e.g. "Select trade 3"; without it
+// the cell content names the button. The selected row (selectedKey matches its rowKey) carries
+// aria-current="true"; other rows carry no aria-current. Rows are not focusable and have no key
+// handler; no selected-state attribute of the grid pattern is used (it is not valid on a plain table
+// row). With onSelect every row has class "selectable".
 // caption: the table's accessible name; captionHidden hides it visually but keeps it for screen readers.
 import { h } from "./dom.js";
 import { formatNet, netClass } from "./format.js";
@@ -60,11 +67,6 @@ export function nextSort(sort, index) {
   return { column: index, direction };
 }
 
-// Enter and Space select a focused row.
-export function isSelectKey(key) {
-  return key === "Enter" || key === " " || key === "Spacebar";
-}
-
 function isSpec(value) {
   return value !== null && typeof value === "object" && !(value instanceof Node) && "content" in value;
 }
@@ -77,11 +79,13 @@ function sameKey(a, b) {
 
 export function dataTable({
   columns, rows, caption, captionHidden = false, sort = null, rowKey = null, selectedKey = null, onSelect = null,
+  selectLabel = null,
 }) {
   let current = rows;
   let selected = selectedKey;
   let sortState = { column: sort ? sort.column : -1, direction: sort && sort.direction === "desc" ? "desc" : "asc" };
   const rowElements = new Map(); // String(key) -> <tr>, for the rows on show
+  const rowButtons = new Map(); // String(key) -> the row's <button> (only with onSelect)
   const tbody = h("tbody", {});
   const headers = columns.map((column, index) => headerCell(column, index));
 
@@ -99,49 +103,59 @@ export function dataTable({
     return h("th", { scope: "col", class: cls }, button);
   }
 
-  function markSelected(tr, key) {
-    if (!rowKey) return;
-    tr.setAttribute("aria-selected", sameKey(key, selected) ? "true" : "false");
+  function markSelected(tr, button, key) {
+    const on = sameKey(key, selected);
+    if (on) tr.setAttribute("aria-current", "true");
+    else tr.removeAttribute("aria-current");
+    if (button) button.setAttribute("aria-pressed", on ? "true" : "false");
   }
 
   function bodyRow(row, rowIndex) {
     const key = rowKey ? rowKey(row) : null;
     const attrs = {};
+    let button = null;
     if (onSelect) {
       attrs.class = "selectable";
-      attrs.tabindex = "0";
       attrs.onclick = (event) => {
         const inner = event.target && event.target.closest ? event.target.closest(INTERACTIVE) : null;
         if (inner && tr.contains(inner)) return; // a link or a checkbox in the row does its own thing
         onSelect(row);
       };
-      attrs.onkeydown = (event) => {
-        if (event.target !== tr || !isSelectKey(event.key)) return;
-        event.preventDefault();
-        onSelect(row);
-      };
     }
-    const tr = h("tr", attrs, columns.map((column) => {
+    const tr = h("tr", attrs, columns.map((column, index) => {
       const made = column.cell(row, rowIndex);
       const spec = isSpec(made) ? made : { content: made };
       const cls = [column.numeric ? "num" : "", spec.className || ""].filter(Boolean).join(" ");
-      return h("td", { class: cls, title: spec.title }, spec.content);
+      let content = spec.content;
+      if (onSelect && index === 0) {
+        button = h("button", {
+          type: "button",
+          class: "row-select",
+          "aria-pressed": "false",
+          "aria-label": selectLabel ? selectLabel(row) : null,
+          onclick: () => onSelect(row),
+        }, content);
+        content = button;
+      }
+      return h("td", { class: cls, title: spec.title }, content);
     }));
     if (rowKey) {
       rowElements.set(String(key), tr);
-      markSelected(tr, key);
+      if (button) rowButtons.set(String(key), button);
+      markSelected(tr, button, key);
     }
     return tr;
   }
 
   function paint() {
     let focusedKey = null;
-    for (const [key, tr] of rowElements) if (tr === document.activeElement) focusedKey = key;
+    for (const [key, button] of rowButtons) if (button === document.activeElement) focusedKey = key;
     rowElements.clear();
+    rowButtons.clear();
     const sortKey = sortState.column >= 0 && columns[sortState.column] ? columns[sortState.column].sortKey : null;
     const ordered = sortKey ? sortRows(current, sortKey, sortState.direction) : current;
     tbody.replaceChildren(...ordered.map(bodyRow));
-    if (focusedKey !== null && rowElements.has(focusedKey)) rowElements.get(focusedKey).focus({ preventScroll: true });
+    if (focusedKey !== null && rowButtons.has(focusedKey)) rowButtons.get(focusedKey).focus({ preventScroll: true });
     columns.forEach((column, index) => {
       if (!column.sortKey) return;
       const sorted = index === sortState.column;
@@ -166,7 +180,7 @@ export function dataTable({
         current = change.rows;
         paint();
       } else if ("selectedKey" in change) {
-        for (const [key, tr] of rowElements) markSelected(tr, key);
+        for (const [key, tr] of rowElements) markSelected(tr, rowButtons.get(key) || null, key);
       }
     },
     getSort: () => ({ ...sortState }),
