@@ -275,3 +275,203 @@ def test_finish_with_open_position_and_no_close_is_not_reachable_through_the_eng
     engine = build(FakeFeed(["AAPL"]), SimBroker(), [FakeAlgo("a", "AAPL")], ledger=ledger)
     with pytest.raises(ValueError, match="no close"):
         engine.run_backtest()
+
+
+# --- real offline data through CsvBarFeed + SimBroker + Ledger ----------------
+
+REAL_CASES = [
+    ("EMACrossing", {"idname": "AAPL-10/30EMA", "ticker": "AAPL", "short": "10", "long": "30"},
+     "emacrossing_aapl"),
+    ("FridayFrenzy", {"idname": "TSLA-ff", "ticker": "TSLA", "RRRatio": 3}, "fridayfrenzy_tsla"),
+]
+
+
+class RecordingBroker(SimBroker):
+    """Bar-aware SimBroker that records hook calls into a shared event list."""
+
+    def __init__(self, events: list) -> None:
+        super().__init__()
+        self.events = events
+        self.n_end = 0
+
+    def on_bar(self, symbol: str, bar: Bar) -> None:
+        self.events.append(("on_bar", symbol, bar.date))
+
+    def on_end(self, last_bars) -> None:
+        self.n_end += 1
+        self.events.append(("on_end", dict(last_bars)))
+
+
+def _real_engine(specs, broker, ledger=None, **kwargs):
+    from pathlib import Path
+
+    from MainStoinker.engine.algos import load_algo
+    from MainStoinker.engine.feed import CsvBarFeed
+    from tests import harness
+
+    symbols = list(dict.fromkeys(cfg["ticker"] for _, cfg in specs))
+    harness.stage_offline_data(Path.cwd(), symbols)
+    algos = [load_algo(a, cfg) for a, cfg in specs]
+    feed = CsvBarFeed(Path.cwd() / "OfflineData", symbols, 2)
+    engine = Engine(EngineConfig(), feed, broker, NullSink(), algos, ledger=ledger, **kwargs)
+    return feed, algos, engine
+
+
+@pytest.mark.parametrize("algo_id, cfg, golden_id", REAL_CASES)
+def test_real_data_ledger_marks_and_golden_trades(algo_id, cfg, golden_id) -> None:
+    import json
+
+    from tests import harness
+    from tests.conftest import GOLDEN_DIR
+
+    ledger = Ledger()
+    ledger.open_account(cfg["idname"], cfg["ticker"], 10_000)
+    feed, algos, engine = _real_engine([(algo_id, cfg)], SimBroker(), ledger)
+    engine.run_backtest()
+    batches = list(feed)
+    assert len(batches) > 100
+    points = ledger.equity_points
+    assert len(points) == 2 * len(batches)  # account + total per post-warm-up timestamp
+    assert [p.time for p in points[::2]] == [t for t, _ in batches]
+    assert points[-1].time == batches[-1][0]
+    # SimBroker does not report to the ledger yet: flat at capital throughout
+    assert {p.equity for p in points} == {Decimal("10000.0000")}
+    warm_last = feed.warmup(cfg["ticker"])["date"].iloc[-1]
+    assert all(p.time > warm_last for p in points)
+    expected = json.loads((GOLDEN_DIR / f"{golden_id}.json").read_text())
+    assert harness.trade_records(algos[0]) == expected
+
+
+def test_real_data_hooks_order_multi_symbol_and_end_bars() -> None:
+    events: list = []
+    broker = RecordingBroker(events)
+    specs = [
+        ("EMACrossing", {"idname": "AAPL-e", "ticker": "AAPL", "short": "10", "long": "30"}),
+        ("FridayFrenzy", {"idname": "MSFT-ff", "ticker": "MSFT", "RRRatio": 3}),
+    ]
+    from pathlib import Path
+
+    from MainStoinker.engine.algos import load_algo
+    from MainStoinker.engine.feed import CsvBarFeed
+    from tests import harness
+
+    harness.stage_offline_data(Path.cwd(), ["AAPL", "MSFT"])
+    algos = [load_algo(a, c) for a, c in specs]
+    for algo in algos:
+        real = algo.update
+
+        def spy(frame, _real=real, _algo=algo):
+            events.append(("update", _algo.ticker, frame["date"].iloc[-1]))
+            return _real(frame)
+
+        algo.update = spy
+    feed = CsvBarFeed(Path.cwd() / "OfflineData", ["AAPL", "MSFT"], 2)
+    Engine(EngineConfig(), feed, broker, NullSink(), algos).run_backtest()
+    batches = list(feed)
+    on_bars = [e for e in events if e[0] == "on_bar"]
+    assert len(on_bars) == 2 * len(batches)
+    assert broker.n_end == 1
+    assert events[-1][0] == "on_end"
+    assert events[-1][1] == batches[-1][1]
+    warm_last = max(feed.warmup(s)["date"].iloc[-1] for s in ("AAPL", "MSFT"))
+    assert all(e[2] > warm_last for e in events if e[0] in ("on_bar", "update"))
+    # per timestamp: both on_bars (feed order) strictly before that timestamp's updates
+    chunk = 4
+    body = events[:-1]
+    assert len(body) == chunk * len(batches)
+    for i, (stamp, _) in enumerate(batches):
+        group = body[i * chunk:(i + 1) * chunk]
+        assert [(e[0], e[1]) for e in group] == [
+            ("on_bar", "AAPL"), ("on_bar", "MSFT"), ("update", "AAPL"), ("update", "MSFT")]
+        assert all(e[2] == stamp for e in group)
+
+
+def test_two_engine_runs_in_one_process_do_not_leak_state() -> None:
+    results = []
+    for _ in range(2):
+        ledger = Ledger()
+        ledger.open_account("a", "AAPL", 1000)
+        build(FakeFeed(["AAPL"]), RecordingBroker([]), [FakeAlgo("a", "AAPL")],
+              ledger=ledger).run_backtest()
+        results.append(len(ledger.equity_points))
+    assert results == [6, 6]
+
+
+# --- edge cases ------------------------------------------------------------------
+
+
+def test_missing_name_in_mapping_router_names_the_algo() -> None:
+    with pytest.raises(KeyError, match="no broker routed for algo 'zz'"):
+        build(FakeFeed(["AAPL"]), MappingRouter({}), [FakeAlgo("zz", "AAPL")])
+
+
+def test_non_broker_from_router_injects_nothing_into_any_algo() -> None:
+    algos = [FakeAlgo("a", "AAPL"), FakeAlgo("b", "AAPL"), FakeAlgo("c", "AAPL")]
+    router = MappingRouter({"a": SimBroker(), "b": SimBroker(), "c": None})  # type: ignore[dict-item]
+    with pytest.raises(TypeError):
+        build(FakeFeed(["AAPL"]), router, algos)
+    assert not any(hasattr(a, "broker") for a in algos)
+
+
+def test_two_algos_sharing_one_bar_aware_broker_get_one_hook_stream() -> None:
+    events: list = []
+    shared = RecordingBroker(events)
+    algos = [FakeAlgo("a", "AAPL"), FakeAlgo("b", "AAPL")]
+    build(FakeFeed(["AAPL"], rows=3), shared, algos).run_backtest()
+    assert len([e for e in events if e[0] == "on_bar"]) == 3
+    assert shared.n_end == 1
+
+
+def test_ledger_finish_error_propagates_not_swallowed() -> None:
+    class Boom(Ledger):
+        def finish(self, *args, **kwargs):
+            raise RuntimeError("finish boom")
+
+    with pytest.raises(RuntimeError, match="finish boom"):
+        build(FakeFeed(["AAPL"]), SimBroker(), [FakeAlgo("a", "AAPL")], ledger=Boom()).run_backtest()
+
+
+def test_end_commission_and_closes_reach_finish_for_a_short() -> None:
+    seen: dict = {}
+
+    class Spy(Ledger):
+        def finish(self, time, closes, commission=None):
+            seen.update(time=time, closes=dict(closes), commission=commission)
+            return super().finish(time, closes, commission)
+
+    ledger = Spy()
+    recorder = ledger.open_account("a", "AAPL", 10_000)
+    recorder.fill("r", side="sell", quantity=5, price=110, commission=0, time=T0, reason="entry")
+
+    def commission(idname: str, quantity: Decimal) -> Decimal:
+        return Decimal("2")
+
+    feed = FakeFeed(["AAPL", "MSFT"], rows=3)
+    build(feed, SimBroker(), [FakeAlgo("a", "AAPL")], ledger=ledger,
+          end_commission=commission).run_backtest()
+    assert seen["commission"] is commission
+    assert seen["time"] == T0 + 2 * STEP
+    assert seen["closes"] == {"AAPL": 102.0, "MSFT": 112.0}
+    (trip,) = ledger.round_trips
+    assert trip.side == "short" and trip.net == Decimal("38.0000")  # 5 * (110 - 102) - 2
+
+
+def test_exception_in_on_bar_propagates_and_stops_the_run() -> None:
+    class Bad(RecordingBroker):
+        def on_bar(self, symbol: str, bar: Bar) -> None:
+            raise RuntimeError("on_bar boom")
+
+    algo = FakeAlgo("a", "AAPL")
+    with pytest.raises(RuntimeError, match="on_bar boom"):
+        build(FakeFeed(["AAPL"]), Bad([]), [algo]).run_backtest()
+    assert algo.frames == []
+
+
+def test_single_post_warmup_bar_marks_once_and_finishes_once() -> None:
+    events: list = []
+    ledger = Ledger()
+    ledger.open_account("a", "AAPL", 1000)
+    broker = RecordingBroker(events)
+    build(FakeFeed(["AAPL"], rows=1), broker, [FakeAlgo("a", "AAPL")], ledger=ledger).run_backtest()
+    assert len(ledger.equity_points) == 2
+    assert [e[0] for e in events] == ["on_bar", "on_end"]
