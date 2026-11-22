@@ -10,12 +10,25 @@ Money and prices are `Decimal` quantized to 0.0001 with ROUND_HALF_EVEN, which
 is exactly Python's `round(x, 4)` on the float. Capital is notional: nothing
 here checks buying power.
 
+Whole shares only for now: fractional quantities are accepted but rounding
+of partial-exit cost basis to 0.0001 can then drift the identity below.
+
 Definitions, for one account (one algo):
 - cash = capital + signed fill value - commissions paid;
-- realised P&L = sum of net P&L of its closed round trips;
-- unrealised P&L = open positions marked to the last close, minus the
-  commission already paid on them;
-- equity = cash + position value = capital + realised + unrealised.
+- cost basis: a position keeps the cost of its open quantity (average cost
+  method); an exit fill removes `open cost * qty / open qty` of it;
+- realised P&L accrues at every exit fill: (exit value - removed cost for a
+  long, the reverse for a short), minus the share of the position's pending
+  commission released by that fill (`pending * qty / open qty`, everything
+  on the closing fill). Entry commission stays pending until released;
+- unrealised P&L = open quantity marked to the last close against its
+  remaining cost, minus the commission still pending on it;
+- equity = cash + position value = capital + realised + unrealised, exactly
+  (to the Decimal) at every mark, also with partial exits. Once a position is
+  flat, its realised contributions sum to its round trip's `net`;
+- a round trip is still one record, flat to flat (entry/exit prices are
+  averages over all its entry/exit fills; `gross` is the sum of its
+  realised gross parts).
 
 This module must not import anything from `MainStoinker.*` outside
 `MainStoinker.engine`, nor `ibapi`.
@@ -32,6 +45,9 @@ from typing import Literal
 Side = Literal["buy", "sell"]
 FillReason = Literal["entry", "stop", "target", "algo_exit", "end_of_data"]
 OrderEventKind = Literal["placed", "modified", "cancelled"]
+IgnoredKind = Literal["close", "modify_stop", "take_profit"]
+
+IGNORED_KINDS: tuple[str, ...] = ("close", "modify_stop", "take_profit")
 
 FILL_REASONS: tuple[str, ...] = ("entry", "stop", "target", "algo_exit", "end_of_data")
 ZERO = Decimal("0.0000")
@@ -113,9 +129,20 @@ class EquityPoint:
     time: datetime
     account: str | None
     cash: Decimal
+    position_value: Decimal  # equity - cash: signed market value of open positions
     realised: Decimal
     unrealised: Decimal
     equity: Decimal
+
+
+@dataclass(frozen=True)
+class IgnoredEvent:
+    """A request the broker ignored because the position was already closed or gone."""
+
+    account: str
+    broker_ref: Hashable
+    kind: IgnoredKind
+    time: datetime
 
 
 @dataclass(frozen=True)
@@ -147,7 +174,10 @@ class _Position:
         self.entry_value = Decimal(0)
         self.exit_qty = Decimal(0)
         self.exit_value = Decimal(0)
-        self.commission = Decimal(0)
+        self.open_cost = Decimal(0)  # cost basis of the open quantity
+        self.realised_gross = Decimal(0)  # gross P&L already realised by exit fills
+        self.commission = Decimal(0)  # all commission paid on this position
+        self.pending = Decimal(0)  # part of it not yet released into realised P&L
 
     @property
     def open_qty(self) -> Decimal:
@@ -155,14 +185,12 @@ class _Position:
 
     @property
     def average_price(self) -> Decimal:
-        return money(self.entry_value / self.entry_qty)
+        return money(self.open_cost / self.open_qty)
 
     def unrealised_gross(self, close: Decimal) -> Decimal:
-        """Mark-to-market of the open quantity against its average entry cost."""
-        open_qty = self.open_qty
-        cost =self.entry_value / self.entry_qty * open_qty
-        value = close * open_qty
-        return money(value - cost if self.long else cost - value)
+        """Mark-to-market of the open quantity against its remaining cost."""
+        value = close * self.open_qty
+        return money(value - self.open_cost if self.long else self.open_cost - value)
 
 
 class _AccountState:
@@ -170,7 +198,6 @@ class _AccountState:
         self.info = info
         self.cash = info.capital
         self.realised = ZERO
-        self.ignored_closes = 0
         self.positions: dict[Hashable, _Position] = {}
 
 
@@ -202,9 +229,9 @@ class AccountRecorder:
         return self._ledger._fill(self.idname, ref, side, quantity, price, commission,
                                   time, reason, order_id, False)
 
-    def ignored_close(self, ref: Hashable) -> None:
-        """Count a close request the broker ignored because the position was already closed."""
-        self._ledger._accounts[self.idname].ignored_closes += 1
+    def ignored(self, ref: Hashable, *, time: datetime, kind: IgnoredKind) -> None:
+        """Record a request the broker ignored (position already closed or gone)."""
+        self._ledger._ignored(self.idname, ref, kind, time)
 
 
 class Ledger:
@@ -217,6 +244,7 @@ class Ledger:
         self._fills: list[Fill] = []
         self._round_trips: list[RoundTrip] = []
         self._equity: list[EquityPoint] = []
+        self._ignored_events: list[IgnoredEvent] = []
         self._marks: dict[str, Decimal] = {}
         self._next_order_id = 1
         self._next_fill_id = 1
@@ -279,6 +307,9 @@ class Ledger:
                 raise ValueError("entry fill on the opposite side of the open position")
             pos.entry_qty += qty
             pos.entry_value += qty * px
+            pos.open_cost += qty * px
+            pos.commission += comm
+            pos.pending += comm
         else:
             if pos is None:
                 raise ValueError(f"{reason} fill with no open position for ref {ref!r}")
@@ -286,26 +317,39 @@ class Ledger:
                 raise ValueError("exit fill must be on the opposite side of the position")
             if qty > pos.open_qty:
                 raise ValueError("exit fill larger than the open position")
+            full = qty == pos.open_qty
+            removed = pos.open_cost if full else money(pos.open_cost * qty / pos.open_qty)
+            part = money(qty * px - removed if pos.long else removed - qty * px)
+            pos.commission += comm
+            pos.pending += comm
+            release = pos.pending if full else money(pos.pending * qty / pos.open_qty)
             pos.exit_qty += qty
             pos.exit_value += qty * px
-        pos.commission += comm
+            pos.open_cost -= removed
+            pos.pending -= release
+            pos.realised_gross += part
+            acct.realised = money(acct.realised + part - release)
         acct.cash += money((-qty * px if side == "buy" else qty * px) - comm)
 
+        synthetic = synthetic or reason == "end_of_data"
         fill_id = self._next_fill_id
         self._next_fill_id += 1
         self._fills.append(Fill(fill_id, order_id, idname, ref, acct.info.symbol, side, qty, px,
                                 comm, time, reason, synthetic))
         if reason != "entry" and pos.open_qty == 0:
-            self._close(acct, pos, time, reason, synthetic or reason == "end_of_data")
+            self._close(acct, pos, time, reason, synthetic)
         return fill_id
+
+    def _ignored(self, idname: str, ref: Hashable, kind: IgnoredKind, time: datetime) -> None:
+        if kind not in IGNORED_KINDS:
+            raise ValueError(f"unknown ignored kind {kind!r}")
+        self._ignored_events.append(IgnoredEvent(idname, ref, kind, time))
 
     def _close(self, acct: _AccountState, pos: _Position, time: datetime, reason: FillReason,
                synthetic: bool) -> None:
-        gross = money(pos.exit_value - pos.entry_value if pos.long
-                      else pos.entry_value - pos.exit_value)
+        gross = money(pos.realised_gross)
         commission = money(pos.commission)
         net = money(gross - commission)
-        acct.realised = money(acct.realised + net)
         del acct.positions[pos.ref]
         self._round_trips.append(RoundTrip(
             acct.info.idname, pos.ref, pos.symbol, "long" if pos.long else "short",
@@ -330,24 +374,39 @@ class Ledger:
         return points
 
     def finish(self, time: datetime, closes_by_symbol: Mapping[str, float | Decimal],
-               commission: Callable[[Decimal], float | Decimal] | None = None) -> list[RoundTrip]:
+               commission: Callable[[str, Decimal], float | Decimal] | None = None
+               ) -> list[RoundTrip]:
         """Close every open position with a synthetic `end_of_data` fill at the given close.
 
-        `commission(quantity)` supplies the charge per synthetic fill (the cost
-        model is the broker's); without it the fill is free. A position whose
-        symbol has no close is closed at its average entry price. Returns the
-        round trips this call created.
+        `commission(idname, quantity)` supplies the charge per synthetic fill
+        (each algo has its own broker and cost model); without it the fill is
+        free. A symbol absent from `closes_by_symbol` uses its last mark; if an
+        open position's symbol has neither, `ValueError` is raised (before
+        anything is closed), since a missing close at end of data is a wiring
+        bug. Afterwards one final equity point per account plus the total is
+        stored at `time`, replacing any points already stored at that same
+        time, so the last stored point equals `equity()`. Returns the round
+        trips this call created.
         """
+        prices: dict[str, Decimal] = {s: money(c) for s, c in closes_by_symbol.items()}
+        for acct in self._accounts.values():
+            for pos in acct.positions.values():
+                if pos.symbol not in prices and pos.symbol not in self._marks:
+                    raise ValueError(f"no close for open position of account "
+                                     f"{acct.info.idname!r} in symbol {pos.symbol!r}")
+        self._marks.update(prices)
         before = len(self._round_trips)
         for acct in self._accounts.values():
             for pos in list(acct.positions.values()):
                 qty = pos.open_qty
-                close = closes_by_symbol.get(pos.symbol)
-                price = money(close) if close is not None else pos.average_price
-                self._marks[pos.symbol] = price
-                comm = commission(qty) if commission else ZERO
-                self._fill(acct.info.idname, pos.ref, "sell" if pos.long else "buy", qty, price,
-                           comm, time, "end_of_data", None, True)
+                comm = commission(acct.info.idname, qty) if commission else ZERO
+                self._fill(acct.info.idname, pos.ref, "sell" if pos.long else "buy", qty,
+                           self._marks[pos.symbol], comm, time, "end_of_data", None, True)
+        points = [self._point(time, idname) for idname in self._accounts]
+        points.append(self._point(time, None))
+        while self._equity and self._equity[-1].time == time:
+            self._equity.pop()
+        self._equity.extend(points)
         return self._round_trips[before:]
 
     # --- results -----------------------------------------------------------
@@ -361,7 +420,7 @@ class Ledger:
         total = ZERO
         for pos in acct.positions.values():
             close = self._marks.get(pos.symbol, pos.average_price)
-            total += pos.unrealised_gross(close) - money(pos.commission)
+            total += pos.unrealised_gross(close) - pos.pending
         return money(total)
 
     def _position_value(self, acct: _AccountState) -> Decimal:
@@ -375,7 +434,7 @@ class Ledger:
         accts = self._select(account)
         cash = money(sum((a.cash for a in accts), ZERO))
         value = money(sum((self._position_value(a) for a in accts), ZERO))
-        return EquityPoint(time, account, cash, self.realised_pnl(account),
+        return EquityPoint(time, account, cash, value, self.realised_pnl(account),
                            self.unrealised_pnl(account), money(cash + value))
 
     def cash(self, account: str | None = None) -> Decimal:
@@ -391,8 +450,19 @@ class Ledger:
         accts = self._select(account)
         return money(self.cash(account) + sum((self._position_value(a) for a in accts), ZERO))
 
+    def ignored_count(self, kind: IgnoredKind | None = None, account: str | None = None) -> int:
+        """Ignored requests, optionally narrowed to one kind and/or one account."""
+        if account is not None and account not in self._accounts:
+            raise KeyError(account)
+        return sum(1 for e in self._ignored_events
+                   if (kind is None or e.kind == kind) and (account is None or e.account == account))
+
     def ignored_closes(self, account: str | None = None) -> int:
-        return sum(a.ignored_closes for a in self._select(account))
+        return self.ignored_count("close", account)
+
+    @property
+    def ignored_events(self) -> tuple[IgnoredEvent, ...]:
+        return tuple(self._ignored_events)
 
     @property
     def accounts(self) -> tuple[AccountInfo, ...]:

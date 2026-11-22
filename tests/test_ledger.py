@@ -111,8 +111,8 @@ def test_flat_algo_equity_is_capital():
 def test_second_close_is_ignored_and_counted():
     led, rec = one_account()
     round_trip(rec, 1)
-    rec.ignored_close(1)
-    rec.ignored_close(1)
+    rec.ignored(1, time=at(6), kind="close")
+    rec.ignored(1, time=at(7), kind="close")
     assert led.ignored_closes() == 2
     assert led.ignored_closes("algo1") == 2
     assert len(led.round_trips) == 1
@@ -122,7 +122,7 @@ def test_second_close_is_ignored_and_counted():
 def test_end_of_data_close_is_synthetic_and_flagged():
     led, rec = one_account(1000)
     rec.fill(1, side="buy", quantity=10, price=10.0, commission=1.0, time=at(0), reason="entry")
-    closed = led.finish(at(9), {"AAPL": 12.0}, commission=lambda q: Decimal("1"))
+    closed = led.finish(at(9), {"AAPL": 12.0}, commission=lambda name, q: Decimal("1"))
     (rt,) = closed
     assert led.round_trips == (rt,)
     assert rt.synthetic
@@ -289,7 +289,7 @@ def test_sequential_round_trips_on_one_ref_are_independent():
 def test_finish_short_with_commission_callable_and_without():
     led, rec = one_account(1000)
     rec.fill(1, side="sell", quantity=10, price=20.0, commission=1.0, time=at(0), reason="entry")
-    (rt,) = led.finish(at(1), {"AAPL": 18.0}, commission=lambda q: q * Decimal("0.1"))
+    (rt,) = led.finish(at(1), {"AAPL": 18.0}, commission=lambda name, q: q * Decimal("0.1"))
     assert (rt.side, rt.gross, rt.commission, rt.net) == (
         "short", Decimal("20.0000"), Decimal("2.0000"), Decimal("18.0000"))
     assert led.equity() == Decimal("1018.0000")
@@ -396,3 +396,177 @@ def test_fresh_ledgers_share_no_state():
     assert b.fills == () and b.round_trips == () and b.accounts == ()
     rec_b = b.open_account("algo1", "AAPL", 1)
     assert rec_b.order_placed(1, time=at(0), side="buy", quantity=1, order_type="market") == 1
+
+
+# --- review-fix tests: partial exits, finish, ignored events ------------------
+
+
+@pytest.mark.parametrize("long", [True, False])
+def test_partial_exit_keeps_equity_identity(long):
+    led, rec = one_account(1000)
+    open_side, close_side = ("buy", "sell") if long else ("sell", "buy")
+    rec.fill(1, side=open_side, quantity=10, price=10.0, commission=0, time=at(0), reason="entry")
+    exit_price = 12.0 if long else 8.0
+    rec.fill(1, side=close_side, quantity=4, price=exit_price, commission=0, time=at(1),
+             reason="target")
+    assert led.realised_pnl() == Decimal("8.0000")  # 4 shares x 2.00, realised at the fill
+    mark = 11.0 if long else 9.0
+    (pt, _) = led.mark(at(2), {"AAPL": mark})
+    assert pt.equity == Decimal("1014.0000")
+    assert pt.realised + pt.unrealised == Decimal("14.0000")
+    assert pt.equity == Decimal("1000") + pt.realised + pt.unrealised
+    assert not led.round_trips  # still open
+
+
+def test_partial_exit_commission_released_proportionally_and_round_trip_is_one_record():
+    led, rec = one_account(1000)
+    rec.fill(1, side="buy", quantity=10, price=10.0, commission=1.0, time=at(0), reason="entry")
+    rec.fill(1, side="sell", quantity=4, price=12.0, commission=0.5, time=at(1), reason="target")
+    # pending 1.5 -> 4/10 released = 0.6; realised = 8 - 0.6
+    assert led.realised_pnl() == Decimal("7.4000")
+    rec.fill(1, side="sell", quantity=6, price=13.0, commission=0.5, time=at(2), reason="stop")
+    (rt,) = led.round_trips
+    assert (rt.quantity, rt.gross, rt.commission, rt.net) == (
+        Decimal("10.0000"), Decimal("26.0000"), Decimal("2.0000"), Decimal("24.0000"))
+    assert rt.exit_price == Decimal("12.6000")
+    assert rt.exit_reason == "stop"
+    assert led.realised_pnl() == rt.net
+    assert led.equity() == Decimal("1024.0000")
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_equity_identity_exact_with_entries_partial_exits_and_commissions(seed):
+    rng = random.Random(seed)
+    capital = Decimal("5000")
+    led, rec = one_account(5000)
+    ref, state = 0, None  # state = [long, open_qty]
+    for t in range(400):
+        comm = rng.choice((0, 0.35, 1.0, 1.25))
+        px = round(rng.uniform(1, 200), 2)
+        if state is None:
+            ref += 1
+            state = [rng.random() < 0.5, rng.randint(1, 40)]
+            rec.fill(ref, side="buy" if state[0] else "sell", quantity=state[1], price=px,
+                     commission=comm, time=at(t), reason="entry")
+        elif rng.random() < 0.3:
+            extra = rng.randint(1, 30)
+            rec.fill(ref, side="buy" if state[0] else "sell", quantity=extra, price=px,
+                     commission=comm, time=at(t), reason="entry")
+            state[1] += extra
+        elif rng.random() < 0.7:
+            q = rng.randint(1, state[1])
+            rec.fill(ref, side="sell" if state[0] else "buy", quantity=q, price=px,
+                     commission=comm, time=at(t), reason="algo_exit")
+            state[1] -= q
+            if state[1] == 0:
+                state = None
+        if state is None:
+            assert led.realised_pnl() == sum((rt.net for rt in led.round_trips), Decimal(0))
+        (pt, total) = led.mark(at(t), {"AAPL": round(rng.uniform(1, 200), 2)})
+        assert pt.equity == capital + pt.realised + pt.unrealised
+        assert pt.equity == pt.cash + pt.position_value
+        assert total.equity == pt.equity
+
+
+def test_equity_point_has_position_value():
+    led, rec = one_account(1000)
+    rec.fill(1, side="sell", quantity=10, price=20.0, commission=0, time=at(0), reason="entry")
+    (pt, total) = led.mark(at(1), {"AAPL": 18.0})
+    assert pt.position_value == Decimal("-180.0000")
+    assert total.position_value == Decimal("-180.0000")
+    assert pt.equity == pt.cash + pt.position_value
+
+
+def test_finish_appends_final_equity_point_matching_equity():
+    led, rec = one_account(1000)
+    rec.fill(1, side="buy", quantity=10, price=10.0, commission=1.0, time=at(0), reason="entry")
+    led.mark(at(1), {"AAPL": 11.0})
+    led.finish(at(2), {"AAPL": 12.0}, commission=lambda name, q: Decimal("1"))
+    last_acct, last_total = led.equity_points[-2:]
+    assert (last_acct.time, last_acct.account, last_total.account) == (at(2), "algo1", None)
+    assert last_acct.equity == last_total.equity == led.equity() == Decimal("1018.0000")
+    assert last_acct.position_value == Decimal("0.0000")
+    assert last_acct.unrealised == Decimal("0.0000")
+    assert last_acct.realised == Decimal("18.0000")
+
+
+def test_finish_replaces_points_already_stored_at_the_same_time():
+    led, rec = one_account(1000)
+    rec.fill(1, side="buy", quantity=10, price=10.0, commission=0, time=at(0), reason="entry")
+    led.mark(at(1), {"AAPL": 11.0})
+    led.finish(at(1), {"AAPL": 11.0})  # same bar as the last mark: replace, not duplicate
+    assert [p.time for p in led.equity_points] == [at(1), at(1)]
+    assert led.equity_points[0].position_value == Decimal("0.0000")
+    # Nothing open and identical values at the same time: still no duplicate.
+    led2, _ = one_account(1000)
+    led2.mark(at(1), {"AAPL": 5.0})
+    led2.finish(at(1), {"AAPL": 5.0})
+    assert len(led2.equity_points) == 2
+
+
+def test_finish_commission_is_per_account():
+    led = Ledger()
+    a = led.open_account("a", "AAPL", 1000)
+    b = led.open_account("b", "AAPL", 1000)
+    a.fill(1, side="buy", quantity=10, price=10.0, commission=0, time=at(0), reason="entry")
+    b.fill(1, side="buy", quantity=10, price=10.0, commission=0, time=at(0), reason="entry")
+    seen = []
+
+    def per_account(idname, qty):
+        seen.append((idname, qty))
+        return Decimal("1") if idname == "a" else Decimal("3")
+
+    led.finish(at(1), {"AAPL": 10.0}, commission=per_account)
+    assert seen == [("a", Decimal("10.0000")), ("b", Decimal("10.0000"))]
+    assert led.realised_pnl("a") == Decimal("-1.0000")
+    assert led.realised_pnl("b") == Decimal("-3.0000")
+
+
+def test_end_of_data_reason_fill_is_synthetic_even_when_recorded_directly():
+    led, rec = one_account()
+    rec.fill(1, side="buy", quantity=1, price=1.0, commission=0, time=at(0), reason="entry")
+    rec.fill(1, side="sell", quantity=1, price=2.0, commission=0, time=at(1), reason="end_of_data")
+    assert led.fills[-1].synthetic
+    assert led.round_trips[0].synthetic
+    assert not led.fills[0].synthetic
+
+
+def test_finish_without_any_close_raises_naming_account_and_symbol():
+    led = Ledger()
+    a = led.open_account("algoA", "AAPL", 1000)
+    a.fill(1, side="buy", quantity=1, price=1.0, commission=0, time=at(0), reason="entry")
+    with pytest.raises(ValueError, match="algoA.*AAPL"):
+        led.finish(at(1), {"MSFT": 5.0})
+    assert led.open_positions()  # nothing was closed
+    assert led.round_trips == ()
+
+
+def test_finish_uses_last_mark_when_close_is_missing():
+    led, rec = one_account(1000)
+    rec.fill(1, side="buy", quantity=10, price=10.0, commission=0, time=at(0), reason="entry")
+    led.mark(at(1), {"AAPL": 12.0})
+    (rt,) = led.finish(at(2), {})
+    assert rt.exit_price == Decimal("12.0000")
+    assert led.equity() == Decimal("1020.0000")
+
+
+def test_ignored_events_are_recorded_and_counted_per_kind_and_account():
+    led = Ledger()
+    a = led.open_account("a", "AAPL", 1000)
+    b = led.open_account("b", "MSFT", 1000)
+    a.ignored(1, time=at(1), kind="close")
+    a.ignored(1, time=at(2), kind="modify_stop")
+    a.ignored(2, time=at(3), kind="take_profit")
+    b.ignored(1, time=at(4), kind="close")
+    assert led.ignored_count() == 4
+    assert led.ignored_count("close") == 2
+    assert led.ignored_count("modify_stop", "a") == 1
+    assert led.ignored_count("take_profit", "b") == 0
+    assert led.ignored_count(account="a") == 3
+    assert led.ignored_closes("b") == 1
+    ev = led.ignored_events[0]
+    assert (ev.account, ev.broker_ref, ev.kind, ev.time) == ("a", 1, "close", at(1))
+    with pytest.raises(ValueError, match="kind"):
+        a.ignored(1, time=at(5), kind="bogus")  # type: ignore[arg-type]
+    with pytest.raises(KeyError):
+        led.ignored_count(account="nope")
