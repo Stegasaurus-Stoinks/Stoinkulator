@@ -19,6 +19,15 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   successors) must be flagged `needs-human-review` in the PR. A reviewer
   agent's approval is not sufficient for these.
 - Never commit credentials, account numbers or machine addresses.
+- Three mechanical guards back these rules. `IBapi.connect` refuses any port
+  other than the paper ports 7497 / 4002 unless `STOINK_ALLOW_LIVE_PORT=1`,
+  which only a human sets, on the trading machine. Any broker connection
+  during a pytest run raises (`tests/conftest.py`). A `PreToolUse` hook
+  (`.claude/settings.json`, `.claude/hooks/block_live_launch.py`) blocks shell
+  commands that would run the entry script or the launcher.
+- Never set that variable, and never weaken, disable, bypass or work around
+  any of the guards or their tests. Changing them is only allowed as an
+  approved task with `needs-human-review`.
 
 ## Commands
 
