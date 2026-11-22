@@ -1,0 +1,208 @@
+# Milestone 4 spec: API and dashboard
+
+Status: draft, waiting for the owner's answers under "Decisions needed".
+
+## Goal
+
+Milestone 2 stores every run in SQLite and can print it on the command line.
+Milestone 4 puts that in a browser: a small read-only web API over the
+database and a dashboard that shows runs, account and per-algo performance,
+trades and charts.
+
+It is built on stored backtest runs, because that is what exists today. Paper
+and live runs will go into the same database with the same tables, so the
+dashboard shows them without redesign once the live side exists.
+
+Done means:
+
+1. `python -m MainStoinker serve --db SPEC` starts a local web server that
+   never writes to the database and never touches a broker.
+2. The API returns runs, statistics, trades, orders, equity curves and price
+   bars as JSON, with the same numbers as `report --json`.
+3. The dashboard has four views: run list, run overview, algo detail with a
+   price chart and trade markers, and a comparison of two runs.
+4. The hardcoded front-end address in `Globals.py` is gone (issue 20).
+
+## What stays as it is
+
+- The engine, the brokers, the ledger, the store schema (version 1) and every
+  golden file. This milestone only reads.
+- The live program, `apiApi.py`, `trade.py`, and the old socket.io client
+  (`Util/SocketIO_Client.py`). The old client is not extended; it is removed
+  with the legacy runtime in milestone 1 Phase B.
+- The algos.
+
+## Design
+
+### Package layout
+
+- `MainStoinker/api/`: the web API. It imports `MainStoinker.engine` (store,
+  stats, report) and nothing legacy. A test enforces this, like the engine's
+  import boundary. The engine does not import the API.
+- `MainStoinker/api/static/`: the dashboard files, served by the API.
+- New dependencies: `fastapi`, `uvicorn`, and `httpx` for tests only. They are
+  needed only by `serve`; `backtest`, `runs` and `report` must still work
+  without them installed.
+
+### The `serve` command
+
+```
+python -m MainStoinker serve --db SPEC [--host 127.0.0.1] [--port 8750]
+```
+
+- `--db` is required unless the environment variable `STOINK_DB` is set.
+  `backtest`, `runs` and `report` accept `STOINK_DB` the same way, so the
+  database location is set once per machine and never committed.
+- The database must exist; `serve` does not create one. It is opened
+  read-only (`mode=ro`), per request, so a backtest can write while the
+  dashboard is open.
+- Exit code 2 for a usage error, a missing database or a missing dependency,
+  with one line on stderr.
+
+### Safety and privacy
+
+- **Local only.** The default host is `127.0.0.1`. Any other host is refused
+  unless `--allow-remote` is given, because there is no login in this
+  milestone.
+- **Read-only.** Only `GET` routes exist. No route starts a run, changes
+  config or reaches a broker. `MainStoinker/api/` must not import `ibapi`,
+  `apiApi` or `trade`; the import-boundary test covers it.
+- **No machine details.** The API never returns the database path, the
+  absolute data directory or the user name. The data directory is shown by its
+  last folder name only.
+- **No cross-origin access.** No CORS headers; the dashboard is served from
+  the same origin.
+
+### API
+
+All routes are under `/api`. Money, prices and quantities are strings with
+four decimals, exactly as `report --json` prints them; times are ISO 8601 in
+UTC. The statistics come from `engine/stats.py`, so a number has one
+definition everywhere.
+
+| Route | Returns |
+|---|---|
+| `GET /api/health` | API version, schema version, number of runs, runs that never finished |
+| `GET /api/runs` | Run summaries, newest first (what `runs --json` prints) |
+| `GET /api/runs/{id}` | Run header and statistics per algo and in total (what `report --json` prints) |
+| `GET /api/runs/{id}/trades?algo=` | Round trips, in exit order |
+| `GET /api/runs/{id}/orders?algo=` | Order events and fills |
+| `GET /api/runs/{id}/equity?algo=&max_points=` | Equity series of one algo, or of the account when `algo` is left out |
+| `GET /api/runs/{id}/bars?symbol=&start=&end=` | One-minute bars for the price chart |
+| `GET /api/compare?runs=1,2` | Statistics of the listed runs side by side, matched by algo `idname` |
+
+- An unknown run, algo or symbol is a 404 with a one-line JSON message. A bad
+  parameter is a 422. A database error is a 503 with one line, never a
+  traceback.
+- `max_points` thins a long equity series by keeping the last point of each
+  bucket plus every peak and trough, so the drawdown still reads correctly.
+- A run that never finished is reported with status `incomplete`, as `runs`
+  does.
+
+### Bars
+
+Bars are not in the database. The bars route reads the CSV files of the run's
+stored data directory through the engine's existing bar loader. If the
+directory no longer exists, or the file changed since the run, the route says
+so and the dashboard shows the trades without candles. The response is limited
+to a time window (default: the session of the selected trade or day) so a long
+history is never sent in one piece.
+
+### Dashboard
+
+Plain HTML, CSS and JavaScript modules served as static files: no Node, no
+build step, no framework. Charts use TradingView Lightweight Charts, copied
+into the repo at a pinned version (Apache 2.0; it requires an attribution
+link, which goes in the page footer). The old front end's series types (line,
+segment, markers, baseline) suggest it used the same library.
+
+Views:
+
+1. **Runs.** Table of runs: start, duration, status, kind, fill model, algos,
+   trades, net, code version. Filter by kind and status. Tick two to compare.
+2. **Run overview.** Account equity curve with the drawdown under it, the
+   run's settings (capital, costs, fill model, bar range), and the per-algo
+   table from `report`. Notes for synthetic closes, ignored events and
+   cancelled entries.
+3. **Algo detail.** Equity curve of one algo, its trade table (sortable, with
+   exit reason), and a candle chart with entry and exit markers. Selecting a
+   trade moves the chart to it.
+4. **Compare.** Two runs side by side: statistics per algo and both equity
+   curves on one chart. This is the legacy-versus-realistic view now and the
+   paper-versus-live view later.
+
+A header strip shows the health route: database reachable, schema version,
+and any incomplete runs. Process health (heartbeat, broker connection) is
+milestone 3.
+
+The page loads data when opened and has a refresh button. Live updates are not
+part of this phase: runs are written once, at the end (issue 70 covers
+incremental writes).
+
+### Front-end address (issue 20)
+
+`Globals.Config.FrontEndPort` becomes a value read from the environment
+variable `STOINK_FRONTEND_ADDR` with `localhost:3000` as the default.
+`LiveTrading`, `LiveData`, `TWS_HOST` and `TWS_PORT` are not touched.
+
+### Database location
+
+The store keeps refusing OneDrive folders. Its hint changes from
+`%LOCALAPPDATA%\Stoinkulator\runs.db` to `%USERPROFILE%\Stoinkulator\runs.db`:
+programs installed from the Microsoft Store (the Claude app is one) get a
+private copy of `AppData`, so a database created there by one program is
+invisible to another. A plain folder in the user profile has no such problem.
+
+## Testing
+
+- API tests use FastAPI's test client against a database built in a temp
+  directory by the existing harness. They pin that each route returns the same
+  numbers as `report --json` for the paper golden cases.
+- Tests for: read-only open (a write through the API's connection fails), the
+  host refusal, 404 and 503 paths, no absolute path or user name in any
+  response, the import boundary, and `backtest` working with the web
+  dependencies absent.
+- The JavaScript is kept thin (fetch, format, draw) so the logic that can be
+  wrong lives in Python. One test checks that every static file the pages
+  reference is served. Each dashboard task is also checked by hand in a
+  browser against the two stored runs, with a screenshot in the pull request.
+
+## Phases
+
+**Phase A, stored runs (this spec).** Rough task list; the task divider
+produces the final split:
+
+- C1. `serve` command, dependencies, health route, safety refusals,
+  `STOINK_DB`.
+- C2. Runs and run-detail routes.
+- C3. Trades, orders and equity routes, with thinning.
+- C4. Bars route.
+- C5. Compare route.
+- C6. Dashboard shell and runs view.
+- C7. Run overview.
+- C8. Algo detail with the candle chart.
+- C9. Compare view.
+- C10. Issue 20 and the database-location hint.
+
+**Phase B, with the live side.** Live updates (server-sent events), paper and
+live runs side by side, open positions, the account view from the broker, and
+a login if the dashboard is ever reached from another machine.
+
+**Later.** Indicator overlays on the candle chart (moving averages, opening
+range, wave points). The algos already describe these series for the old
+front end, but they are not stored; storing them needs a schema change and is
+left out of Phase A.
+
+## Decisions needed
+
+1. **Dashboard technology.** Recommended: plain static pages with no build
+   step, as described. The alternative is a React app, which needs Node and a
+   build pipeline and is worth it only if the dashboard grows well beyond
+   these views.
+2. **Chart library.** Recommended: TradingView Lightweight Charts, copied into
+   the repo. It requires a visible attribution link.
+3. **Access.** Recommended: this machine only, no login, in Phase A.
+4. **Indicator overlays.** Recommended: leave for later, as above. Including
+   them now adds a schema change and about two tasks.
+5. **Database location.** Recommended: `%USERPROFILE%\Stoinkulator\runs.db`,
+   set once through `STOINK_DB`.
