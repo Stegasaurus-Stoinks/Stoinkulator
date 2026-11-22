@@ -1,7 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime
 from dateutil.relativedelta import relativedelta
 import logging
+import os
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,7 @@ class Config:
 
     # Frontend
     FrontEndDisplay: bool = True
-    FrontEndPort: str = '192.168.0.69:3000'
+    FrontEndPort: str = field(default_factory=lambda: os.environ.get("STOINK_FRONTEND_ADDR") or "localhost:3000")
     intraMinuteDisplay: bool = True
 
     # Backtesting
