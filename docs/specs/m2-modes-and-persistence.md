@@ -1,6 +1,7 @@
 # Milestone 2 spec: results you can trust and keep
 
-Status: draft for owner approval. Input to the task-divider once approved.
+Status: approved by the owner on 2026-11-21, except the choice of database
+(decision 1), which is still open. See "Decisions" at the end.
 
 ## Goal
 
@@ -148,15 +149,17 @@ dashboard shows comes from the store. So:
    with no further design work.
 4. Milestone 3, unattended operation.
 
-## Decisions for the owner
+## Decisions
 
-1. **Database.** SQLite file (recommended: no server, nothing to install,
-   enough for one machine) or PostgreSQL (`psycopg2` is in the requirements
-   but unused).
-2. **Order of milestones.** Dashboard before the live side, as above?
-3. **Fill model defaults.** Entry at the next bar's open; stop assumed first
-   when a bar covers both stop and target. Agreed?
-4. **Costs and capital.** Proposed defaults: commission 0.005 per share with a
-   1.00 minimum per order, no slippage, 10,000 starting capital per algo. All
-   configurable; the commission figures should be checked against the
-   account's actual IBKR pricing plan.
+1. **Database: open.** SQLite file is the working assumption; the owner has
+   asked what it is for and has not yet chosen. Only the store task depends on
+   this.
+2. **Order of milestones: approved (2026-11-21).** Dashboard before the live
+   side, as listed above.
+3. **Fill model defaults: approved (2026-11-21).** Entry at the next bar's
+   open; the stop is assumed to fill first when a bar covers both stop and
+   target.
+4. **Costs and capital: approved (2026-11-21).** Commission 0.005 per share
+   with a 1.00 minimum per order, no slippage, 10,000 starting capital per
+   algo. All configurable; the commission figures are still to be checked
+   against the account's actual IBKR pricing plan.
