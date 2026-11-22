@@ -67,11 +67,16 @@ def stage_offline_data(workdir: Path, symbols: list[str], max_rows: int | None =
             pd.read_csv(OFFLINE_DATA / name, index_col=0).head(max_rows).to_csv(target / name)
 
 
-def run_offline_backtest(algo_id: str, algo_configs: list[dict], warmup_days: int = 2) -> list:
+def run_offline_backtest(
+    algo_id: str, algo_configs: list[dict], warmup_days: int = 2, *, broker=None
+) -> list:
     """Run algo_id over offline data for each config. Returns the algo objects.
 
     The current working directory must contain OfflineData/ (see
     stage_offline_data); the runtime also writes its log and CSV output there.
+
+    If `broker` is given it is set as `algo.broker` on every algo before the
+    replay, so their trades report to it. Without it the legacy path runs.
     """
     from MainStoinker.DataCollection.apiApi import ibapi
     from MainStoinker.MainStuff import Globals
@@ -89,6 +94,8 @@ def run_offline_backtest(algo_id: str, algo_configs: list[dict], warmup_days: in
             ticker = Ticker(cfg["ticker"], len(by_symbol))
             by_symbol[cfg["ticker"]] = ticker
         algo = utils.algo_starter(algo_id, cfg)
+        if broker is not None:
+            algo.broker = broker
         ticker.register_algo(algo)
         algos.append(algo)
 

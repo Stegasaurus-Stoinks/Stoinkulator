@@ -13,7 +13,7 @@ class Trade:
     #OpenPrice is the price the algo tried to buy at, which will likely be different from the entryPrice, same for openTime vs entryTime
     #used for tracking entry discrpencies since we are going to start with market orders and not limit orders
 
-    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, logger, limitOrder = False):
+    def __init__(self, symbol, volume, ID, openPrice, openTime, direction, logger, limitOrder = False, *, broker = None):
         self.symbol = symbol
         self.volume = volume
         self.tradeID = ID
@@ -44,7 +44,12 @@ class Trade:
         self.stopDelta = abs(openPrice - self.stopPrice)
         
 
-        if config.LiveTrading:
+        self.broker = broker
+
+        if self.broker is not None:
+            self.brokerRef = self.broker.open_position(symbol=self.symbol, volume=self.volume, direction=self.direction, price=self.openPrice, time=self.openTime, limit=self.limitOrder, stop_price=self.stopPrice, oca_group=self.ocaGroupName)
+            self.fake_open()
+        elif config.LiveTrading:
             self.open_position()
         else:
             self.fake_open()
@@ -123,7 +128,15 @@ class Trade:
 
         #call funtion to close order through api
 
-        if config.LiveTrading:
+        if self.broker is not None:
+            self.broker.close_position(self.brokerRef, price=closePrice, time=closeTime)
+
+            self.position = False
+            self.status = "Closed"
+
+            print("Closed a fake Postion! Sold " + str(self.volume) + " of " + str(self.symbol) + " Trade ID: " + str(self.tradeID))
+
+        elif config.LiveTrading:
             if self.direction:
                 if self.limitOrder:
                     self.parentCloseOrder = sell_order_object(self.volume, limitPrice=self.openPrice)
@@ -176,7 +189,11 @@ class Trade:
     def check_stoploss(self, curpoint, value='close'):
         result = 1
         price = curpoint[value]
-        if config.LiveTrading:
+        if self.broker is not None:
+            if not self.broker.stop_is_working(self.brokerRef):
+                self.logger.info(str(self.tradeID)+" - Broker reports stoploss is no longer working")
+                return 0
+        elif config.LiveTrading:
             self.logger.debug(str(self.tradeID)+" - printing open orders, looking for "+str(self.stopOrder.orderId))
             self.logger.debug(str(self.tradeID)+" - "+str(ibapi.all_openorders))
             if self.stopOrder.orderId in ibapi.all_openorders.index:
@@ -219,7 +236,9 @@ class Trade:
     def create_tp(self, tp, quantity):
         self.tp = tp
 
-        if config.LiveTrading:
+        if self.broker is not None:
+            self.broker.set_take_profit(self.brokerRef, tp, quantity)
+        elif config.LiveTrading:
             if self.tpOrder:
                 print("Modifying TP order")
                 self.tpOrder.lmtPrice = tp
@@ -268,7 +287,9 @@ class Trade:
     # tying the stopOrder update to set_stopPrice because realistically we never want these to be out of sync to avoid misinformation
     def set_stopPrice(self, price):
         self.stopPrice = price
-        if config.LiveTrading:
+        if self.broker is not None:
+            self.broker.modify_stop(self.brokerRef, price)
+        elif config.LiveTrading:
             self.stopOrder.auxPrice = price
             self.logger.debug(str(self.tradeID)+" - updating auxPrice for "+str(self.symbol)+": " + str(self.stopOrder.auxPrice))
             ibapi.placeOrder(self.stopOrder.orderId,self.contract,self.stopOrder)

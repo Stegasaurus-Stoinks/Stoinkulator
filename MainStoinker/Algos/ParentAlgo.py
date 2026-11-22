@@ -35,6 +35,7 @@ class ParentAlgo:
         self.FrontEndDataStruct = 0
         self.FrontEndDataType = 0
         self.trade = 0
+        self.broker = None
 
     def pre_update(self, StockData):
         # TODO: add check_stoploss in here
@@ -70,7 +71,7 @@ class ParentAlgo:
         enterPrice = self.curStockData['close']
         enterTime = self.curStockData['date']
         tradeid = str(self.name) + str(len(self.trades))
-        newTrade = Trade(self.ticker, volume, tradeid, enterPrice, enterTime, trend, self.logger)
+        newTrade = Trade(self.ticker, volume, tradeid, enterPrice, enterTime, trend, self.logger, broker=self.broker)
         self.inTrade = True
         self.trades.append(newTrade)
         
