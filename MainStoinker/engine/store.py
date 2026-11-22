@@ -483,7 +483,9 @@ def _utc_now() -> datetime:
 
 def _enable_wal(conn: sqlite3.Connection, wait: float = 10.0) -> None:
     """Switch to WAL. The switch needs an exclusive lock and fails at once, ignoring
-    the busy timeout, when another opener holds it; retry until it is free."""
+    the busy timeout, when another opener holds it; retry until it is free. A
+    transient "disk I/O error" (seen on Windows right after a writer was killed
+    hard) is retried the same way; any other error raises at once."""
     deadline = time.monotonic() + wait
     while True:
         try:
@@ -491,7 +493,8 @@ def _enable_wal(conn: sqlite3.Connection, wait: float = 10.0) -> None:
             return
         except sqlite3.OperationalError as exc:
             text = str(exc).lower()
-            if ("locked" not in text and "busy" not in text) or time.monotonic() >= deadline:
+            transient = "locked" in text or "busy" in text or "disk i/o error" in text
+            if not transient or time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
 
@@ -530,6 +533,9 @@ class SqliteStore:
             raise StoreError(f"cannot open database {self._path}: {exc}") from exc
         try:
             self._conn.execute("PRAGMA foreign_keys=ON")
+            # A newer database is refused before anything is written to it: the
+            # switch to WAL rewrites the file header.
+            self._refuse_newer(self._conn.execute("PRAGMA user_version").fetchone()[0])
             _enable_wal(self._conn)
             self._migrate()
         except StoreError:
@@ -563,6 +569,12 @@ class SqliteStore:
             _rollback(conn)
             raise StoreError(f"commit failed: {exc}") from exc
 
+    @staticmethod
+    def _refuse_newer(version: int) -> None:
+        if version > SCHEMA_VERSION:
+            raise StoreError(f"database schema version {version} is newer than this code "
+                             f"understands ({SCHEMA_VERSION}); update the program")
+
     def _migrate(self) -> None:
         conn = self._db()
         if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
@@ -570,9 +582,7 @@ class SqliteStore:
         with self._tx():
             # Re-read inside the write lock: another process may have migrated.
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > SCHEMA_VERSION:
-                raise StoreError(f"database schema version {version} is newer than this code "
-                                 f"understands ({SCHEMA_VERSION}); update the program")
+            self._refuse_newer(version)
             for step in range(version, SCHEMA_VERSION):
                 for statement in MIGRATIONS[step]:
                     conn.execute(statement)

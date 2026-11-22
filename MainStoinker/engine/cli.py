@@ -24,20 +24,32 @@ ledger (same shape) and adds `ledger.json`: per algo a `summary` and the
 with legacy fills is an error rather than being silently ignored.
 
 Storing runs: `--db SPEC` (a SQLite file path or `sqlite:///path`, see
-`store.open_store`) keeps each run in a database, for both fill models (a
-ledger is attached to every run). The store is opened after every input check
-and before anything is written or run; any `StoreError` while opening (a
-OneDrive folder, a newer schema, not a database, an unsupported scheme) is an
-error with exit code 2 and nothing else is written. The run is recorded with
-`begin_run` (kind `backtest`, the fill model, the code version, the validated
-config and the data directory, symbols and first / last replayed bar), the
-algos with `write_algos`, then the ledger's records in one `write_results`
-after the engine has finished, and `end_run("completed")` once the output files
-are written. An exception during the run attempts `end_run("failed")` and is
+`store.open_store`; `:memory:` is refused, nothing durable would be stored)
+keeps each run in a database, for both fill models (a ledger is attached to
+every run). Every input check comes first, including that each algo id can be
+imported (`check_algos_importable`: an unknown id or a module that fails to
+import is an input error). Then the store is opened, before anything is
+written or run; any `StoreError` while opening (a OneDrive folder, a newer
+schema, not a database, an unsupported scheme) is an input error too. So a bad
+input stores nothing and creates no `--out` directory. (Constructing the algos
+still happens inside the run, in `--out`, because legacy constructors write
+side files into the working directory; an error raised by a constructor is
+therefore a failed run.) The run is recorded with `begin_run` (kind
+`backtest`, the fill model, the code version, the validated config and the data
+directory, symbols and first / last replayed bar), the algos with
+`write_algos`; after the engine has finished the output files are written,
+then the ledger's records go in with one `write_results`, then
+`end_run("completed")`. A storage failure therefore never discards a finished
+run's `trades.json` / `ledger.json`. An exception during the run, including a
+failure writing the output files, attempts `end_run("failed")` and is
 re-raised unchanged. Legacy runs store `SimBroker`'s cost-free fills with
 capital 10,000; the run's `fills` column says so. Without `--db` nothing is
 opened and no file is created. `trades.json` and `ledger.json` are the same
 with and without `--db`.
+
+The code version stored with a run is `<HEAD sha>` for a clean checkout and
+`<HEAD sha>-dirty:<12 hex>` otherwise (see `current_code_version`): changed
+tracked files and untracked, non-ignored files both make a tree dirty.
 
 Output files: a stale `ledger.json` is removed before `trades.json` is written
 (both fill models) and a realistic run writes `ledger.json` last, so a failure
@@ -50,24 +62,31 @@ directory the command was started from. All paths are resolved to absolute
 paths before the change.
 
 Exit codes: 0 success; 2 usage or input error (one line on stderr, no
-traceback). Any other exception propagates with its traceback.
+traceback); 3 the store failed after it was opened (one line on stderr, no
+traceback): `run finished but could not be stored: ...` when the engine had
+finished (the output files are already written and stay in place), otherwise
+`could not record the run: ...`. Any other exception propagates with its
+traceback.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
+import importlib
 import json
 import logging
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +126,18 @@ _REALISTIC_ONLY = {
 
 class CliError(Exception):
     """A usage or input problem; the message is shown as one line, exit code 2."""
+
+
+class RunStoreError(Exception):
+    """The store failed after it was opened; one line, exit code 3.
+
+    `finished` is True when the engine had already finished (the output files
+    are written), False when the run could not even be recorded.
+    """
+
+    def __init__(self, message: str, *, finished: bool) -> None:
+        super().__init__(message)
+        self.finished = finished
 
 
 def validate_algo_config(parsed: object) -> list[dict[str, Any]]:
@@ -235,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
             "(both simulated); \"live\" is not available yet and is refused. A legacy-fills "
             "run deletes a ledger.json left in --out by an earlier realistic run."
         ),
+        epilog=(
+            "exit codes: 0 success; 2 usage or input error (nothing is stored, nothing is "
+            "written to --out); 3 the database failed after it was opened (the run could "
+            "not be recorded, or it finished and its output files were written but it "
+            "could not be stored)"
+        ),
     )
     bt.add_argument(
         "--algos", required=True, metavar="JSON", help="algo config file (Algo_config.json shape)"
@@ -354,6 +391,31 @@ def _load_algos(entries: Sequence[Mapping[str, Any]], log_path: Path | None, alg
                 raise
 
 
+def check_algos_importable(entries: Sequence[Mapping[str, Any]]) -> None:
+    """Raise `CliError` unless every algo id's module imports and has an `Algo` class.
+
+    Done before the store is opened and before `--out` exists, so a typo in an
+    algo id is an input error that stores nothing. It only imports (the same
+    module name `load_algo` uses); constructing the algos waits until the run
+    is in `--out`, because legacy constructors write side files into the
+    working directory.
+    """
+    for algo_id in dict.fromkeys(entry["ID"] for entry in entries):
+        module_name = f"MainStoinker.Algos.{algo_id}.{algo_id}_Algo"
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            missing = exc.name
+            if missing is None or module_name == missing or module_name.startswith(missing + "."):
+                raise CliError(f"unknown algo {algo_id!r}: cannot import {module_name}") from exc
+            raise CliError(f"algo {algo_id!r} cannot be imported: {exc}") from exc
+        except Exception as exc:
+            raise CliError(
+                f"algo {algo_id!r} cannot be imported: {type(exc).__name__}: {exc}") from exc
+        if not hasattr(module, "Algo"):
+            raise CliError(f"algo {algo_id!r}: {module_name} has no class 'Algo'")
+
+
 def parse_money(text: str, flag: str, *, positive: bool = False) -> Decimal:
     """Parse a money option from its text (never through float).
 
@@ -415,42 +477,164 @@ def parse_fill_options(args: argparse.Namespace) -> tuple[CostModel, Decimal]:
 
 
 _GIT_TIMEOUT = 15
+_MAX_HASHED_FILE = 5 * 1024 * 1024  # a larger file contributes its name and size only
+_CHUNK = 1024 * 1024
+# Variables that would point git somewhere other than the checkout it is run in.
+_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+
+
+def _blob_ids(algorithm: str, path: Path, link: bool) -> set[str]:
+    """The git object ids the file's bytes would have as a blob, without running filters.
+
+    Two candidates: the raw bytes, and the bytes with CRLF turned into LF (what
+    `core.autocrlf` / `text` attributes store for a file checked out with CRLF).
+    The caller has checked the file is at most `_MAX_HASHED_FILE`.
+    """
+    if link:
+        data = os.fsencode(os.readlink(path))
+    else:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    ids = set()
+    for body in (data, data.replace(b"\r\n", b"\n")):
+        digest = hashlib.new(algorithm)
+        digest.update(b"blob %d\0" % len(body))
+        digest.update(body)
+        ids.add(digest.hexdigest())
+    return ids
+
+
+def _feed(digest: Any, path: Path, link: bool) -> None:
+    """Stream a file's bytes (or a link's target) into `digest`."""
+    if link:
+        digest.update(os.fsencode(os.readlink(path)))
+        return
+    with open(path, "rb") as handle:
+        while chunk := handle.read(_CHUNK):
+            digest.update(chunk)
+
+
+def _kind(path: Path) -> tuple[str, int]:
+    """('file' | 'link' | 'other' | 'missing', size) of a path, without following links."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return "missing", 0
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            return "link", len(os.fsencode(os.readlink(path)))
+        except OSError:
+            return "missing", 0
+    if stat.S_ISREG(info.st_mode):
+        return "file", info.st_size
+    return "other", 0
 
 
 def current_code_version(
     repo: Path | None = None,
     *,
     run: Callable[..., Any] = subprocess.run,
+    git: str | None = None,
 ) -> str:
     """The git revision of the code: `<HEAD sha>`, with `-dirty:<12 hex>` when modified.
 
     `repo` is a directory inside the repository (default: the folder of this
-    package). The suffix is the first 12 hex digits of the sha256 of the
-    output of `git diff HEAD` (tracked files only, no external diff drivers),
-    appended when that output is not empty. Returns `"unknown"` when git is
-    missing or too slow, `repo` is not in a repository, or the output is not a
-    commit id. Runs git directly (no shell) with an explicit working directory
-    and a timeout; called per run, never at import time. `run` is injectable
-    for tests.
-    """
-    where = Path(__file__).resolve().parent if repo is None else Path(repo)
+    package). The tree counts as modified when a tracked file differs from
+    HEAD (content or deleted) or an untracked, non-ignored file exists; the
+    suffix is the first 12 hex digits of a sha256 over those files, sorted by
+    path: for each its path, kind, size and (up to 5 MB, streamed) bytes. A
+    file over 5 MB contributes its path and size only (and is compared with
+    HEAD by size only). Returns `"unknown"` when git is missing or too slow,
+    `repo` is not in a repository, or the output is not a commit id.
 
-    def git(*words: str) -> bytes | None:
+    Reading the version must not change the checkout, so git is only asked
+    read-only questions that never use the index's stat data, never `git
+    diff` / `git status` / `diff-index` (those refresh and may rewrite
+    `.git/index`, take `index.lock` and run `clean` filters; `diff-index` does
+    so for any file whose mtime is not older than the index, the "racy"
+    case): `rev-parse HEAD`, `rev-parse --show-toplevel`, `ls-tree -r -l HEAD`
+    (HEAD's blob ids and sizes) and `ls-files --others --exclude-standard`
+    (names only). Every call passes `-c core.fsmonitor=false` and runs with
+    `GIT_OPTIONAL_LOCKS=0`. Tracked files are compared with HEAD here: the
+    hash git would give the file's bytes, as they are and with CRLF read as LF
+    (a checkout under `core.autocrlf`), is looked up among HEAD's blobs. No
+    other conversion is attempted, so a file that a custom filter changes
+    counts as modified, and a file mode change alone is not noticed. The git
+    executable is
+    resolved once with `shutil.which` (`git` overrides it for tests). Git is
+    run directly (no shell) with an explicit working directory and a timeout;
+    called per run, never at import time. `run` is injectable for tests.
+    """
+    exe = git if git is not None else shutil.which("git")
+    if not exe:
+        return "unknown"
+    where = Path(__file__).resolve().parent if repo is None else Path(repo)
+    child_env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECTS}
+    child_env["GIT_OPTIONAL_LOCKS"] = "0"
+
+    def ask(*words: str) -> bytes | None:
         try:
-            done = run(["git", *words], cwd=str(where), capture_output=True,
-                       stdin=subprocess.DEVNULL, timeout=_GIT_TIMEOUT, check=False)
+            done = run([exe, "-c", "core.fsmonitor=false", *words], cwd=str(where),
+                       env=child_env, capture_output=True, stdin=subprocess.DEVNULL,
+                       timeout=_GIT_TIMEOUT, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
         return done.stdout if done.returncode == 0 else None
 
-    head = git("rev-parse", "HEAD")
+    head = ask("rev-parse", "HEAD")
     sha = "" if head is None else head.decode("ascii", "replace").strip()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
         return "unknown"
-    diff = git("diff", "HEAD", "--no-ext-diff", "--no-textconv")
-    if diff is None:
+    top = ask("rev-parse", "--show-toplevel")
+    tree = ask("ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD")
+    others = ask("ls-files", "--others", "--exclude-standard", "--full-name", "-z")
+    if top is None or tree is None or others is None:
         return "unknown"
-    return f"{sha}-dirty:{sha256(diff).hexdigest()[:12]}" if diff else sha
+    root = Path(os.fsdecode(top).rstrip("\r\n"))
+    algorithm = "sha1" if len(sha) == 40 else "sha256"
+
+    # (path as git prints it, tag, absolute path): T tracked and changed, D tracked and
+    # deleted, U untracked.
+    found: list[tuple[bytes, bytes, Path]] = []
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        header, tab, name = record.partition(b"\t")
+        parts = header.split()
+        if not tab or len(parts) != 4:
+            return "unknown"
+        _mode, otype, blob, blob_size = parts
+        if otype != b"blob":
+            continue  # a submodule is not part of this checkout's files
+        path = root / os.fsdecode(name)
+        kind, size = _kind(path)
+        if kind == "missing":
+            found.append((name, b"D", path))
+            continue
+        try:
+            if kind in ("file", "link") and max(size, int(blob_size)) <= _MAX_HASHED_FILE:
+                same = blob.decode("ascii") in _blob_ids(algorithm, path, kind == "link")
+            else:  # too big to hash: name and size are all that is compared
+                same = kind == "file" and size == int(blob_size)
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            found.append((name, b"T", path))
+    found.extend((name, b"U", root / os.fsdecode(name)) for name in others.split(b"\0") if name)
+    if not found:
+        return sha
+
+    digest = hashlib.sha256()
+    for name, tag, path in sorted(found, key=lambda item: (item[0], item[1])):
+        kind, size = _kind(path) if tag != b"D" else ("missing", 0)
+        digest.update(tag + b"\0" + name + b"\0" + kind.encode() + b"\0" + b"%d" % size + b"\0")
+        if kind in ("file", "link") and size <= _MAX_HASHED_FILE:
+            try:
+                _feed(digest, path, kind == "link")
+            except OSError:
+                digest.update(b"unreadable")
+        digest.update(b"\0")
+    return f"{sha}-dirty:{digest.hexdigest()[:12]}"
 
 
 def _db_display(spec: str) -> str:
@@ -481,9 +665,13 @@ def run_backtest_command(
     out_dir = Path(args.out).resolve()
     if args.warmup_days < 0:
         raise CliError("--warmup-days must be 0 or more")
+    if args.db is not None and args.db.removeprefix("sqlite:///") == ":memory:":
+        raise CliError("--db :memory: would keep nothing once the command ends; "
+                       "give a database file")
     costs, capital = parse_fill_options(args)
 
     entries = read_algo_config(algos_path)
+    check_algos_importable(entries)
     if not data_dir.is_dir():
         raise CliError(f"data directory not found: {data_dir}")
     try:
@@ -510,8 +698,9 @@ def run_backtest_command(
     except ModeError as exc:
         raise CliError(str(exc)) from exc
 
-    # Every input problem is behind us. The store comes next, before the output
-    # directory is touched, so a refused database leaves nothing behind.
+    # Every input problem is behind us, the algo ids included. The store comes
+    # next, before the output directory is touched, so a refused database leaves
+    # nothing behind.
     store = None
     db_shown = ""
     if args.db is not None:
@@ -529,6 +718,7 @@ def run_backtest_command(
         ledger_path = out_dir / LEDGER_NAME
         log_path = out_dir / LOG_NAME if args.log else None
         run_id: int | None = None
+        engine_done = False
         try:
             if store is not None:
                 run_id = store.begin_run(RunMeta(
@@ -561,6 +751,7 @@ def run_backtest_command(
                     engine = Engine(EngineConfig(), feed, router, NullSink(), algos,
                                     ledger=ledger, end_commission=router.end_commission)
                     engine.run_backtest()
+                    engine_done = True
                     if realistic:
                         assert ledger is not None
                         result = {i: ledger_trade_records(ledger, i) for i in idnames}
@@ -571,17 +762,6 @@ def run_backtest_command(
                         }
             finally:
                 close_algo_logs(algos)
-
-            if store is not None:
-                assert run_id is not None and ledger is not None
-                store.write_results(
-                    run_id,
-                    order_events=ledger.orders,
-                    fills=ledger.fills,
-                    round_trips=ledger.round_trips,
-                    equity=ledger.equity_points,
-                    ignored_events=ledger.ignored_events,
-                )
 
             summary: dict[str, str] = {}
             document = None
@@ -607,14 +787,26 @@ def run_backtest_command(
             write_json_atomic(trades_path, result)
             if document is not None:
                 write_json_atomic(ledger_path, document)
+            # The output files are done; only now is the run stored, so a storage
+            # failure cannot take a finished run's files away.
             if store is not None:
-                assert run_id is not None
+                assert run_id is not None and ledger is not None
+                store.write_results(
+                    run_id,
+                    order_events=ledger.orders,
+                    fills=ledger.fills,
+                    round_trips=ledger.round_trips,
+                    equity=ledger.equity_points,
+                    ignored_events=ledger.ignored_events,
+                )
                 store.end_run(run_id, "completed")
-        except BaseException:
+        except BaseException as exc:
             if store is not None and run_id is not None:
                 # Whatever goes wrong here must not hide the error being handled.
                 with contextlib.suppress(Exception):
                     store.end_run(run_id, "failed")
+            if isinstance(exc, StoreError):
+                raise RunStoreError(str(exc), finished=engine_done) from exc
             raise
     finally:
         if store is not None:
@@ -645,11 +837,20 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         if args.command == "backtest":
             return run_backtest_command(args, env=env)
     except CliError as exc:
-        message = "error: " + " ".join(str(exc).split())
-        # Values from the config are shown through ascii(); paths and OS messages
-        # are not, so never let an unencodable character turn this into a traceback.
-        encoding = getattr(sys.stderr, "encoding", None) or "ascii"
-        print(message.encode(encoding, "backslashreplace").decode(encoding), file=sys.stderr)
+        _report("error: " + str(exc))
         return 2
+    except RunStoreError as exc:
+        what = ("run finished but could not be stored" if exc.finished
+                else "could not record the run")
+        _report(f"error: {what}: {exc}")
+        return 3
     raise AssertionError(f"unhandled command {args.command!r}")  # pragma: no cover
+
+
+def _report(message: str) -> None:
+    """One line on stderr. Values from the config are shown through ascii(); paths and
+    OS messages are not, so never let an unencodable character turn this into a traceback."""
+    line = " ".join(message.split())
+    encoding = getattr(sys.stderr, "encoding", None) or "ascii"
+    print(line.encode(encoding, "backslashreplace").decode(encoding), file=sys.stderr)
 

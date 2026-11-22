@@ -491,44 +491,132 @@ class Done:
         self.stdout, self.returncode = stdout, returncode
 
 
-def fake_git(sha: bytes, diff: bytes, calls: list | None = None):
+GIT = "/usr/bin/git"  # never executed: the fake runner answers
+
+
+def fake_git(sha: bytes, tree: bytes = b"", others: bytes = b"", top: str = "/nowhere",
+             calls: list | None = None):
     def runner(args, **kwargs):
         if calls is not None:
             calls.append((args, kwargs))
-        if args[:3] == ["git", "rev-parse", "HEAD"]:
+        assert args[:3] == [GIT, "-c", "core.fsmonitor=false"], args
+        words = args[3:]
+        if words == ["rev-parse", "HEAD"]:
             return Done(sha + b"\n")
-        if args[:3] == ["git", "diff", "HEAD"]:
-            return Done(diff)
+        if words == ["rev-parse", "--show-toplevel"]:
+            return Done(top.encode() + b"\n")
+        if words[0] == "ls-tree":
+            return Done(tree)
+        if words[0] == "ls-files":
+            return Done(others)
         raise AssertionError(args)
 
     return runner
 
 
+def version_of(tmp_path, **kwargs) -> str:
+    return cli.current_code_version(tmp_path, run=fake_git(VERSION.encode(), **kwargs), git=GIT)
+
+
+def blob_of(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def tracked(name: str, committed: bytes) -> bytes:
+    """One `git ls-tree -r -l -z` record for a file whose HEAD content is `committed`."""
+    return f"100644 blob {blob_of(committed)} {len(committed):>7}\t{name}\0".encode()
+
+
 def test_code_version_clean(tmp_path):
-    assert cli.current_code_version(tmp_path, run=fake_git(VERSION.encode(), b"")) == VERSION
+    assert version_of(tmp_path, top=str(tmp_path)) == VERSION
 
 
-def test_code_version_dirty_suffix(tmp_path):
-    diff = b"diff --git a/x b/x\n+changed\n"
+def test_code_version_dirty_suffix_and_the_git_commands_asked(tmp_path):
+    (tmp_path / "x.py").write_bytes(b"changed\n")
+    committed = tracked("x.py", b"original\n")
     calls: list = []
-    version = cli.current_code_version(tmp_path, run=fake_git(VERSION.encode(), diff, calls))
-    assert version == f"{VERSION}-dirty:{hashlib.sha256(diff).hexdigest()[:12]}"
-    assert len(version.split("-dirty:")[1]) == 12
-    # git is run without a shell, in the given directory, with a timeout
-    assert [c[0][:3] for c in calls] == [["git", "rev-parse", "HEAD"], ["git", "diff", "HEAD"]]
+    version = version_of(tmp_path, tree=committed, top=str(tmp_path), calls=calls)
+    assert version.startswith(VERSION + "-dirty:") and len(version.split("-dirty:")[1]) == 12
+    # read-only plumbing only (never diff / status / diff-index, which can refresh the index and
+    # run filters), no shell, in the given directory, with a timeout, with fsmonitor off and
+    # optional locks (index refresh writes) off
+    assert [c[0][3:5] for c in calls] == [["rev-parse", "HEAD"], ["rev-parse", "--show-toplevel"],
+                                          ["ls-tree", "-r"], ["ls-files", "--others"]]
+    assert "--exclude-standard" in calls[3][0]
     for args, kwargs in calls:
         assert isinstance(args, list) and not kwargs.get("shell")
         assert kwargs["cwd"] == str(tmp_path) and 0 < kwargs["timeout"] <= 60
-    assert "--no-ext-diff" in calls[1][0]
-    # a different change gives a different suffix
-    other = cli.current_code_version(tmp_path, run=fake_git(VERSION.encode(), diff + b"+more\n"))
-    assert other != version and other.startswith(VERSION + "-dirty:")
+        assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert not {"GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"} & set(kwargs["env"])
+        assert not {"diff", "diff-index", "diff-files", "status"} & set(args)
+    (tmp_path / "x.py").write_bytes(b"changed again\n")  # different content, different suffix
+    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) != version
+    (tmp_path / "x.py").write_bytes(b"original\n")  # back to HEAD's content: clean
+    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
+    (tmp_path / "x.py").write_bytes(b"original\r\n")  # a CRLF checkout of the same text: clean
+    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
 
 
 def test_code_version_defaults_to_the_package_directory():
     calls: list = []
-    cli.current_code_version(run=fake_git(VERSION.encode(), b"", calls))
+    cli.current_code_version(run=fake_git(VERSION.encode(), calls=calls), git=GIT)
     assert calls[0][1]["cwd"] == str(Path(cli.__file__).resolve().parent)
+
+
+def test_code_version_resolves_git_once_with_which(tmp_path, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: seen.append(name) or "/x/git")
+    calls: list = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        return Done(b"", 1)
+
+    cli.current_code_version(tmp_path, run=runner)
+    assert seen == ["git"] and calls and all(c[0] == "/x/git" for c in calls)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    assert cli.current_code_version(tmp_path, run=lambda *a, **k: 1 / 0) == "unknown"
+
+
+def test_code_version_dirty_for_an_untracked_file_by_name_and_content(tmp_path):
+    (tmp_path / "new_algo.py").write_text("one\n")
+    names = b"new_algo.py\0"
+    first = version_of(tmp_path, others=names, top=str(tmp_path))
+    assert first.startswith(VERSION + "-dirty:")
+    (tmp_path / "new_algo.py").write_text("two\n")  # content counts
+    second = version_of(tmp_path, others=names, top=str(tmp_path))
+    assert second.startswith(VERSION + "-dirty:") and second != first
+    (tmp_path / "other.py").write_text("two\n")  # and so does the name
+    assert version_of(tmp_path, others=b"other.py\0", top=str(tmp_path)) != second
+
+
+def test_code_version_large_file_counts_by_name_and_size_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_MAX_HASHED_FILE", 8)
+    big = tmp_path / "big.bin"
+    names = b"big.bin\0"
+    big.write_bytes(b"a" * 20)
+    first = version_of(tmp_path, others=names, top=str(tmp_path))
+    big.write_bytes(b"b" * 20)  # same size: not read
+    assert version_of(tmp_path, others=names, top=str(tmp_path)) == first
+    big.write_bytes(b"b" * 21)  # new size
+    assert version_of(tmp_path, others=names, top=str(tmp_path)) != first
+
+
+def test_code_version_deleted_tracked_file_is_dirty(tmp_path):
+    gone = tracked("gone.py", b"x\n")
+    assert version_of(tmp_path, tree=gone, top=str(tmp_path)).startswith(VERSION + "-dirty:")
+
+
+def test_code_version_large_tracked_file_is_compared_by_size_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_MAX_HASHED_FILE", 8)
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"a" * 20)
+    committed = tracked("big.bin", b"a" * 20)
+    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
+    big.write_bytes(b"b" * 20)  # same size, over the bound: not looked at
+    assert version_of(tmp_path, tree=committed, top=str(tmp_path)) == VERSION
+    big.write_bytes(b"b" * 21)
+    assert version_of(tmp_path, tree=committed, top=str(tmp_path)).startswith(VERSION + "-dirty:")
 
 
 @pytest.mark.parametrize("failure", [
@@ -539,25 +627,27 @@ def test_code_version_unknown_when_git_is_unavailable(tmp_path, failure):
     def runner(args, **kwargs):
         raise failure
 
-    assert cli.current_code_version(tmp_path, run=runner) == "unknown"
+    assert cli.current_code_version(tmp_path, run=runner, git=GIT) == "unknown"
 
 
 @pytest.mark.parametrize("sha, code", [(b"", 128), (b"fatal", 128), (b"abc123", 0), (b"", 0),
                                        (b"zz" * 20, 0)])
 def test_code_version_unknown_for_a_non_repository_or_odd_output(tmp_path, sha, code):
     assert cli.current_code_version(
-        tmp_path, run=lambda args, **kw: Done(sha, code)) == "unknown"
+        tmp_path, run=lambda args, **kw: Done(sha, code), git=GIT) == "unknown"
 
 
-def test_code_version_unknown_when_the_diff_fails(tmp_path):
+@pytest.mark.parametrize("failing", ["--show-toplevel", "ls-tree", "ls-files"])
+def test_code_version_unknown_when_a_listing_fails(tmp_path, failing):
     def runner(args, **kwargs):
-        return Done(VERSION.encode(), 0) if args[1] == "rev-parse" else Done(b"", 1)
+        if failing in args:
+            return Done(b"", 1)
+        return Done(VERSION.encode(), 0) if args[3] == "rev-parse" else Done(b"", 0)
 
-    assert cli.current_code_version(tmp_path, run=runner) == "unknown"
+    assert cli.current_code_version(tmp_path, run=runner, git=GIT) == "unknown"
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
-def test_code_version_with_a_real_repository(tmp_path):
+def real_repo(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -569,20 +659,116 @@ def test_code_version_with_a_real_repository(tmp_path):
         return done.stdout.strip()
 
     git("init", "-q")
+    return repo, git
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+@needs_git
+def test_code_version_with_a_real_repository(tmp_path):
+    repo, git = real_repo(tmp_path)
     (repo / "a.txt").write_text("one\n")
-    git("add", "a.txt")
+    (repo / ".gitignore").write_text("ignored.txt\n")
+    git("add", "a.txt", ".gitignore")
     git("commit", "-q", "-m", "first")
     head = git("rev-parse", "HEAD")
     assert cli.current_code_version(repo) == head
     (repo / "sub").mkdir()
     assert cli.current_code_version(repo / "sub") == head  # any folder inside the repository
+    (repo / "ignored.txt").write_text("ignored\n")  # ignored files do not count
+    assert cli.current_code_version(repo) == head
     (repo / "a.txt").write_text("two\n")
-    expected = hashlib.sha256(subprocess.run(
-        ["git", "diff", "HEAD", "--no-ext-diff", "--no-textconv"], cwd=repo,
-        capture_output=True, check=True, timeout=60).stdout).hexdigest()[:12]
-    assert cli.current_code_version(repo) == f"{head}-dirty:{expected}"
+    dirty = cli.current_code_version(repo)
+    assert dirty.startswith(head + "-dirty:") and len(dirty) == len(head) + 7 + 12
+    (repo / "a.txt").write_text("three\n")
+    assert cli.current_code_version(repo) not in (head, dirty)
     git("checkout", "--", "a.txt")
     assert cli.current_code_version(repo) == head
+    # a new, uncommitted file is not a clean commit; its content and name are part of the hash
+    (repo / "new_algo.py").write_text("print(1)\n")
+    untracked = cli.current_code_version(repo)
+    assert untracked.startswith(head + "-dirty:")
+    (repo / "new_algo.py").write_text("print(2)\n")
+    assert cli.current_code_version(repo) not in (head, untracked)
+    (repo / "new_algo.py").unlink()
+    assert cli.current_code_version(repo) == head
+    (repo / "a.txt").unlink()  # a deleted tracked file
+    assert cli.current_code_version(repo).startswith(head + "-dirty:")
+
+
+def run_git_marked(repo: Path, tmp_path: Path):
+    """A repository whose *.txt files go through a `clean` filter that leaves a marker file."""
+    marker = tmp_path / "filter-ran"
+    script = tmp_path / "clean.py"
+    script.write_text("import sys\nopen(sys.argv[1], 'w').write('ran')\n"
+                      "sys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+    command = f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}" "{marker.as_posix()}"'
+    return marker, command
+
+
+@needs_git
+def test_code_version_leaves_the_index_alone_and_runs_no_filter(tmp_path):
+    repo, git = real_repo(tmp_path)
+    marker, command = run_git_marked(repo, tmp_path)
+    (repo / ".gitattributes").write_text("*.txt filter=probe\n")
+    (repo / "a.txt").write_text("one\n")
+    (repo / "b.txt").write_text("two\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "first")
+    git("config", "filter.probe.clean", command)  # only now: committing needs no filter
+    head = git("rev-parse", "HEAD")
+    index = repo / ".git" / "index"
+
+    # stat-dirty but unchanged: same bytes, new mtime (the case where `git diff` would run the
+    # filter to compare content, and rewrite the refreshed index)
+    stamp = (repo / "a.txt").stat().st_mtime_ns + 5_000_000_000
+    os.utime(repo / "a.txt", ns=(stamp, stamp))
+    before = index.read_bytes()
+    assert cli.current_code_version(repo) == head  # unchanged content is not dirty
+    assert index.read_bytes() == before and not marker.exists()
+    assert not (repo / ".git" / "index.lock").exists()
+
+    # really modified, plus an untracked file
+    (repo / "b.txt").write_text("changed\n")
+    (repo / "c.txt").write_text("brand new\n")
+    dirty = cli.current_code_version(repo)
+    assert dirty.startswith(head + "-dirty:")
+    assert index.read_bytes() == before and not marker.exists()
+    assert not (repo / ".git" / "index.lock").exists()
+
+    # control: the filter really would have run (and the index rewritten) under `git diff HEAD`
+    subprocess.run(["git", "diff", "HEAD"], cwd=repo, capture_output=True, check=True,
+                   timeout=60)
+    assert marker.exists(), "the probe filter never ran: this test would prove nothing"
+
+
+@needs_git
+def test_code_version_touched_crlf_checkout_is_still_clean(tmp_path):
+    repo, git = real_repo(tmp_path)
+    git("config", "core.autocrlf", "true")
+    (repo / "a.txt").write_bytes(b"one\r\ntwo\r\n")
+    git("add", "a.txt")
+    git("commit", "-q", "-m", "first")
+    stamp = (repo / "a.txt").stat().st_mtime_ns + 5_000_000_000
+    os.utime(repo / "a.txt", ns=(stamp, stamp))
+    assert cli.current_code_version(repo) == git("rev-parse", "HEAD")
+    (repo / "a.txt").write_bytes(b"one\r\nthree\r\n")
+    assert "-dirty:" in cli.current_code_version(repo)
+
+
+@needs_git
+def test_a_commit_can_run_while_the_version_is_computed(tmp_path):
+    """The version takes no index lock, so it cannot collide with a concurrent commit."""
+    repo, git = real_repo(tmp_path)
+    (repo / "a.txt").write_text("one\n")
+    git("add", "a.txt")
+    git("commit", "-q", "-m", "first")
+    (repo / "a.txt").write_text("two\n")
+    (repo / ".git" / "index.lock").write_bytes(b"")  # another git process holds the lock
+    version = cli.current_code_version(repo)
+    assert version.startswith(git("rev-parse", "HEAD") + "-dirty:")
+    assert (repo / ".git" / "index.lock").exists()  # and ours did not remove it
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -723,17 +909,169 @@ def test_out_pointing_at_a_file_is_an_error_and_no_run_is_stored(env, db, capsys
         db.unlink()
 
 
-def test_begin_run_failure_propagates_and_closes_the_store(env, db, monkeypatch):
+def test_begin_run_failure_is_one_line_exit_3_and_closes_the_store(env, db, monkeypatch, capsys):
     env.setup(ema_config(), ["AAPL"], rows=100)
 
     def broken(self, meta):
         raise StoreError("attempt to write a readonly database")
 
     monkeypatch.setattr(store_module.SqliteStore, "begin_run", broken)
-    with pytest.raises(StoreError):
-        run(env, "--db", str(db))
+    assert run(env, "--db", str(db)) == 3
+    captured = capsys.readouterr()
+    assert captured.out == "" and len(captured.err.splitlines()) == 1
+    assert captured.err == ("error: could not record the run: "
+                            "attempt to write a readonly database\n")
+    assert not (env.out / "trades.json").exists()  # the engine never ran
     db.unlink()  # a connection left open would make this fail on Windows
     assert not list(db.parent.glob("runs.db*"))
+
+
+def test_write_algos_failure_is_a_record_failure_exit_3(env, db, monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+
+    def broken(self, run_id, algos):
+        raise StoreError("disk full")
+
+    monkeypatch.setattr(store_module.SqliteStore, "write_algos", broken)
+    assert run(env, "--db", str(db)) == 3
+    assert capsys.readouterr().err == "error: could not record the run: disk full\n"
+    assert [r.status for r in read_runs(db)] == ["failed"]
+    db.unlink()
+
+
+@pytest.mark.parametrize("method", ["write_results", "end_run"])
+def test_storage_failure_after_the_run_keeps_the_output_files(env, db, monkeypatch, capsys,
+                                                              method):
+    """The files are written before the results are stored, so a storage failure
+    (exit 3, one line) cannot discard a finished run's trades.json / ledger.json."""
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    seen: dict = {}
+    real = getattr(store_module.SqliteStore, method)
+
+    def broken(self, *a, **kw):
+        if method == "end_run" and a[1] == "failed":
+            return real(self, *a, **kw)  # the honest marker still goes in
+        seen["files"] = sorted(p.name for p in env.out.glob("*.json"))
+        raise StoreError("database or disk is full")
+
+    monkeypatch.setattr(store_module.SqliteStore, method, broken)
+    assert run(env, "--fills", "realistic", "--db", str(db)) == 3
+    assert capsys.readouterr().err == (
+        "error: run finished but could not be stored: database or disk is full\n")
+    assert seen["files"] == ["ledger.json", "trades.json"]  # already there when storing began
+    assert sorted(p.name for p in env.out.glob("*.json")) == ["ledger.json", "trades.json"]
+    assert env.trades()[EMA["idname"]]
+    assert [r.status for r in read_runs(db)] == ["failed"]
+    db.unlink()  # the store was closed
+
+
+def test_end_run_completed_failing_leaves_a_running_row_and_the_files(env, db, monkeypatch,
+                                                                       capsys):
+    env.setup(ema_config(), ["AAPL"], rows=900)
+
+    def broken(self, run_id, status):
+        raise StoreError("locked")
+
+    monkeypatch.setattr(store_module.SqliteStore, "end_run", broken)
+    assert run(env, "--db", str(db)) == 3
+    assert capsys.readouterr().err == "error: run finished but could not be stored: locked\n"
+    assert (env.out / "trades.json").exists()
+    monkeypatch.undo()
+    assert [r.status for r in read_runs(db)] == ["running"]  # honest: never ended
+    db.unlink()
+
+
+def test_output_files_are_written_before_results_and_before_the_run_is_completed(
+        env, db, monkeypatch):
+    env.setup(ema_config(), ["AAPL"], rows=900)
+    order: list[str] = []
+    real_write, real_results = cli.write_json_atomic, store_module.SqliteStore.write_results
+    real_end = store_module.SqliteStore.end_run
+
+    def write(path, payload):
+        order.append("file:" + path.name)
+        return real_write(path, payload)
+
+    def results(self, run_id, **kw):
+        order.append("results")
+        return real_results(self, run_id, **kw)
+
+    def end(self, run_id, status):
+        order.append("end:" + status)
+        return real_end(self, run_id, status)
+
+    monkeypatch.setattr(cli, "write_json_atomic", write)
+    monkeypatch.setattr(store_module.SqliteStore, "write_results", results)
+    monkeypatch.setattr(store_module.SqliteStore, "end_run", end)
+    assert run(env, "--fills", "realistic", "--db", str(db)) == 0
+    assert order == ["file:trades.json", "file:ledger.json", "results", "end:completed"]
+
+
+def test_exit_codes_are_documented(capsys):
+    assert "0 success; 2 usage or input error" in cli.__doc__ and "3 the store failed" in cli.__doc__
+    with pytest.raises(SystemExit):
+        main(["backtest", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "exit codes: 0 success; 2 usage or input error" in text and "3 the database failed" in text
+
+
+def test_a_non_store_error_after_the_store_opened_still_propagates(env, db, monkeypatch):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    monkeypatch.setattr(store_module.SqliteStore, "begin_run",
+                        lambda self, meta: (_ for _ in ()).throw(ValueError("odd")))
+    with pytest.raises(ValueError, match="odd"):
+        run(env, "--db", str(db))
+    db.unlink()
+
+
+# ---- input errors store nothing ---------------------------------------------------
+
+
+def test_unknown_algo_id_with_db_exits_2_and_stores_nothing(env, db, capsys):
+    env.setup([{"ID": "NoSuchAlgo", "data": [EMA]}], ["AAPL"], rows=100)
+    assert run(env, "--db", str(db)) == 2
+    assert "unknown algo 'NoSuchAlgo'" in one_line_error(capsys)
+    assert not db.exists() and not db.parent.exists() and not env.out.exists()
+
+
+def test_algo_that_fails_to_import_with_db_exits_2_and_stores_nothing(env, db, monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    real = cli.importlib.import_module
+
+    def broken(name, *a, **kw):
+        if name.endswith("EMACrossing_Algo"):
+            raise ImportError("cannot import name 'x'")
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(cli.importlib, "import_module", broken)
+    assert run(env, "--db", str(db)) == 2
+    err = one_line_error(capsys)
+    assert "EMACrossing" in err and "ImportError" in err
+    assert not db.parent.exists() and not env.out.exists()
+
+
+def test_algo_module_without_an_algo_class_exits_2(env, db, monkeypatch, capsys):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name, *a, **k: object())
+    assert run(env, "--db", str(db)) == 2
+    assert "has no class 'Algo'" in one_line_error(capsys)
+    assert not db.parent.exists() and not env.out.exists()
+
+
+@pytest.mark.parametrize("spec", [":memory:", "sqlite:///:memory:"])
+def test_db_memory_is_refused_on_the_command_line(env, capsys, spec):
+    env.setup(ema_config(), ["AAPL"], rows=100)
+    assert run(env, "--db", spec) == 2
+    assert ":memory:" in one_line_error(capsys)
+    assert not env.out.exists()
+
+
+def test_open_store_in_memory_is_still_allowed_in_the_library():
+    store = open_store(":memory:", env={})
+    try:
+        assert store.list_runs() == ()
+    finally:
+        store.close()
 
 
 def _spawn(env: Env, db: Path, out: Path, *extra: str, code: str | None = None):

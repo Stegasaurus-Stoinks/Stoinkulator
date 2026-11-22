@@ -258,6 +258,61 @@ def test_newer_schema_refused(db):
     db.unlink()
 
 
+def test_newer_schema_refusal_does_not_modify_the_file(db):
+    """The switch to WAL rewrites the file header, so a newer database is refused first."""
+    import hashlib
+
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE t (x)")
+    con.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    con.close()
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    with pytest.raises(StoreError, match="newer"):
+        SqliteStore(db)
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert sorted(p.name for p in db.parent.iterdir()) == [db.name]  # no -wal / -shm left behind
+    db.unlink()
+
+
+class FlakyWal:
+    """Stands in for a connection: `PRAGMA journal_mode=WAL` fails with the given errors first."""
+
+    def __init__(self, *errors: str) -> None:
+        self.errors = list(errors)
+        self.calls = 0
+
+    def execute(self, sql: str):
+        self.calls += 1
+        if self.errors:
+            raise sqlite3.OperationalError(self.errors.pop(0))
+
+
+def test_wal_switch_retries_a_transient_disk_io_error():
+    from MainStoinker.engine.store import _enable_wal
+
+    conn = FlakyWal("disk I/O error")
+    _enable_wal(conn, wait=5.0)  # type: ignore[arg-type]
+    assert conn.calls == 2
+
+
+def test_wal_switch_gives_up_on_a_persistent_disk_io_error_after_the_deadline():
+    from MainStoinker.engine.store import _enable_wal
+
+    conn = FlakyWal(*["disk I/O error"] * 1000)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        _enable_wal(conn, wait=0.05)  # type: ignore[arg-type]
+    assert conn.calls > 1
+
+
+def test_wal_switch_raises_other_errors_at_once():
+    from MainStoinker.engine.store import _enable_wal
+
+    conn = FlakyWal("attempt to write a readonly database")
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        _enable_wal(conn, wait=5.0)  # type: ignore[arg-type]
+    assert conn.calls == 1
+
+
 def test_not_a_database_refused(db):
     db.write_text("this is not sqlite" * 50)
     with pytest.raises(StoreError):
