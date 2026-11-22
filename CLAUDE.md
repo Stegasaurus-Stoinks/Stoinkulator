@@ -39,10 +39,11 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m pytest                  # fast suite, ~55 s
 .venv\Scripts\python.exe -m pytest -m slow          # full Elliot state digests + legacy-path parity, ~100 s
 .venv\Scripts\ruff.exe check .                      # legacy defect set
-.venv\Scripts\ruff.exe check tests MainStoinker/engine MainStoinker/__main__.py --select E,F,W,I,B   # new-code set
+.venv\Scripts\ruff.exe check tests conftest.py MainStoinker/engine MainStoinker/api MainStoinker/__main__.py --select E,F,W,I,B   # new-code set
 .venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS.json --data OfflineData --out OUTDIR   # offline backtest -> OUTDIR/trades.json
 .venv\Scripts\python.exe -m MainStoinker runs --db DB [--json]              # list the runs stored by `backtest --db` (read-only)
 .venv\Scripts\python.exe -m MainStoinker report RUN --db DB [--json]        # per-algo and total statistics of one stored run
+.venv\Scripts\python.exe -m MainStoinker serve --db DB [--port 8750] [--allow-remote]   # read-only API + dashboard on 127.0.0.1 (needs requirements-web.txt)
 ```
 
 ## Layout
@@ -57,6 +58,9 @@ uv pip install --python .venv\Scripts\python.exe -e .
   loaded by name from `MainStuff/Algo_config.json`.
 - `MainStoinker/engine/` new engine package: `Broker` protocol, `SimBroker`; imports nothing legacy
   (enforced by `tests/test_engine_import_boundary.py`).
+- `MainStoinker/api/` read-only web API (FastAPI, GET only) and static dashboard, started by `serve`;
+  may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy
+  (enforced by `tests/test_api_boundary.py`); the engine never imports it.
 - `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.
 
