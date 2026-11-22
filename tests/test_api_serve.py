@@ -155,7 +155,7 @@ def test_serve_flag_wins_over_stoink_db(
 def test_serve_refuses_remote_host_without_flag(
     db: Path, started: list[dict[str, Any]], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    for host in ("0.0.0.0", "192.168.1.20", "::", "example.com"):
+    for host in ("0.0.0.0", "172.16.0.5", "::", "example.com"):
         assert serve.main(["--db", str(db), "--host", host], env=NO_ENV) == 2
         assert "--allow-remote" in one_line_error(capsys)
     assert started == []
