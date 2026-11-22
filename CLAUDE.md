@@ -69,6 +69,12 @@ uv pip install --python .venv\Scripts\python.exe -e .
   (`harness.run_legacy_offline_backtest`) is compared against the same golden
   files read-only in the slow suite (`tests/test_legacy_path_parity.py`) and
   goes away in Phase B. Only `test_golden_backtests.py` may write goldens.
+- Realistic-fill goldens live in `tests/golden_paper/`. They pin the ledger's
+  round trips, a summary and an equity hash for the same eight cases through
+  `PaperBroker`. Only `tests/test_paper_goldens.py` writes them, with
+  `--update-golden` (add `-m "slow or not slow"` to regenerate all eight). It
+  also checks after every bar that each algo and the broker agree on whether a
+  trade is open.
 - Known defects are recorded as `xfail(strict=True)` tests. Fixing one means
   removing its marker in the same change.
 - The runtime writes `loggy.log`, `tradey.txt` and `algo.csv` to the current
