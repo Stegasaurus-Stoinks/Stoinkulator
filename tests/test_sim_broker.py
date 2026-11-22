@@ -262,3 +262,81 @@ def test_ledger_trade_records_open_trade_and_synthetic_close_show_as_open():
          "openTime": str(T0), "openPrice": 100.0, "closeTime": "None", "closePrice": None},
     ]
     assert ledger_trade_records(ledger, "nobody") == []
+
+
+def test_exit_reason_when_stop_and_target_prices_coincide_is_stop():
+    ledger, broker = _acct()
+    ref = _open(broker)
+    broker.set_take_profit(ref, 99.0, 10)  # same price as the initial stop
+    broker.close_position(ref, price=99.0, time=T1)
+    assert ledger.fills[-1].reason == "stop"
+
+
+def test_exit_at_the_old_stop_price_after_the_stop_moved_is_algo_exit():
+    ledger, broker = _acct()
+    ref = _open(broker)  # initial stop 99.0
+    broker.modify_stop(ref, 101.0)
+    broker.close_position(ref, price=99.0, time=T1)
+    assert ledger.fills[-1].reason == "algo_exit"
+
+
+def test_short_exit_reasons_stop_target_and_algo_exit():
+    ledger, broker = _acct()
+    stopped = _open_dir(broker, 0, stop=101.0)
+    targeted = _open_dir(broker, 0, stop=101.0)
+    manual = _open_dir(broker, 0, stop=101.0)
+    broker.set_take_profit(targeted, 95.0, 10)
+    broker.close_position(stopped, price=101.0, time=T1)
+    broker.close_position(targeted, price=95.0, time=T1)
+    broker.close_position(manual, price=98.0, time=T1)
+    exits = {f.broker_ref: (f.reason, f.side) for f in ledger.fills if f.reason != "entry"}
+    assert exits == {stopped: ("stop", "buy"), targeted: ("target", "buy"),
+                     manual: ("algo_exit", "buy")}
+    assert [r.side for r in ledger.round_trips] == ["short"] * 3
+
+
+def test_take_profit_set_twice_uses_the_latest_price_for_the_reason():
+    ledger, broker = _acct()
+    ref = _open(broker)
+    broker.set_take_profit(ref, 105.0, 10)
+    broker.set_take_profit(ref, 106.0, 10)
+    broker.close_position(ref, price=105.0, time=T1)
+    assert ledger.fills[-1].reason == "algo_exit"
+
+
+def test_two_brokers_sharing_a_ledger_keep_the_same_refs_apart_by_account():
+    ledger = Ledger()
+    one = SimBroker(account=ledger.open_account("a", "AAPL", 100_000))
+    two = SimBroker(account=ledger.open_account("b", "AAPL", 100_000))
+    ref_one, ref_two = _open(one), _open_dir(two, 0, stop=101.0)
+    assert ref_one == ref_two == 1  # refs restart per broker
+    one.close_position(1, price=104.0, time=T1)
+    two.modify_stop(1, 102.0)  # b's position is still open: not ignored
+    two.close_position(1, price=97.0, time=T2)
+    one.close_position(1, price=104.0, time=T2)  # a's second close only
+    assert [(e.account, e.kind) for e in ledger.ignored_events] == [("a", "close")]
+    trips = {t.account: t for t in ledger.round_trips}
+    assert (trips["a"].side, trips["a"].exit_price) == ("long", Decimal(104))
+    assert (trips["b"].side, trips["b"].exit_price) == ("short", Decimal(97))
+    assert [r["id"] for r in ledger_trade_records(ledger)] == ["a0", "b0"]
+    assert [(r["id"], r["direction"], r["closePrice"])
+            for r in ledger_trade_records(ledger, "b")] == [("b0", 0, 97.0)]
+
+
+def test_modify_stop_for_a_ref_never_opened_is_dropped_before_any_time_is_known():
+    ledger, broker = _acct()
+    broker.modify_stop(5, 1.0)
+    broker.set_take_profit(5, 1.0, 1)
+    assert ledger.ignored_events == () and ledger.fills == () and ledger.orders == ()
+    assert [c.method for c in broker.calls] == ["modify_stop", "set_take_profit"]
+
+
+def test_repeated_runs_in_one_process_do_not_share_state():
+    def run() -> list:
+        ledger, broker = _acct()
+        ref = _open(broker)
+        broker.close_position(ref, price=99.0, time=T1)
+        broker.close_position(ref, price=99.0, time=T2)
+        return [ledger_trade_records(ledger), len(ledger.ignored_events), len(ledger.fills)]
+
+    assert run() == run()
