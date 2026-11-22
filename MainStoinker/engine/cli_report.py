@@ -43,7 +43,8 @@ from pathlib import Path
 from typing import Any
 
 from .ledger import IGNORED_KINDS
-from .stats import fmt4, run_statistics, statistics_record
+from .run_documents import report_document, run_header, run_net, run_summary_record
+from .stats import fmt4, run_statistics
 from .store import RunData, RunSummary, Store, StoreError, open_store_readonly
 
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
@@ -187,10 +188,6 @@ def _read(action: Any) -> Any:
         raise ReportError(f"stored data cannot be read: {type(exc).__name__}: {exc}") from exc
 
 
-def _net(run: RunData) -> Decimal:
-    return sum((t.net for t in run.round_trips), Decimal("0.0000"))
-
-
 # --- runs ------------------------------------------------------------------------
 
 
@@ -203,26 +200,7 @@ def run_runs_command(spec: str | None, *, as_json: bool,
     finally:
         store.close()
     if as_json:
-        records = []
-        for summary, run in entries:
-            duration = (None if summary.ended_at is None
-                        else round(max((summary.ended_at - summary.started_at).total_seconds(), 0.0), 3))
-            records.append({
-                "run_id": summary.run_id,
-                "started_at": summary.started_at.astimezone(timezone.utc).isoformat(),
-                "ended_at": (None if summary.ended_at is None
-                             else summary.ended_at.astimezone(timezone.utc).isoformat()),
-                "duration_seconds": duration,
-                "status": summary.status,
-                "incomplete": summary.status == "running",
-                "kind": summary.kind,
-                "fills": summary.fills,
-                "code_version": summary.code_version,
-                "symbols": list(summary.data.symbols),
-                "algo_count": len(run.algos),
-                "trade_count": len(run.round_trips),
-                "net": fmt4(_net(run)),
-            })
+        records = [run_summary_record(summary, run) for summary, run in entries]
         _write([json.dumps({"runs": records}, indent=1)])
         return 0
     if not entries:
@@ -230,7 +208,7 @@ def run_runs_command(spec: str | None, *, as_json: bool,
         return 0
     rows = [[str(s.run_id), _utc(s.started_at), _duration(s.started_at, s.ended_at),
              _status_shown(s.status), s.kind, s.fills, str(len(r.algos)),
-             str(len(r.round_trips)), _money2(_net(r)), _short_version(s.code_version)]
+             str(len(r.round_trips)), _money2(run_net(r)), _short_version(s.code_version)]
             for s, r in entries]
     headers = ["id", "started (UTC)", "duration", "status", "kind", "fills", "algos", "trades",
                "net", "code"]
@@ -239,28 +217,6 @@ def run_runs_command(spec: str | None, *, as_json: bool,
 
 
 # --- report ----------------------------------------------------------------------
-
-
-def _run_header(run: RunData) -> dict[str, Any]:
-    s = run.summary
-    config = run.config if isinstance(run.config, Mapping) else {}
-    costs = config.get("costs") if s.fills == "realistic" else None
-    return {
-        "run_id": s.run_id,
-        "status": s.status,
-        "incomplete": s.status == "running",
-        "kind": s.kind,
-        "fills": s.fills,
-        "started_at": s.started_at.astimezone(timezone.utc).isoformat(),
-        "ended_at": None if s.ended_at is None else s.ended_at.astimezone(timezone.utc).isoformat(),
-        "code_version": s.code_version,
-        "symbols": list(s.data.symbols),
-        "first_bar": None if s.data.first_bar is None else s.data.first_bar.isoformat(),
-        "last_bar": None if s.data.last_bar is None else s.data.last_bar.isoformat(),
-        "data_directory": _data_directory(s.data.directory),
-        "capital": config.get("capital") if s.fills == "realistic" else None,
-        "costs": costs if isinstance(costs, Mapping) else None,
-    }
 
 
 def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
@@ -273,18 +229,13 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
         run: RunData = _read(lambda: store.load_run(run_id))
     finally:
         store.close()
-    stats = run_statistics(run, IGNORED_KINDS)
-    header = _run_header(run)
+    data_directory = _data_directory(run.summary.data.directory)
     if as_json:
-        accounts = {
-            algo.idname: {"symbol": algo.ticker, "algo": algo.algo_id, "mode": algo.mode,
-                          **statistics_record(stats["accounts"][algo.idname])}
-            for algo in run.algos
-        }
-        _write([json.dumps({"run": header, "accounts": accounts,
-                            "total": statistics_record(stats["total"])}, indent=1)])
+        _write([json.dumps(report_document(run, data_directory=data_directory), indent=1)])
         return 0
 
+    stats = run_statistics(run, IGNORED_KINDS)
+    header = run_header(run, data_directory=data_directory)
     s = run.summary
     lines = [f"run {s.run_id}"]
     if s.status == "completed":
