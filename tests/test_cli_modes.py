@@ -513,3 +513,159 @@ def test_realistic_run_matches_paper_reference(tmp_path_factory, key):
     assert summary["commission"] == commission
     assert Decimal(summary["final_equity"]) == Decimal("10000") + Decimal(net)
     assert len(env.trades()[idname]) == trades
+
+
+# ---- verification additions: refusal everywhere, golden pins, multi-algo, hand-computed costs ----
+
+ORC = {"idname": "AAPL-orc", "ticker": "AAPL", "RRRatio": 3}
+FF = {"idname": "TSLA-ff", "ticker": "TSLA", "RRRatio": 3}
+GOLDEN_PAPER = Path(__file__).parent / "golden_paper"
+# golden file name -> (algo id, config, symbols)
+FAST_CASES = {
+    "emacrossing_aapl": ("EMACrossing", EMA, ["AAPL"]),
+    "openingrangecandle_aapl": ("OpeningRangeCandle", ORC, ["AAPL"]),
+    "fridayfrenzy_tsla": ("FridayFrenzy", FF, ["TSLA"]),
+    "fvg_aapl": ("FVG", FVG, ["AAPL"]),
+}
+
+
+def single_realistic(tmp_path_factory, case: str, *extra: str) -> Env:
+    algo_id, cfg, symbols = FAST_CASES[case]
+    key = f"case-{case}-realistic" + "".join(extra)
+    return full_run(tmp_path_factory, key, [{"ID": algo_id, "data": [cfg]}], symbols,
+                    "--fills", "realistic", *extra)
+
+
+def _live_in(position: str, mode: object) -> list[dict]:
+    live = {**EMA_MSFT, "mode": mode}
+    return {
+        "first_entry": [{"ID": "EMACrossing", "data": [live]}, {"ID": "EMACrossing", "data": [EMA]}],
+        "last_of_several": [{"ID": "EMACrossing", "data": [EMA]},
+                            {"ID": "FunctionTest", "data": [{**FUNC_MSFT, "mode": "paper"}]},
+                            {"ID": "EMACrossing", "data": [live]}],
+        "second_config": [{"ID": "EMACrossing", "data": [EMA, live]}],
+    }[position]
+
+
+@pytest.mark.parametrize("position", ["first_entry", "last_of_several", "second_config"])
+@pytest.mark.parametrize("mode", ["live", "Live", " live ", "LIVE", "live\n", None, 1, True, ["live"]])
+@pytest.mark.parametrize("fills", ["legacy", "realistic"])
+def test_live_or_odd_mode_anywhere_refused_and_nothing_written(env, capsys, position, mode, fills):
+    env.setup(_live_in(position, mode), ["AAPL", "MSFT"], rows=60)
+    assert env.run("--fills", fills) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: algo 'MSFT-10/30EMA': ")
+    assert len(captured.err.strip().splitlines()) == 1
+    if mode == "live":
+        assert captured.err.strip().endswith(
+            "mode 'live' is not available yet (needs the live broker, milestone 1 Phase B)")
+    assert not env.out.exists()
+    assert list(env.start.iterdir()) == []  # no loggy.log / tradey.txt / algo.csv in the start dir
+    assert not list(env.inputs.rglob("loggy.log")) and not list(env.inputs.rglob("tradey.txt"))
+
+
+def test_refused_config_leaves_no_state_for_the_next_run(env, capsys):
+    env.setup(ema_config(), ["AAPL"])
+    assert env.run("--fills", "realistic") == 0
+    first = (env.trades_bytes(), (env.out / "ledger.json").read_bytes())
+    env.algos.write_text(json.dumps(ema_config(mode="live")), encoding="utf-8")
+    assert env.run("--fills", "realistic") == 2
+    capsys.readouterr()
+    env.algos.write_text(json.dumps(ema_config()), encoding="utf-8")
+    assert env.run("--fills", "realistic") == 0
+    assert (env.trades_bytes(), (env.out / "ledger.json").read_bytes()) == first
+    assert env.run() == 0  # legacy afterwards in the same process
+    assert "status" in env.trades()[EMA["idname"]][0]  # legacy shape again
+
+
+@pytest.mark.skipif(not any(GOLDEN_PAPER.glob("*.json")), reason="tests/golden_paper not merged yet")
+@pytest.mark.parametrize("case", sorted(FAST_CASES))
+def test_realistic_cli_output_matches_golden_paper(tmp_path_factory, case):
+    cfg = FAST_CASES[case][1]
+    env = single_realistic(tmp_path_factory, case)
+    golden = json.loads((GOLDEN_PAPER / f"{case}.json").read_text())
+    account = env.ledger()["accounts"][cfg["idname"]]
+    summary, expected = account["summary"], golden["summary"]
+    assert summary["trades"] == expected["trade_count"]
+    for key in ("net", "commission", "final_equity"):
+        assert Decimal(summary[key]) == Decimal(expected[key]), key
+    assert len(account["round_trips"]) == len(golden["trades"])
+    for trip, want in zip(account["round_trips"], golden["trades"], strict=True):
+        assert set(trip) == set(want)
+        for key, value in want.items():
+            if key in ("side", "exit_reason", "entry_time", "exit_time", "synthetic"):
+                assert trip[key] == value, key
+            else:
+                assert Decimal(trip[key]) == Decimal(value), key
+    records = env.trades()[cfg["idname"]]
+    assert len(records) == expected["trade_count"]
+    assert all("status" not in record for record in records)
+
+
+def test_multi_algo_run_equals_the_single_algo_runs(tmp_path_factory):
+    cases = sorted(FAST_CASES)
+    config = [{"ID": FAST_CASES[c][0], "data": [FAST_CASES[c][1]]} for c in cases]
+    realistic = full_run(tmp_path_factory, "multi4-realistic", config, ["AAPL", "TSLA"],
+                         "--fills", "realistic")
+    legacy = full_run(tmp_path_factory, "multi4-legacy", config, ["AAPL", "TSLA"])
+    doc, trades, legacy_trades = realistic.ledger(), realistic.trades(), legacy.trades()
+    total_trades = 0
+    total_net = Decimal(0)
+    for case in cases:
+        idname = FAST_CASES[case][1]["idname"]
+        single = single_realistic(tmp_path_factory, case)
+        assert doc["accounts"][idname] == single.ledger()["accounts"][idname]
+        assert trades[idname] == single.trades()[idname]
+        assert legacy_trades[idname] == json.loads((GOLDEN / f"{case}.json").read_text())
+        total_trades += doc["accounts"][idname]["summary"]["trades"]
+        total_net += Decimal(doc["accounts"][idname]["summary"]["net"])
+    assert list(doc["accounts"]) == [FAST_CASES[c][1]["idname"] for c in cases]
+    assert doc["summary"]["trades"] == total_trades
+    assert Decimal(doc["summary"]["net"]) == total_net
+    assert Decimal(doc["summary"]["final_equity"]) == Decimal(10000 * len(cases)) + total_net
+
+
+def test_commission_minimum_zero_charges_per_share_on_every_fill(env):
+    env.setup(ema_config(), ["AAPL"])
+    assert env.run("--fills", "realistic", "--commission-per-share", "0", "--commission-min", "0") == 0
+    free = env.ledger()["accounts"][EMA["idname"]]
+    assert env.run("--fills", "realistic", "--commission-per-share", "0.01",
+                   "--commission-min", "0") == 0
+    costly = env.ledger()["accounts"][EMA["idname"]]
+    assert len(free["round_trips"]) == len(costly["round_trips"]) > 1
+    assert any(t["synthetic"] for t in costly["round_trips"])  # the end-of-data close pays too
+    for a, b in zip(free["round_trips"], costly["round_trips"], strict=True):
+        assert Decimal(a["commission"]) == 0 and Decimal(a["net"]) == Decimal(a["gross"])
+        assert b["gross"] == a["gross"] and b["entry_price"] == a["entry_price"]
+        # entry and exit, 0.01 per share each
+        assert Decimal(b["commission"]) == Decimal(b["quantity"]) * Decimal("0.01") * 2
+        assert Decimal(b["net"]) == Decimal(b["gross"]) - Decimal(b["commission"])
+    assert Decimal(costly["summary"]["commission"]) == Decimal("0.10") * 2 * len(costly["round_trips"])
+
+
+@pytest.mark.parametrize("case", ["openingrangecandle_aapl", "fridayfrenzy_tsla"])
+def test_slippage_worsens_market_and_stop_fills_only(tmp_path_factory, case):
+    free = ("--commission-per-share", "0", "--commission-min", "0")
+    base = single_realistic(tmp_path_factory, case, *free)
+    slipped = single_realistic(tmp_path_factory, case, *free, "--slippage-per-share", "0.01")
+    idname = FAST_CASES[case][1]["idname"]
+    a = base.ledger()["accounts"][idname]["round_trips"]
+    b = slipped.ledger()["accounts"][idname]["round_trips"]
+    assert len(a) == len(b) > 0
+    assert {"stop", "target"} <= {t["exit_reason"] for t in a}
+    penny = Decimal("0.01")
+    for before, after in zip(a, b, strict=True):
+        assert (before["entry_time"], before["exit_reason"]) == (after["entry_time"], after["exit_reason"])
+        sign = 1 if before["side"] == "long" else -1
+        # the entry is a market fill: a buyer pays more, a short seller receives less
+        assert Decimal(after["entry_price"]) - Decimal(before["entry_price"]) == sign * penny
+        move = Decimal(after["exit_price"]) - Decimal(before["exit_price"])
+        if before["exit_reason"] in ("target", "end_of_data"):
+            # limit fills and the synthetic close are not slipped
+            assert move == 0, before["exit_reason"]
+            expected_cost = penny
+        else:
+            assert move == -sign * penny, before["exit_reason"]
+            expected_cost = 2 * penny
+        assert Decimal(before["net"]) - Decimal(after["net"]) == expected_cost * Decimal(before["quantity"])
