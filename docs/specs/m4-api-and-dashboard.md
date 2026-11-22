@@ -1,6 +1,7 @@
 # Milestone 4 spec: API and dashboard
 
-Status: draft, waiting for the owner's answers under "Decisions needed".
+Status: draft. One decision is open (dashboard technology); the other four
+were made by the owner on 2026-11-22.
 
 ## Goal
 
@@ -20,13 +21,17 @@ Done means:
 2. The API returns runs, statistics, trades, orders, equity curves and price
    bars as JSON, with the same numbers as `report --json`.
 3. The dashboard has four views: run list, run overview, algo detail with a
-   price chart and trade markers, and a comparison of two runs.
-4. The hardcoded front-end address in `Globals.py` is gone (issue 20).
+   price chart, the algo's own indicators and trade markers, and a comparison
+   of two runs.
+4. Each run stores the indicator series its algos drew, so the chart shows why
+   a trade was taken.
+5. The hardcoded front-end address in `Globals.py` is gone (issue 20).
 
 ## What stays as it is
 
-- The engine, the brokers, the ledger, the store schema (version 1) and every
-  golden file. This milestone only reads.
+- The engine's trading behaviour, the brokers, the ledger and every golden
+  file. The store gains two tables (schema version 2, see "Indicator
+  series"); the existing tables do not change.
 - The live program, `apiApi.py`, `trade.py`, and the old socket.io client
   (`Util/SocketIO_Client.py`). The old client is not extended; it is removed
   with the legacy runtime in milestone 1 Phase B.
@@ -89,6 +94,7 @@ definition everywhere.
 | `GET /api/runs/{id}/orders?algo=` | Order events and fills |
 | `GET /api/runs/{id}/equity?algo=&max_points=` | Equity series of one algo, or of the account when `algo` is left out |
 | `GET /api/runs/{id}/bars?symbol=&start=&end=` | One-minute bars for the price chart |
+| `GET /api/runs/{id}/series?algo=&start=&end=` | The algo's indicator series for the price chart |
 | `GET /api/compare?runs=1,2` | Statistics of the listed runs side by side, matched by algo `idname` |
 
 - An unknown run, algo or symbol is a 404 with a one-line JSON message. A bad
@@ -108,6 +114,44 @@ so and the dashboard shows the trades without candles. The response is limited
 to a time window (default: the session of the selected trade or day) so a long
 history is never sent in one piece.
 
+### Indicator series
+
+Every algo already keeps its indicators: `AlgoData` is a frame with one row
+per bar, `FrontEndDataStruct` names its columns and `FrontEndDataType` says how
+each is drawn (`line`, `segment`, `marker-up`, `marker-down`, `baseline`). For
+example EMACrossing has two moving-average lines, the opening-range algos have
+upper and lower bound, target and stop segments, and Elliot has swing-low and
+swing-high markers. What is missing is that nothing keeps this after the run.
+
+- **Capture.** When a run with `--db` ends, the command reads each algo's
+  `AlgoData` and stores every non-empty value. The algos are not changed and
+  an algo without `AlgoData` simply stores nothing. A new algo gets its
+  indicators on the chart by filling the same three attributes.
+- **Schema version 2.** `algo_series` (run, algo, name, draw type, order) and
+  `algo_series_points` (run, algo, name, bar time, value). Values are stored
+  as floating point: they are indicator levels for drawing, not money. The
+  migration from version 1 only adds the tables. Runs stored before it have no
+  series, and the chart says so.
+- **Read.** `RunData` gains the series; the series route returns them for a
+  time window, like bars.
+- **Draw.** Lines as line series, segments as stepped lines that break where
+  the value is empty, markers as arrows on the candles.
+
+Two things the chart must be honest about:
+
+- **Swing markers are drawn with hindsight.** A swing low is only confirmed
+  some bars after it happens, and the algo marks it on the bar where it
+  happened. The stored frame is the final one, so a marker shows where the
+  swing was, not when the algo knew. The chart legend says this.
+- **Stop and target lines come from the order events for realistic-fill
+  runs.** The algo's own `StopPrice` and `tp` columns are read from the legacy
+  `Trade`, which goes stale when the broker closes a position. Entry and exit
+  markers always come from the ledger. The `Trade` column is stored but not
+  drawn.
+
+Live and paper runs will need the series written as bars arrive; that is part
+of incremental writes (issue 70) in Phase B.
+
 ### Dashboard
 
 Plain HTML, CSS and JavaScript modules served as static files: no Node, no
@@ -125,8 +169,9 @@ Views:
    table from `report`. Notes for synthetic closes, ignored events and
    cancelled entries.
 3. **Algo detail.** Equity curve of one algo, its trade table (sortable, with
-   exit reason), and a candle chart with entry and exit markers. Selecting a
-   trade moves the chart to it.
+   exit reason), and a candle chart with the algo's indicators, stop and
+   target lines, and entry and exit markers. Selecting a trade moves the chart
+   to it. Each indicator can be switched off in the legend.
 4. **Compare.** Two runs side by side: statistics per algo and both equity
    curves on one chart. This is the legacy-versus-realistic view now and the
    paper-versus-live view later.
@@ -177,21 +222,20 @@ produces the final split:
 - C2. Runs and run-detail routes.
 - C3. Trades, orders and equity routes, with thinning.
 - C4. Bars route.
-- C5. Compare route.
-- C6. Dashboard shell and runs view.
-- C7. Run overview.
-- C8. Algo detail with the candle chart.
-- C9. Compare view.
-- C10. Issue 20 and the database-location hint.
+- C5. Schema version 2 and capture of the indicator series at the end of a
+  run.
+- C6. Series route.
+- C7. Compare route.
+- C8. Dashboard shell and runs view.
+- C9. Run overview.
+- C10. Algo detail with the candle chart and trade markers.
+- C11. Indicator overlays and stop and target lines on the chart.
+- C12. Compare view.
+- C13. Issue 20 and the database-location hint.
 
 **Phase B, with the live side.** Live updates (server-sent events), paper and
 live runs side by side, open positions, the account view from the broker, and
 a login if the dashboard is ever reached from another machine.
-
-**Later.** Indicator overlays on the candle chart (moving averages, opening
-range, wave points). The algos already describe these series for the old
-front end, but they are not stored; storing them needs a schema change and is
-left out of Phase A.
 
 ## Decisions needed
 
@@ -199,10 +243,13 @@ left out of Phase A.
    step, as described. The alternative is a React app, which needs Node and a
    build pipeline and is worth it only if the dashboard grows well beyond
    these views.
-2. **Chart library.** Recommended: TradingView Lightweight Charts, copied into
-   the repo. It requires a visible attribution link.
-3. **Access.** Recommended: this machine only, no login, in Phase A.
-4. **Indicator overlays.** Recommended: leave for later, as above. Including
-   them now adds a schema change and about two tasks.
-5. **Database location.** Recommended: `%USERPROFILE%\Stoinkulator\runs.db`,
-   set once through `STOINK_DB`.
+
+## Decisions
+
+2. **Chart library: TradingView Lightweight Charts (owner, 2026-11-22).**
+   Copied into the repo, with the attribution link it requires.
+3. **Access: this machine only, no login (owner, 2026-11-22).**
+4. **Indicator overlays: in Phase A (owner, 2026-11-22).** Without them
+   trades appear on the chart with no visible reason. See "Indicator series".
+5. **Database location: `%USERPROFILE%\Stoinkulator\runs.db` (owner,
+   2026-11-22),** set once through `STOINK_DB`.
