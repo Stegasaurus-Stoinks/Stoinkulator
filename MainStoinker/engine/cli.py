@@ -125,16 +125,16 @@ from .algos import close_algo_logs, load_algo
 from .cli_report import ReportError, run_report_command, run_runs_command
 from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
-from .feed import CsvBarFeed
+from .feed import _SYMBOL, CsvBarFeed, file_fingerprint, offline_data_path
 from .ledger import Ledger
 from .modes import DEFAULT_MODE, ModeError, build_router, parse_mode
 from .paper_broker import CostModel
 from .report import ledger_document, ledger_trade_records, trade_records
+from .series import extract_series
 from .sink import NullSink
 from .stats import fmt4
 from .store import AlgoMeta, DataMeta, RunMeta, StoreError, open_store
 
-_SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _MONEY = re.compile(_NUMBER)
 _NEGATIVE_MONEY = re.compile("-" + _NUMBER)
@@ -628,10 +628,12 @@ def run_backtest_command(
     # One pass over the batches (they are in memory): count them and note the
     # first and last replayed bar, which the stored run records.
     bar_count = 0
+    replay_times: list[datetime] = []
     first_bar: datetime | None = None
     last_bar: datetime | None = None
     for stamp, _bars in feed:
         bar_count += 1
+        replay_times.append(stamp)
         if first_bar is None:
             first_bar = stamp
         last_bar = stamp
@@ -649,6 +651,16 @@ def run_backtest_command(
     # cheap check that `--out` can be created. The store comes next, before the
     # output directory is touched, so a refused database leaves nothing behind.
     _check_out_creatable(out_dir)
+    data_files: tuple[tuple[str, str, int], ...] = ()
+    if args.db is not None:
+        # Fingerprints of the bar files, taken before the run is recorded.
+        try:
+            data_files = tuple(
+                (symbol, *file_fingerprint(offline_data_path(data_dir, symbol)))
+                for symbol in feed.symbols()
+            )
+        except OSError as exc:
+            raise CliError(f"cannot read data file: {exc}") from exc
     store = None
     db_shown = ""
     if args.db is not None:
@@ -694,7 +706,7 @@ def run_backtest_command(
                     },
                     data=DataMeta(source="csv", directory=str(data_dir),
                                   symbols=tuple(feed.symbols()), first_bar=first_bar,
-                                  last_bar=last_bar),
+                                  last_bar=last_bar, files=data_files),
                 ))
                 store.write_algos(run_id, [
                     AlgoMeta(cfg["idname"], entry["ID"], cfg["ticker"], router.modes[cfg["idname"]],
@@ -750,6 +762,17 @@ def run_backtest_command(
                     equity=ledger.equity_points,
                     ignored_events=ledger.ignored_events,
                 )
+                # The indicator series: the full history each algo saw (its
+                # symbol's warm-up bars, then every replayed bar), matched by position.
+                all_infos: list = []
+                all_points: list = []
+                for algo in algos:
+                    history = [*feed.warmup(algo.ticker)["date"].tolist(), *replay_times]
+                    infos, points = extract_series(algo, history)
+                    all_infos += infos
+                    all_points += points
+                if all_infos:  # one transaction: a run has all its series or none
+                    store.write_series(run_id, all_infos, all_points)
                 store.end_run(run_id, "completed")
         except BaseException as exc:
             if not engine_started:
