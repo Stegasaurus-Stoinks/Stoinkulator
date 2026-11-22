@@ -1,6 +1,7 @@
 """CsvBarFeed: parity with the legacy offline loader and strict alignment."""
 from __future__ import annotations
 
+import hashlib
 import threading
 from pathlib import Path
 
@@ -8,7 +9,16 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
-from MainStoinker.engine.feed import COLUMNS, Bar, BarFeed, CsvBarFeed
+from MainStoinker.engine.feed import (
+    COLUMNS,
+    Bar,
+    BarFeed,
+    CsvBarFeed,
+    bars_between,
+    file_fingerprint,
+    offline_data_path,
+    read_offline_bars,
+)
 from tests import harness
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -245,3 +255,46 @@ def test_csv_feed_satisfies_protocol(feed_all: CsvBarFeed) -> None:
 
 def test_non_feed_fails_protocol() -> None:
     assert not isinstance(object(), BarFeed)
+
+
+def test_read_offline_bars_equals_feed_parsing(feed_all: CsvBarFeed, batches_all: list) -> None:
+    ours = read_offline_bars(offline_data_path(DATA_DIR, "AAPL"))
+    replay = pd.DataFrame.from_records([bars["AAPL"].as_record() for _, bars in batches_all])
+    held = pd.concat([feed_all.warmup("AAPL"), replay], ignore_index=True)
+    assert_frame_equal(ours, held, check_dtype=True, check_index_type=True)
+
+
+def test_bars_between_inclusive_and_empty() -> None:
+    frame = read_offline_bars(offline_data_path(DATA_DIR, "AAPL"))
+    start, end = frame["date"].iloc[10], frame["date"].iloc[19]
+    window = bars_between(frame, start.to_pydatetime(), end.to_pydatetime())
+    assert len(window) == 10
+    assert window["date"].iloc[0] == start and window["date"].iloc[-1] == end
+    assert isinstance(window.index, pd.RangeIndex)
+    assert list(window.columns) == list(COLUMNS)
+    last = frame["date"].iloc[-1]
+    assert bars_between(frame, last + pd.Timedelta(days=1), last + pd.Timedelta(days=2)).empty
+    assert bars_between(frame, end, start).empty
+
+
+def test_file_fingerprint_stable_and_changes_with_content(tmp_path: Path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"abc" * 1_000_000)
+    first = file_fingerprint(path)
+    assert first == file_fingerprint(path)
+    assert first[1] == 3_000_000 and len(first[0]) == 64
+    assert first[0] == hashlib.sha256(b"abc" * 1_000_000).hexdigest()
+    path.write_bytes(b"abd" * 1_000_000)
+    assert file_fingerprint(path)[0] != first[0]
+
+
+@pytest.mark.parametrize(
+    "symbol", ["", "..", "../AAPL", "A/B", "A\\B", ".AAPL", "AAPL\n", "A B", "/etc"]
+)
+def test_offline_data_path_rejects_bad_symbol(symbol: str, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid symbol"):
+        offline_data_path(tmp_path, symbol)
+
+
+def test_offline_data_path_good_symbol(tmp_path: Path) -> None:
+    assert offline_data_path(tmp_path, "BRK.B") == tmp_path / "_BRK.B_offlinedata_"
