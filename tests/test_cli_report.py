@@ -8,10 +8,12 @@ checks the repository at the end of the module.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -599,3 +601,58 @@ def test_run_id_arguments_are_read_without_a_database_round_trip(db, capsys):
     assert main(["report", str(2**64), "--db", str(db)]) == 2
     assert error_of(capsys) == f"error: no run {2**64}"
 
+
+
+def test_non_ascii_idname_does_not_crash_a_cp1252_console(db, monkeypatch, capsys):
+    name = "caf\u00e9-\u65e5\u672c"
+    algos = [AlgoMeta(name, "Algo", "AAPL", "backtest", D("1000"))]
+    make_run(db, algos=algos, trips=[trip(name, "3.0000")],
+             equity=[point(name, "1003"), point(None, "1003")])
+    real = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", write_through=True)
+    monkeypatch.setattr("sys.stdout", real)
+    assert main(["report", "1", "--db", str(db)]) == 0
+    assert main(["runs", "--db", str(db)]) == 0
+    text = real.buffer.getvalue().decode("cp1252")
+    assert "caf\u00e9-\\u65e5\\u672c" in text  # what cp1252 cannot show is escaped, not a traceback
+    assert main(["report", "1", "--json", "--db", str(db)]) == 0
+    document = real.buffer.getvalue().decode("cp1252").split("\n{", 1)[1]
+    assert document.isascii() and name in json.loads("{" + document)["accounts"]
+
+
+def test_repeated_invocations_in_one_process_leak_nothing(db, tmp_path, capsys):
+    other = tmp_path / "other" / "runs.db"
+    make_run(db, algos=HAND_ALGOS, trips=HAND_TRIPS, equity=HAND_EQUITY)
+    make_run(other, algos=HAND_ALGOS, trips=[trip("X-1", "-9")],
+             equity=[point("X-1", "991"), point(None, "991")])
+    seen = {}
+    for _ in range(2):
+        for name, path in (("a", db), ("b", other)):
+            assert main(["report", "1", "--db", str(path)]) == 0
+            assert seen.setdefault(("report", name), out_of(capsys)) == seen[("report", name)]
+            assert main(["runs", "--json", "--db", str(path)]) == 0
+            assert seen.setdefault(("runs", name), out_of(capsys)) == seen[("runs", name)]
+    assert seen[("report", "a")] != seen[("report", "b")]
+    assert json.loads(seen[("runs", "a")])["runs"][0]["net"] == "9.8450"
+    assert json.loads(seen[("runs", "b")])["runs"][0]["net"] == "-9.0000"
+
+
+def test_runs_and_report_import_no_algo_broker_or_legacy_module(db):
+    make_run(db, algos=HAND_ALGOS, trips=HAND_TRIPS, equity=HAND_EQUITY)
+    banned = "('MainStoinker.Algos', 'MainStoinker.DataCollection', 'MainStoinker.TradeTools', " \
+             "'MainStoinker.MainStuff', 'ibapi')"
+    code = ("import sys\nfrom MainStoinker.engine.cli import main\n"
+            "assert main(['runs', '--db', sys.argv[1]]) == 0\n"
+            "assert main(['report', '1', '--db', sys.argv[1]]) == 0\n"
+            f"bad = [m for m in sys.modules if m.startswith({banned})]\n"
+            "print(bad)\nsys.exit(1 if bad else 0)\n")
+    result = subprocess.run([sys.executable, "-c", code, str(db)], cwd=db.parent,
+                            env={**os.environ, "PYTHONPATH": str(REPO)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("command", [["runs", "extra"], ["report", "1", "extra"], ["report"]])
+def test_extra_or_missing_arguments_are_a_usage_error(db, command):
+    make_run(db, algos=HAND_ALGOS)
+    with pytest.raises(SystemExit) as stop:
+        main([*command, "--db", str(db)])
+    assert stop.value.code == 2

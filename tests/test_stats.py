@@ -261,3 +261,71 @@ def test_account_aggregates_algos():
     assert total["synthetic_closes"] == 1 and total["cancelled_entries"] == 2
     assert total["ignored_events"] == {"close": 2, "modify_stop": 0, "take_profit": 1}
     assert total["avg_win"] == D("6") and total["avg_loss"] == D("-2.5")  # (10+2)/2, (-4-1)/2
+
+
+def test_cancelled_entry_counts_equal_the_paper_brokers_own_count():
+    """The derivation from order events must agree with `PaperBroker.cancelled_entries`, which
+    is what `ledger.json` records, in each way an entry can be cancelled (and in the ways a
+    stop or target is cancelled without any entry being so)."""
+    from tests.test_paper_broker import bar, make, open_pos, opened
+
+    def counted(ledger):
+        return stats.cancelled_entry_counts(ledger.orders).get("a", 0)
+
+    # an entry that never fills (session ends), with its stop and a target working
+    ledger, broker = make()
+    ref = open_pos(broker)
+    broker.set_take_profit(ref, 110.0, 10)
+    broker.on_bar("AAPL", bar(0, 100.0, day=1))
+    assert broker.cancelled_entries == 1 == counted(ledger)
+    assert [e.kind for e in ledger.orders].count("cancelled") == 3  # entry, stop, target
+
+    # closed while still pending
+    ledger, broker = make()
+    broker.close_position(open_pos(broker), price=100.0, time=bar(0, 100.0).date)
+    assert broker.cancelled_entries == 1 == counted(ledger)
+
+    # still pending when the data ends, twice over
+    ledger, broker = make()
+    open_pos(broker)
+    broker.on_end({})
+    broker.on_end({})
+    assert broker.cancelled_entries == 1 == counted(ledger)
+
+    # a filled entry whose stop or target is cancelled is not a cancelled entry
+    for high, low in ((111.0, 99.0), (105.0, 94.0)):
+        ledger, broker = make()
+        opened(broker, stop=95.0, tp=110.0)
+        broker.on_bar("AAPL", bar(2, 100.0, high, low))
+        assert [e.kind for e in ledger.orders].count("cancelled") == 1
+        assert broker.cancelled_entries == 0 == counted(ledger)
+
+    # a filled entry closed by the algo cancels its stop, not an entry
+    ledger, broker = make()
+    ref = opened(broker)
+    broker.close_position(ref, price=100.0, time=bar(2, 100.0).date)
+    assert broker.cancelled_entries == 0 == counted(ledger)
+
+    # one cancelled and one filled position on the same account
+    ledger, broker = make()
+    first = open_pos(broker)
+    second = open_pos(broker, minute=0)
+    broker.close_position(first, price=100.0, time=bar(0, 100.0).date)
+    broker.on_bar("AAPL", bar(1, 100.0, 100.5, 99.5))
+    assert broker.position_state(second) == "open"
+    assert broker.cancelled_entries == 1 == counted(ledger)
+
+
+def test_ledger_document_names_an_unknown_idname_instead_of_stopiteration():
+    import pytest
+
+    from MainStoinker.engine.ledger import Ledger
+    from MainStoinker.engine.paper_broker import CostModel
+    from MainStoinker.engine.report import ledger_document
+
+    ledger = Ledger()
+    ledger.open_account("a", "AAPL", D("1000"))
+    free = CostModel(D(0), D(0), D(0))
+    with pytest.raises(ValueError, match="unknown idname 'nope'"):
+        ledger_document(ledger, ["a", "nope"], fills="realistic", costs=free, capital=D("1000"))
+    assert ledger_document(ledger, ["a"], fills="realistic", costs=free, capital=D("1000"))["accounts"]
