@@ -1,7 +1,6 @@
 # Milestone 4 spec: API and dashboard
 
-Status: draft. One decision is open (dashboard technology); the other four
-were made by the owner on 2026-11-22.
+Status: approved by the owner on 2026-11-22. See "Decisions" at the end.
 
 ## Goal
 
@@ -237,15 +236,12 @@ produces the final split:
 live runs side by side, open positions, the account view from the broker, and
 a login if the dashboard is ever reached from another machine.
 
-## Decisions needed
-
-1. **Dashboard technology.** Recommended: plain static pages with no build
-   step, as described. The alternative is a React app, which needs Node and a
-   build pipeline and is worth it only if the dashboard grows well beyond
-   these views.
-
 ## Decisions
 
+1. **Dashboard technology: plain static pages for now (owner, 2026-11-22).**
+   No build step. A move to React is revisited once the API is built; the API
+   does not change either way. If it happens, agents for the React tasks and
+   builds are set up first.
 2. **Chart library: TradingView Lightweight Charts (owner, 2026-11-22).**
    Copied into the repo, with the attribution link it requires.
 3. **Access: this machine only, no login (owner, 2026-11-22).**
