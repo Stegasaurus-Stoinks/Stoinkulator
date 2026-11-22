@@ -46,6 +46,7 @@ A `SqliteStore` belongs to the thread that made it (sqlite3's rule).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -109,6 +110,9 @@ class DataMeta:
     symbols: tuple[str, ...] = ()
     first_bar: datetime | None = None
     last_bar: datetime | None = None
+    # (symbol, sha256 hex, size in bytes) of each data file; kept in `data_json`.
+    # Rows written before schema 2 have no such key and read back as ().
+    files: tuple[tuple[str, str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,26 @@ class AlgoMeta:
     mode: str
     capital: Decimal
     params: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SeriesInfo:
+    """One indicator series of an algo: what it is called and how to draw it."""
+
+    account: str  # the algo's idname
+    name: str
+    draw_type: str
+    position: int  # drawing order / pane, as the algo declared it
+
+
+@dataclass(frozen=True)
+class SeriesPoint:
+    """One value of an indicator series. `time` is stored as given (data time)."""
+
+    account: str
+    name: str
+    time: datetime
+    value: float  # finite
 
 
 @dataclass(frozen=True)
@@ -162,6 +186,9 @@ class RunData:
     round_trips: tuple[RoundTrip, ...]
     equity: tuple[EquityPoint, ...]
     ignored_events: tuple[IgnoredEvent, ...]
+    # Only the infos of the indicator series; their points are not loaded here,
+    # use `load_series`. Empty for a schema-1 database.
+    series: tuple[SeriesInfo, ...] = ()
 
     def accounts(self) -> tuple[AccountInfo, ...]:
         return tuple(AccountInfo(a.idname, a.ticker, a.capital) for a in self.algos)
@@ -191,6 +218,9 @@ def expand_equity(points: Sequence[EquityPoint], times: Iterable[datetime]) -> l
 
 
 class Store(Protocol):
+    @property
+    def schema_version(self) -> int: ...
+
     def begin_run(self, meta: RunMeta) -> int: ...
 
     def write_algos(self, run_id: int, algos: Sequence[AlgoMeta]) -> None: ...
@@ -206,11 +236,17 @@ class Store(Protocol):
         ignored_events: Iterable[IgnoredEvent] = (),
     ) -> None: ...
 
+    def write_series(self, run_id: int, infos: Sequence[SeriesInfo],
+                     points: Iterable[SeriesPoint] = ()) -> None: ...
+
     def end_run(self, run_id: int, status: RunStatus) -> None: ...
 
     def list_runs(self) -> tuple[RunSummary, ...]: ...
 
     def load_run(self, run_id: int) -> RunData: ...
+
+    def load_series(self, run_id: int, algo: str, start: datetime | None = None,
+                    end: datetime | None = None) -> tuple[SeriesPoint, ...]: ...
 
     def close(self) -> None: ...
 
@@ -220,6 +256,10 @@ class NullStore:
 
     def __init__(self) -> None:
         self._next = 1
+
+    @property
+    def schema_version(self) -> int:
+        return SCHEMA_VERSION
 
     def begin_run(self, meta: RunMeta) -> int:
         run_id = self._next
@@ -241,6 +281,10 @@ class NullStore:
     ) -> None:
         return None
 
+    def write_series(self, run_id: int, infos: Sequence[SeriesInfo],
+                     points: Iterable[SeriesPoint] = ()) -> None:
+        return None
+
     def end_run(self, run_id: int, status: RunStatus) -> None:
         return None
 
@@ -249,6 +293,10 @@ class NullStore:
 
     def load_run(self, run_id: int) -> RunData:
         raise StoreError("the null store keeps no runs")
+
+    def load_series(self, run_id: int, algo: str, start: datetime | None = None,
+                    end: datetime | None = None) -> tuple[SeriesPoint, ...]:
+        return ()
 
     def close(self) -> None:
         return None
@@ -405,6 +453,23 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX idx_equity_run_algo ON equity (run_id, algo)",
         "CREATE INDEX idx_ignored_run_algo ON ignored_events (run_id, algo)",
     ),
+    # 2: indicator series (tables only; nothing existing is altered)
+    (
+        """CREATE TABLE algo_series (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL,
+            algo TEXT NOT NULL,
+            name TEXT NOT NULL,
+            draw_type TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            UNIQUE (run_id, algo, name),
+            FOREIGN KEY (run_id, algo) REFERENCES algos(run_id, idname) ON DELETE CASCADE)""",
+        """CREATE TABLE algo_series_points (
+            series_id INTEGER NOT NULL REFERENCES algo_series(id) ON DELETE CASCADE,
+            time TEXT NOT NULL,
+            value REAL NOT NULL,
+            PRIMARY KEY (series_id, time)) WITHOUT ROWID""",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -431,6 +496,56 @@ def _opt_e4(value: Decimal | None) -> int | None:
 
 def _from_e4(value: int) -> Decimal:
     return (Decimal(value) / _SCALE).quantize(_QUANT)
+
+
+def _finite(value: Any) -> float:
+    if isinstance(value, (bool, str, bytes)) or type(value).__name__ in ("bool", "bool_"):
+        raise StoreError(f"series value {value!r} is not a number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise StoreError(f"series value {value!r} is not a number") from exc
+    if not math.isfinite(number):
+        raise StoreError(f"series value {value!r} is not finite")
+    return number
+
+
+def _text(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise StoreError(f"{what} {value!r} must be a non-empty string")
+    return value
+
+
+def _series_time(value: Any) -> str:
+    """Text of a series point time: a naive `datetime` that is not NaT.
+
+    `pd.NaT` is a `datetime` subclass that is unequal to itself and has no real
+    ISO text; it is refused here without importing pandas.
+    """
+    if not isinstance(value, datetime) or value != value:
+        raise StoreError(f"series time {value!r} must be a datetime (not NaT)")
+    if value.tzinfo is not None:
+        raise StoreError(f"series time {value!r} must be naive (data time)")
+    return value.isoformat()
+
+
+def _series_position(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or abs(value) > _INT64_MAX:
+        raise StoreError(f"series position {value!r} must be a 64-bit integer")
+    return value
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _data_file(entry: Any) -> list[Any]:
+    ok = (isinstance(entry, (tuple, list)) and len(entry) == 3
+          and isinstance(entry[0], str) and isinstance(entry[1], str)
+          and _SHA256.fullmatch(entry[1]) is not None
+          and isinstance(entry[2], int) and not isinstance(entry[2], bool) and entry[2] >= 0)
+    if not ok:
+        raise StoreError(f"data file {entry!r} must be (symbol, sha256 hex, size >= 0)")
+    return list(entry)
 
 
 def _opt_from_e4(value: int | None) -> Decimal | None:
@@ -473,11 +588,14 @@ def _dumps(value: Any, what: str) -> str:
 
 
 def _dt(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise StoreError(f"stored time {value!r} cannot be read") from exc
 
 
 def _opt_dt(value: str | None) -> datetime | None:
-    return None if value is None else datetime.fromisoformat(value)
+    return None if value is None else _dt(value)
 
 
 @dataclass
@@ -684,6 +802,7 @@ class SqliteStore:
             "symbols": list(data.symbols),
             "first_bar": None if data.first_bar is None else data.first_bar.isoformat(),
             "last_bar": None if data.last_bar is None else data.last_bar.isoformat(),
+            "files": [_data_file(entry) for entry in data.files],
         }, "data")
         config_json = _dumps(dict(meta.config), "config")
         with self._tx() as conn:
@@ -816,6 +935,44 @@ class SqliteStore:
         for key in [k for k in self._equity_state if k[0] == run_id]:
             del self._equity_state[key]
 
+    def write_series(self, run_id: int, infos: Sequence[SeriesInfo],
+                     points: Iterable[SeriesPoint] = ()) -> None:
+        """Add indicator series (and optionally their points) to a running run.
+
+        One transaction. A series is declared once (a repeated name for an
+        algo raises `StoreError`); points may come in this call or later ones
+        but must belong to a declared series. Every value must be a finite
+        number; NaN and infinity are refused and nothing is written.
+        """
+        info_rows = [
+            (run_id, _text(i.account, "series account"), _text(i.name, "series name"),
+             _text(i.draw_type, "series draw_type"), _series_position(i.position))
+            for i in infos]
+        point_rows: list[tuple[str, str, str, float]] = []
+        for p in points:
+            point_rows.append((_text(p.account, "series account"), _text(p.name, "series name"),
+                               _series_time(p.time), _finite(p.value)))
+        with self._tx() as conn:
+            if self._schema_version < 2:
+                raise StoreError("this database has no series tables (schema version 1)")
+            self._require_run(conn, run_id, running=True)
+            conn.executemany(
+                "INSERT INTO algo_series (run_id, algo, name, draw_type, position)"
+                " VALUES (?,?,?,?,?)", info_rows)
+            ids = {(a, n): i for i, a, n in conn.execute(
+                "SELECT id, algo, name FROM algo_series WHERE run_id=?", (run_id,))}
+            rows = []
+            for algo, name, time_text, value in point_rows:
+                if (algo, name) not in ids:
+                    raise StoreError(f"series {name!r} of {algo!r} was not declared")
+                rows.append((ids[(algo, name)], time_text, value))
+            try:
+                conn.executemany(
+                    "INSERT INTO algo_series_points (series_id, time, value) VALUES (?,?,?)",
+                    rows)
+            except sqlite3.IntegrityError as exc:
+                raise StoreError(f"a series point is already stored for that time: {exc}") from exc
+
     @staticmethod
     def _require_run(conn: sqlite3.Connection, run_id: int, *, running: bool = False) -> None:
         row = conn.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -832,11 +989,45 @@ class SqliteStore:
             " FROM runs ORDER BY id").fetchall()
         return tuple(self._summary(r) for r in rows)
 
+    def load_series(self, run_id: int, algo: str, start: datetime | None = None,
+                    end: datetime | None = None) -> tuple[SeriesPoint, ...]:
+        """Points of every series of one algo, ordered by series name then time.
+
+        `start` and `end` (both inclusive, either may be None) bound the time
+        window, so one day can be fetched without reading every point. A
+        schema-1 database has no series: the result is empty and the series
+        tables are not queried.
+        """
+        conn = self._db()
+        sql = "SELECT time, value FROM algo_series_points WHERE series_id=?"
+        bounds: list[str] = []
+        if start is not None:
+            sql += " AND time >= ?"
+            bounds.append(start.isoformat())
+        if end is not None:
+            sql += " AND time <= ?"
+            bounds.append(end.isoformat())
+        sql += " ORDER BY time"
+        try:
+            self._require_run(conn, run_id)
+            if self._schema_version < 2:
+                return ()
+            out: list[SeriesPoint] = []
+            for series_id, name in conn.execute(
+                    "SELECT id, name FROM algo_series WHERE run_id=? AND algo=? ORDER BY name",
+                    (run_id, algo)).fetchall():
+                out.extend(SeriesPoint(algo, name, _dt(t), v)
+                           for t, v in conn.execute(sql, (series_id, *bounds)))
+            return tuple(out)
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
     @staticmethod
     def _summary(r: tuple[Any, ...]) -> RunSummary:
         d = json.loads(r[7])
         data = DataMeta(d["source"], d["directory"], tuple(d["symbols"]),
-                        _opt_dt(d["first_bar"]), _opt_dt(d["last_bar"]))
+                        _opt_dt(d["first_bar"]), _opt_dt(d["last_bar"]),
+                        tuple((f[0], f[1], f[2]) for f in d.get("files", ())))
         return RunSummary(r[0], _dt(r[1]), _opt_dt(r[2]), r[3], r[4], r[5], r[6], data)
 
     def load_run(self, run_id: int) -> RunData:
@@ -892,8 +1083,15 @@ class SqliteStore:
             for r in conn.execute(
                 "SELECT algo, broker_ref, kind, time FROM ignored_events WHERE run_id=?"
                 " ORDER BY seq", (run_id,)))
+        series: tuple[SeriesInfo, ...] = ()
+        if self._schema_version >= 2:
+            series = tuple(
+                SeriesInfo(r[0], r[1], r[2], r[3])
+                for r in conn.execute(
+                    "SELECT algo, name, draw_type, position FROM algo_series WHERE run_id=?"
+                    " ORDER BY position, id", (run_id,)))
         return RunData(self._summary(row[:8]), json.loads(row[8]), algos, orders, fills, trips,
-                       equity, ignored)
+                       equity, ignored, series)
 
 
 def open_store(spec: str, *, env: Mapping[str, str], busy_timeout: float = 10.0) -> Store:
