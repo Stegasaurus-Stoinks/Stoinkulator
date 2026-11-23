@@ -22,6 +22,7 @@ FORBIDDEN_PREFIXES = (
     "MainStoinker.Util.SocketIO_Client",
     "MainStoinker.NeatTools",
     "MainStoinker.api",
+    "MainStoinker.ib",
     "ibapi",
 )
 
@@ -119,6 +120,9 @@ def test_checker_catches_violations():
     assert find_violations("import MainStoinker.api.app\n", "x.py")
     assert find_violations("from MainStoinker import api\n", "x.py")
     assert find_violations("from ..Util.broker_guard import x\n", "x.py")
+    assert find_violations("import MainStoinker.ib.connection\n", "x.py")
+    assert find_violations("from MainStoinker import ib\n", "x.py")
+    assert find_violations("from ..ib import connection\n", "x.py")
     # allowed: stdlib, third party, and engine-internal imports
     ok = "import pandas\nfrom .broker import Broker\nfrom MainStoinker.engine import x\n"
     assert not find_violations(ok, "x.py")
@@ -130,10 +134,12 @@ def test_importing_engine_does_not_import_legacy_modules():
         "import MainStoinker.engine.broker\n"
         "bad = [m for m in ('MainStoinker.DataCollection.apiApi',\n"
         "                   'MainStoinker.Util.SocketIO_Client',\n"
-        "                   'MainStoinker.TradeTools.trade', 'ibapi') if m in sys.modules]\n"
+        "                   'MainStoinker.TradeTools.trade', 'MainStoinker.ib',\n"
+        "                   'ibapi') if m in sys.modules]\n"
         "print(','.join(bad))\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60,
+        cwd=ENGINE_DIR.parent.parent,  # the tests run in a scratch directory; import this checkout
     )
     assert result.stdout.strip() == ""
