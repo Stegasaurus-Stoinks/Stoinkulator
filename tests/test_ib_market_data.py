@@ -177,7 +177,7 @@ def test_market_data_has_no_order_methods(rig: Rig) -> None:
     assert public == {
         "request_history", "cancel_history", "set_market_data_type", "request_quotes",
         "cancel_quotes", "request_server_time", "wait_history", "next_event_for",
-        "wait_server_time", "resolve_stock", "general_events",
+        "wait_server_time", "resolve_stock", "general_events", "poll_event", "poll_server_time",
     }
 
 
@@ -406,11 +406,13 @@ def test_wait_history_reports_a_connection_that_closes(rig: Rig) -> None:
 def test_wait_history_reports_lost_connectivity_and_resumes_after_restore(rig: Rig) -> None:
     req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
     rig.fake.drop(1100)
+    before = rig.clock.now
     assert rig.md.wait_history(req_id, 30).outcome == LOST
+    assert rig.clock.now - before >= 30  # T6 fix round: the timeout is honoured while lost
     rig.fake.drop(1102)
     rig.fake.push("historicalDataEnd", req_id, "s", "e")
-    # While lost, a wait reads only what is already queued; the reader thread delivers the
-    # restore and the end marker a moment later, so ask again until they have arrived.
+    # The restore and the end marker are delivered by the reader thread a moment later; a wait
+    # that is still before its deadline keeps reading until they arrive.
     outcome = LOST
     for _ in range(5000):
         outcome = rig.md.wait_history(req_id, 30).outcome

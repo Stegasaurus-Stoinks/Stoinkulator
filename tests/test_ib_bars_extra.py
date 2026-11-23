@@ -193,11 +193,6 @@ def test_regular_session_bars_never_share_a_naive_time_across_a_year() -> None:
             seen[stamp] = minute
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T6 defect: the repeated autumn hour (01:00-02:00 New York) maps two epochs to one "
-    "naive time and bar_from_ib accepts both",
-)
 def test_the_repeated_autumn_hour_is_not_silently_ambiguous() -> None:
     first, second = utc_epoch(2024, 11, 3, 5, 30), utc_epoch(2024, 11, 3, 6, 30)
     stamps = []
@@ -209,13 +204,73 @@ def test_the_repeated_autumn_hour_is_not_silently_ambiguous() -> None:
     assert len(stamps) < 2 or stamps[0] != stamps[1]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T6 defect: a volume above int64 is accepted and would not fit an engine frame",
-)
 def test_a_volume_beyond_int64_is_refused() -> None:
     with pytest.raises(BadBar):
         bar_from_ib(ib_row("1723815000", 10, 11, 9, 10.5, Decimal(10**30)))
+
+
+def test_volume_and_price_bounds_are_exact() -> None:
+    top = bar_from_ib(ib_row("1723815000", 10, 11, 9, 10.5, Decimal(2**63 - 1)))
+    assert top.volume == 2**63 - 1
+    for volume in (Decimal(2**63), 2**63, Decimal(10**30)):
+        with pytest.raises(BadBar, match="int64"):
+            bar_from_ib(ib_row("1723815000", 10, 11, 9, 10.5, volume))
+    edge = bar_from_ib(ib_row("1723815000", 10_000_000, 10_000_000, 10_000_000, 10_000_000, 1))
+    assert edge.high == 10_000_000.0
+    for price in (10_000_000.01, 1e308, 1e9):
+        with pytest.raises(BadBar, match="above"):
+            bar_from_ib(ib_row("1723815000", price, price, 9, price, Decimal(1)))
+        with pytest.raises(BadBar, match="above"):
+            bar_from_ib(ib_row("1723815000", 10, price, 9, 10.5, Decimal(1)))
+
+
+@pytest.mark.parametrize(
+    ("year", "month", "day"), [(2024, 11, 3), (2025, 11, 2)],
+)
+def test_both_epochs_of_the_repeated_autumn_hour_are_refused(
+    year: int, month: int, day: int
+) -> None:
+    for hour, minute in ((5, 0), (5, 30), (5, 59), (6, 0), (6, 30), (6, 59)):
+        with pytest.raises(BadBar, match="outside"):
+            bar_from_ib(ib_row(str(utc_epoch(year, month, day, hour, minute)), 10, 11, 9, 10.5, 1))
+
+
+@pytest.mark.parametrize(
+    ("utc", "accepted"),
+    [
+        (utc_epoch(2024, 8, 16, 7, 59), False),    # 03:59 EDT
+        (utc_epoch(2024, 8, 16, 8, 0), True),      # 04:00 EDT, the first extended-hours minute
+        (utc_epoch(2024, 8, 16, 23, 59), True),    # 19:59 EDT, the last
+        (utc_epoch(2024, 8, 17, 0, 0), False),     # 20:00 EDT
+        (utc_epoch(2024, 12, 2, 8, 59), False),    # 03:59 EST
+        (utc_epoch(2024, 12, 2, 9, 0), True),      # 04:00 EST
+        (utc_epoch(2024, 12, 3, 0, 59), True),     # 19:59 EST
+        (utc_epoch(2024, 12, 3, 1, 0), False),     # 20:00 EST
+        (utc_epoch(2024, 11, 3, 8, 59), False),    # 03:59 EST on the change day
+        (utc_epoch(2024, 11, 3, 9, 0), True),      # 04:00 EST on the change day
+        (utc_epoch(2024, 3, 10, 7, 59), False),    # 03:59 EDT on the spring change day
+        (utc_epoch(2024, 3, 10, 8, 0), True),      # 04:00 EDT
+        (utc_epoch(2024, 8, 16, 3, 0), False),     # 23:00 the evening before
+    ],
+)
+def test_only_the_extended_session_in_new_york_is_accepted(utc: int, accepted: bool) -> None:
+    if accepted:
+        assert bar_from_ib(ib_row(str(utc), 10, 11, 9, 10.5, 1)).time == utc
+    else:
+        with pytest.raises(BadBar, match="extended session"):
+            bar_from_ib(ib_row(str(utc), 10, 11, 9, 10.5, 1))
+
+
+def test_an_ambiguous_time_in_another_zone_is_refused_too() -> None:
+    # 09:30 UTC on 2024-11-03 is 04:30 EST in New York (in session) but 01:30 PST, the second
+    # time Los Angeles shows 01:30 that morning.
+    epoch = utc_epoch(2024, 11, 3, 9, 30)
+    with pytest.raises(BadBar, match="ambiguous"):
+        bar_from_ib(ib_row(str(epoch), 10, 11, 9, 10.5, 1), "America/Los_Angeles")
+    assert bar_from_ib(ib_row(str(epoch), 10, 11, 9, 10.5, 1)).date == pd.Timestamp(
+        "2024-11-03 04:30:00")
+    assert bar_from_ib(ib_row(str(epoch), 10, 11, 9, 10.5, 1), "UTC").date == pd.Timestamp(
+        "2024-11-03 09:30:00")
 
 
 @pytest.mark.parametrize(
