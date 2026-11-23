@@ -34,11 +34,24 @@ def _fetch_bars(argv: list[str]) -> int:
     return fetch_main(argv)
 
 
+def _probe_data(argv: list[str]) -> int:
+    # Lazy, like `fetch-bars`: the offline commands never import MainStoinker.ib (or ibapi).
+    try:
+        from MainStoinker.ib.cli import probe_data_main
+    except ImportError as exc:
+        print(f"error: probe-data could not load the IB client ({type(exc).__name__}): "
+              "install requirements.txt", file=sys.stderr)
+        return 2
+    return probe_data_main(argv)
+
+
 def _run(argv: list[str]) -> int:
     if argv[:1] == ["serve"]:
         return _serve(argv[1:])
     if argv[:1] == ["fetch-bars"]:
         return _fetch_bars(argv[1:])
+    if argv[:1] == ["probe-data"]:
+        return _probe_data(argv[1:])
     from MainStoinker.engine.cli import main
 
     return main(argv)
