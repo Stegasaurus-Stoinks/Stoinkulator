@@ -24,7 +24,8 @@ Checks, in this sequence, before any client or connection is built
 5. the folder layout, then the output and recording folders are created (the last refusal);
    those this run made and left empty are removed again when it ends;
 6. the console gate: stdin must be an interactive terminal and the owner types the port
-   number. There is no option that skips it.
+   number. The only option that skips it is `--no-prompt`, and it is refused (usage error,
+   exit 2) without `--paper`.
 
 The environment is read in `main` only. Every printed line passes `scrub`: anything
 shaped like an account id becomes `ACCOUNT`, and `ManagedAccounts` is never printed.
@@ -44,6 +45,10 @@ not contain `STOINK_ALLOW_LIVE_PORT` at all (`paper_refusal`). The connection is
 with its own exit code (5 for `fetch-bars`, 4 for `probe-data`), is never retried, and no
 account id is printed. Any other exception from `open()` is fatal in paper mode (no retry).
 Without `--paper` nothing here changes.
+
+`--paper --no-prompt` (unattended): the same, minus the console gate (no terminal, no port
+typed, nothing read from stdin); the first output line says `no prompt`. Every other check
+of paper mode still runs. `--no-prompt` without `--paper` is a usage error.
 
 Exit codes: see `EXIT_CODES_TEXT` (shown by `--help`).
 """
@@ -127,6 +132,7 @@ exit codes:
 PAPER_PORT = 7497
 PAPER_HOST = "127.0.0.1"
 PAPER_MODE_LINE = f"paper mode: port {PAPER_PORT}, account check on"
+PAPER_NO_PROMPT_LINE = f"{PAPER_MODE_LINE}, no prompt"
 NOT_PAPER_LINE = ("The account TWS is signed into is not a paper account. Nothing was requested. "
                   "Not retried.")
 NOT_PAPER_LABEL = "not a paper account, nothing was requested"
@@ -215,6 +221,9 @@ def _add_connection_arguments(parser: argparse.ArgumentParser, paper: bool = Fal
                              f"{ALLOW_LIVE_ENV} not set in the environment; the account list IB "
                              "sends must show a paper account before anything is requested "
                              "(else exit code, see below; never retried)")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="only with --paper: skip the console gate (no terminal needed, no port "
+                             "to type); every other check of paper mode still runs")
 
 
 def _wants_paper(argv: Sequence[str] | None) -> bool:
@@ -233,6 +242,8 @@ def _add_record_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _check_connection_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.no_prompt and not args.paper:
+        parser.error("--no-prompt is valid only together with --paper")
     if args.port is None:  # only possible with --paper
         args.port = PAPER_PORT
     if not 1 <= args.port <= 65535:
@@ -1002,7 +1013,7 @@ def main(
             say(refusal)
             return EXIT_REFUSED
         args.not_paper_exit = EXIT_NOT_PAPER_PROBE if probe else EXIT_NOT_PAPER_FETCH
-        say(PAPER_MODE_LINE)
+        say(PAPER_NO_PROMPT_LINE if args.no_prompt else PAPER_MODE_LINE)
     try:
         resolve_paths(args, variables, today or date.today(), Path.cwd(), command)
     except PathRefused as exc:
@@ -1066,7 +1077,10 @@ def _after_checks(
     tty = sys.stdin if stdin is None else stdin
     ask = input if input_fn is None else input_fn
     probe = command == PROBE_DATA
-    if not gate(args, tty, ask, say, describe_probe if probe else describe_session):
+    describe = describe_probe if probe else describe_session
+    if args.no_prompt:  # `parse_*` accepted it only together with --paper; nothing is read from stdin
+        say(describe(args))
+    elif not gate(args, tty, ask, say, describe):
         return EXIT_REFUSED
     logging.getLogger("ibapi").setLevel(logging.WARNING)
     now = clock or time.monotonic

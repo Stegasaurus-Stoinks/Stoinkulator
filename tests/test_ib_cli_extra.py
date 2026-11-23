@@ -319,11 +319,16 @@ def test_bad_option_values_are_usage_errors(flag: str, value: str,
     capsys.readouterr()
 
 
-def test_there_is_no_option_that_skips_the_gate() -> None:
+def test_the_only_option_that_skips_the_gate_is_no_prompt_and_it_is_refused_without_paper() -> None:
     options = {o for action in cli.build_parser()._actions for o in action.option_strings}
     assert options == {"-h", "--help", "--symbols", "--start", "--end", "--port", "--host", "--client-id",
                        "--out", "--record", "--no-record", "--connect-timeout", "--settle-hours",
-                       "--paper"}  # --paper only adds checks; the gate stays (tests/test_ib_cli_paper.py)
+                       "--paper", "--no-prompt"}
+    # --paper only adds checks; --no-prompt is the one option that skips the gate, and only with --paper
+    # (tests/test_ib_cli_paper.py pins both)
+    with pytest.raises(SystemExit) as info:
+        cli.parse_args(["--symbols", "AAPL", *DAYS, "--port", "7497", "--no-prompt"])
+    assert info.value.code == 2
 
 
 @pytest.mark.parametrize("flag", ["--yes", "-y", "--force", "--no-gate", "--skip-gate", "--assume-yes",

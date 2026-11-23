@@ -46,6 +46,26 @@ piped into a shell, decodes ``-EncodedCommand``, follows a ``cd`` into the
 package directory, and blocks a command over 50,000 characters that mentions
 the package. Blocked by design, even though they only print help:
 ``fetch-bars --help``, ``probe-data -h``, ``python -c "import MainStoinker.ib..."``.
+
+The ONE allowance (``allowed_paper_data_command``, owner decision 2026-11-23): an agent
+may run a DATA session against the PAPER account, written as one whole plain command
+``<venv python> [-P] -m MainStoinker (fetch-bars|probe-data) <args>``. ``<venv python>``
+is a path ending in ``.venv\\Scripts\\python.exe`` or ``.venv/Scripts/python.exe``
+(optionally double-quoted, optionally preceded by ``& ``); ``<args>`` are plain tokens
+(letters, digits and ``_ , . : = \\ / -``, or a double-quoted token that may also hold
+spaces) that include ``--paper`` and ``--no-prompt`` as exact standalone tokens;
+``--port`` only ``7497``, ``--host`` only ``127.0.0.1``. The match is anchored on the
+whole string: no separator, wrapper, redirect, expansion, quote other than ``"``,
+newline, ``cd`` or variable assignment, and the live opt-in variable name nowhere. A
+command that merely CONTAINS that shape is not covered and is judged by the rules above.
+It is not a free pass: after the match the connecting rule still judges the same text
+with only the subcommand word replaced by ``backtest``, and every other rule judges the
+text unchanged, so a command blocked for any other reason stays blocked. The allowance
+applies to the command as typed, never to its NFKC form or to decoded text. What it
+permits is data requests against the paper account: ``--paper`` makes the command itself
+refuse any port but 7497, any host but 127.0.0.1 and any non-paper account (see
+``MainStoinker/ib/cli.py``). Order placement, the live account and the live ports remain
+the owner's alone.
 Not seen: a script or file that itself imports and runs the package (written
 in one call, run in another), ``bash script.sh``, aliases/functions, a module
 name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
@@ -550,7 +570,13 @@ _MAX_DEPTH = 6
 _CONNECT_MESSAGE = (
     "Blocked: {what}. It can connect to Interactive Brokers (only backtest, "
     "runs, report and serve are allowed) and only the owner runs connecting "
-    "commands (see CLAUDE.md safety rules)."
+    "commands (see CLAUDE.md safety rules). The one exception is a DATA session on "
+    "the PAPER account, written as ONE plain command and nothing else: "
+    '"<project>\\.venv\\Scripts\\python.exe" [-P] -m MainStoinker fetch-bars|probe-data '
+    "<args> with --paper and --no-prompt among the args (--port only 7497, --host only "
+    "127.0.0.1). No ; && || | & ` $ % < > ( ) quotes other than \", newline, cd, "
+    "variable assignment or wrapper (start, cmd /c, powershell -c, bash -c) may appear, "
+    "and the live opt-in variable name may not appear at all."
 )
 
 
@@ -1170,6 +1196,101 @@ def _decode_encoded(value: str) -> str | None:
         return None
 
 
+# --- the one allowance: an unattended DATA session on the PAPER account ---------
+# One anchored regular expression over the whole (trimmed) command, then explicit
+# token checks. Plain tokens use only the characters below; a double-quoted token
+# may also hold spaces (the project path has some). Nothing else is ever matched.
+_PAPER_CHARS = r"A-Za-z0-9_,.:=\\/-"
+_PAPER_TOKEN = rf'(?:"[ {_PAPER_CHARS}]*"|[{_PAPER_CHARS}]+)'
+_PAPER_COMMAND = re.compile(
+    rf"(?:& +)?(?P<py>{_PAPER_TOKEN})(?: +-P)? +-m +MainStoinker +"
+    rf"(?P<sub>fetch-bars|probe-data)(?P<args>(?: +{_PAPER_TOKEN})+)"
+)
+_PAPER_TOKEN_RE = re.compile(_PAPER_TOKEN)
+_PAPER_PYTHON = re.compile(r"(?:^|[\\/])\.venv[\\/]Scripts[\\/]python\.exe$")
+_PAPER_QUOTED_OPTION = re.compile(r" -\S")
+_PAPER_GUARDED = ("--port", "--host", "--paper", "--no-prompt")
+_PAPER_PORT = "7497"
+_PAPER_HOST = "127.0.0.1"
+_PAPER_MAX_LEN = 4000
+# The live opt-in variable: its name may not appear anywhere in an allowed command.
+_PAPER_FORBIDDEN_NAME = "allow_live_port"
+
+
+def _paper_token_ok(token: str) -> bool:
+    """Per-token rules the character class cannot express."""
+    if token.startswith('"'):
+        inner = token[1:-1]
+        return not (
+            not inner
+            or inner.startswith("-")  # a quoted option is not looked at as an option
+            or inner.endswith("\\")  # bash reads backslash-quote as an escaped quote
+            or _PAPER_QUOTED_OPTION.search(inner)
+            or ",-" in inner
+        )
+    # A backslash at the end can swallow the next space; ``a,--port`` is an array
+    # of two arguments in PowerShell.
+    return not (token.endswith("\\") or ",-" in token or (token[0] == "-" and token[1:2] != "-"))
+
+
+def _paper_match(command: str) -> re.Match[str] | None:
+    """The match of the allowed shape on the trimmed command, else None."""
+    text = command.strip(" \t\r\n")
+    if not text or len(text) > _PAPER_MAX_LEN or _PAPER_FORBIDDEN_NAME in text.lower():
+        return None
+    m = _PAPER_COMMAND.fullmatch(text)
+    if m is None:
+        return None
+    py = m.group("py")
+    path = py[1:-1] if py.startswith('"') else py
+    if not _paper_token_ok(py) or _PAPER_PYTHON.search(path) is None:
+        return None
+    tokens = _PAPER_TOKEN_RE.findall(m.group("args"))
+    if not all(_paper_token_ok(t) for t in tokens):
+        return None
+    if "--paper" not in tokens or "--no-prompt" not in tokens:  # exact, standalone, unquoted
+        return None
+    for i, tok in enumerate(tokens):
+        if tok.startswith('"') or not tok.startswith("--"):
+            continue
+        name = tok.split("=", 1)[0]
+        # an abbreviation or a differently cased spelling of a guarded option
+        if any(g.startswith(name.lower()) and name != g for g in _PAPER_GUARDED):
+            return None
+        following = tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok == "--port" and following != _PAPER_PORT:
+            return None
+        if tok == "--host" and following != _PAPER_HOST:
+            return None
+        if name == "--port" and tok != "--port" and tok != f"--port={_PAPER_PORT}":
+            return None
+        if name == "--host" and tok != "--host" and tok != f"--host={_PAPER_HOST}":
+            return None
+    return m
+
+
+def allowed_paper_data_command(command: str) -> bool:
+    """True only for the one allowed shape (see the header): a whole plain command that runs
+    ``fetch-bars`` or ``probe-data`` of the project package with ``--paper --no-prompt``,
+    and that the rest of this hook would not block once its subcommand is neutral."""
+    neutral = _paper_neutral(command)
+    # depth 1: the allowance itself is off in this judgement, so it cannot recurse
+    return neutral is not None and not _decide(neutral, 1)[0]
+
+
+def _paper_neutral(command: str) -> str | None:
+    """The allowed command with only the subcommand word replaced by ``backtest``, else None.
+
+    The connecting rule judges this text, so every OTHER reason to block the command
+    still applies: only "connecting subcommand of ``-m MainStoinker``" is suppressed.
+    """
+    m = _paper_match(command)
+    if m is None:
+        return None
+    lead = len(command) - len(command.lstrip(" \t\r\n"))
+    return command[: lead + m.start("sub")] + "backtest" + command[lead + m.end("sub") :]
+
+
 def decide(command: str) -> tuple[bool, str]:
     """Return (blocked, reason) for a shell command line."""
     return _decide(command, 0)
@@ -1177,7 +1298,9 @@ def decide(command: str) -> tuple[bool, str]:
 
 def _decide(command: str, depth: int) -> tuple[bool, str]:
     """The command as typed, then its NFKC form (full-width look-alikes): a block in either wins."""
-    result = _decide_text(command, depth)
+    # The paper allowance applies to the command as typed only: not to decoded text,
+    # and not to the folded form below (a look-alike letter must not become a flag).
+    result = _decide_text(command, depth, allow_paper=depth == 0)
     if result[0]:
         return result
     folded = unicodedata.normalize("NFKC", command).casefold()
@@ -1186,7 +1309,7 @@ def _decide(command: str, depth: int) -> tuple[bool, str]:
     return result
 
 
-def _decide_text(command: str, depth: int) -> tuple[bool, str]:
+def _decide_text(command: str, depth: int, allow_paper: bool = False) -> tuple[bool, str]:
     low = command.lower()
     # Quotes, backticks, backslashes and carets inside the name do not hide it.
     deobfuscated = _ESCAPES.sub("", low).replace("$()", "")
@@ -1236,10 +1359,17 @@ def _decide_text(command: str, depth: int) -> tuple[bool, str]:
         return True, _CONNECT_MESSAGE.format(
             what="an -EncodedCommand value that cannot be decoded, next to MainStoinker"
         )
+    judged = joined
+    if allow_paper and allowed_paper_data_command(command):
+        # THE one place of the paper allowance: for the allowed shape only, the connecting
+        # rule judges the same text with the subcommand word replaced by an offline one.
+        neutral = _paper_neutral(command)
+        if neutral is not None:
+            judged = _join_continuations(_strip_message_args(_strip_heredocs(neutral)))
     try:
-        why = _judge_connecting(joined)
-        if why is None and ".." in joined:
-            why = _judge_connecting(joined, resolve=False)  # as typed, too
+        why = _judge_connecting(judged)
+        if why is None and ".." in judged:
+            why = _judge_connecting(judged, resolve=False)  # as typed, too
     except Exception:  # noqa: BLE001 - a rule bug must fail closed
         why = "the hook could not analyse a MainStoinker command" if mentions else None
     if why:
