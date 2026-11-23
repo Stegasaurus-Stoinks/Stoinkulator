@@ -768,7 +768,7 @@ def test_real_backtests_roundtrip_through_the_store(db):
     ]
     synthetic_seen = False
     for n, (algo_id, cfg) in enumerate(cases):
-        harness.stage_offline_data(Path.cwd(), [cfg["ticker"]])
+        harness.stage_offline_data(Path.cwd(), [cfg["ticker"]], max_rows=700)
         led = Ledger()
         harness.run_offline_backtest(algo_id, [cfg], ledger=led)
         path = db.parent / f"real{n}.db"

@@ -15,14 +15,14 @@ import MainStoinker.engine.run_documents as run_documents
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.run_documents import report_document, run_summary_record
 from MainStoinker.engine.store import open_store_readonly
+from tests.run_support import small_store_run
 from tests.test_cli_report import HAND_ALGOS, HAND_EQUITY, HAND_TRIPS, make_run
-from tests.test_cli_store import full_store_run
 
 
 @pytest.fixture(scope="module")
 def stored(tmp_path_factory):
     """The realistic four-algo run (cached), its database, and the stored data directory."""
-    _full, database = full_store_run(tmp_path_factory, "realistic")
+    _full, database = small_store_run(tmp_path_factory, "realistic")
     store = open_store_readonly(str(database), env={})
     try:
         entries = [(s, store.load_run(s.run_id)) for s in store.list_runs()]

@@ -27,7 +27,8 @@ from MainStoinker.engine.cli import CliError, main
 from MainStoinker.engine.feed import CsvBarFeed
 from MainStoinker.engine.stats import account_summary, round_trip_record
 from MainStoinker.engine.store import StoreError, expand_equity, open_store
-from tests.test_cli_modes import EMA, EMA_MSFT, FF, FUNC_MSFT, FVG, GOLDEN, ORC, Env, ema_config
+from tests.run_support import FAST_CASES, ROWS, full_store_run
+from tests.test_cli_modes import EMA, EMA_MSFT, FUNC_MSFT, GOLDEN, Env, ema_config
 from tests.test_paper_goldens import equity_series_bytes
 
 REPO = Path(__file__).resolve().parent.parent
@@ -114,7 +115,7 @@ def test_db_option_stores_completed_run(env, db, capsys):
 
 
 def test_algos_stored_with_mode_params_and_capital(env, db):
-    env.setup(MULTI, ["AAPL", "MSFT"], rows=900)
+    env.setup(MULTI, ["AAPL", "MSFT"], rows=ROWS)
     assert run(env, "--fills", "realistic", "--capital", "2500.5", "--db", str(db)) == 0
     algos = stored(db).algos
     assert [(a.idname, a.algo_id, a.ticker, a.mode, a.capital) for a in algos] == [
@@ -126,7 +127,7 @@ def test_algos_stored_with_mode_params_and_capital(env, db):
 
 
 def test_run_exists_while_the_engine_runs_and_results_are_written_once(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     seen: dict = {}
     real_run = cli.Engine.run_backtest
 
@@ -198,7 +199,7 @@ def test_stored_trades_equal_ledger_json(env, db):
 
 
 def test_legacy_run_stores_cost_free_fills_marked_legacy(env, db):
-    env.setup([{"ID": "EMACrossing", "data": [EMA]}], ["AAPL"], rows=900)
+    env.setup([{"ID": "EMACrossing", "data": [EMA]}], ["AAPL"], rows=ROWS)
     assert run(env, "--db", str(db)) == 0
     data = stored(db)
     assert data.summary.fills == "legacy" and data.summary.status == "completed"
@@ -216,7 +217,7 @@ def test_legacy_run_stores_cost_free_fills_marked_legacy(env, db):
 
 def test_trades_json_still_written_with_db(env, db):
     """With --db the output files are byte-identical to the same run without it."""
-    env.setup(MULTI, ["AAPL", "MSFT"], rows=900)
+    env.setup(MULTI, ["AAPL", "MSFT"], rows=ROWS)
     for fills in ("legacy", "realistic"):
         assert run(env, "--fills", fills) == 0
         # (tradey.txt is a legacy side file the algos append to; it is not an output)
@@ -227,7 +228,12 @@ def test_trades_json_still_written_with_db(env, db):
         assert ("ledger.json" in plain) == (fills == "realistic")
 
 
+@pytest.mark.slow  # full data again; the fast suite covers the same behaviour (see below)
 def test_legacy_trades_json_with_db_equals_the_golden(env, db):
+    """Covered in the fast suite by `test_stored_legacy_run_matches_the_legacy_golden` (a legacy
+    run with --db, trades.json equal to the golden, no ledger.json), by
+    `test_trades_json_still_written_with_db` (the bytes do not depend on --db) and by
+    `test_legacy_fills_output_byte_identical_to_golden` (the golden's byte format)."""
     env.setup(ema_config(mode="paper"), ["AAPL"], rows=None)
     assert run(env, "--db", str(db)) == 0
     golden = json.loads((GOLDEN / "emacrossing_aapl.json").read_text())
@@ -237,9 +243,9 @@ def test_legacy_trades_json_with_db_equals_the_golden(env, db):
 
 
 def test_two_runs_one_database_are_isolated(env, db, capsys):
-    env.setup(MULTI, ["AAPL", "MSFT"], rows=900)
+    env.setup(MULTI, ["AAPL", "MSFT"], rows=ROWS)
     assert run(env, "--fills", "realistic", "--db", str(db)) == 0
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert run(env, "--db", str(db)) == 0
     assert capsys.readouterr().out.splitlines()[-1] == f"stored run 2 in {db.resolve()}"
     first, second = stored(db, 1), stored(db, 2)
@@ -275,7 +281,7 @@ def test_no_db_option_creates_no_db_file(env, tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "open_store", forbidden)
     monkeypatch.setattr(cli, "current_code_version", forbidden)
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     for fills in ("legacy", "realistic"):
         assert run(env, "--fills", fills) == 0
     assert "stored run" not in capsys.readouterr().out
@@ -286,7 +292,7 @@ def test_no_db_option_creates_no_db_file(env, tmp_path, monkeypatch, capsys):
 
 
 def test_output_lines_unchanged_without_db(env, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert run(env) == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].startswith("replayed ") and lines[-1] == f"wrote {env.out.resolve() / 'trades.json'}"
@@ -380,7 +386,7 @@ def boom(self):
 
 
 def test_failed_run_marked_failed(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     monkeypatch.setattr(cli.Engine, "run_backtest", boom)
     with pytest.raises(RuntimeError, match="engine exploded"):
         run(env, "--fills", "realistic", "--db", str(db))
@@ -395,7 +401,7 @@ def test_failed_run_marked_failed(env, db, monkeypatch):
 
 
 def test_end_run_failing_does_not_hide_the_original_error(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     monkeypatch.setattr(cli.Engine, "run_backtest", boom)
 
     def broken(self, run_id, status):
@@ -414,7 +420,7 @@ def test_end_run_failing_does_not_hide_the_original_error(env, db, monkeypatch):
 
 
 def test_end_run_failing_with_a_bare_exception_does_not_hide_it_either(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     monkeypatch.setattr(cli.Engine, "run_backtest", boom)
 
     def broken(self, run_id, status):
@@ -426,7 +432,7 @@ def test_end_run_failing_with_a_bare_exception_does_not_hide_it_either(env, db, 
 
 
 def test_store_closed_even_when_end_run_fails(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     monkeypatch.setattr(cli.Engine, "run_backtest", boom)
     monkeypatch.setattr(store_module.SqliteStore, "end_run",
                         lambda self, run_id, status: (_ for _ in ()).throw(StoreError("x")))
@@ -437,7 +443,7 @@ def test_store_closed_even_when_end_run_fails(env, db, monkeypatch):
 
 
 def test_keyboard_interrupt_marks_the_run_failed_and_propagates(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
 
     def interrupt(self):
         raise KeyboardInterrupt
@@ -449,7 +455,7 @@ def test_keyboard_interrupt_marks_the_run_failed_and_propagates(env, db, monkeyp
 
 
 def test_output_failure_after_results_marks_the_run_failed(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
 
     def refuse(path, payload):
         raise OSError("disk full")
@@ -462,14 +468,14 @@ def test_output_failure_after_results_marks_the_run_failed(env, db, monkeypatch)
 
 
 def test_store_closed_on_success(env, db):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert run(env, "--db", str(db)) == 0
     db.unlink()  # a connection left open would make this fail on Windows
     assert not list(db.parent.glob("runs.db*"))
 
 
 def test_db_in_a_new_folder_and_sqlite_url_form(env, tmp_path, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     target = tmp_path / "a" / "b" / "runs.db"
     assert run(env, "--db", "sqlite:///" + str(target)) == 0
     assert capsys.readouterr().out.splitlines()[-1] == f"stored run 1 in {target.resolve()}"
@@ -477,7 +483,7 @@ def test_db_in_a_new_folder_and_sqlite_url_form(env, tmp_path, capsys):
 
 
 def test_backtest_uses_stoink_db(env, tmp_path, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     target = tmp_path / "named" / "env.db"
     assert run(env, environ={"STOINK_DB": str(target)}) == 0
     assert capsys.readouterr().out.splitlines()[-1] == f"stored run 1 in {target.resolve()}"
@@ -492,13 +498,13 @@ def test_backtest_uses_stoink_db(env, tmp_path, capsys):
 
 
 def test_whitespace_stoink_db_is_unset(env, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert run(env, environ={"STOINK_DB": "   "}) == 0
     assert "stored run" not in capsys.readouterr().out
 
 
 def test_relative_db_path_is_relative_to_the_start_directory(env, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert run(env, "--db", "rel.db") == 0
     assert (env.start / "rel.db").exists() and not (env.out / "rel.db").exists()
     assert capsys.readouterr().out.splitlines()[-1] == f"stored run 1 in {(env.start / 'rel.db').resolve()}"
@@ -518,7 +524,7 @@ def test_code_version_is_stored_and_computed_once_per_run(env, db, monkeypatch):
         return "abc-dirty:123456789abc"
 
     monkeypatch.setattr(cli, "current_code_version", version)
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert run(env, "--db", str(db)) == 0
     assert calls == [1] and stored(db).summary.code_version == "abc-dirty:123456789abc"
     # an injected callable wins over the default
@@ -543,29 +549,8 @@ def test_importing_cli_does_not_run_git():
 
 GOLDEN_PAPER = Path(__file__).parent / "golden_paper"
 LEGACY_GOLDEN = Path(__file__).parent / "golden"
-FAST_CASES = {
-    "emacrossing_aapl": ("EMACrossing", EMA, "AAPL"),
-    "openingrangecandle_aapl": ("OpeningRangeCandle", ORC, "AAPL"),
-    "fridayfrenzy_tsla": ("FridayFrenzy", FF, "TSLA"),
-    "fvg_aapl": ("FVG", FVG, "AAPL"),
-}
-_full: dict[str, Env] = {}
-
-
-def full_store_run(tmp_path_factory, fills: str) -> tuple[Env, Path]:
-    """All fast golden cases in one config, full data, one database (cached per fill model)."""
-    if fills not in _full:
-        root = tmp_path_factory.mktemp(f"store-full-{fills}")
-        full = Env(root)
-        full.setup([{"ID": a, "data": [c]} for a, c, _ in FAST_CASES.values()],
-                   ["AAPL", "TSLA"], rows=None)
-        database = root / "runs.db"
-        assert main(["backtest", "--algos", str(full.algos), "--data", str(full.data),
-                     "--out", str(full.out), "--quiet", "--fills", fills,
-                     "--db", str(database)]) == 0
-        _full[fills] = full
-    return _full[fills], _full[fills].inputs.parent / "runs.db"
-
+# FAST_CASES and full_store_run (the full-data stored runs, built once per session) are in
+# tests/run_support.py and re-exported here for the tests that import them from this module.
 
 @pytest.mark.parametrize("case", sorted(FAST_CASES))
 def test_stored_realistic_run_equals_golden_paper(tmp_path_factory, case):
@@ -615,7 +600,7 @@ def test_stored_legacy_run_matches_the_legacy_golden(tmp_path_factory, case):
 
 def test_a_failed_output_write_after_the_run_is_failed_not_completed(env, db):
     """`trades.json` cannot be replaced (it is a directory): the run row says failed."""
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     (env.out / "trades.json").mkdir(parents=True)
     with pytest.raises(OSError):
         run(env, "--db", str(db))
@@ -674,7 +659,7 @@ def test_storage_failure_after_the_run_keeps_the_output_files(env, db, monkeypat
                                                               method):
     """The files are written before the results are stored, so a storage failure
     (exit 3, one line) cannot discard a finished run's trades.json / ledger.json."""
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     seen: dict = {}
     real = getattr(store_module.SqliteStore, method)
 
@@ -697,7 +682,7 @@ def test_storage_failure_after_the_run_keeps_the_output_files(env, db, monkeypat
 
 def test_end_run_completed_failing_leaves_a_running_row_and_the_files(env, db, monkeypatch,
                                                                        capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
 
     def broken(self, run_id, status):
         raise StoreError("locked")
@@ -713,7 +698,7 @@ def test_end_run_completed_failing_leaves_a_running_row_and_the_files(env, db, m
 
 def test_output_files_are_written_before_results_and_before_the_run_is_completed(
         env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     order: list[str] = []
     real_write, real_results = cli.write_json_atomic, store_module.SqliteStore.write_results
     real_end = store_module.SqliteStore.end_run
@@ -814,7 +799,7 @@ def _spawn(env: Env, db: Path, out: Path, *extra: str, code: str | None = None):
 
 
 def test_two_processes_write_different_runs_to_one_database_at_once(env, db):
-    env.setup(MULTI, ["AAPL", "MSFT"], rows=900)
+    env.setup(MULTI, ["AAPL", "MSFT"], rows=ROWS)
     other = env.inputs / "other.json"
     other.write_text(json.dumps(ema_config()))
     first = _spawn(env, db, env.out / "a", "--fills", "realistic")
@@ -840,7 +825,7 @@ def test_two_processes_write_different_runs_to_one_database_at_once(env, db):
 def test_a_killed_process_leaves_a_running_row_and_the_database_stays_usable(env, db):
     import time
 
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     stall = ("import sys, time\n"
              "import MainStoinker.engine.cli as cli\n"
              "cli.Engine.run_backtest = lambda self: time.sleep(600)\n"
@@ -919,7 +904,7 @@ def test_a_locked_database_at_begin_run_is_exit_3_one_line_no_traceback(env, db,
 
 def test_a_locked_database_at_write_results_is_exit_3_with_the_files_in_place(
         env, db, short_wait, monkeypatch, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     real_run = cli.Engine.run_backtest
     held: list[sqlite3.Connection] = []
 
@@ -1126,7 +1111,7 @@ def test_series_cover_warmup_bars(env, db):
 
 
 def test_series_of_two_algos_on_two_symbols_are_kept_apart(env, db):
-    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=ROWS)
     assert run(env, "--db", str(db)) == 0
     data, aapl = series_of(db, EMA["idname"])
     _, msft = series_of(db, EMA_MSFT["idname"])
@@ -1143,7 +1128,7 @@ def test_data_files_fingerprint_stored(env, db):
 
 
 def test_series_store_failure_exit_3_run_failed(env, db, monkeypatch, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
 
     def broken(self, run_id, infos, points=()):
         raise StoreError("disk full")
@@ -1157,7 +1142,7 @@ def test_series_store_failure_exit_3_run_failed(env, db, monkeypatch, capsys):
 
 
 def test_series_are_written_after_results_and_before_the_run_ends(env, db, monkeypatch):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     order: list[str] = []
     for method in ("write_results", "write_series", "end_run"):
         real = getattr(store_module.SqliteStore, method)
@@ -1182,7 +1167,7 @@ def test_without_db_nothing_is_extracted(env, monkeypatch):
 
 
 def test_an_algo_with_mismatched_frame_is_skipped_with_a_warning(env, db, monkeypatch, capsys):
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     real = cli.extract_series
 
     def short(algo, bar_times):
@@ -1210,11 +1195,11 @@ def test_trades_and_ledger_json_unchanged_with_capture(env, db, fills):
 def test_repeated_bar_time_skips_the_algo_and_the_run_completes(env, db, capsys):
     import pandas as pd
 
-    env.setup(ema_config(), ["AAPL"], rows=900)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     path = env.data / "_AAPL_offlinedata_"
     frame = pd.read_csv(path, index_col=0)
-    repeated = frame["date"].iloc[880]
-    frame = pd.concat([frame.iloc[:881], frame.iloc[880:]], ignore_index=True)
+    repeated = frame["date"].iloc[ROWS - 20]
+    frame = pd.concat([frame.iloc[:ROWS - 19], frame.iloc[ROWS - 20:]], ignore_index=True)
     frame.to_csv(path)
     assert run(env, "--db", str(db)) == 0
     err = capsys.readouterr().err.splitlines()
@@ -1229,7 +1214,7 @@ def test_repeated_bar_time_skips_the_algo_and_the_run_completes(env, db, capsys)
 
 def test_an_exception_while_reading_one_algos_series_skips_that_algo(
         env, db, monkeypatch, capsys):
-    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=ROWS)
     real = cli.extract_series
 
     class Broken:
@@ -1255,7 +1240,7 @@ def test_an_exception_while_reading_one_algos_series_skips_that_algo(
 
 
 def test_write_series_is_called_once_per_algo_with_series(env, db, monkeypatch):
-    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=ROWS)
     accounts: list[set[str]] = []
     real = store_module.SqliteStore.write_series
 
@@ -1272,7 +1257,7 @@ def test_write_series_is_called_once_per_algo_with_series(env, db, monkeypatch):
 
 def test_a_store_error_part_way_keeps_earlier_series_and_fails_the_run(
         env, db, monkeypatch, capsys):
-    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=900)
+    env.setup([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}], ["AAPL", "MSFT"], rows=ROWS)
     real = store_module.SqliteStore.write_series
     calls: list[int] = []
 

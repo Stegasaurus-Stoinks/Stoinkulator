@@ -302,7 +302,7 @@ class RecordingBroker(SimBroker):
         self.events.append(("on_end", dict(last_bars)))
 
 
-def _real_engine(specs, broker, ledger=None, **kwargs):
+def _real_engine(specs, broker, ledger=None, max_rows=None, **kwargs):
     from pathlib import Path
 
     from MainStoinker.engine.algos import load_algo
@@ -310,15 +310,24 @@ def _real_engine(specs, broker, ledger=None, **kwargs):
     from tests import harness
 
     symbols = list(dict.fromkeys(cfg["ticker"] for _, cfg in specs))
-    harness.stage_offline_data(Path.cwd(), symbols)
+    harness.stage_offline_data(Path.cwd(), symbols, max_rows=max_rows)
     algos = [load_algo(a, cfg) for a, cfg in specs]
     feed = CsvBarFeed(Path.cwd() / "OfflineData", symbols, 2)
     engine = Engine(EngineConfig(), feed, broker, NullSink(), algos, ledger=ledger, **kwargs)
     return feed, algos, engine
 
 
+REAL_ROWS = 900  # 390 warm-up rows and 510 replayed bars: enough for the marks, a fraction of the cost
+
+
+@pytest.mark.slow
 @pytest.mark.parametrize("algo_id, cfg, golden_id", REAL_CASES)
-def test_real_data_ledger_marks_and_golden_trades(algo_id, cfg, golden_id) -> None:
+def test_real_data_trades_equal_golden_through_the_engine_and_ledger(algo_id, cfg, golden_id) -> None:
+    """Full data through `Engine` + `CsvBarFeed` + `SimBroker` + `Ledger`: the golden trades.
+
+    Slow because the same trades are already pinned by the fast `test_golden_backtests.py`
+    (engine, ledger attached) and the slice test below checks the ledger marks.
+    """
     import json
 
     from tests import harness
@@ -326,7 +335,17 @@ def test_real_data_ledger_marks_and_golden_trades(algo_id, cfg, golden_id) -> No
 
     ledger = Ledger()
     ledger.open_account(cfg["idname"], cfg["ticker"], 10_000)
-    feed, algos, engine = _real_engine([(algo_id, cfg)], SimBroker(), ledger)
+    _feed, algos, engine = _real_engine([(algo_id, cfg)], SimBroker(), ledger)
+    engine.run_backtest()
+    expected = json.loads((GOLDEN_DIR / f"{golden_id}.json").read_text())
+    assert harness.trade_records(algos[0]) == expected
+
+
+@pytest.mark.parametrize("algo_id, cfg, golden_id", REAL_CASES)
+def test_real_data_ledger_marks(algo_id, cfg, golden_id) -> None:
+    ledger = Ledger()
+    ledger.open_account(cfg["idname"], cfg["ticker"], 10_000)
+    feed, algos, engine = _real_engine([(algo_id, cfg)], SimBroker(), ledger, max_rows=REAL_ROWS)
     engine.run_backtest()
     batches = list(feed)
     assert len(batches) > 100
@@ -338,8 +357,6 @@ def test_real_data_ledger_marks_and_golden_trades(algo_id, cfg, golden_id) -> No
     assert {p.equity for p in points} == {Decimal("10000.0000")}
     warm_last = feed.warmup(cfg["ticker"])["date"].iloc[-1]
     assert all(p.time > warm_last for p in points)
-    expected = json.loads((GOLDEN_DIR / f"{golden_id}.json").read_text())
-    assert harness.trade_records(algos[0]) == expected
 
 
 def test_real_data_hooks_order_multi_symbol_and_end_bars() -> None:
@@ -355,7 +372,7 @@ def test_real_data_hooks_order_multi_symbol_and_end_bars() -> None:
     from MainStoinker.engine.feed import CsvBarFeed
     from tests import harness
 
-    harness.stage_offline_data(Path.cwd(), ["AAPL", "MSFT"])
+    harness.stage_offline_data(Path.cwd(), ["AAPL", "MSFT"], max_rows=REAL_ROWS)
     algos = [load_algo(a, c) for a, c in specs]
     for algo in algos:
         real = algo.update

@@ -36,8 +36,9 @@ Use the project venv (`.venv`, Python 3.14, Windows). It is uv-managed and has n
 ```
 uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
 uv pip install --python .venv\Scripts\python.exe -e .
-.venv\Scripts\python.exe -m pytest                  # fast suite, ~55 s
-.venv\Scripts\python.exe -m pytest -m slow          # full Elliot state digests + legacy-path parity, ~100 s
+.venv\Scripts\python.exe -m pytest                  # fast suite, parallel (pytest-xdist `-n auto`, `--dist loadfile`): ~100-160 s on 16 cores, ~230 s on 4
+.venv\Scripts\python.exe -m pytest -n 0             # fast suite in one process (debugging, a clean traceback): ~9-12 min
+.venv\Scripts\python.exe -m pytest -m slow          # slow suite, also parallel: full Elliot state digests, legacy-path parity, the four slow golden cases; ~2-2.5 min (serial `-n 0`: ~15 min)
 .venv\Scripts\ruff.exe check .                      # legacy defect set
 .venv\Scripts\ruff.exe check tests conftest.py MainStoinker/engine MainStoinker/api MainStoinker/__main__.py --select E,F,W,I,B   # new-code set
 .venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS.json --data OfflineData --out OUTDIR   # offline backtest -> OUTDIR/trades.json
@@ -74,7 +75,9 @@ uv pip install --python .venv\Scripts\python.exe -e .
   `Engine` + `CsvBarFeed` + `SimBroker`). The legacy runtime path
   (`harness.run_legacy_offline_backtest`) is compared against the same golden
   files read-only in the slow suite (`tests/test_legacy_path_parity.py`) and
-  goes away in Phase B. Only `test_golden_backtests.py` may write goldens.
+  goes away in Phase B. `test_golden_backtests.py` writes `tests/golden/` (four
+  of its eight cases are slow: add `-m "slow or not slow"` to regenerate all) and
+  `test_paper_goldens.py` writes `tests/golden_paper/`; nothing else writes goldens.
 - Realistic-fill goldens live in `tests/golden_paper/`. They pin the ledger's
   round trips, a summary and an equity hash for the same eight cases through
   `PaperBroker`. Only `tests/test_paper_goldens.py` writes them, with
@@ -86,6 +89,15 @@ uv pip install --python .venv\Scripts\python.exe -e .
 - The runtime writes `loggy.log`, `tradey.txt` and `algo.csv` to the current
   directory. Tests run in a temp directory (autouse fixture); keep it that way.
 - New behaviour needs a test that fails without the change.
+- The suite runs in parallel (pytest-xdist). Nothing may use a fixed path or a
+  fixed port or depend on what else is running on the machine (the dashboard
+  listens on 8750: use port 0 or stub the check). Expensive runs shared by
+  several tests are built once per session, across all workers, by
+  `tests/run_support.py` (`full_store_run` for tests that compare with goldens,
+  `small_store_run` for tests that only need a stored run, `full_run`); they are
+  read-only, so copy before changing. Use a short slice of the data
+  (`rows=`) unless the data is the point of the test, and mark a test
+  `slow` only if the fast suite covers the same behaviour another way.
 
 ## Code conventions
 

@@ -8,8 +8,9 @@ pip install -r requirements.txt
 ## Tests
 ```
 pip install -r requirements-dev.txt
-pytest            # fast suite
-pytest -m slow    # slow golden backtests
+pytest            # fast suite, in parallel (pytest-xdist, one worker per core)
+pytest -n 0       # the same, in one process (slower; easier to debug)
+pytest -m slow    # slow golden backtests (also parallel)
 ruff check .
 ```
 Tests run offline against `OfflineData/` and never connect to TWS. See `CLAUDE.md` for conventions.

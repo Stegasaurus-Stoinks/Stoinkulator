@@ -10,13 +10,14 @@ import pytest
 
 from MainStoinker.engine.stats import run_statistics
 from MainStoinker.engine.store import RunData
-from tests.api_support import make_client, stored_run_database
+from tests.api_support import make_client
+from tests.run_support import full_store_run
 from tests.test_cli_store import FAST_CASES, GOLDEN_PAPER, stored
 
 
 @pytest.fixture(scope="module")
 def full_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return stored_run_database(tmp_path_factory, "realistic")
+    return full_store_run(tmp_path_factory, "realistic")[1]  # the golden test below needs full data
 
 
 @pytest.fixture(scope="module")

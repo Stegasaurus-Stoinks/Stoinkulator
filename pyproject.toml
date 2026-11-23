@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -m 'not slow'"
+addopts = "-ra -m 'not slow' -n auto --dist loadfile"
 markers = [
     "slow: takes minutes; run with `pytest -m slow` (CI runs these)",
 ]
