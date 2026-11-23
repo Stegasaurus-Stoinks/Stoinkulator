@@ -65,6 +65,10 @@ _DECIMAL_FIELDS: dict[str, frozenset[str]] = {
 }
 _ID_NAMES = frozenset({"reqId", "tickerId"})
 NO_REQUEST_ID = -1
+# The recorder writes IB's server time (`currentTime`) as 0, it being the wall clock of the
+# session. Replay hands back this fixed time for every `currentTime`, whatever the file says:
+# 2000-01-01T00:00:00Z in epoch seconds, a value no real session of this system can produce.
+SYNTHETIC_CURRENT_TIME = 946684800
 
 
 class ReplayExhausted(AssertionError):
@@ -299,9 +303,13 @@ def decode(value: Any, cls_name: str | None = None, field_name: str | None = Non
 
 
 def decode_callback(ev: RecordedEvent) -> tuple[Any, ...]:
-    """The arguments of a recorded callback, with `Decimal` parameters rebuilt."""
+    """The arguments of a recorded callback, with `Decimal` parameters rebuilt.
+
+    `currentTime` is always the fixed `SYNTHETIC_CURRENT_TIME`."""
     fn = getattr(EWrapper, ev.name)
     params = list(inspect.signature(fn).parameters.values())[1:]
+    if ev.name == "currentTime" and ev.args:
+        return (SYNTHETIC_CURRENT_TIME,)  # the recorded value is zeroed; see the constant
     out = []
     for i, raw in enumerate(ev.args):
         value = decode(raw)

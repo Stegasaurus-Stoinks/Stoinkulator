@@ -12,15 +12,28 @@ Format (version 1)
 ------------------
 Header: `{"format": "stoinkulator-ib-session", "version": 1, "redaction": N,
 "ibapi": "10.37.2", "command": ..., "port": ..., "start_utc": ..., "error_time":
-"zeroed"}`. `start_utc` is the one wall-clock value: a string the caller passes (the
-recorder never reads the wall clock) so a recording can be matched to TWS's own log;
-it may be null. Every other time is `t`, seconds since the recorder was built, taken
-from the injected monotonic `clock`, so the same input gives the same bytes. The one
-exception IB itself brings is `errorTime` (epoch milliseconds), the second argument of
-every `error` callback, connect messages included; it would say when the session ran,
-so it is replaced by 0 at write time (the header says `"error_time": "zeroed"`; replay
-does not use it). Other epoch values IB sends (bar times, `currentTime`, a head
-timestamp) are market data and are kept: they say which period was fetched, not when.
+"zeroed", "current_time": "zeroed"}`. `start_utc` is the one wall-clock value: a string
+the caller passes (the recorder never reads the wall clock) so a recording can be matched
+to TWS's own log; it may be null. Every other time is `t`, seconds since the recorder was
+built, taken from the injected monotonic `clock`, so the same input gives the same bytes.
+Two values IB itself brings would say when the session ran, and are replaced by 0 at write
+time: `errorTime` (epoch milliseconds), the second argument of every `error` callback,
+connect messages included, and `currentTime` (epoch seconds), the argument of the
+server-time callback, which is the wall clock of TWS at the moment of the request. The
+header says `"error_time": "zeroed"` and `"current_time": "zeroed"`. Replay does not use
+the recorded values: `tests/ib_replay.py` hands back the fixed synthetic time
+`SYNTHETIC_CURRENT_TIME` (946684800, 2000-01-01T00:00:00Z) for every `currentTime`.
+The other 15 callbacks the data-only client forwards (`MainStoinker/ib/client.py`) were
+searched for further arguments that are the wall clock of the session: `error` (its time
+is the one above; its text is IB's own and is kept), `nextValidId`, `connectAck`,
+`connectionClosed`, `managedAccounts`, `contractDetails`, `contractDetailsEnd`,
+`marketDataType`, `tickPrice`, `tickSize` and `headTimestamp` carry none. What remains is
+market data that is kept: bar times (`historicalData`, `historicalDataUpdate`), the head
+timestamp, the start and end strings of `historicalDataEnd`, and the text of `tickString`
+(last-trade and real-time-volume stamps). They say which period was fetched, not when the
+session ran, EXCEPT that a request for data up to "now" (an empty end time) makes the
+last bar, the end string and any live tick stamp close to the time of the session; the
+owner must know that before committing a recording of such a request.
 `command` is a string or a sequence of strings (argv); see "Paths" below.
 
 Event: `{"seq": n, "t": s, "kind": "request" | "raw", "name": ..., "args": [...]}`.
@@ -60,22 +73,52 @@ then, in order:
    replaced too, so the bare digits of an id are caught once the id was learned.
    Learned ids are matched with several small patterns (32 ids each); learning one id
    recompiles at most one of them.
-4. The pattern `ACCOUNT_PATTERN`: one or two letters, then at most one separator
-   character of any kind (anything that is not a letter or a digit: space, dot,
-   colon, slash, non-breaking space, comma, equals, pipe, dash, underscore...), then
-   five or more digits, which may themselves have a single space, dot, comma, dash
-   or underscore between digits. It applies cold, before `managedAccounts` has been
-   seen, as well as warm, wherever it stands (also glued to other letters or
-   digits). Every id it finds is learned too (step 3 then applies to it). It covers
+4. The pattern `ACCOUNT_PATTERN`: one or two letters, then up to three separator
+   characters of any kind (anything that is not a letter or a digit: space, dot,
+   colon, slash, non-breaking space, comma, equals, pipe, dash, underscore...; a
+   backslash followed by a quote, as JSON writes a quote inside a string, counts as one),
+   then five or more digits, which may themselves have up to two separator characters
+   of any kind between digits (`12:34 56`, `12 - 34`). It applies cold, before
+   `managedAccounts` has been seen, as well as warm, wherever it stands (also glued to
+   other letters or digits). Every id it finds is learned too (step 3 then applies to
+   it), except that a hit whose digits are a calendar date is learned as written but its
+   digit run is not learned alone. Once an id is learned, its digit run also matches with
+   up to two separator characters of any kind between its digits. It covers
    IB's id shapes (`U`, `DU`, `F`, `DF`, `I`, `DI` plus seven digits, longer for
    some institutional ids; a sub-account suffix after a dot goes with the digits
    when it is a number). It over-redacts on purpose: any token of one or two letters
    and five or more digits (an ISIN, a version string such as a letter, a space and a
-   dotted number, a date after a time zone name, a `CLOSED;` marker before a date in
-   trading hours). The one exemption is an option symbol in OCC shape, `_OCC`: an
-   optional root of up to six letters (IB pads it with spaces: `AAPL  240816C00220000`),
-   six digits, `C` or `P`, eight digits, standing alone. The same placeholder
-   `ACCOUNT-n` is used for the same id in any spelling.
+   dotted number, a time such as `at 14:30:00`). There are three exemptions, all
+   narrow. (a) An option symbol in OCC shape, `_OCC`: an optional root of up to six
+   letters (IB pads it with spaces: `AAPL  240816C00220000`), six digits, `C` or `P`,
+   eight digits, standing alone. (b) A trading-hours date after a word: IB writes a
+   closed day as `<date>:CLOSED;<next date>:0400-<next date>:2000`, and the pattern would
+   take the last two letters of CLOSED, the semicolon and the next date for an id,
+   learn the date, and remove it from every later string, so a normal session would
+   no longer replay. A hit is therefore left alone, and never learned, when its letters
+   are immediately preceded by another letter (the tail of a longer word), its first
+   run of digits is exactly eight and a valid calendar date `YYYYMMDD` (year 1990 to
+   2100), and the hit goes on with nothing or with a colon and digits only. What this
+   loosens: cold only, an id of eight digits that happen to form a valid date AND is
+   written glued to a preceding letter is not caught by the pattern; warm it is still
+   caught, because an id learned from `managedAccounts` is matched as a substring
+   whatever its digits. (c) The `T03:04:05` of an ISO 8601 time after a digit (the
+   caller's `start_utc`): a capital T, exactly hh:mm:ss, an optional fraction and
+   offset. The same placeholder `ACCOUNT-n` is used for the same id in any spelling.
+
+Names. A name that is a method of `EWrapper` (a raw event) or `EClient` (a request) is
+code, not session data, and is written as it is; so are the attribute names of objects
+from the `ibapi` package (`tradingHours`, `headTimestamp`). A word in `private_values`
+that happens to occur inside one of them therefore does not rename it. Keys of a plain
+dict come from data and are redacted like values, and take part (with their value) in
+the scan for an id split over adjacent leaves.
+
+E-mail addresses. `local@host` is replaced, except an exchange token as IB writes it in
+error texts (`SYMBOL@EXCHANGE`, error 162): a local part of at most six upper-case
+letters and digits and an all-upper-case host without a dot. `user@host` in lower or
+mixed case, and any other form, is still replaced. The cost: an upper-case
+`NAME@HOST` of that shape is kept as well; `private_values` (step 1) removes the user
+and machine names before this rule runs, which is why the caller must pass them.
 
 Numbers. A value whose Python type is `int`, `float` or `Decimal` (not `str`, not
 `bytes`) and which is not under an account-like name is replaced only when its
@@ -121,16 +164,49 @@ the arguments are replaced by a marker naming the exception type. Both are count
 
 Not covered: ids written in a look-alike alphabet (Cyrillic or Greek letters),
 split across two *events*, split by something other than directly adjacent
-arguments, encoded (percent, base64, hex, reversed) or spelled out in words; private
-data that is not an account, an address, a path, an e-mail address or one of
-`private_values`; a recording's timing, which says when the owner traded (bar times
-are kept). Over-redaction is accepted. The owner reads a redacted recording and runs
-`scan_recording` on it before it is committed.
+arguments (an id split over a dict key and its value IS caught, for keys of a plain
+dict), encoded (percent, base64, HTML entities, hex, reversed) or spelled out in words;
+more than three separators between the letters and the digits cold, or more than two
+between digits cold; an eight-digit id that forms a valid date and is glued to a
+preceding letter, cold (see step 4); private data that is not an account, an address,
+a path, an e-mail address or one of `private_values`; a recording's timing, which says
+when the owner traded (bar times are kept; for a request that ends "now" they also
+say roughly when the session ran). Words of one or two letters in a name are not
+removed by `private_values` (only the whole value and its words of three or more
+characters are). Without `private_values`, names can survive in relative paths, paths
+without a recognised start, host names and display names in mail headers. Over-redaction
+is accepted. The owner reads a redacted recording and runs `scan_recording` on it
+before it is committed.
+
+Before committing a real recording
+----------------------------------
+1. Record with the user name, machine name, home folder and the OneDrive / organisation
+   folder name passed as `private_values`, and the `ibapi` logger at WARNING.
+2. Run `scan_recording` with `words` = your account number(s), their digits alone, your
+   first and last name, the machine and folder names; read every finding.
+3. Search the file yourself for the account digits with any separator between them, and
+   for each word of one or two letters in your names (those are not removed).
+4. Read the header (`command`, `start_utc`), every `error` line and every `currentTime`
+   line by eye.
+5. Replay it (`tests/ib_replay.py`): `Recording.problems` must be empty, and the hours
+   strings and `historicalDataEnd` values must still hold their dates.
+6. Commit only after reading the whole file once; when in doubt, do not commit it.
 
 `scan_recording(path, words=())` is a standalone checker for the owner. It does not
 use the `Redactor`'s patterns and reports, with line numbers and a short reason,
 what a careful reader should look at (never the matched text itself, only its first
-two characters and its length). The command-line wiring for it is a later task.
+two characters and its length). It flags: letters and five or more digits; any run of
+six or more digits outside the places the format names as numbers; digit groups joined
+by one or two separators (`12:34 56`) with six or more digits; a value in a date position
+that is not a valid date (`YYYYMMDD`, 1990 to 2100) or epoch (9, 10 or 13 digits up to
+2100); a long digit run under a numeric field name whose value is not a number (a string
+under `conId`, a list under `price`), except the strings the format writes for `Decimal`
+fields and epochs; digit-only dict keys of five or more digits; e-mail addresses (not
+`SYMBOL@EXCHANGE`), IP addresses, paths, and `words`. It cannot see: encodings (base64,
+percent-encoding, HTML entities, hex), ids split over several arguments or events,
+look-alike letters, private data that is none of the above. A clean scan is NOT a proof;
+the owner must still search the file for the account digits by hand. The command-line
+wiring for it is a later task.
 
 Threading: `on_request` and `on_raw` run on the reader, connect-helper and caller
 threads. One lock covers redaction, numbering and the write. Nothing here calls
@@ -140,6 +216,7 @@ an exception is caught and counted, never raised.
 
 from __future__ import annotations
 
+import datetime
 import enum
 import inspect
 import json
@@ -160,13 +237,15 @@ from ibapi.wrapper import EWrapper
 
 FORMAT_NAME = "stoinkulator-ib-session"
 FORMAT_VERSION = 1
-REDACTION_VERSION = 2
+REDACTION_VERSION = 3
 
 MAX_STRING = 65536  # a longer string is not written, it is replaced by a note
 MAX_PATTERN_IDS = 256  # ids learned from pattern hits; ids from managedAccounts / names are not capped
 _TIER_SIZE = 32  # learned ids per compiled pattern
 
-ACCOUNT_PATTERN = re.compile(r"[A-Za-z]{1,2}[^A-Za-z0-9]?\d(?:[ .,\-_]?\d){4,}")
+ACCOUNT_PATTERN = re.compile(
+    r"[A-Za-z]{1,2}(?:\\[\"']|[^A-Za-z0-9]){0,3}\d(?:[^A-Za-z0-9]{0,2}\d){4,}"
+)
 _SPLIT_PATTERN = re.compile(r"[A-Za-z]{1,2}[-_]?\d{5,9}(?!\d)")
 _DATE = re.compile(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])")
 _OCC = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,6} *)?\d{6}[CcPp]\d{8}(?![A-Za-z0-9])")
@@ -175,6 +254,9 @@ _TOKEN = re.compile(r"[A-Za-z0-9]+")
 # Linear on any input: it starts only at the beginning of a run of address characters
 # and the possessive quantifiers never give characters back.
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]++(?:@[\w.+-]*+)+")
+_EXCHANGE_TOKEN = re.compile(r"[A-Z0-9]{1,6}@[A-Z]+")  # AAPL@SMART in IB's error texts, not an address
+_ISO_TIME = re.compile(r"T\d\d:\d\d:\d\d(?:\.\d+)?(?:[+-]\d\d(?::?\d\d)?)?")
+_GAP = r"[^A-Za-z0-9]{0,2}"  # what a learned digit run tolerates between its digits
 _IPV4 = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.]*\d)")
 _IPV4_MAPPED = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}\d{1,3}(?:\.\d{1,3}){3}(?!\d)")
 _IPV6 = re.compile(
@@ -247,6 +329,60 @@ def _overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
     return any(span[0] < b and a < span[1] for a, b in spans)
 
 
+def _is_date(digits: str) -> bool:
+    """Whether `digits` is exactly a calendar date `YYYYMMDD` with a year from 1990 to 2100."""
+    if len(digits) != 8 or not (digits.isascii() and digits.isdigit()):
+        return False
+    try:
+        datetime.date(int(digits[:4]), int(digits[4:6]), int(digits[6:]))
+    except ValueError:
+        return False
+    return 1990 <= int(digits[:4]) <= 2100
+
+
+def _glued_date(text: str, m: re.Match[str]) -> bool:
+    """The one exemption from `ACCOUNT_PATTERN`: a pattern hit that is the tail of a word
+    followed by a date, as in `CLOSED;<date>:0400-...` of IB's trading hours.
+
+    All of: the hit's letters are immediately preceded by another letter; its first run of
+    digits is exactly eight and a valid date; what follows that run inside the hit is
+    nothing or a colon and more digits (a time)."""
+    start = m.start()
+    if start == 0 or not text[start - 1].isalpha():
+        return False
+    hit = m.group(0)
+    lead = re.search(r"\d+", hit)
+    if lead is None or not _is_date(lead.group(0)):
+        return False
+    rest = hit[lead.end():]
+    return rest == "" or rest.startswith(":")
+
+
+def _iso_time(text: str, m: re.Match[str]) -> bool:
+    """The second exemption: the `T03:04:05` of an ISO 8601 date and time (the caller's
+    `start_utc`): a capital T after a digit, then exactly hh:mm:ss, an optional fraction and offset."""
+    start = m.start()
+    return start > 0 and text[start - 1].isdigit() and _ISO_TIME.fullmatch(m.group(0)) is not None
+
+
+def _exempt(text: str, m: re.Match[str]) -> bool:
+    return _glued_date(text, m) or _iso_time(text, m)
+
+
+def _pattern_hits(text: str) -> list[re.Match[str]]:
+    """The `ACCOUNT_PATTERN` hits in `text` that count: not an option symbol, not a glued date."""
+    occ = _occ_spans(text)
+    return [
+        m for m in ACCOUNT_PATTERN.finditer(text)
+        if not _overlaps(m.span(), occ) and not _exempt(text, m)
+    ]
+
+
+def _email_sub(m: re.Match[str]) -> str:
+    text = m.group(0)
+    return text if _EXCHANGE_TOKEN.fullmatch(text) else "EMAIL-REDACTED"
+
+
 def _scrub_paths(text: str) -> str:
     """Replace each path, whole: to the closing quote if it began inside quotes, else to
     the end of the line or the next character that cannot be in a Windows path."""
@@ -306,8 +442,17 @@ def _private_pattern(terms: Sequence[str]) -> re.Pattern[str] | None:
     return re.compile("|".join(p for p in parts if p), re.IGNORECASE)
 
 
+def _id_regex(token: str) -> str:
+    """A digit run of five or more digits also matches with up to two separator characters
+    of any kind between its digits; an id with letters is matched as written."""
+    if len(token) >= 5 and token.isascii() and token.isdigit():
+        return _GAP.join(re.escape(c) for c in token)
+    return re.escape(token)
+
+
 def _compile_ids(ids: Iterable[str]) -> re.Pattern[str]:
-    return re.compile("|".join(re.escape(i) for i in sorted(ids, key=len, reverse=True)), re.IGNORECASE)
+    ordered = sorted(ids, key=len, reverse=True)
+    return re.compile("|".join(_id_regex(i) for i in ordered), re.IGNORECASE)
 
 
 def _number_digits(value: int | float | Decimal) -> str | None:
@@ -366,11 +511,13 @@ class Redactor:
             number = self._numbers[key] = len(self._numbers) + 1
         return f"ACCOUNT-{number}"
 
-    def learn(self, token: str, *, from_pattern: bool = False) -> None:
+    def learn(self, token: str, *, from_pattern: bool = False, runs: bool = True) -> None:
         """Remember `token` as an account id of this session.
 
         Ids found by the pattern (`from_pattern`) stop being learned after
-        `MAX_PATTERN_IDS`; all others are always learned."""
+        `MAX_PATTERN_IDS`; all others are always learned. With `runs=False` the id is
+        learned as written but its digit run is not learned on its own (used for a pattern
+        hit whose digits are a calendar date, so that dates are not removed elsewhere)."""
         key = _norm_key(_normalise(token))
         if len(key) < 3 or key in self._alias:
             return
@@ -380,7 +527,7 @@ class Redactor:
             self._pattern_learned += 1
         self._alias[key] = key
         new = [key]
-        for run in re.findall(r"\d{5,}", key):
+        for run in re.findall(r"\d{5,}", key) if runs else ():
             if run not in self._alias:
                 self._alias[run] = key
                 new.append(run)
@@ -456,7 +603,7 @@ class Redactor:
         if self._private is not None:
             s = self._private.sub("REDACTED", s)
         s = _scrub_paths(s)
-        s = _EMAIL.sub("EMAIL-REDACTED", s)
+        s = _EMAIL.sub(_email_sub, s)
         s = _IPV4_MAPPED.sub("IP-REDACTED", s)
         s = _IPV6.sub("IP-REDACTED", s)
         s = _IPV4.sub("IP-REDACTED", s)
@@ -464,9 +611,11 @@ class Redactor:
         occ = _occ_spans(s)
 
         def by_pattern(m: re.Match[str]) -> str:
-            if _overlaps(m.span(), occ):
+            if _overlaps(m.span(), occ) or _exempt(s, m):
                 return m.group(0)
-            self.learn(m.group(0), from_pattern=True)  # the same id elsewhere is then caught too
+            digits = re.sub(r"\D", "", m.group(0))
+            # the same id elsewhere is then caught too, unless its digits are a date
+            self.learn(m.group(0), from_pattern=True, runs=not _is_date(digits))
             return self._placeholder(_norm_key(m.group(0)))
 
         return ACCOUNT_PATTERN.sub(by_pattern, s)
@@ -486,8 +635,7 @@ class Redactor:
         """Whether `text` still holds something account-shaped (the last check before a write)."""
         if self._learned_spans(text):
             return True
-        occ = _occ_spans(text)
-        return any(not _overlaps(m.span(), occ) for m in ACCOUNT_PATTERN.finditer(text))
+        return bool(_pattern_hits(text))
 
     def leaks_in_value(self, value: Any, depth: int = 0) -> bool:
         """The last check before a write, on the JSON value itself: a string (or key) that
@@ -568,7 +716,7 @@ class Redactor:
             return "<cycle>"
         path = path | {id(v)}
         if isinstance(v, Mapping):
-            return self._walk_items(None, v.items(), force, depth, path)
+            return self._walk_items(None, v.items(), force, depth, path, False)
         if isinstance(v, list | tuple):
             return [self._walk(x, force, depth + 1, path) for x in v]
         if isinstance(v, set | frozenset):
@@ -582,19 +730,32 @@ class Redactor:
         attrs = _attributes(v)
         if attrs is None:
             return f"<unserialisable {type(v).__name__}>"
-        return self._walk_items(type(v).__name__, attrs.items(), force, depth, path)
+        module = type(v).__module__
+        from_ibapi = module == "ibapi" or module.startswith("ibapi.")
+        return self._walk_items(type(v).__name__, attrs.items(), force, depth, path, from_ibapi)
 
     def _walk_items(
         self, cls: str | None, items: Iterable[tuple[Any, Any]], force: bool, depth: int,
-        path: frozenset[int],
+        path: frozenset[int], code_names: bool,
     ) -> dict[str, Any]:
+        """`code_names`: the keys are attribute names of an `ibapi` object, which come from
+        code and are written as they are. Keys of a plain dict come from data: they are
+        redacted and, like values, take part in the scan for an id split over adjacent leaves."""
         out: dict[str, Any] = {}
         if cls is not None:
             out["__class__"] = cls
         for key, value in items:
             key_text = key if isinstance(key, str) else str(key)
-            sub_force = force or _account_name(_normalise(key_text))
-            shown = self._redact_text(_normalise(str.__str__(key_text)))
+            norm = _normalise(str.__str__(key_text))
+            sub_force = force or _account_name(norm)
+            if code_names:
+                shown = norm
+            elif cls is None:
+                index = len(self._leaves)
+                self._leaves.append(norm)
+                shown = _WIPED if norm and index in self._wipe else self._redact_text(norm)
+            else:
+                shown = self._redact_text(norm)
             n = 2
             unique = shown
             while unique in out:
@@ -620,6 +781,14 @@ class Redactor:
         self._names[(kind, name)] = names
         return names
 
+    def event_name(self, kind: str, name: str) -> str:
+        """The name of an event as written: a method of `EWrapper` (raw) or `EClient`
+        (request) is code, not session data, and is never rewritten; any other name is scrubbed."""
+        owner = EWrapper if kind == "raw" else EClient
+        if name.isidentifier() and not name.startswith("_") and callable(getattr(owner, name, None)):
+            return name
+        return self.scrub(name)
+
     def _run(self, args: Sequence[Any], forced: set[int]) -> list[Any]:
         self._leaves = []
         self._nodes = 0
@@ -630,8 +799,11 @@ class Redactor:
         args = tuple(args)
         names = self._param_names(kind, name)
         forced = {i for i, n in enumerate(names[: len(args)]) if _account_name(n)}
-        if kind == "raw":  # IB's own wall-clock stamp: zeroed, see the module docstring
-            args = tuple(0 if names[i : i + 1] == ("errorTime",) else a for i, a in enumerate(args))
+        if kind == "raw":  # IB's own wall-clock stamps: zeroed, see the module docstring
+            args = tuple(
+                0 if names[i : i + 1] == ("errorTime",) or (name == "currentTime" and i == 0) else a
+                for i, a in enumerate(args)
+            )
         self._wipe, self._wipe_strings = set(), False
         if name == "managedAccounts":
             for a in args:
@@ -653,8 +825,7 @@ class Redactor:
     def leaks_in_text(self, text: str) -> list[tuple[int, int]]:
         """Spans in `text` of a learned id or of the account pattern (OCC symbols excepted)."""
         spans = [(a, b) for a, b, _t in self._learned_spans(text)]
-        occ = _occ_spans(text)
-        spans += [m.span() for m in ACCOUNT_PATTERN.finditer(text) if not _overlaps(m.span(), occ)]
+        spans += [m.span() for m in _pattern_hits(text)]
         return spans
 
     def split_candidates(self, text: str) -> list[tuple[int, int]]:
@@ -771,6 +942,7 @@ class SessionRecorder:
             "port": port if type(port) is int else None,
             "start_utc": self._redactor.scrub(start_utc) if isinstance(start_utc, str) else None,
             "error_time": "zeroed",
+            "current_time": "zeroed",
         }
         self._write(_json_text(header))
 
@@ -822,7 +994,7 @@ class SessionRecorder:
                 t = None
                 self.failures += 1
             try:
-                shown_name = self._redactor.scrub(str(name))
+                shown_name = self._redactor.event_name(kind, str(name))
             except Exception:
                 shown_name = "<unknown>"
             marker: str | None = None
@@ -876,6 +1048,9 @@ class Finding:
 
 
 LONG_RUN_REASON = "run of six or more digits in an unknown position"
+SEPARATED_RUN_REASON = "digit groups joined by separators, six or more digits in an unknown position"
+DIGIT_KEY_REASON = "dict key made of five or more digits"
+INVALID_DATE_REASON = "digits in a date position that are not a valid date or epoch"
 _S_LETTERS_DIGITS = re.compile(r"(?<![A-Za-z])[A-Za-z]++[^A-Za-z0-9]?(?:\d[ .,\-_]?){4,}\d")
 _S_OCC = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,6} *)?\d{6}[CcPp]\d{8}(?![A-Za-z0-9])")
 _S_LONG_DIGITS = re.compile(r"\d{6,}")
@@ -901,8 +1076,42 @@ _S_DATE_NAMES = frozenset({
     "lastTradeDateOrContractMonth", "lastTradeDate", "contractMonth", "realExpirationDate",
     "start_utc", "start", "end", "date",
 })
+# Numbers the format writes as text (`Decimal`): a plain number string is expected there.
+_S_DECIMAL_TEXT_NAMES = frozenset({
+    "volume", "wap", "size", "minSize", "sizeIncrement", "suggestedSizeIncrement", "bidSize",
+    "askSize", "lastSize", "volume24Hr", "totalVolume",
+})
+# Fields that carry an epoch in seconds as text.
+_S_EPOCH_NAMES = frozenset({"date", "headTimestamp"})
+# A comma separated list of small numbers, whose digit groups are not an id.
+_S_LIST_NAMES = frozenset({"marketRuleIds"})
 _S_PLAIN_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
-_S_EIGHT_DIGITS = re.compile(r"(?<!\d)\d{8}(?!\d)")
+_S_SEP_DIGITS = re.compile(r"\d+(?:[^A-Za-z0-9]{1,2}\d+)+")
+_S_EXCHANGE_TOKEN = re.compile(r"[A-Z0-9]{1,6}@[A-Z]+")
+_S_EMAIL_TOKEN = re.compile(r"(?<![\w.+-])[\w.+-]*+@[\w.+-]*+")  # linear: starts at a run's beginning
+_S_DIGIT_KEY = re.compile(r"\d{5,}")
+_S_EPOCH_LIMIT = 4102444800  # 2100-01-01
+
+
+def _s_valid_date(run: str) -> bool:
+    """Eight digits that are a calendar date, year 1990 to 2100."""
+    if len(run) != 8 or not (run.isascii() and run.isdigit()):
+        return False
+    year, month, day = int(run[:4]), int(run[4:6]), int(run[6:])
+    if not 1990 <= year <= 2100 or not 1 <= month <= 12:
+        return False
+    days = (31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30,
+            31, 31, 30, 31, 30, 31)
+    return 1 <= day <= days[month - 1]
+
+
+def _s_valid_epoch(run: str) -> bool:
+    """Nine or ten digits of an epoch in seconds, or thirteen of one in milliseconds, up to 2100."""
+    if not (run.isascii() and run.isdigit()):
+        return False
+    if len(run) in (9, 10):
+        return int(run) <= _S_EPOCH_LIMIT
+    return len(run) == 13 and int(run) <= _S_EPOCH_LIMIT * 1000
 
 
 def _s_shown(text: str) -> str:
@@ -916,30 +1125,49 @@ def _s_text_findings(
 ) -> list[Finding]:
     found: list[Finding] = []
     occ = [m.span() for m in _S_OCC.finditer(text)]
+    in_date = name in _S_DATE_NAMES
     for m in _S_LETTERS_DIGITS.finditer(text):
-        if not _overlaps(m.span(), occ):
-            found.append(Finding(line, "letters then five or more digits", _s_shown(m.group(0))))
-    for rx, reason in (
-        (_S_EMAIL, "e-mail address"), (_S_IPV4, "IPv4 address"), (_S_PATH, "path"),
-    ):
+        if _overlaps(m.span(), occ):
+            continue
+        lead = re.search(r"\d+", m.group(0))
+        if in_date and lead is not None and _s_valid_date(lead.group(0)):
+            continue  # CLOSED;<date> in trading hours: a date after a word
+        found.append(Finding(line, "letters then five or more digits", _s_shown(m.group(0))))
+    for rx, reason in ((_S_IPV4, "IPv4 address"), (_S_PATH, "path")):
         m = rx.search(text)
         if m:
             found.append(Finding(line, reason, _s_shown(m.group(0))))
+    for m in _S_EMAIL_TOKEN.finditer(text):
+        token = m.group(0)
+        if _S_EMAIL.search(token) and _S_EXCHANGE_TOKEN.fullmatch(token) is None:
+            found.append(Finding(line, "e-mail address", _s_shown(token)))
+            break
     for m6 in _S_IPV6.finditer(text):
         token = m6.group(0)
         if "::" in token or token.count(":") >= 7:
             found.append(Finding(line, "IPv6 address", _s_shown(token)))
             break
     if structured:
-        known_number = name in _S_NUMERIC_NAMES
-        for m in _S_LONG_DIGITS.finditer(text):
-            if known_number and _S_PLAIN_NUMBER.fullmatch(text):
-                continue  # the whole string is the number (an epoch, a volume, a conId, a price)
-            if _overlaps(m.span(), occ):
-                continue  # an option symbol in OCC shape
-            if name in _S_DATE_NAMES and len(m.group(0)) == 8 and _S_EIGHT_DIGITS.fullmatch(m.group(0)):
-                continue
-            found.append(Finding(line, LONG_RUN_REASON, _s_shown(m.group(0))))
+        if name in _S_DECIMAL_TEXT_NAMES and _S_PLAIN_NUMBER.fullmatch(text):
+            whole_ok = True  # a Decimal written as text: a volume, a price, a size
+        elif name in _S_EPOCH_NAMES and _s_valid_epoch(text):
+            whole_ok = True  # the whole string is an epoch in seconds
+        else:
+            whole_ok = False
+        if not whole_ok:
+            for m in _S_LONG_DIGITS.finditer(text):
+                run = m.group(0)
+                if _overlaps(m.span(), occ):
+                    continue  # an option symbol in OCC shape
+                if in_date and _s_valid_date(run):
+                    continue
+                reason = INVALID_DATE_REASON if in_date and len(run) == 8 else LONG_RUN_REASON
+                found.append(Finding(line, reason, _s_shown(run)))
+            if not in_date and name not in _S_LIST_NAMES and name not in _S_DECIMAL_TEXT_NAMES:
+                for m in _S_SEP_DIGITS.finditer(text):
+                    digits = sum(c.isdigit() for c in m.group(0))
+                    if digits >= 6 and not _overlaps(m.span(), occ):
+                        found.append(Finding(line, SEPARATED_RUN_REASON, _s_shown(m.group(0))))
     low = text.casefold()
     for i, word in enumerate(words, 1):
         if word and word.casefold() in low:
@@ -965,11 +1193,15 @@ def _s_walk(
         return _s_text_findings(value, line, name, words, structured=True)
     out: list[Finding] = []
     if isinstance(value, list):
+        # a list under a numeric name is not a number: its items get no numeric exemption
+        child = None if name in _S_NUMERIC_NAMES else name
         for v in value:
-            out.extend(_s_walk(v, line, name, words, depth + 1))
+            out.extend(_s_walk(v, line, child, words, depth + 1))
     elif isinstance(value, dict):
         for k, v in value.items():
             out.extend(_s_text_findings(str(k), line, None, words, structured=False))
+            if _S_DIGIT_KEY.fullmatch(str(k)):
+                out.append(Finding(line, DIGIT_KEY_REASON, _s_shown(str(k))))
             out.extend(_s_walk(v, line, k if isinstance(k, str) else None, words, depth + 1))
     else:
         out.append(Finding(line, "unexpected JSON value", ""))
@@ -984,13 +1216,15 @@ def _s_event_findings(event: dict[str, Any], line: int, words: Sequence[str]) ->
     for key in ("seq", "t"):
         if key in event:
             out.extend(_s_walk(event[key], line, key, words))
+    owner = EWrapper if kind == "raw" else EClient
+    fn = getattr(owner, name, None) if isinstance(name, str) and not name.startswith("_") else None
     if isinstance(name, str):
-        out.extend(_s_text_findings(name, line, None, words, structured=False))
+        # the name of an EWrapper / EClient method is code: a caller word inside it is no finding
+        own_words = () if callable(fn) and name.isidentifier() else words
+        out.extend(_s_text_findings(name, line, None, own_words, structured=False))
     if not isinstance(args, list):
         out.extend(_s_walk(args, line, None, words))
         return out
-    owner = EWrapper if kind == "raw" else EClient
-    fn = getattr(owner, name, None) if isinstance(name, str) and not name.startswith("_") else None
     params: list[str] = []
     if callable(fn):
         try:
@@ -1007,12 +1241,23 @@ def scan_recording(path: str | Path, words: Iterable[str] = ()) -> list[Finding]
 
     Flags, per line, with line number and a short reason (the matched text is never
     shown in full: at most its first two characters and its length): letters, at most
-    one separator and five or more digits (an OCC option symbol excepted); a run of
-    six or more digits outside the places the format names as numbers (epoch times,
-    conId, prices, volumes, dates); an e-mail address, IP address or path; any of
-    `words` (case-insensitive: user name, machine name, folder names, the account
-    number); any line that is not valid JSON. It fails closed: a file that cannot be
-    read, is not UTF-8, is empty or has no session header is itself a finding.
+    one separator and five or more digits (an OCC option symbol excepted, and a date
+    after a word in a date-named field); a run of six or more digits outside the places
+    the format names as numbers (epoch times, conId, prices, volumes, dates), also under
+    a numeric field name when the value is text or a list (except the text the format
+    writes for `Decimal` fields and epochs); digit groups joined by one or two
+    separators with six or more digits (outside date fields); a value in a date field
+    that is not a valid date or epoch; a dict key of five or more digits only; an e-mail
+    address (not `SYMBOL@EXCHANGE`), IP address or path; any of `words`
+    (case-insensitive: user name, machine name, folder names, the account number; not
+    held against the name of an `EWrapper` / `EClient` method); any line that is not
+    valid JSON. It fails closed: a file that cannot be read, is not UTF-8, is empty or
+    has no session header is itself a finding.
+
+    It cannot see: encodings (base64, percent-encoding, HTML entities, hex), an id split
+    over several arguments or events, look-alike letters, or private data of no
+    recognisable shape. A clean result is not proof: the owner must still search the
+    file for the account digits by hand (see "Before committing a real recording").
 
     It uses its own patterns, not the `Redactor`'s, so a blind spot of the recorder is
     not shared. The command-line wiring is a later task.

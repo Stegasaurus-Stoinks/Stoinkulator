@@ -415,15 +415,23 @@ def test_committed_file_list_covers_every_recorder_replay_and_recording_file() -
     assert on_disk <= names
 
 
+# The shape of an account id in committed text: the pattern the recorder used before it was widened
+# to up to three separators before the digits and two inside them. The widened one is for strings
+# IB sends; applied to source and JSON text it would flag every `conId` and every `f(x, 12345)`.
+_COMMITTED_SHAPE = rmod.re.compile(r"[A-Za-z]{1,2}[^A-Za-z0-9]?\d(?:[ .,\-_]?\d){4,}")
+
+
 def test_no_account_pattern_in_committed_files() -> None:
     files = committed_recorder_files()
     assert any(p.name == "synthetic_history.jsonl" for p in files)
     red = Redactor()
     for p in files:
         text = p.read_text(encoding="utf-8")
-        found = [text[a:b] for a, b in red.leaks_in_text(text)]
+        occ = rmod._occ_spans(text)
+        found = [m.group(0) for m in _COMMITTED_SHAPE.finditer(text) if not rmod._overlaps(m.span(), occ)]
         assert not found, f"{p}: account-shaped text {found}"
-    assert red.leaks_in_text(f"x {A} y")  # the scan does flag one
+    assert red.leaks_in_text(f"x {A} y")  # the recorder's own scan does flag one
+    assert _COMMITTED_SHAPE.search(f"x {A} y")  # and so does this one
 
 
 # -- replay -------------------------------------------------------------------------------------
@@ -723,10 +731,10 @@ def test_header_and_line_format(tmp_path: Path) -> None:
     assert header == {
         "format": FORMAT_NAME, "version": 1, "redaction": REDACTION_VERSION, "ibapi": "10.37.2",
         "command": "probe AAPL", "port": 7496, "start_utc": "2026-01-02T03:04:05Z",
-        "error_time": "zeroed",
+        "error_time": "zeroed", "current_time": "zeroed",
     }
     assert req == {"seq": 1, "t": 1.0, "kind": "request", "name": "reqCurrentTime", "args": []}
-    assert raw == {"seq": 2, "t": 2.0, "kind": "raw", "name": "currentTime", "args": [1700000000]}
+    assert raw == {"seq": 2, "t": 2.0, "kind": "raw", "name": "currentTime", "args": [0]}
 
 
 def test_objects_and_decimals_are_serialised(tmp_path: Path) -> None:
@@ -1384,7 +1392,8 @@ def test_scan_flags_letters_with_a_separator_inside_the_digits_and_exempts_only_
         ev(3, "error", -1, 0, 1, "sym " + occ(right="X") + " end", ""),
     )
     assert [(f.line, f.reason) for f in scan_recording(path)] == [
-        (2, LETTERS), (4, LETTERS), (4, LONG_RUN),  # the OCC symbol on line 3 is exempt from both
+        (2, LETTERS), (2, rmod.SEPARATED_RUN_REASON),  # the second is the new separated-digits rule
+        (4, LETTERS), (4, LONG_RUN),  # the OCC symbol on line 3 is exempt from all
     ]
 
 

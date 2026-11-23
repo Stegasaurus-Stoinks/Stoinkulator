@@ -1,4 +1,4 @@
-{"format":"stoinkulator-ib-session","version":1,"redaction":2,"ibapi":"10.37.2","command":"synthetic recording written by hand, not a real session","port":7497,"start_utc":null,"error_time":"zeroed"}
+{"format":"stoinkulator-ib-session","version":1,"redaction":3,"ibapi":"10.37.2","command":"synthetic recording written by hand, not a real session","port":7497,"start_utc":null,"error_time":"zeroed","current_time":"zeroed"}
 {"seq":1,"t":0.0,"kind":"raw","name":"connectAck","args":[]}
 {"seq":2,"t":0.01,"kind":"raw","name":"nextValidId","args":[1]}
 {"seq":3,"t":0.01,"kind":"raw","name":"managedAccounts","args":["ACCOUNT-1"]}
