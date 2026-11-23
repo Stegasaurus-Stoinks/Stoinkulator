@@ -12,9 +12,13 @@ This module must not import anything from `MainStoinker.*` outside
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import os
 import re
-from collections.abc import Iterator, Mapping, Sequence
+import tempfile
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -80,6 +84,175 @@ def file_fingerprint(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def month_file_path(data_dir: Path, symbol: str, year: int, month: int) -> Path:
+    """Path of the month file `<data_dir>/<SYMBOL>/<SYMBOL>_<YYYY>-<MM>.csv`.
+
+    Raises `ValueError` for a symbol that is not a plain ticker or a month
+    outside 1..12 (so the path always stays inside `data_dir`).
+    """
+    if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
+        raise ValueError(f"invalid symbol {ascii(symbol)}")
+    if not (isinstance(year, int) and isinstance(month, int) and 1 <= month <= 12
+            and 1 <= year <= 9999):
+        raise ValueError(f"invalid month {year!r}-{month!r}")
+    return Path(data_dir) / symbol / f"{symbol}_{year:04d}-{month:02d}.csv"
+
+
+def _month_name(symbol: str) -> re.Pattern[str]:
+    return re.compile(re.escape(symbol) + r"_([0-9]{4})-(0[1-9]|1[0-2])\.csv")
+
+
+def symbol_bar_files(data_dir: Path, symbol: str) -> list[Path]:
+    """The bar file(s) of `symbol`: the legacy single file, else its month files, sorted.
+
+    Other names in the symbol folder (manifest.json, *.tmp, ...) are ignored.
+    Both layouts present is a `ValueError`; neither is a `FileNotFoundError`
+    naming both places.
+    """
+    legacy = offline_data_path(data_dir, symbol)
+    folder = Path(data_dir) / symbol
+    pattern = _month_name(symbol)
+    months = (
+        sorted(p for p in folder.iterdir() if pattern.fullmatch(p.name) and p.is_file())
+        if folder.is_dir()
+        else []
+    )
+    if legacy.is_file():
+        if months:
+            raise ValueError(
+                f"symbol {symbol} has both the single file {legacy} and month files in "
+                f"{folder}; keep only one"
+            )
+        return [legacy]
+    if not months:
+        raise FileNotFoundError(
+            f"offline data not found for {symbol}: neither {legacy} nor month files "
+            f"{folder / (symbol + '_YYYY-MM.csv')}"
+        )
+    return months
+
+
+def read_symbol_bars(
+    data_dir: Path,
+    symbol: str,
+    reader: Callable[[Path], pd.DataFrame] = read_offline_bars,
+) -> pd.DataFrame:
+    """All bars of `symbol` as one frame (columns `COLUMNS`, RangeIndex).
+
+    A legacy file is read exactly as `read_offline_bars` does. Month files are
+    concatenated; every row must lie in its file's month and the dates of a
+    file must be strictly increasing, else `ValueError` naming the file (files
+    are sorted by month, so the whole result is then strictly increasing).
+    Errors are those of `symbol_bar_files` and `read_offline_bars`.
+    `reader` reads one file (default `read_offline_bars`; a seam for callers).
+    """
+    files = symbol_bar_files(data_dir, symbol)
+    if files[0] == offline_data_path(data_dir, symbol):
+        return reader(files[0])
+    pattern = _month_name(symbol)
+    frames = []
+    for path in files:
+        frame = reader(path)
+        match = pattern.fullmatch(path.name)
+        assert match is not None  # symbol_bar_files only returns matching names
+        year, month = int(match.group(1)), int(match.group(2))
+        dates = frame["date"]
+        if getattr(dates.dt, "tz", None) is not None:
+            raise ValueError(f"month file {path} has time-zone aware dates")
+        outside = (dates.dt.year != year) | (dates.dt.month != month)
+        if outside.any():
+            raise ValueError(
+                f"month file {path} has a row outside {year:04d}-{month:02d}: "
+                f"{dates[outside].iloc[0]}"
+            )
+        if not dates.is_monotonic_increasing or dates.duplicated().any():
+            raise ValueError(f"month file {path} has dates that are not strictly increasing")
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)[list(COLUMNS)]
+
+
+def symbol_fingerprint(
+    data_dir: Path,
+    symbol: str,
+    hasher: Callable[[Path], tuple[str, int]] = file_fingerprint,
+) -> tuple[str, int]:
+    """`(sha256 hex digest, size in bytes)` of the data of `symbol`.
+
+    For a legacy single file this is `file_fingerprint` of that file, so runs
+    stored before month files existed still verify. For month files it is the
+    sha256 over one `"<name> NUL <file sha> NUL <size>\\n"` line per file, in
+    name order, with the total size of the files. `hasher` computes the
+    `(sha, size)` of one file (default `file_fingerprint`; a seam for callers).
+    """
+    files = symbol_bar_files(data_dir, symbol)
+    if files[0] == offline_data_path(data_dir, symbol):
+        return hasher(files[0])
+    digest = hashlib.sha256()
+    total = 0
+    for path in files:
+        sha, size = hasher(path)
+        digest.update(f"{path.name}\0{sha}\0{size}\n".encode("ascii"))
+        total += size
+    return digest.hexdigest(), total
+
+
+# On Windows `os.replace` raises PermissionError while a reader has the target
+# open; the writer retries for at most this long, pausing this long between tries.
+REPLACE_RETRY_SECONDS = 2.0
+REPLACE_RETRY_PAUSE = 0.05
+
+
+def write_month_file(
+    path: Path,
+    frame: pd.DataFrame,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Write `frame` (columns `COLUMNS`) as a month file, atomically.
+
+    Format: header `date,time,open,high,low,close,volume`, no index column,
+    `date` as `YYYY-MM-DD HH:MM:SS`, LF line endings. The data goes to a temp
+    file in the same folder and is then moved over `path` with `os.replace`, so
+    a reader never sees a half-written file. The folder is created if needed.
+    A frame with other columns or no rows is a `ValueError`; so is a row outside
+    the month named by `path` when `path` is a month file name. If the move fails
+    with `PermissionError` (a reader holds the target open, Windows) it is retried
+    for up to `REPLACE_RETRY_SECONDS`, pausing with `sleep`, timed by `clock`; then
+    the original error is raised. On any failure `path` is unchanged and no temp
+    file is left.
+    """
+    path = Path(path)
+    if list(frame.columns) != list(COLUMNS):
+        raise ValueError(f"month file frame needs columns {list(COLUMNS)}, got {list(frame.columns)}")
+    if frame.empty:
+        raise ValueError("refusing to write an empty month file")
+    dates = pd.to_datetime(frame["date"])
+    match = re.fullmatch(r".+_([0-9]{4})-(0[1-9]|1[0-2])\.csv", path.name)
+    if match and ((dates.dt.year != int(match.group(1))) | (dates.dt.month != int(match.group(2)))).any():
+        raise ValueError(f"frame has rows outside the month of {path.name}")
+    out = frame.copy()
+    out["date"] = dates.dt.strftime("%Y-%m-%d %H:%M:%S")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="") as temp:
+            out.to_csv(temp, index=False, lineterminator="\n")
+        deadline = clock() + REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if clock() >= deadline:
+                    raise
+                sleep(REPLACE_RETRY_PAUSE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+        raise
+
+
 @dataclass(frozen=True, slots=True)
 class Bar:
     """One closed 1-minute bar.
@@ -128,7 +301,7 @@ class BarFeed(Protocol):
 
 
 class CsvBarFeed:
-    """Feed backed by `<data_dir>/_<SYMBOL>_offlinedata_` files.
+    """Feed backed by `<data_dir>/_<SYMBOL>_offlinedata_` files or month files.
 
     Parsing matches `IBapi.load_offline_data`. Files are read eagerly in the
     constructor, so every problem (missing file, bad columns, misaligned
@@ -150,7 +323,7 @@ class CsvBarFeed:
         self._warmup: dict[str, pd.DataFrame] = {}
         replay: dict[str, pd.DataFrame] = {}
         for symbol in self._symbols:
-            data = self._read(offline_data_path(Path(data_dir), symbol))
+            data = self._read(Path(data_dir), symbol)
             cutoff = data["date"].iloc[0] + timedelta(days=warmup_days)
             is_warmup = data["date"] < cutoff
             self._warmup[symbol] = data.loc[is_warmup].reset_index(drop=True)
@@ -159,8 +332,8 @@ class CsvBarFeed:
         self._batches: list[tuple[pd.Timestamp, dict[str, Bar]]] = self._build_batches(replay)
 
     @staticmethod
-    def _read(path: Path) -> pd.DataFrame:
-        return read_offline_bars(path)
+    def _read(data_dir: Path, symbol: str) -> pd.DataFrame:
+        return read_symbol_bars(data_dir, symbol)
 
     def _check_aligned(self, replay: Mapping[str, pd.DataFrame]) -> None:
         ref_symbol = self._symbols[0]

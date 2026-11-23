@@ -24,9 +24,9 @@ from MainStoinker.api.errors import NotFound
 from MainStoinker.api.windows import WindowError, format_time, parse_window
 from MainStoinker.engine.feed import (
     bars_between,
-    file_fingerprint,
-    offline_data_path,
     read_offline_bars,
+    read_symbol_bars,
+    symbol_fingerprint,
 )
 from MainStoinker.engine.store import DataMeta, Store
 
@@ -42,10 +42,10 @@ def _empty(symbol: str, reason: str, available: bool = False) -> dict[str, Any]:
     return {"symbol": symbol, "available": available, "reason": reason, "bars": []}
 
 
-def _read(path: Path) -> pd.DataFrame | None:
-    """The bar file, or None when it is absent or unreadable."""
+def _read(directory: Path, symbol: str) -> pd.DataFrame | None:
+    """The bars of `symbol` (single file or month files), or None when absent or unreadable."""
     try:
-        frame = read_offline_bars(path)
+        frame = read_symbol_bars(directory, symbol, read_offline_bars)
     except (OSError, ValueError):
         return None
     if not pd.api.types.is_datetime64_any_dtype(frame["date"]) \
@@ -81,21 +81,18 @@ def _bars(store: Store, run_id: int, symbol: str,
         raise HTTPException(422, str(error)) from None
     if not data.directory:
         return _empty(symbol, "missing")
-    try:
-        path = offline_data_path(Path(data.directory), symbol)
-    except ValueError:  # a stored symbol that is not a plain ticker
-        return _empty(symbol, "missing")
+    directory = Path(data.directory)
     reason: str | None = "unverified"
     recorded = next(((sha, size) for sym, sha, size in data.files if sym == symbol), None)
     if recorded is not None:
         try:
-            current = file_fingerprint(path)
-        except OSError:
+            current = symbol_fingerprint(directory, symbol)
+        except (OSError, ValueError):  # absent, both layouts present, or not a plain ticker
             return _empty(symbol, "missing")
         if current != recorded:
             return _empty(symbol, "changed")
         reason = None
-    frame = _read(path)
+    frame = _read(directory, symbol)
     if frame is None:
         return _empty(symbol, "missing")
     try:

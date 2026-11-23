@@ -125,7 +125,7 @@ from .algos import close_algo_logs, load_algo
 from .cli_report import ReportError, run_report_command, run_runs_command
 from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
-from .feed import _SYMBOL, CsvBarFeed, file_fingerprint, offline_data_path
+from .feed import _SYMBOL, CsvBarFeed, file_fingerprint, symbol_fingerprint
 from .ledger import Ledger
 from .modes import DEFAULT_MODE, ModeError, build_router, parse_mode
 from .paper_broker import CostModel
@@ -656,7 +656,7 @@ def run_backtest_command(
         # Fingerprints of the bar files, taken before the run is recorded.
         try:
             data_files = tuple(
-                (symbol, *file_fingerprint(offline_data_path(data_dir, symbol)))
+                (symbol, *symbol_fingerprint(data_dir, symbol, file_fingerprint))
                 for symbol in feed.symbols()
             )
         except OSError as exc:
