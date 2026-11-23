@@ -153,21 +153,30 @@ def test_synthetic_aligned_files_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "bad_stamps", "needle"),
+    ("name", "bad_stamps", "absent"),
     [
+        # BAD lacks one replay timestamp in the middle
         ("gap", STAMPS[:8] + STAMPS[9:], "2024-01-05 00:00:00"),
+        # BAD lacks the last one
         ("shorter", STAMPS[:-1], "2024-01-06 12:00:00"),
-        ("shifted_warmup", STAMPS[1:], "2024-01-03"),
+        # BAD starts 12 h later, so its warm-up (2 days from its first row) also ends
+        # 12 h later and GOOD's first replay bar has no BAD partner
+        ("shifted_warmup", STAMPS[1:], "2024-01-03 00:00:00"),
     ],
 )
-def test_misaligned_symbols_raise(
-    tmp_path: Path, name: str, bad_stamps: list[str], needle: str
+def test_misaligned_symbols_skip_the_missing_minute(
+    tmp_path: Path, name: str, bad_stamps: list[str], absent: str
 ) -> None:
+    """Symbols that do not line up are no longer refused: batches are the union, BAD is
+    absent from the one timestamp it lacks."""
     write_csv(tmp_path, "GOOD", STAMPS)
     write_csv(tmp_path, "BAD", bad_stamps)
-    with pytest.raises(ValueError, match="BAD") as info:
-        CsvBarFeed(tmp_path, ["GOOD", "BAD"])
-    assert needle in str(info.value), name
+    feed = CsvBarFeed(tmp_path, ["GOOD", "BAD"])
+    batches = list(feed)
+    assert [stamp for stamp, _ in batches] == [pd.Timestamp(s) for s in STAMPS[4:]], name
+    for stamp, bars in batches:
+        assert list(bars) == (["GOOD"] if stamp == pd.Timestamp(absent) else ["GOOD", "BAD"])
+    assert feed.missing_counts() == {"GOOD": 0, "BAD": 1}
 
 
 def test_missing_file_raises_file_not_found(tmp_path: Path) -> None:

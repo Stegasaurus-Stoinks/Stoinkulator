@@ -295,7 +295,9 @@ class BarFeed(Protocol):
     def __iter__(self) -> Iterator[tuple[pd.Timestamp, dict[str, Bar]]]:
         """Yield `(timestamp, bars)` per timestamp after warm-up, in time order.
 
-        `bars` maps each symbol to its bar, keys in `symbols()` order.
+        `bars` maps each symbol that has a bar at that timestamp to its bar,
+        keys in `symbols()` order. A symbol with no bar then is absent from the
+        mapping (no bar is invented), and a batch is never empty.
         """
         ...
 
@@ -311,8 +313,17 @@ class CsvBarFeed:
 
     Symbols are de-duplicated, keeping the caller's order. The warm-up of a
     symbol is the rows whose date is before `first_date + warmup_days days`
-    (`first_date` = that symbol's first row), as in the legacy loader. After
-    warm-up all symbols must have identical timestamps, else `ValueError`.
+    (`first_date` = that symbol's first row), as in the legacy loader; warm-up
+    stays per symbol, so symbols may have different numbers of warm-up bars.
+
+    After warm-up the feed replays the sorted union of the symbols' timestamps.
+    A batch holds only the symbols that have a bar at that timestamp, in
+    `symbols()` order, and is never empty. A symbol with no bar at a timestamp
+    is skipped there; `missing_counts()` reports how often. A repeated
+    timestamp within one symbol's replay bars is a `ValueError`, with one
+    exception kept from before: when every symbol has exactly the same
+    replay timestamps (repeats included) the bars pair up by position, so a
+    stored run whose data repeats a minute in every symbol still replays.
     The feed may be iterated repeatedly and yields the same batches each time.
     """
 
@@ -328,47 +339,63 @@ class CsvBarFeed:
             is_warmup = data["date"] < cutoff
             self._warmup[symbol] = data.loc[is_warmup].reset_index(drop=True)
             replay[symbol] = data.loc[~is_warmup].reset_index(drop=True)
-        self._check_aligned(replay)
-        self._batches: list[tuple[pd.Timestamp, dict[str, Bar]]] = self._build_batches(replay)
+        per_symbol = self._bars_by_symbol(replay)
+        self._batches: list[tuple[pd.Timestamp, dict[str, Bar]]] = self._build_batches(per_symbol)
+        self._missing: dict[str, int] = {
+            symbol: len(self._batches) - len(per_symbol[symbol]) for symbol in self._symbols
+        }
 
     @staticmethod
     def _read(data_dir: Path, symbol: str) -> pd.DataFrame:
         return read_symbol_bars(data_dir, symbol)
 
-    def _check_aligned(self, replay: Mapping[str, pd.DataFrame]) -> None:
-        ref_symbol = self._symbols[0]
-        ref = replay[ref_symbol]["date"]
-        for symbol in self._symbols[1:]:
-            dates = replay[symbol]["date"]
-            common = min(len(ref), len(dates))
-            diff = (ref.iloc[:common].to_numpy() != dates.iloc[:common].to_numpy()).nonzero()[0]
-            if len(diff):
-                row = int(diff[0])
-                raise ValueError(
-                    f"symbol {symbol} is not aligned with {ref_symbol}: replay row {row} "
-                    f"is {dates.iloc[row]} but {ref_symbol} has {ref.iloc[row]}"
-                )
-            if len(ref) != len(dates):
-                longer, shorter = (ref, dates) if len(ref) > len(dates) else (dates, ref)
-                raise ValueError(
-                    f"symbol {symbol} is not aligned with {ref_symbol}: {symbol} has "
-                    f"{len(dates)} replay bars, {ref_symbol} has {len(ref)} "
-                    f"(first unmatched timestamp {longer.iloc[len(shorter)]})"
-                )
-
-    def _build_batches(
-        self, replay: Mapping[str, pd.DataFrame]
-    ) -> list[tuple[pd.Timestamp, dict[str, Bar]]]:
+    def _bars_by_symbol(self, replay: Mapping[str, pd.DataFrame]) -> dict[str, list[Bar]]:
         per_symbol: dict[str, list[Bar]] = {}
         for symbol in self._symbols:
             frame = replay[symbol]
             per_symbol[symbol] = [
                 Bar(*row) for row in zip(*(frame[name].tolist() for name in COLUMNS), strict=True)
             ]
-        batches = []
-        for i, first in enumerate(per_symbol[self._symbols[0]]):
-            batches.append((first.date, {s: per_symbol[s][i] for s in self._symbols}))
-        return batches
+        return per_symbol
+
+    def _build_batches(
+        self, per_symbol: Mapping[str, list[Bar]]
+    ) -> list[tuple[pd.Timestamp, dict[str, Bar]]]:
+        first = self._symbols[0]
+        identical = all(
+            [bar.date for bar in per_symbol[symbol]] == [bar.date for bar in per_symbol[first]]
+            for symbol in self._symbols[1:]
+        )
+        if identical:
+            # Every symbol has the same timestamps: pair the bars by position (this
+            # is also the path that keeps a repeated minute replaying when every
+            # symbol repeats it).
+            return [
+                (bar.date, {s: per_symbol[s][i] for s in self._symbols})
+                for i, bar in enumerate(per_symbol[first])
+            ]
+        by_time: dict[pd.Timestamp, dict[str, Bar]] = {}
+        for symbol in self._symbols:
+            for bar in per_symbol[symbol]:
+                at = by_time.setdefault(bar.date, {})
+                if symbol in at:
+                    raise ValueError(
+                        f"symbol {symbol} has more than one bar at {bar.date}"
+                    )
+                at[symbol] = bar
+        order = {symbol: i for i, symbol in enumerate(self._symbols)}
+        return [
+            (stamp, dict(sorted(by_time[stamp].items(), key=lambda item: order[item[0]])))
+            for stamp in sorted(by_time)
+        ]
+
+    def missing_counts(self) -> dict[str, int]:
+        """Per symbol, in `symbols()` order: replay timestamps at which it has no bar.
+
+        Every symbol is listed, with 0 when it has a bar at every timestamp. A
+        symbol with no replay bars at all misses every timestamp.
+        """
+        return dict(self._missing)
 
     def symbols(self) -> list[str]:
         """Symbols in caller order, de-duplicated (a fresh list each call)."""

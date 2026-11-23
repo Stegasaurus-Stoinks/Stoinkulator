@@ -303,13 +303,16 @@ def test_error_missing_data_file(env, capsys):
     _bad(env, capsys, "not found")
 
 
-def test_error_misaligned_data(env, capsys):
+def test_misaligned_data_skips_the_missing_minute(env, capsys):
+    # Was an error ("not aligned") before decision 6: now the symbol is skipped for that minute.
     env.stage(["AAPL", "MSFT"])
     path = env.data / "_MSFT_offlinedata_"
     frame = pd.read_csv(path, index_col=0)
     frame.drop(index=frame.index[600]).to_csv(path)
     env.write_algos([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}])
-    _bad(env, capsys, "aligned")
+    assert env.run() == 0
+    out = capsys.readouterr().out
+    assert "MSFT: no bar at 1 of " in out
 
 
 def test_error_negative_warmup(env, capsys):

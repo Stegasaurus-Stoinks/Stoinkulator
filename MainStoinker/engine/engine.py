@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from .bars import BarStore
 from .broker import Broker
-from .feed import BarFeed
+from .feed import Bar, BarFeed
 from .ledger import Ledger
 from .router import BarAwareBroker, BrokerRouter, SingleBrokerRouter
 from .sink import EventSink
@@ -138,21 +138,37 @@ class Engine:
         `ledger.finish(last_timestamp, last_closes, end_commission)`. A feed
         with no post-warm-up bars does none of that: no marks, no `on_end`, no
         `finish`.
+
+        A batch holds only the symbols that have a bar at that timestamp
+        (decision 6). A symbol absent from a batch is skipped there: no bar is
+        appended, no broker gets `on_bar` for it, none of its algos is updated
+        (so `update_frontend` is not called either), the sink gets no `on_bar`
+        for it, and the ledger is marked with the present closes only (the
+        absent symbol keeps its last mark). Its algos next see a frame whose
+        last two rows are more than a minute apart; nothing is invented. A
+        batch with no known symbol at all is ignored. `on_end` gets the last
+        bar of each symbol that had any, in feed symbol order, and
+        `ledger.finish` runs at the last timestamp with those closes.
         """
         if self._ran:
             raise RuntimeError("run_backtest() can only be called once per Engine")
         self._ran = True
         stores = {symbol: BarStore(self._feed.warmup(symbol)) for symbol in self._symbols}
         wants_algo_data = self._sink.wants_algo_data
-        last: tuple | None = None
+        last_time = None
+        last_bars: dict[str, Bar] = {}
         for timestamp, bars in self._feed:
-            last = (timestamp, bars)
-            for symbol in self._symbols:
+            present = [symbol for symbol in self._symbols if symbol in bars]
+            if not present:
+                continue  # a feed should never yield this; nothing happened at this time
+            last_time = timestamp
+            for symbol in present:
                 stores[symbol].append(bars[symbol])
+                last_bars[symbol] = bars[symbol]
             for broker in self._bar_brokers:
-                for symbol in self._symbols:
+                for symbol in present:
                     broker.on_bar(symbol, bars[symbol])
-            for symbol in self._symbols:
+            for symbol in present:
                 algo_data: list | None = [] if wants_algo_data else None
                 for algo in self._by_symbol[symbol]:
                     algo.update(stores[symbol].view())  # type: ignore[attr-defined]
@@ -160,15 +176,15 @@ class Engine:
                         algo_data.append(algo.update_frontend())  # type: ignore[attr-defined]
                 self._sink.on_bar(symbol, bars[symbol], algo_data)
             if self._ledger is not None:
-                self._ledger.mark(timestamp, {s: bars[s].close for s in self._symbols})
-        if last is None:
+                self._ledger.mark(timestamp, {s: bars[s].close for s in present})
+        if last_time is None:
             return
-        last_time, last_bars = last
+        final = {s: last_bars[s] for s in self._symbols if s in last_bars}
         for broker in self._bar_brokers:
-            broker.on_end(dict(last_bars))
+            broker.on_end(dict(final))
         if self._ledger is not None:
             self._ledger.finish(
                 last_time,
-                {s: b.close for s, b in last_bars.items()},
+                {s: b.close for s, b in final.items()},
                 self._end_commission,
             )
