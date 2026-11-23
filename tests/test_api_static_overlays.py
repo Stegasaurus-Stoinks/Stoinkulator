@@ -222,18 +222,22 @@ console.log(JSON.stringify({
     t = {int(k): v for k, v in out["times"].items()}
     # two positions in one window: stop and target of position 1, the stop of 2 and of 3; position 4 never worked
     assert out["roles"] == ["stop:1", "target:1", "stop:2", "stop:3"]
-    # placed, modified twice, cancelled: the price at each change, held to the cancel (not to the exit fill at 09:38)
-    assert out["stop1"] == {"role": "stop", "ref": "1", "start": t[31], "end": t[37], "before": False, "after": False,
-                            "data": [[t[31], 100], [t[33], 101], [t[35], 102], [t[37], 102]]}
-    assert out["target1"]["data"] == [[t[31], 110], [t[37], 110]]
-    # placed, never cancelled: it ends at the position's exit fill (here the synthetic end-of-data fill)
-    assert out["stop2"]["end"] == t[40] and out["stop2"]["data"] == [[t[38], 50], [t[40], 50]]
-    # placed, never cancelled, no exit: it runs to the end of the window
-    assert out["stop3"]["end"] is None and out["stop3"]["data"] == [[t[36], 20], [t[40], 20]]
-    # a window that starts after the stop was placed: it starts at the first bar with the then-current price
+    # Placed at 09:31 (decision bar), the entry fills on 09:32; modified at 09:33 and 09:35 (first checked on
+    # 09:34 and 09:36); cancelled at 09:37 (it rested through that bar, so the line ends there, not at the
+    # exit fill at 09:38). The line starts on the entry fill bar, not on the decision bar.
+    assert out["stop1"] == {"role": "stop", "ref": "1", "start": t[32], "end": t[37], "before": False, "after": False,
+                            "data": [[t[32], 100], [t[34], 101], [t[36], 102], [t[37], 102]]}
+    assert out["target1"]["data"] == [[t[32], 110], [t[37], 110]]
+    # placed at 09:38, never cancelled: it works from 09:39 (the entry fill) to the position's exit fill (here
+    # the synthetic end-of-data fill)
+    assert out["stop2"]["end"] == t[40] and out["stop2"]["data"] == [[t[39], 50], [t[40], 50]]
+    # placed at 09:36, entry fill 09:37, never cancelled, no exit: it runs to the end of the window
+    assert out["stop3"]["end"] is None and out["stop3"]["data"] == [[t[37], 20], [t[40], 20]]
+    # a window that starts after the stop was placed: it starts at the first bar with the then-current price;
+    # the 09:35 change (the window's first bar) applies from the next bar
     late = out["lateStop1"]
-    assert late["before"] is True and late["start"] == t[31]
-    assert late["data"] == [[t[35], 102], [t[37], 102]]
+    assert late["before"] is True and late["start"] == t[35]
+    assert late["data"] == [[t[35], 101], [t[36], 102], [t[37], 102]]
     assert out["lateTarget1"]["data"] == [[t[35], 110], [t[37], 110]]
     assert out["lateRoles"] == ["stop:1", "target:1", "stop:2", "stop:3"]
     # lines entirely outside the window are left out
@@ -242,6 +246,76 @@ console.log(JSON.stringify({
     # without the fills nothing can be said about entries: only the cancelled-without-entry order is kept too
     assert out["noFills"] == ["stop:1", "target:1", "stop:2", "stop:3", "stop:4"]
     assert out["junk"] == [[], [], []]
+
+
+TIMING_SOURCE = ORDERS_SOURCE + """
+import { planOverlays } from "./js/charts/overlays.js";
+const view = (l) => ({ role: l.role, ref: l.brokerRef, start: l.start, end: l.end, data: l.data.map((p) => [p.time, p.value]) });
+const byRef = (lines, role, ref) => { const l = lines.find((x) => x.role === role && x.brokerRef === ref); return l ? view(l) : null; };
+const evs = [
+  // position 1 (the reviewer's case): the stop is placed on 09:31, the entry fills on 09:32, and the stop is
+  // moved on 09:34 and again on 09:35 (to a level inside the range of the 09:35 bar). Nothing fills on 09:35;
+  // the stop fills on 09:36.
+  ev(1, "1", "placed", "31", { order_type: "stop", price: "100.0000" }),
+  ev(1, "1", "modified", "34", { price: "103.0000" }),
+  ev(1, "1", "modified", "35", { price: "104.5000" }),
+  // position 2: placed early, but the entry fills only on 09:35; a move before the entry
+  ev(2, "2", "placed", "31", { order_type: "stop", price: "50.0000" }),
+  ev(2, "2", "modified", "33", { price: "52.0000" }),
+  // position 3: moved and cancelled on the same bar 09:36 (the move would first apply on 09:37)
+  ev(3, "3", "placed", "31", { order_type: "stop", price: "10.0000" }),
+  ev(3, "3", "modified", "36", { price: "11.0000" }), ev(3, "3", "cancelled", "36"),
+  // position 4: moved on the last bar of the window (it would first apply after the window)
+  ev(4, "4", "placed", "31", { order_type: "stop", price: "10.0000" }),
+  ev(4, "4", "modified", "40", { price: "12.0000" }),
+  // position 5: stop and target placed on 09:38, the entry fills on 09:39, both cancelled on 09:39: one bar
+  ev(5, "5", "placed", "38", { order_type: "stop", price: "7.0000" }),
+  ev(6, "5", "placed", "38", { order_type: "target", price: "9.0000" }),
+  ev(5, "5", "cancelled", "39"), ev(6, "5", "cancelled", "39"),
+];
+const fls = [fill("1", "entry", "32"), fill("1", "stop", "36"), fill("2", "entry", "35"), fill("3", "entry", "32"),
+  fill("3", "algo_exit", "37"), fill("4", "entry", "32"), fill("5", "entry", "39"), fill("5", "algo_exit", "40")];
+const timing = buildOrderLines(evs, fls, T);
+"""
+
+
+def test_order_lines_work_from_the_bar_after_the_decision_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overlay_timing", TIMING_SOURCE + """
+console.log(JSON.stringify({ times: Object.fromEntries(T.map((t, i) => [String(30 + i), t])),
+  stop1: byRef(timing, "stop", "1"), stop2: byRef(timing, "stop", "2"), stop3: byRef(timing, "stop", "3"),
+  stop4: byRef(timing, "stop", "4"), stop5: byRef(timing, "stop", "5"), target5: byRef(timing, "target", "5") }));
+""")
+    assert isinstance(out, dict)
+    t = {int(k): v for k, v in out["times"].items()}
+    # the reviewer's case: the move made on 09:35 is first checked on 09:36, so the level drawn on 09:35 is the
+    # old one (103), the new one (104.5) starts on the fill bar; the line starts on the entry fill bar 09:32
+    stop1 = out["stop1"]
+    assert stop1["start"] == t[32] and stop1["end"] == t[36]
+    assert stop1["data"] == [[t[32], 100], [t[35], 103], [t[36], 104.5]]
+    # a line never starts before the entry fill bar; a move before it holds the then-current price
+    assert out["stop2"]["start"] == t[35] and out["stop2"]["data"] == [[t[35], 52], [t[40], 52]]
+    # a change whose effective bar is past the end of the line is not drawn
+    assert out["stop3"]["data"] == [[t[32], 10], [t[36], 10]] and out["stop3"]["end"] == t[36]
+    assert out["stop4"]["data"] == [[t[32], 10], [t[40], 10]]  # the 09:40 move would apply after the window
+    # one bar only: a single point
+    assert out["stop5"]["data"] == [[t[39], 7]] and out["target5"]["data"] == [[t[39], 9]]
+
+
+def test_a_one_bar_level_is_a_circle_marker_at_its_price_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overlay_one_bar", TIMING_SOURCE + """
+const plan = planOverlays({ times: T, orderEvents: evs, fills: fls, fillModel: "realistic" });
+const item = (role) => plan.items.find((i) => i.key === "orders:" + role);
+const brief = (i) => ({ lines: i.lines.map((l) => [l.style, l.width, l.data.length]), markers: i.markers, count: i.count });
+console.log(JSON.stringify({ t39: T[9], stop: brief(item("stop")), target: brief(item("target")) }));
+""")
+    assert isinstance(out, dict)
+    stop, target = out["stop"], out["target"]
+    # stop lines are dashed and target lines dotted, two pixels wide; the one-bar level has no line
+    assert len(stop["lines"]) == 4 and all(line[:2] == ["dashed", 2] for line in stop["lines"])
+    assert target["lines"] == []
+    assert stop["markers"] == [{"time": out["t39"], "position": "atPriceMiddle", "price": 7, "shape": "circle", "text": "stop"}]
+    assert target["markers"] == [{"time": out["t39"], "position": "atPriceMiddle", "price": 9, "shape": "circle", "text": "target"}]
+    assert target["count"] == 1
 
 
 # --- the plan: defaults, notes ------------------------------------------------------------------
@@ -439,7 +513,7 @@ s.candles.setBars(barsOf(DAY1));
 const o = ordersFor(DAY1);
 draw(s, DAY1, { fillModel: "realistic", orderEvents: o.events, fills: o.fills });
 const names = buttons(s).map((b) => [b.getAttribute("aria-pressed"), b.textContent]);
-const drawn = lines(s).map((x) => [x.opts.visible, x.opts.lineType, x.opts.lineWidth, x.data.map((d) => [d.time, d.value])]);
+const drawn = lines(s).map((x) => [x.opts.visible, x.opts.lineType, x.opts.lineWidth, x.data.map((d) => [d.time, d.value]), x.opts.lineStyle, x.opts.color]);
 // the same data under legacy fills: no order lines, the column is on
 s.candles.setBars(barsOf(DAY1));
 draw(s, DAY1, { fillModel: "legacy", orderEvents: o.events, fills: o.fills });
@@ -453,10 +527,13 @@ console.log(JSON.stringify({ names, drawn, legacy, nSeries: s.chart.series.lengt
     assert "stop (orders)" in names[3][1] and "target (orders)" in names[4][1]
     t = [seconds(f"2024-01-02 09:3{i}:00") for i in range(5)]
     by_data = {tuple(map(tuple, d[3])): d for d in out["drawn"]}
-    stop = by_data[((t[1], 9), (t[3], 9))]  # placed 09:31, cancelled 09:33, held between
-    target = by_data[((t[1], 14), (t[3], 14))]
+    stop = by_data[((t[2], 9), (t[3], 9))]  # placed 09:31, entry fills 09:32, cancelled 09:33
+    target = by_data[((t[2], 14), (t[3], 14))]
     assert stop[0] is True and stop[1] == 1 and target[0] is True  # stepped, on by default
-    own = by_data[((t[1], 9), (t[2], 9))]
+    assert stop[2] == 2 and target[2] == 2  # line width 2
+    assert stop[4] == 2 and target[4] == 1  # a stop is dashed, a target dotted (LineStyle.Dashed, Dotted)
+    assert stop[5] != target[5]
+    own = by_data[((t[1], 9), (t[2], 9))]  # its own column, drawn on the bars it holds
     assert own[0] is False  # the algo's own StopPrice: drawn but hidden
     assert [n[0] for n in out["legacy"]] == ["true", "true", "true"] and not any("orders" in n[1] for n in out["legacy"])
 
@@ -721,3 +798,253 @@ console.log(JSON.stringify(result));
     for name in ("empty", "missing", "changed"):
         assert out[name]["toggles"] == 0 and out[name]["lines"] == 0, name
         assert out[name]["back"] == 2, name
+
+
+def test_stepping_a_day_while_the_shown_day_loads_does_not_abort_it_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "wiring_step_while_loading", WIRING_SOURCE + """
+const routes = () => ({ "/api/runs/1": ok(doc({}, { fills: "legacy" })), "/api/runs/1/trades": ok({ trades: TRADES }), "/api/runs/1/equity": ok(equity),
+  "/api/runs/1/series": (req) => [seriesBody(req.query.start.slice(0, 10)), 200] });
+const dayButtons = (container) => find(byClass(container, "day-control")[0], (c) => c.tag === "BUTTON");
+const result = {};
+async function scenario(name, answerSearch) {
+  requests.length = 0; charts.length = 0; markerApis.length = 0;
+  install(routes());
+  const { container, done } = await open();
+  const day = barsRequests()[0], daySeries = seriesRequests()[0];
+  dayButtons(container)[1].fire("click"); // Next, while 2024-01-02 is still loading
+  const search = barsRequests()[1];
+  const during = { day: day.aborted, series: daySeries.aborted, search: search.query.start };
+  answerSearch(search);
+  await tick();
+  const afterSearch = { day: day.aborted, series: daySeries.aborted, requests: barsRequests().length };
+  if (!day.aborted) day.answer(barsFor("2024-01-02"));
+  await tick();
+  const second = barsRequests()[2];
+  if (second) second.answer(barsFor("2024-01-03"));
+  await done;
+  await tick();
+  result[name] = { during, afterSearch, label: byClass(container, "day-label")[0].textContent, candles: charts[1].series[0].data.length,
+    toggles: toggles(container).length, lines: lineSeries().length, errors: byClass(container, "bars-error")[0].children.length };
+}
+await scenario("nothing", (search) => search.answer({ symbol: "AAPL", available: true, reason: null, bars: [] }));
+await scenario("failed", (search) => search.answer({ detail: "boom" }, 500));
+await scenario("found", (search) => search.answer({ symbol: "AAPL", available: true, reason: null, bars: barsFor("2024-01-03").bars }));
+console.log(JSON.stringify(result));
+""")
+    assert isinstance(out, dict)
+    for name in ("nothing", "failed"):
+        run = out[name]
+        assert run["during"]["day"] is False and run["during"]["series"] is False, name  # the search did not abort the day
+        assert run["afterSearch"]["day"] is False and run["afterSearch"]["series"] is False, name
+        assert run["afterSearch"]["requests"] == 2, name  # no other day was requested
+        assert run["label"] == "2024-01-02 (data time)" and run["candles"] == 3, name  # it finished normally
+        assert run["toggles"] == 2 and run["lines"] == 2, name  # with its overlays
+    assert out["failed"]["errors"] == 1 and out["nothing"]["errors"] == 0
+    found = out["found"]
+    assert found["during"]["day"] is False and found["afterSearch"]["day"] is True  # replaced only once a day is found
+    assert found["label"] == "2024-01-03 (data time)" and found["candles"] == 3 and found["lines"] == 2
+
+
+def test_a_run_with_only_the_baseline_series_says_nothing_is_drawable_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overlay_nothing_drawable", DRAW_SOURCE + """
+import { planOverlays, NO_DRAWABLE_NOTE } from "./js/charts/overlays.js";
+const baselineOnly = { algo: "A/1", run_status: "completed", available: true, series: [entry("Trade", "baseline", 0, [p(DAY1, "09:31", 1)])] };
+const s = make();
+s.candles.setBars(barsOf(DAY1));
+s.overlays.setData({ series: baselineOnly, fillModel: "legacy", runStatus: "completed", bars: barsOf(DAY1) });
+console.log(JSON.stringify({ hidden: s.legendBox.children[0].hidden, notes: texts(s), buttons: buttons(s).length, text: NO_DRAWABLE_NOTE,
+  planNotes: planOverlays({ series: baselineOnly, times: [1, 2], fillModel: "legacy" }).notes,
+  // a real indicator next to it: no such note
+  withLine: planOverlays({ series: seriesFor(DAY1), times: [1, 2], fillModel: "legacy" }).notes }));
+""")
+    assert isinstance(out, dict)
+    assert out["text"] == "No drawable indicators are stored for this algo in this run."
+    assert out["hidden"] is False and out["notes"] == [out["text"]] and out["buttons"] == 0
+    assert out["planNotes"] == [out["text"]] and out["text"] not in out["withLine"]
+
+
+def test_a_one_bar_order_level_is_drawn_as_a_marker_by_the_drawing_layer_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overlay_one_bar_draw", DRAW_SOURCE + """
+const s = make();
+s.candles.setBars(barsOf(DAY1));
+const o = ordersFor(DAY1);
+// the stop is placed on 09:31, the entry fills on 09:32 and the stop is cancelled on 09:32: it worked on one bar
+const events = o.events.filter((e) => e.order_id === 1 && e.kind !== "cancelled").concat([{ order_id: 1, account: "A/1", broker_ref: "1", kind: "cancelled", time: at(DAY1, "09:32") }]);
+draw(s, DAY1, { fillModel: "realistic", orderEvents: events, fills: o.fills });
+const stopButton = buttons(s).find((b) => b.textContent.startsWith("Stop ")); // not the algo's own StopPrice
+const read = () => s.markers.log.at(-1).filter((m) => m.position === "atPriceMiddle").map((m) => [m.time, m.price, m.shape, m.text, m.color]);
+const on = read();
+stopButton.fire("click");
+const off = read();
+console.log(JSON.stringify({ on, off, label: stopButton.textContent, lines: lines(s).length, t: barsOf(DAY1).map((b) => b.time) }));
+""")
+    assert isinstance(out, dict)
+    assert len(out["on"]) == 1
+    time_, price, shape, text, color = out["on"][0]
+    assert time_ == seconds("2024-01-02 09:32:00") and price == 9 and shape == "circle" and text == "stop" and color
+    assert out["off"] == []  # hidden with its legend item
+    assert "none on this day" not in out["label"]
+
+
+def test_overlay_colours_never_equal_the_entry_marker_or_the_candle_colours_with_node(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "overlay_palette", """
+import { overlayColors } from "./js/charts/overlays.js";
+import { FALLBACK_THEMES } from "./js/charts/theme.js";
+const result = {};
+for (const [name, theme] of Object.entries(FALLBACK_THEMES)) {
+  const c = overlayColors(theme);
+  result[name] = { theme, palette: c.palette, stop: c.stop, target: c.target, ownStop: c.ownStop, ownTarget: c.ownTarget };
+}
+console.log(JSON.stringify(result));
+""")
+    assert isinstance(out, dict)
+    for name, got in out.items():
+        theme = got["theme"]
+        everything = [*got["palette"], got["stop"], got["target"], got["ownStop"], got["ownTarget"]]
+        assert theme["accent"] not in everything, name  # the entry marker colour (candles.js buildMarkers)
+        assert got["stop"] != theme["neg"] and got["target"] != theme["pos"], name  # nor the exit markers and candles
+        assert theme["neg"] not in everything and theme["pos"] not in everything, name
+        assert got["stop"] != got["target"], name
+        assert len(set(got["palette"])) == len(got["palette"]), name
+
+
+def test_a_legend_item_that_is_off_keeps_text_contrast_in_both_themes() -> None:
+    import re
+
+    from tests.test_api_static import contrast
+
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    block = css[css.index("/* Indicator overlays"):]
+    # no opacity anywhere in the overlay block: "off" is shown by the unpressed look, not by fading text
+    assert "opacity" not in block
+    off = re.search(r'\.overlay-toggle\[aria-pressed="false"\]\s*\{([^}]*)\}', block)
+    assert off is not None and "background: var(--bg)" in off.group(1)
+    assert "line-through" in block and "repeating-linear-gradient" in block  # struck-through name, striped swatch
+    dark_start = css.index("prefers-color-scheme: dark")
+    for theme, part in (("light", css[:dark_start]), ("dark", css[dark_start:css.index("* { box-sizing")])):
+        values = dict(re.findall(r"--([\w-]+):\s*(#[0-9a-fA-F]{6})", part))
+        # the button's own text (--text) and the muted text inside it (--muted), on the off background (--bg)
+        for foreground in ("text", "muted"):
+            assert contrast(values[foreground], values["bg"]) >= 4.5, (theme, foreground)
+
+
+# --- the stop and target lines against the real stored runs (slow) ------------------------------
+
+CROSSING_SCRIPT = """
+import fs from "node:fs";
+import { buildOrderLines } from "./js/charts/overlays.js";
+import { convertBars } from "./js/charts/candles.js";
+import { dataTimeToChartTime } from "./js/format.js";
+const input = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const key = (account, ref) => account + "|" + ref;
+function check(conv, events, fills) {
+  const times = conv.map((b) => b.time);
+  const indexOf = new Map(times.map((t, i) => [t, i]));
+  const side = new Map(events.filter((e) => e.kind === "placed").map((e) => [key(e.account, e.order_id), e.side]));
+  const fillBars = new Map();
+  for (const f of fills) {
+    const set = fillBars.get(key(f.account, f.broker_ref)) || new Set();
+    set.add(dataTimeToChartTime(f.time));
+    fillBars.set(key(f.account, f.broker_ref), set);
+  }
+  const result = { lines: 0, singlePoints: 0, bars: 0, crossings: [] };
+  for (const line of buildOrderLines(events, fills, times)) {
+    result.lines += 1;
+    if (line.data.length === 1) result.singlePoints += 1;
+    const long = side.get(key(line.account, line.orderId)) === "sell"; // the exit side of a long position
+    const first = indexOf.get(line.data[0].time);
+    const last = indexOf.get(line.data[line.data.length - 1].time);
+    const fillsOfPosition = fillBars.get(key(line.account, line.brokerRef)) || new Set();
+    let level = null, next = 0;
+    for (let i = first; i < last; i += 1) { // every bar of the line but its end bar
+      while (next < line.data.length && indexOf.get(line.data[next].time) <= i) { level = line.data[next].value; next += 1; }
+      if (fillsOfPosition.has(times[i])) continue; // a fill happened on that bar
+      const bar = conv[i];
+      result.bars += 1;
+      const crosses = line.role === "stop"
+        ? (long ? bar.low <= level : bar.high >= level)
+        : (long ? bar.high > level : bar.low < level);
+      if (crosses) result.crossings.push([line.role, line.brokerRef, times[i], level, bar.low, bar.high]);
+    }
+  }
+  return result;
+}
+const out = {};
+for (const [name, set] of Object.entries(input)) {
+  const conv = convertBars(set.bars);
+  const whole = check(conv, set.events, set.fills);
+  // the same, one day at a time as the algo view loads them (lines clipped to each day's bars)
+  const days = new Map();
+  for (const bar of conv) { const d = Math.floor(bar.time / 86400); (days.get(d) || days.set(d, []).get(d)).push(bar); }
+  const perDay = { lines: 0, bars: 0, crossings: [] };
+  for (const bars of days.values()) {
+    const r = check(bars, set.events, set.fills);
+    perDay.lines += r.lines; perDay.bars += r.bars; perDay.crossings.push(...r.crossings);
+  }
+  out[name] = { whole, perDay, totalBars: conv.length };
+}
+console.log(JSON.stringify(out));
+"""
+
+
+@pytest.mark.slow
+def test_no_bar_inside_a_drawn_stop_or_target_line_crosses_its_level_with_node(
+        tmp_path_factory: pytest.TempPathFactory, node_workdir: Path) -> None:
+    """Real stored runs (EMACrossing and OpeningRangeCandle on AAPL, Elliot on MSFT, realistic fills): on
+    every bar of a drawn line but its end bar, with no fill on it, the bar's range must not reach the level
+    drawn on that bar. A line drawn from the decision bar (the old timing) fails this for Elliot."""
+    import json
+    from datetime import date, timedelta
+
+    from MainStoinker.engine.cli import main
+    from tests.test_cli_modes import EMA, ORC, Env
+    from tests.test_cli_store import ELLIOT_MSFT
+
+    root = tmp_path_factory.mktemp("overlay-crossings")
+    env = Env(root)
+    env.setup([{"ID": "EMACrossing", "data": [EMA]}, {"ID": "OpeningRangeCandle", "data": [ORC]},
+               {"ID": "Elliot", "data": [ELLIOT_MSFT]}], ["AAPL", "MSFT"], rows=None)
+    database = root / "runs.db"
+    assert main(["backtest", "--algos", str(env.algos), "--data", str(env.data), "--out", str(env.out),
+                 "--quiet", "--fills", "realistic", "--db", str(database)]) == 0
+    client = make_client(database)
+    run = client.get("/api/runs/1").json()["run"]
+    first = date.fromisoformat(run["first_bar"][:10])
+    last = date.fromisoformat(run["last_bar"][:10])
+    gathered: dict[str, dict[str, object]] = {}
+    for name, symbol in (("AAPL-10/30EMA", "AAPL"), ("AAPL-orc", "AAPL"), ("MSFT-elliot", "MSFT")):
+        bars: list[dict] = []
+        day = first - timedelta(days=7)  # the run's bars start after the warm-up days: start early
+        while day <= last:
+            window = {"symbol": symbol, "start": f"{day} 00:00:00", "end": f"{day + timedelta(days=6)} 23:59:59"}
+            body = client.get("/api/runs/1/bars", params=window).json()
+            assert body["available"] is True
+            bars.extend(body["bars"])
+            day += timedelta(days=7)
+        orders = client.get("/api/runs/1/orders", params={"algo": name}).json()
+        assert orders["order_events"] and orders["fills"], name
+        gathered[name] = {"bars": bars, "events": orders["order_events"], "fills": orders["fills"]}
+    data_file = node_workdir / "crossings_input.json"
+    data_file.write_text(json.dumps(gathered), encoding="utf-8")
+    script = node_workdir / "crossings.mjs"
+    script.write_text(CROSSING_SCRIPT, encoding="utf-8")
+    import subprocess
+
+    from tests.test_api_static import NODE
+
+    assert NODE is not None
+    done = subprocess.run([NODE, str(script), str(data_file)], capture_output=True, encoding="utf-8",
+                          timeout=300, cwd=node_workdir)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    print("overlay crossing check (bars inside drawn lines, crossings, total bars):")
+    for name, result in out.items():
+        whole, per_day = result["whole"], result["perDay"]
+        print(f"  {name}: whole range {len(whole['crossings'])} of {whole['bars']} bars in {whole['lines']} lines "
+              f"({whole['singlePoints']} one-point); per day {len(per_day['crossings'])} of {per_day['bars']}; "
+              f"{result['totalBars']} bars loaded")
+    for name, result in out.items():
+        assert result["whole"]["lines"] > 0 and result["whole"]["bars"] > 0, name
+        assert result["whole"]["crossings"] == [], name
+        assert result["perDay"]["crossings"] == [], name
+

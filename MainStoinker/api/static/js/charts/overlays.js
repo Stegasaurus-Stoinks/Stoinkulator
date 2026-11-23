@@ -3,7 +3,7 @@
 // appears out of nowhere. The pure core is exported separately so node can test it without a DOM or the chart
 // library; createOverlays is the thin drawing layer on the candle chart's seam (charts/candles.js).
 //
-// Exports: HINDSIGHT_NOTE, FAILED_NOTE, NO_INDICATORS_NOTE, OWN_COLUMN_NOTE, barTimes, convertSeries,
+// Exports: HINDSIGHT_NOTE, FAILED_NOTE, NO_INDICATORS_NOTE, NO_DRAWABLE_NOTE, OWN_COLUMN_NOTE, barTimes, convertSeries,
 // buildOrderLines, overlayColors, mixColors, planOverlays, createOverlays.
 //
 // Times are chart seconds (format.js dataTimeToChartTime). An indicator point is only ever placed on a candle
@@ -36,9 +36,15 @@
 //                      lists. Per order: its price over time from the placed and modified events, ending at its
 //                      cancelled event or, when there is none, at the exit fill of the same (account,
 //                      broker_ref) position (a stop closed by the synthetic end-of-data fill has no cancel
-//                      event), or at the end of the window. `data` is a stepped line on candle times, clipped
-//                      to the window: one that starts before it starts at the first bar with its then-current
-//                      price; one entirely outside it is left out. Orders of a position that never had an entry
+//                      event), or at the end of the window. TIMING: the engine checks the resting orders
+//                      against bar t before the algos run on it, so a price placed or modified while bar t is
+//                      processed (event time t) is first checked against the NEXT bar of `times`: it applies
+//                      from the bar after the event's bar (a change from before the window: the window's
+//                      first bar), and a line never starts before the entry fill bar. The end is the bar of
+//                      the cancel (the order rested through it) or of the exit fill. A change that would
+//                      apply after the end is not drawn. `data` is a stepped line on candle times, clipped
+//                      to the window (one entirely outside it is left out; one bar long it has one point,
+//                      which planOverlays draws as a marker). Orders of a position that never had an entry
 //                      fill never worked and are left out (when `fills` is a list).
 // overlayColors(theme), mixColors(a, b, weight)  the colours, all derived from the page theme's own.
 // planOverlays({series, orderEvents, fills, fillModel, runStatus, times, ordersError})
@@ -71,6 +77,7 @@ export const HINDSIGHT_NOTE = "Swing markers are drawn where the swing happened.
 export const FAILED_NOTE = "This run failed. Its indicators may be incomplete.";
 export const NO_INDICATORS_NOTE = "No indicators are stored for this algo in this run. Runs stored before "
   + "indicator capture, and algos whose indicators were skipped at capture, have none.";
+export const NO_DRAWABLE_NOTE = "No drawable indicators are stored for this algo in this run.";
 export const OWN_COLUMN_NOTE = "algo's own column, can be stale";
 export const ORDERS_FAILED_NOTE = "The stop and target orders could not be loaded, so their lines are not drawn.";
 
@@ -209,7 +216,7 @@ export function buildOrderLines(orderEvents, fills, times) {
   }
 
   const known = Array.isArray(fills);
-  const entered = new Set();
+  const enteredAt = new Map(); // position -> the time of its (first) entry fill
   const exitedAt = new Map();
   if (known) {
     for (const fill of fills) {
@@ -217,7 +224,7 @@ export function buildOrderLines(orderEvents, fills, times) {
       const key = positionKey(fill.account, fill.broker_ref);
       const time = dataTimeToChartTime(fill.time);
       if (fill.reason === "entry") {
-        entered.add(key);
+        if (!enteredAt.has(key) || (time !== null && time < enteredAt.get(key))) enteredAt.set(key, time);
       } else if (time !== null && (!exitedAt.has(key) || time > exitedAt.get(key))) {
         exitedAt.set(key, time);
       }
@@ -227,18 +234,30 @@ export function buildOrderLines(orderEvents, fills, times) {
   const lines = [];
   for (const order of orders.values()) {
     const key = positionKey(order.account, order.brokerRef);
-    if (known && !entered.has(key)) continue; // the entry never filled: this order never worked
+    if (known && !enteredAt.has(key)) continue; // the entry never filled: this order never worked
     order.changes.sort((a, b) => a.time - b.time); // stable
-    const start = order.changes[0].time;
     const end = order.cancelled !== null ? order.cancelled : (exitedAt.has(key) ? exitedAt.get(key) : null);
-    if (start > windowLast || (end !== null && end < windowFirst)) continue;
+    if (end !== null && end < windowFirst) continue;
     const last = end === null ? windowLast : Math.min(end, windowLast);
     const lastIndex = snapIndex(times, last);
+    // The engine checks the resting orders against bar t before the algos run on it, so a price placed or
+    // modified while bar t is processed (its event time is t) is first checked against the NEXT bar. A
+    // change from before the window applies from the window's first bar; no line starts before the entry
+    // fill bar. The end stays: an order cancelled at t rested through t.
+    const entryTime = known ? enteredAt.get(key) : null;
+    const entryIndex = entryTime === null || entryTime === undefined ? 0 : Math.max(0, snapIndex(times, entryTime));
+    if (entryTime !== null && entryTime !== undefined && entryTime > windowLast) continue;
+    const effective = (change) => {
+      const at = snapIndex(times, change.time);
+      return Math.max(entryIndex, at < 0 ? 0 : at + 1);
+    };
+    const first = effective(order.changes[0]);
+    if (first > lastIndex) continue;
     const byIndex = new Map();
     let price = null;
     for (const change of order.changes) {
-      if (change.time > last) break;
-      const index = Math.max(0, snapIndex(times, change.time)); // before the window: its first bar
+      const index = effective(change);
+      if (index > lastIndex) break; // changes are in time order, so is their effective bar
       byIndex.set(index, change.price);
       price = change.price;
     }
@@ -248,7 +267,8 @@ export function buildOrderLines(orderEvents, fills, times) {
       .map(([index, value]) => ({ time: times[index], value }));
     lines.push({
       role: order.role, account: order.account, brokerRef: order.brokerRef, orderId: order.orderId,
-      start, end, data, startsBeforeWindow: start < windowFirst, endsAfterWindow: end !== null && end > windowLast,
+      start: times[first], end, data, startsBeforeWindow: order.changes[0].time < windowFirst,
+      endsAfterWindow: end !== null && end > windowLast,
     });
   }
   return lines;
@@ -282,11 +302,12 @@ export function overlayColors(theme) {
       mixColors(theme.accent, theme.neg, 0.5),
       mixColors(theme.pos, theme.accent, 0.5),
       theme.text,
-      theme.accent,
+      mixColors(theme.accent, theme.text, 0.5), // never the accent: that is the entry marker
       theme.muted,
     ],
-    stop: theme.neg,
-    target: theme.pos,
+    // red-ish and green-ish, but not the candle bodies and exit markers (theme.neg / theme.pos)
+    stop: mixColors(theme.neg, theme.text, 0.3),
+    target: mixColors(theme.pos, theme.text, 0.3),
     ownStop: mixColors(theme.neg, theme.muted, 0.4),
     ownTarget: mixColors(theme.pos, theme.muted, 0.4),
   };
@@ -348,8 +369,14 @@ export function planOverlays({ series = null, orderEvents = null, fills = null, 
       items.push({
         key: "orders:" + role, name: ORDER_NAMES[role], kindText: ORDER_WORDS[role], shape: "line", paint: role,
         paletteIndex: 0,
-        lines: mine.map((line) => ({ data: line.data, step: true, style: "solid", width: 2 })),
-        markers: [], defaultVisible: true, count: mine.reduce((sum, line) => sum + line.data.length, 0), dropped: 0,
+        // a stop is dashed, a target dotted, so neither passes for a candle or an exit marker; a level that
+        // worked on one bar only is a circle at its price (the library draws nothing for a one-point line)
+        lines: mine.filter((line) => line.data.length > 1)
+          .map((line) => ({ data: line.data, step: true, style: role === "stop" ? "dashed" : "dotted", width: 2 })),
+        markers: mine.filter((line) => line.data.length === 1).map((line) => ({
+          time: line.data[0].time, position: "atPriceMiddle", price: line.data[0].value, shape: "circle", text: role,
+        })),
+        defaultVisible: true, count: mine.reduce((sum, line) => sum + line.data.length, 0), dropped: 0,
         unknownType: false, annotation: "",
       });
     }
@@ -361,6 +388,8 @@ export function planOverlays({ series = null, orderEvents = null, fills = null, 
   // `series` null means the request failed (the legend shows the error instead); otherwise an answer with no
   // series says why there is nothing to draw.
   if (series && (series.available !== true || entries.length === 0)) notes.push(NO_INDICATORS_NOTE);
+  // stored series that are all of the baseline kind (the Trade series) have nothing to draw
+  else if (series && !items.some((item) => item.key.startsWith("series:"))) notes.push(NO_DRAWABLE_NOTE);
   if (realistic && ordersError) notes.push(ORDERS_FAILED_NOTE);
   return { items, notes };
 }
@@ -486,7 +515,7 @@ export function createOverlays(candleHandle, { ctx, container, lib = globalThis.
       color,
       lineWidth: line.width,
       lineType: line.step ? (types.WithSteps ?? 1) : (types.Simple ?? 0),
-      lineStyle: line.style === "dotted" ? (styles.Dotted ?? 1) : (styles.Solid ?? 0),
+      lineStyle: line.style === "dotted" ? (styles.Dotted ?? 1) : line.style === "dashed" ? (styles.Dashed ?? 2) : (styles.Solid ?? 0),
       priceLineVisible: false,
       lastValueVisible: false,
       crosshairMarkerVisible: false,

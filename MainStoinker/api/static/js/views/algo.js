@@ -8,9 +8,11 @@
 //
 // Previous/next day jump to the nearest day that has bars: one bars request covers up to 7 calendar days
 // (stepWindow), the nearest day with a bar (nearestBarDay) is then shown. A trade that exits on another day
-// says so (exitNote) with a button to show that day.
+// says so (exitNote) with a button to show that day; so does one shown on its exit day (entryNote). The search
+// for the nearest day runs in a scope of its own: it never aborts the day being shown, which is replaced only
+// when a day is found.
 //
-// Exports: render, TRADE_COLUMNS, dayOfTime, shiftDay, stepDay, stepWindow, nearestBarDay, exitNote, initialDay,
+// Exports: render, TRADE_COLUMNS, dayOfTime, shiftDay, stepDay, stepWindow, nearestBarDay, exitNote, entryNote, initialDay,
 // dayWindow, barsState, buildTradeRows, selectLabel, summaryItems, trimDecimal. Everything but render is pure
 // (no DOM, no network) so node can test it.
 import { ApiError, getJson, isAbortError } from "../api.js";
@@ -87,6 +89,12 @@ export function nearestBarDay(bars, delta) {
 export function exitNote(row, shownDay) {
   if (!row || !shownDay || row.entryDay !== shownDay || !row.exitDay || row.exitDay === shownDay) return null;
   return { text: "Exits on " + row.exitDay + ".", day: row.exitDay };
+}
+
+// The note for a selected trade shown on its exit day when it entered on another: {text, day} or null.
+export function entryNote(row, shownDay) {
+  if (!row || !shownDay || row.exitDay !== shownDay || !row.entryDay || row.entryDay === shownDay) return null;
+  return { text: "Entered on " + row.entryDay + ".", day: row.entryDay };
 }
 
 // The day the chart opens on: the day of the algo's first trade (earliest entry), else the day of the run's
@@ -410,6 +418,7 @@ export async function render(container, params, ctx) {
   let day = initialDay(rows, run.last_bar);
   let selectedKey = null;
   let request = null;
+  let stepSearch = null; // the scope of a running search for the previous / next day
 
   function paintDay() {
     dayLabel.textContent = day ? day + " (data time)" : "no day";
@@ -436,7 +445,9 @@ export async function render(container, params, ctx) {
     candles.setTrades(rows, selectedKey);
     const row = selectedRow();
     const exits = exitNote(row, day);
-    if (exits) setDayNote(exits.text, { label: "Show " + exits.day, run: () => loadDay(exits.day) });
+    const entered = entryNote(row, day);
+    const other = exits || entered;
+    if (other) setDayNote(other.text, { label: "Show " + other.day, run: () => loadDay(other.day) });
     else setDayNote("");
     if (!row) return;
     if (row.entryDay === day && row.entryChart !== null) {
@@ -490,6 +501,8 @@ export async function render(container, params, ctx) {
   async function loadDay(next) {
     if (!candles) return;
     if (request) request.abort();
+    if (stepSearch) stepSearch.abort(); // showing a day (by any route) ends a search for another
+    stepSearch = null;
     const mine = request = ctx.child();
     day = next;
     paintDay();
@@ -537,8 +550,10 @@ export async function render(container, params, ctx) {
       setDayNote(none);
       return;
     }
-    if (request) request.abort();
-    const mine = request = ctx.child();
+    // A scope of its own: the day on show keeps loading (or stays drawn) while the search runs, and is
+    // replaced only when a day is found (loadDay then aborts and replaces it).
+    if (stepSearch) stepSearch.abort();
+    const mine = stepSearch = ctx.child();
     setDayNote("Looking for the " + direction + " day with bars...");
     try {
       const data = await getJson("/api/runs/" + runId + "/bars",
@@ -546,12 +561,14 @@ export async function render(container, params, ctx) {
       if (!mine.isCurrent()) return;
       const found = data && data.available === true ? nearestBarDay(data.bars, delta) : null;
       if (found === null) {
+        if (stepSearch === mine) stepSearch = null;
         setDayNote(data && data.available !== true ? barsState(data, symbol).note : none);
         return;
       }
-      await loadDay(found); // clears the note
+      await loadDay(found); // aborts the search scope and the shown day's request; clears the note
     } catch (err) {
       if (isAbortError(err) || !mine.isCurrent()) return;
+      if (stepSearch === mine) stepSearch = null;
       setDayNote("");
       showError(err);
     }

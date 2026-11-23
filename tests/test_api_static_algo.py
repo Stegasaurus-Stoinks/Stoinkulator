@@ -919,7 +919,17 @@ find(byClass(container, "day-note")[0], (c) => c.tag === "BUTTON")[0].fire("clic
 out.toExit = { requests: barsRequests().length, query: barsRequests().at(-1).query.start };
 barsRequests().at(-1).answer(barsFor("2024-01-03"));
 await tick();
-out.exitDay = { markers: markerIds(), note: dayNote(), visible: candle.visible.at(-1) };
+out.exitDay = { markers: markerIds(), note: dayNote(), visible: candle.visible.at(-1),
+  buttons: find(byClass(container, "day-note")[0], (c) => c.tag === "BUTTON").map((b) => b.textContent) };
+// the mirror note has a button that shows the entry day again, where the note says "Exits on"
+find(byClass(container, "day-note")[0], (c) => c.tag === "BUTTON")[0].fire("click");
+out.toEntry = { requests: barsRequests().length, query: barsRequests().at(-1).query.start };
+barsRequests().at(-1).answer(barsFor("2024-01-02"));
+await tick();
+out.entryDay = { note: dayNote() };
+// a trade of another day entirely (neither its entry nor its exit day is shown): no note
+rowButtons(container)[1].fire("click");
+out.other = { note: dayNote() };
 console.log(JSON.stringify(out));
 """)
     assert isinstance(out, dict)
@@ -936,4 +946,10 @@ console.log(JSON.stringify(out));
     assert span["note"][0] is True
     assert out["toExit"] == {"requests": 2, "query": "2024-01-03 00:00:00"}
     exit_day = out["exitDay"]
-    assert exit_day["markers"] == ["1:exit:2"] and exit_day["note"][0] is True  # not faded; no note on the exit day
+    assert exit_day["markers"] == ["1:exit:2"]  # not faded
+    # on the exit day a note says where it entered, with a button to show that day
+    assert exit_day["note"][0] is False and exit_day["note"][1].startswith("Entered on 2024-01-02.")
+    assert exit_day["buttons"] == ["Show 2024-01-02"]
+    assert out["toEntry"] == {"requests": 3, "query": "2024-01-02 00:00:00"}
+    assert out["entryDay"]["note"][1].startswith("Exits on 2024-01-03.")
+    assert out["other"]["note"][0] is True
