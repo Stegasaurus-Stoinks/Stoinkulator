@@ -2258,3 +2258,108 @@ def test_fix3_new_rules_are_linear_in_time() -> None:
     for name, command in shapes.items():
         _, took = _timed(command)
         assert took < _TIMING_BOUND, (name, took)
+
+
+# --- legacy broker scripts (#158): deleted files, kept out by a backstop rule ----------
+# Every row is a command string used as data; nothing here is executed.
+
+LEGACY_BLOCKED = [
+    "python MainStoinker/testy/testy.py",
+    "python MainStoinker\\testy\\testy.py",
+    "python ./MainStoinker/testy/testy.py",
+    "python .\\MainStoinker\\testy\\testy.py",
+    "python MainStoinker//testy//testy.py",
+    "python MAINSTOINKER/TESTY/TESTY.PY",
+    "python MainStoinker/engine/../testy/testy.py",
+    ".venv\\Scripts\\python.exe MainStoinker\\testy\\testy.py",
+    "& '.venv/Scripts/python.exe' MainStoinker/testy/testy_advanced.py",
+    "py -3 MainStoinker\\testy\\testy_advanced.py",
+    'python "MainStoinker/DataCollection/Dumb dumb/IBAPI_TESTING.py"',
+    'python "MainStoinker\\DataCollection\\Dumb dumb\\IBAPI_TESTING.py"',
+    "python -m MainStoinker.testy.testy",
+    'python -c "import MainStoinker.testy.testy"',
+    'python -c "from MainStoinker.testy import testy"',
+    "python -c \"import runpy; runpy.run_module('MainStoinker.testy.testy_advanced')\"",
+    "uv run python MainStoinker/testy/testy.py",
+    "uv run MainStoinker/testy/testy.py",
+    "cmd /c python MainStoinker\\testy\\testy.py",
+    'bash -c "python MainStoinker/testy/testy.py"',
+    "python \\\n  MainStoinker/testy/testy.py",
+    "python `\n  MainStoinker\\testy\\testy.py",
+    "git status && python MainStoinker/testy/testy.py",
+    "MainStoinker/testy/testy.py",
+    "& .\\MainStoinker\\testy\\testy.py",
+    "cd MainStoinker/testy && python testy.py",
+    "cd MainStoinker/testy; python testy_advanced.py",
+    "Set-Location MainStoinker\\testy; python .\\testy.py",
+    "python -m ruff check MainStoinker/testy/testy.py",  # accepted false positive, like the entry script
+]
+LEGACY_ALLOWED = [
+    "git rm MainStoinker/testy/testy.py",
+    "git rm MainStoinker/testy/testy_advanced.py",
+    'git rm "MainStoinker/DataCollection/Dumb dumb/IBAPI_TESTING.py"',
+    "git log -- MainStoinker/testy",
+    "git log --stat -- MainStoinker/testy/testy.py",
+    "git diff origin/revival -- MainStoinker/testy/testy.py",
+    "rg testy",
+    'rg -n "app.connect" MainStoinker/testy',
+    "cat MainStoinker/testy/testy.py",
+    "type MainStoinker\\testy\\testy_advanced.py",
+    "Get-Content MainStoinker\\testy\\testy.py",
+    "Remove-Item MainStoinker\\testy\\testy.py",
+    "ls MainStoinker/testy",
+    'cat "MainStoinker/DataCollection/Dumb dumb/IBAPI_TESTING.py"',
+    "python -m pytest MainStoinker/testy",
+    "python -m pytest -q MainStoinker\\testy",
+    "python -m ruff check MainStoinker/testy",
+    "python -m pytest tests/test_ib_import_boundary.py",
+    "python -m pytest tests/test_testy.py",
+    "cd MainStoinker/testy && ls",
+    "cd MainStoinker/testy; git status",
+    "cd MainStoinker && python -m pytest testy",
+    "cd MainStoinker/engine && python testy.py",
+]
+
+
+@pytest.mark.parametrize("command", LEGACY_BLOCKED)
+def test_legacy_broker_scripts_are_blocked(command: str) -> None:
+    assert hook.decide(command) == (True, hook._LEGACY_MESSAGE), command
+
+
+@pytest.mark.parametrize("command", LEGACY_ALLOWED)
+def test_reading_deleting_and_testing_legacy_paths_is_allowed(command: str) -> None:
+    assert hook.decide(command) == (False, ""), command
+
+
+def test_legacy_rule_message_and_main_exit_code(capsys: pytest.CaptureFixture[str]) -> None:
+    assert hook._LEGACY_MESSAGE == (
+        "Blocked: legacy broker test script (connects to the broker when run or imported)."
+    )
+    assert hook.main(_payload("python MainStoinker/testy/testy.py")) == 2
+    assert hook._LEGACY_MESSAGE in capsys.readouterr().err
+
+
+def test_legacy_rule_fails_closed_on_malformed_input(capsys: pytest.CaptureFixture[str]) -> None:
+    assert hook.main('{"tool_input": {"command": "python testy.py"') == 2
+    assert hook.main('{"tool_input": {"command": "python IBAPI_TESTING.py"') == 2
+    capsys.readouterr()
+    assert hook.main('{"tool_input": {"command": "ls"') == 0
+
+
+def test_legacy_rule_is_linear_in_time() -> None:
+    for command in (
+        "python " + "a/../" * 20_000 + "MainStoinker/testy/testy.py",
+        "python " + "x/.. " * 20_000,
+        "cd MainStoinker/testy; " * 5_000 + "python testy.py",
+    ):
+        _, took = _timed(command)
+        assert took < _TIMING_BOUND, took
+
+
+def test_legacy_broker_scripts_do_not_exist() -> None:
+    for rel in (
+        "MainStoinker/testy/testy.py",
+        "MainStoinker/testy/testy_advanced.py",
+        "MainStoinker/DataCollection/Dumb dumb/IBAPI_TESTING.py",
+    ):
+        assert not (REPO_ROOT / rel).exists(), rel
