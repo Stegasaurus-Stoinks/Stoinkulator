@@ -38,10 +38,11 @@ from tests.ib_replay import (
 )
 from tests.test_ib_recorder import (
     RECORDINGS,
-    ROOT,
+    T0,
     WAIT,
     Clock,
     collect,
+    committed_recorder_files,
     contract,
     normalise_ids,
     read_lines,
@@ -196,7 +197,7 @@ def test_managed_accounts_teaches_the_recorder_ids_that_have_no_account_shape(tm
     all_digits = digits_of(make_id("U", 11, 9))
     short = "ZQX" + digits_of(make_id("U", 12))[:3]
     rec = recorder(tmp_path)
-    rec.on_raw("error", (-1, 1, 1, f"cold {all_digits} and {short}", ""))  # not known yet: kept
+    rec.on_raw("error", (-1, 1, 1, f"cold: {all_digits} and {short}", ""))  # not known yet: kept
     rec.on_raw("managedAccounts", (f"{all_digits},{short}",))
     rec.on_raw("error", (-1, 2, 1, f"warm {all_digits} and {short.lower()}", ""))
     rec.on_raw("custom", ({short: [all_digits]}, int(all_digits)))
@@ -207,31 +208,51 @@ def test_managed_accounts_teaches_the_recorder_ids_that_have_no_account_shape(tm
     assert not survivors(later, all_digits, short)
 
 
-def test_numbers_that_contain_the_learned_digits_are_blanked_and_say_so(tmp_path: Path) -> None:
-    """Over-redaction: a conId or a volume that merely contains the digit run becomes ACCOUNT-n."""
+def test_numbers_are_blanked_only_when_equal_to_the_learned_digits_strings_when_they_contain_them(
+    tmp_path: Path,
+) -> None:
+    """Item 6: an int, float or Decimal that merely contains the digit run is a coincidence and stays;
+    one that equals it (also as a float, a Decimal, with a sign) goes; a string that contains it goes."""
     account = make_id("DU", 21)
     run = digits_of(account)
     rec = recorder(tmp_path)
     rec.on_raw("managedAccounts", (account,))
-    rec.on_raw("custom", (int("2" + run + "1"), "3" + run, Decimal("1" + run), 123456, "1704205800"))
+    around = (int("2" + run + "1"), float("2" + run + "1"), Decimal("1" + run + "5"))
+    equal = (int(run), float(run), Decimal(run), Decimal(run + ".00"), -int(run))
+    rec.on_raw("custom", (*around, *equal, "3" + run, 123456, "1704205800"))
     rec.close()
     args = read_lines(tmp_path / "rec.jsonl")[2]["args"]
-    assert not survivors(json.dumps(args), run)
-    assert args[0] == "ACCOUNT-1" and args[2] == "ACCOUNT-1"  # blanked, as the docs say
-    assert args[3] == 123456 and args[4] == "1704205800"  # everything else is untouched
+    assert args[0] == int("2" + run + "1") and args[1] == float("2" + run + "1")
+    assert args[2] == "1" + run + "5"  # a Decimal is written as text, untouched
+    assert args[3:8] == ["ACCOUNT-1"] * 5
+    assert args[8] == "3ACCOUNT-1"  # a string keeps the substring rule
+    assert args[9] == 123456 and args[10] == "1704205800"
+    assert rec.failures == 0  # the last check does not mistake a coincidence for a leak
 
 
-@pytest.mark.xfail(strict=True, reason="a bar field that merely contains an id's digits becomes text and "
-                   "breaks decode_callback (Decimal('ACCOUNT-1')): replay should tolerate a blanked field")
+def test_a_number_under_an_account_like_name_is_replaced_whole(tmp_path: Path) -> None:
+    account = make_id("DU", 23)
+    rec = recorder(tmp_path)
+    rec.on_raw("managedAccounts", (account,))
+    rec.on_raw("custom", ({"acctCode": int("2" + digits_of(account))},))
+    rec.close()
+    text = written(tmp_path / "rec.jsonl")
+    assert not survivors(text, digits_of(account))
+    assert "ACCOUNT-" in read_lines(tmp_path / "rec.jsonl")[2]["args"][0]["acctCode"]
+
+
 def test_replay_survives_a_volume_that_contains_the_digits_of_an_account(tmp_path: Path) -> None:
     account = make_id("DU", 22)
     rec = recorder(tmp_path)
     rec.on_raw("managedAccounts", (account,))
-    rec.on_raw("historicalData", (7, make_bar(1704205800, 1.0, 2.0, 0.5, 1.5, int("1" + digits_of(account)))))
+    volume = int("1" + digits_of(account))
+    rec.on_request("reqHistoricalData", (7, contract(), "", "1 D", "1 min", "TRADES", 1, 2, False, []))
+    rec.on_raw("historicalData", (7, make_bar(T0, 1.0, 2.0, 0.5, 1.5, volume)))
     rec.close()
     recording = load_recording(tmp_path / "rec.jsonl")
+    assert recording.problems == []
     event = next(e for e in recording.raw_events() if e.name == "historicalData")
-    decode_callback(event)  # raises decimal.InvalidOperation today
+    assert decode_callback(event)[1].volume == Decimal(volume)  # the coincidence is kept
 
 
 # -- other private data -----------------------------------------------------------------------
@@ -271,22 +292,22 @@ def test_no_wall_clock_is_written_except_what_ib_sends_and_the_callers_start_utc
     rec.on_raw("error", (-1, 1700000123456, 2104, "ok", ""))  # IB's own errorTime: epoch milliseconds
     rec.close()
     lines = read_lines(tmp_path / "rec.jsonl")
-    assert lines[0]["start_utc"] is None
+    assert lines[0]["start_utc"] is None and lines[0]["error_time"] == "zeroed"
     assert [ln["t"] for ln in lines[1:]] == [1.0, 2.0, 3.0]  # monotonic and relative, from the injected clock
-    # IB's timestamps are passed through: a recording says when the session happened.
-    assert lines[3]["args"][1] == 1700000123456
+    # Item 7: IB's errorTime would say when the session ran: it is zeroed (market times are kept).
+    assert lines[3]["args"] == [-1, 0, 2104, "ok", ""]
+    assert lines[2]["args"] == [1700000123]
+    assert "1700000123456" not in written(tmp_path / "rec.jsonl")
 
 
-@pytest.mark.xfail(strict=True, reason="a path is redacted only up to the first space: "
-                   "the rest of the user's folder names stay readable")
 def test_a_windows_home_path_with_a_space_is_redacted_whole(tmp_path: Path) -> None:
-    rec = recorder(tmp_path, command=r"fetch --out C:\Users\Zed Quux\OneDrive - Acme Widgets\bars")
-    rec.on_raw("error", (-1, 1, 1, r'File "C:\Users\Zed Quux\OneDrive - Acme Widgets\x.py", line 5', ""))
+    path = "\\".join(("C:", "Users", "Zed Quux", "OneDrive - Acme Widgets", "bars"))
+    rec = recorder(tmp_path, command=f"fetch --out {path}")
+    rec.on_raw("error", (-1, 1, 1, f'File "{path}\\x.py", line 5', ""))
     rec.close()
-    assert not survivors(written(tmp_path / "rec.jsonl"), "quux", "acme", "widgets")
+    assert not survivors(written(tmp_path / "rec.jsonl"), "quux", "acme", "widgets", "zed")
 
 
-@pytest.mark.xfail(strict=True, reason="a host name without a dot after the @ is not taken for an address")
 def test_an_email_address_without_a_dot_in_the_domain_is_redacted(tmp_path: Path) -> None:
     rec = recorder(tmp_path)
     rec.on_raw("error", (-1, 1, 1, "mail zed.quux@mailbox now", ""))
@@ -294,7 +315,6 @@ def test_an_email_address_without_a_dot_in_the_domain_is_redacted(tmp_path: Path
     assert not survivors(written(tmp_path / "rec.jsonl"), "zed.quux", "mailbox")
 
 
-@pytest.mark.xfail(strict=True, reason="an IPv4-mapped IPv6 address keeps its last three octets")
 def test_an_ipv4_mapped_ipv6_address_is_redacted_whole(tmp_path: Path) -> None:
     ip = ".".join(("198", "51", "100", "77"))
     rec = recorder(tmp_path)
@@ -303,17 +323,14 @@ def test_an_ipv4_mapped_ipv6_address_is_redacted_whole(tmp_path: Path) -> None:
     assert not survivors(written(tmp_path / "rec.jsonl"), "51.100.77", ip)
 
 
-@pytest.mark.xfail(strict=True, reason="a git-bash style home path (/c/Users/name/...) is not recognised")
 def test_a_posix_style_windows_path_is_redacted(tmp_path: Path) -> None:
     rec = recorder(tmp_path)
-    rec.on_raw("error", (-1, 1, 1, "cwd /c/Users/zedquux/bars", ""))
+    rec.on_raw("error", (-1, 1, 1, "cwd " + "/".join(("", "c", "Users", "zedquux", "bars")), ""))
     rec.close()
     assert not survivors(written(tmp_path / "rec.jsonl"), "zedquux")
 
 
-@pytest.mark.xfail(strict=True, reason="cold: letter, separator other than - or _, digits "
-                   "is not recognised; the final scan cannot see it either")
-@pytest.mark.parametrize("sep", [" ", ".", ":", "/", "\u00a0"])
+@pytest.mark.parametrize("sep", [" ", ".", ":", "/", " "])
 def test_cold_separated_id_is_redacted(tmp_path: Path, sep: str) -> None:
     account = make_id("DU", 31)
     rec = recorder(tmp_path)
@@ -481,7 +498,7 @@ def _script_with_pacing_error(fake: FakeIbClient) -> None:
             text = "Historical Market Data Service error message:Historical data request pacing violation"
             return [("error", req_id, 1700000004000, 162, text, "")]
         bars = [
-            make_bar(1704205800 + 60 * i, 187.0 + i, 187.5 + i, 186.5 + i, 187.2 + i, 100 + i)
+            make_bar(T0 + 60 * i, 187.0 + i, 187.5 + i, 186.5 + i, 187.2 + i, 100 + i)
             for i in range(3)
         ]
         return [("historicalData", req_id, b) for b in bars] + [
@@ -536,16 +553,16 @@ def test_pacing_error_session_replays_to_the_same_events_with_new_request_ids(tm
     assert len(errors) == 1 and errors[0].req_id > 77
 
 
-def test_replay_refuses_a_recording_with_a_marker_line_or_a_torn_last_line() -> None:
-    """Pinned: one marker line (a redaction failure) or a torn last line makes the whole file unreadable."""
+def test_replay_skips_a_marker_line_or_a_torn_last_line_and_reports_it() -> None:
+    """Item 5 (was pinned as a refusal): the file stays readable, the request is reported."""
     text = (RECORDINGS / "synthetic_history.jsonl").read_text(encoding="utf-8")
     lines = text.splitlines()
     marked = lines[:6] + [json.dumps({"seq": 7, "t": 0.5, "kind": "raw", "name": "custom",
                                       "args": "<redaction failed: RuntimeError>"})] + lines[6:]
-    with pytest.raises(ValueError):
-        parse_recording("\n".join(marked))
-    with pytest.raises(ValueError):
-        parse_recording(text[:-20])
+    rec = parse_recording("\n".join(marked))
+    assert len(rec.problems) == 1 and "redaction" in rec.problems[0].reason
+    torn = parse_recording(text[:-20])
+    assert [p.reason for p in torn.problems] == ["torn last line"]
     assert len(parse_recording("\n".join(lines[:12])).requests) == 2  # a file cut between lines is fine
 
 
@@ -565,20 +582,12 @@ def test_replay_refuses_another_version_and_a_header_only_file_is_empty() -> Non
 _STRICT = re.compile(r"[A-Za-z]{1,2}[ ._:/\\-]?\d{5,}")
 _OCC_TEXT = re.compile(r"[A-Za-z]{1,6} *\d{6}[CcPp]\d{8}")
 _KNOWN_LONG_NUMBERS = {
-    "1700000000000", "1700000000001", "1700000000002", "1700000003000", "1700000005000", "1700000006000",
     "1704205800", "1704205860", "1704205920", "20240102", "265598", "345479400",
 }
 
 
 def test_extra_files_hold_no_account_shaped_text() -> None:
-    files = [
-        ROOT / "MainStoinker" / "ib" / "recorder.py",
-        ROOT / "tests" / "ib_replay.py",
-        ROOT / "tests" / "test_ib_recorder.py",
-        Path(__file__),
-        *[p for p in RECORDINGS.rglob("*") if p.is_file()],
-    ]
-    for p in files:
+    for p in committed_recorder_files():
         text = p.read_text(encoding="utf-8")
         masked = _OCC_TEXT.sub(lambda m: " " * len(m.group(0)), text)
         found = [m.group(0) for m in _STRICT.finditer(masked)]

@@ -1,4 +1,4 @@
-"""Session recorder: an `IbConnection` observer that writes what IB said, minus account numbers.
+r"""Session recorder: an `IbConnection` observer that writes what IB said, minus account numbers.
 
 `SessionRecorder(path, clock=...)` is passed to `IbConnection(observers=[...])`. It
 writes JSON Lines: one header line, then one line per request (`on_request`) and
@@ -11,11 +11,17 @@ and does not know the host: the header carries the port only.
 Format (version 1)
 ------------------
 Header: `{"format": "stoinkulator-ib-session", "version": 1, "redaction": N,
-"ibapi": "10.37.2", "command": ..., "port": ..., "start_utc": ...}`. `start_utc`
-is the one wall-clock value: a string the caller passes (the recorder never reads
-the wall clock) so a recording can be matched to TWS's own log; it may be null.
-Every other time is `t`, seconds since the recorder was built, taken from the
-injected monotonic `clock`, so the same input gives the same bytes.
+"ibapi": "10.37.2", "command": ..., "port": ..., "start_utc": ..., "error_time":
+"zeroed"}`. `start_utc` is the one wall-clock value: a string the caller passes (the
+recorder never reads the wall clock) so a recording can be matched to TWS's own log;
+it may be null. Every other time is `t`, seconds since the recorder was built, taken
+from the injected monotonic `clock`, so the same input gives the same bytes. The one
+exception IB itself brings is `errorTime` (epoch milliseconds), the second argument of
+every `error` callback, connect messages included; it would say when the session ran,
+so it is replaced by 0 at write time (the header says `"error_time": "zeroed"`; replay
+does not use it). Other epoch values IB sends (bar times, `currentTime`, a head
+timestamp) are market data and are kept: they say which period was fetched, not when.
+`command` is a string or a sequence of strings (argv); see "Paths" below.
 
 Event: `{"seq": n, "t": s, "kind": "request" | "raw", "name": ..., "args": [...]}`.
 Arguments are JSON values: objects (`Contract`, `BarData`, `ContractDetails`, tick
@@ -23,42 +29,78 @@ attributes, any object with attributes) become dicts of their attributes with a
 `"__class__"` key, `Decimal` becomes a string, bytes become `{"__bytes__": n,
 "text": printable text}`, a value that cannot be serialised becomes
 `"<unserialisable TypeName>"` (never `repr()`), anything nested too deeply or too
-large becomes `"<truncated>"`.
+large becomes `"<truncated>"`. A string longer than 64 KiB (`MAX_STRING`) is not
+written: it becomes `"<omitted: N KiB>"`, so the cost of redacting one string is
+bounded and every pattern below runs on short text only.
 
-Redaction (version 1): fail closed, at write time, before anything reaches disk
+Redaction (version 2): fail closed, at write time, before anything reaches disk
 -----------------------------------------------------------------------------
 Strings are first normalised (NFKC, so full-width and compatibility characters
 become plain ones; control, format and line-separator characters other than tab,
 newline and carriage return are dropped, which also defeats zero-width padding),
 then, in order:
 
-1. `private_values` given by the caller (user name, host name, machine name,
-   home folder: the caller reads them, this module does not) are replaced by
-   `REDACTED`, case-insensitively.
-2. E-mail addresses, IPv4 and IPv6 addresses and file paths (`C:\\...`, `\\\\server\\...`,
-   `/home/...`, `/Users/...`, `~/...`) are replaced by `EMAIL-REDACTED`,
-   `IP-REDACTED`, `PATH-REDACTED`.
+1. `private_values` given by the caller are replaced by `REDACTED`, case-insensitively,
+   as substrings. Besides each value, its path components (split at a backslash or a
+   slash) and its space-separated words of three or more characters are removed too,
+   and a value with spaces also matches with a dot, underscore or dash (or nothing)
+   between its words. The CALLER (the command, a later task) must pass the user name,
+   the machine name, the home folder and the name of the organisation / cloud-sync
+   folder: this module reads no environment and cannot find them itself. Passing the
+   home folder also removes the first and the last name wherever they appear.
+2. Paths, e-mail addresses and IP addresses (see "Paths" below).
 3. Every account id learned in this session is replaced by `ACCOUNT-n`, anywhere,
    as a substring, in any case. Ids are learned from the `managedAccounts`
    callback (every token of three or more letters and digits in any of its
    arguments) and from any value passed under an account-like name (below), when
-   it contains a digit. The digit run (five or more digits) of a learned id is
-   replaced too, so the bare digits of an id are caught once the id was learned. A
-   number (int, float, Decimal) whose text contains such a digit run becomes
-   the placeholder as well.
-4. The pattern `ACCOUNT_PATTERN`: one or two letters, an optional `-` or `_`, then
-   five or more digits, wherever they stand (also glued to other letters or
-   digits). Every id it finds is learned too (step 3 then applies to it). This is
-   IB's id shape (`U`, `DU`, `F`, `DF`, `I`, `DI` plus seven digits, longer for
-   some institutional ids; with a sub-account suffix after a dot the suffix
-   stays and the id before it goes). It works before
-   `managedAccounts` has been seen. It can over-redact: any token of one or two
-   letters and five or more digits (an ISIN, which is a country code plus ten
-   digits, or a short code followed by a long number). The one exemption is an
-   option symbol in OCC shape, `_OCC`: an optional root of up to six letters
-   (IB pads it with spaces: `AAPL  240816C00220000`), six digits, `C` or `P`,
-   eight digits, standing alone. The same placeholder `ACCOUNT-n` is used for the
-   same id in any spelling.
+   it contains a digit; these are never dropped. Ids found by the pattern (step 4)
+   are learned too, but only the first `MAX_PATTERN_IDS` of them (the pattern still
+   catches every later one by its shape; only a later bare digit run without letters
+   would be missed). The digit run (five or more digits) of a learned id is
+   replaced too, so the bare digits of an id are caught once the id was learned.
+   Learned ids are matched with several small patterns (32 ids each); learning one id
+   recompiles at most one of them.
+4. The pattern `ACCOUNT_PATTERN`: one or two letters, then at most one separator
+   character of any kind (anything that is not a letter or a digit: space, dot,
+   colon, slash, non-breaking space, comma, equals, pipe, dash, underscore...), then
+   five or more digits, which may themselves have a single space, dot, comma, dash
+   or underscore between digits. It applies cold, before `managedAccounts` has been
+   seen, as well as warm, wherever it stands (also glued to other letters or
+   digits). Every id it finds is learned too (step 3 then applies to it). It covers
+   IB's id shapes (`U`, `DU`, `F`, `DF`, `I`, `DI` plus seven digits, longer for
+   some institutional ids; a sub-account suffix after a dot goes with the digits
+   when it is a number). It over-redacts on purpose: any token of one or two letters
+   and five or more digits (an ISIN, a version string such as a letter, a space and a
+   dotted number, a date after a time zone name, a `CLOSED;` marker before a date in
+   trading hours). The one exemption is an option symbol in OCC shape, `_OCC`: an
+   optional root of up to six letters (IB pads it with spaces: `AAPL  240816C00220000`),
+   six digits, `C` or `P`, eight digits, standing alone. The same placeholder
+   `ACCOUNT-n` is used for the same id in any spelling.
+
+Numbers. A value whose Python type is `int`, `float` or `Decimal` (not `str`, not
+`bytes`) and which is not under an account-like name is replaced only when its
+digits EQUAL the digit run of a learned id exactly (an integral float equals the
+int; a sign and a trailing `.0` do not matter). It is not replaced when it merely
+contains such a run. Reasoning: IB delivers an account id as text, never as a
+number, so a number that equals one is the id through some conversion, while a
+number that contains the same digits by coincidence (a conId, an epoch time, a
+volume: about one in three million) is not the account, and blanking it breaks
+replay. Residual risk: an id turned into a number and then combined with other
+digits stays in that number. Strings, bytes, anything under an account-like name,
+and numbers rendered inside strings keep the substring rule: any string that
+contains a learned id or digit run is replaced there.
+
+Paths. Once a path start is recognised (a drive letter and a colon and a slash or
+backslash, a UNC double backslash, a git-bash `/c/` form, `/home/`, `/Users/` and
+the other system folders, `~`, `file:`), the match consumes the whole path: to the
+end of the quoted string if the path began inside quotes, otherwise to the end of
+the line or the next character that cannot be in a Windows path (`<>|"*?` or a
+control character). Spaces do not end a path. Anything after an unquoted path on
+the same line goes with it (over-redaction accepted). Each element of an argv
+`command` that looks like a path (contains a separator) is replaced whole, and the
+command is written with paths replaced, never raw. A mail address is `local@host`
+where the host need not have a dot; an IPv4 address, an IPv6 address and an
+IPv4-mapped IPv6 address (colons, then an IPv4 address) are replaced whole.
 
 Whatever is passed under an account-like name is replaced whole, whatever its type
 and shape: dictionary keys and object attributes containing `account` or `acct`
@@ -71,17 +113,24 @@ is caught by scanning the string and int arguments joined: if a match crosses a
 boundary the event's string arguments, and the ints in the match, are replaced by
 `<redacted>`. For this scan only, the digits must be five to nine and not look like
 a date (`YYYYMMDD`), so that `US/Eastern` followed by `20240102:0400` is not taken
-for an id. A final check scans the serialised arguments of every line; if
-anything account-shaped is left the arguments are replaced by a marker. If
-redaction itself fails the arguments are replaced by a marker naming the
-exception type. Both are counted (`failures`).
+for an id. A final check walks the arguments about to be written; if anything
+account-shaped is left (a learned id or the pattern in a string, a learned digit run
+equal to a number) the arguments are replaced by a marker. If redaction itself fails
+the arguments are replaced by a marker naming the exception type. Both are counted
+(`failures`).
 
 Not covered: ids written in a look-alike alphabet (Cyrillic or Greek letters),
 split across two *events*, split by something other than directly adjacent
-arguments, or spelled out in words; private data that is not an account, an
-address, a path, an e-mail address or one of `private_values`; a recording's
-timing, which says when the owner traded. Over-redaction is accepted. The owner
-reads a redacted recording before it is committed.
+arguments, encoded (percent, base64, hex, reversed) or spelled out in words; private
+data that is not an account, an address, a path, an e-mail address or one of
+`private_values`; a recording's timing, which says when the owner traded (bar times
+are kept). Over-redaction is accepted. The owner reads a redacted recording and runs
+`scan_recording` on it before it is committed.
+
+`scan_recording(path, words=())` is a standalone checker for the owner. It does not
+use the `Redactor`'s patterns and reports, with line numbers and a short reason,
+what a careful reader should look at (never the matched text itself, only its first
+two characters and its length). The command-line wiring for it is a later task.
 
 Threading: `on_request` and `on_raw` run on the reader, connect-helper and caller
 threads. One lock covers redaction, numbering and the write. Nothing here calls
@@ -100,6 +149,7 @@ import threading
 import types
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from importlib import metadata
 from pathlib import Path
@@ -110,28 +160,40 @@ from ibapi.wrapper import EWrapper
 
 FORMAT_NAME = "stoinkulator-ib-session"
 FORMAT_VERSION = 1
-REDACTION_VERSION = 1
+REDACTION_VERSION = 2
 
-ACCOUNT_PATTERN = re.compile(r"[A-Za-z]{1,2}[-_]?\d{5,}")
+MAX_STRING = 65536  # a longer string is not written, it is replaced by a note
+MAX_PATTERN_IDS = 256  # ids learned from pattern hits; ids from managedAccounts / names are not capped
+_TIER_SIZE = 32  # learned ids per compiled pattern
+
+ACCOUNT_PATTERN = re.compile(r"[A-Za-z]{1,2}[^A-Za-z0-9]?\d(?:[ .,\-_]?\d){4,}")
 _SPLIT_PATTERN = re.compile(r"[A-Za-z]{1,2}[-_]?\d{5,9}(?!\d)")
 _DATE = re.compile(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])")
 _OCC = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,6} *)?\d{6}[CcPp]\d{8}(?![A-Za-z0-9])")
-_JSON_ESCAPE = re.compile(r"\\.")  # `\n` followed by digits must not look like a letter and digits
 _ACCOUNT_NAME = re.compile(r"acc(?:ount|t)", re.IGNORECASE)
 _TOKEN = re.compile(r"[A-Za-z0-9]+")
-_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+# Linear on any input: it starts only at the beginning of a run of address characters
+# and the possessive quantifiers never give characters back.
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]++(?:@[\w.+-]*+)+")
 _IPV4 = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.]*\d)")
+_IPV4_MAPPED = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}\d{1,3}(?:\.\d{1,3}){3}(?!\d)")
 _IPV6 = re.compile(
     r"(?<![\w:])(?:(?:[0-9A-Fa-f]{1,4}:){5,7}[0-9A-Fa-f]{1,4}"
     r"|(?:[0-9A-Fa-f]{1,4}:){1,6}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5})?"
     r"|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?![\w:])"
 )
-_PATH = re.compile(
-    r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"'<>|]*"
-    r"|\\\\[^\s\"'<>|\\]+\\[^\s\"'<>|]*"
-    r"|(?<![\w/.])~[\\/][^\s\"'<>|]*"
-    r"|(?<![\w.])/(?:home|Users|root|var|tmp|etc|opt|mnt|usr|private)/[^\s\"'<>|]*"
+_PATH_START = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]"
+    r"|\\\\"
+    r"|(?<![\w/.])/[A-Za-z]/"
+    r"|(?<![\w.])/(?:home|users|root|var|tmp|etc|opt|mnt|usr|private)/"
+    r"|(?<![\w.])~(?=[\\/A-Za-z_])"
+    r"|(?<![A-Za-z0-9])file:",
+    re.IGNORECASE,
 )
+_PATH_STOP = re.compile("[<>|\"*?\\x00-\\x1f\\x7f]")
+_PATHLIKE_TOKEN = re.compile(r"\S*[\\/]\S*")
+_ARGV_FLAG = re.compile(r"(--?[\w-]+=)(.*)", re.DOTALL)
 _DROP_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 _KEEP_CONTROLS = "\t\n\r"
 _MAX_DEPTH = 8
@@ -140,6 +202,12 @@ _MAX_PLACEHOLDERS = 1000
 _WIPED = "<redacted>"
 
 _ParamNames = tuple[str, ...]
+
+
+class _NumText(str):
+    """A number rendered as text (a `Decimal`): the final check treats it as a number."""
+
+    __slots__ = ()
 
 
 def _json_text(value: Any) -> str:
@@ -154,8 +222,17 @@ def _norm_key(text: str) -> str:
     return "".join(_TOKEN.findall(text)).upper()
 
 
+def _omitted(length: int) -> str:
+    return f"<omitted: {max(1, length // 1024)} KiB>"
+
+
 def _normalise(text: str) -> str:
+    """NFKC, no control or format characters; a string over `MAX_STRING` becomes a note."""
+    if len(text) > MAX_STRING:
+        return _omitted(len(text))
     text = unicodedata.normalize("NFKC", text.encode("utf-8", "replace").decode("utf-8"))
+    if len(text) > MAX_STRING:
+        return _omitted(len(text))
     return "".join(
         c for c in text
         if c in _KEEP_CONTROLS or unicodedata.category(c) not in _DROP_CATEGORIES
@@ -170,6 +247,90 @@ def _overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
     return any(span[0] < b and a < span[1] for a, b in spans)
 
 
+def _scrub_paths(text: str) -> str:
+    """Replace each path, whole: to the closing quote if it began inside quotes, else to
+    the end of the line or the next character that cannot be in a Windows path."""
+    out: list[str] = []
+    pos = 0
+    while True:
+        m = _PATH_START.search(text, pos)
+        if m is None:
+            break
+        start = m.start()
+        quote = text[start - 1] if start > 0 and text[start - 1] in "\"'`" else None
+        if quote is not None:
+            end = text.find(quote, m.end())
+            if end < 0:
+                end = len(text)
+        else:
+            stop = _PATH_STOP.search(text, m.end())
+            end = stop.start() if stop is not None else len(text)
+        out.append(text[pos:start])
+        out.append("PATH-REDACTED")
+        pos = end
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _looks_like_path(text: str) -> bool:
+    return (
+        "\\" in text or "/" in text or text.startswith("~")
+        or re.match(r"[A-Za-z]:", text) is not None or _PATH_START.search(text) is not None
+    )
+
+
+def _private_terms(values: Iterable[str]) -> list[str]:
+    """Each value, its path components and its words of three or more characters."""
+    terms: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        value = _normalise(raw).strip()
+        if not value:
+            continue
+        terms.add(value)
+        for component in re.split(r"[\\/]+", value):
+            component = component.strip()
+            if len(component) >= 3:
+                terms.add(component)
+            terms.update(w for w in component.split() if len(w) >= 3)
+    return sorted(terms, key=len, reverse=True)
+
+
+def _private_pattern(terms: Sequence[str]) -> re.Pattern[str] | None:
+    if not terms:
+        return None
+    parts = ["[\\s._-]*".join(re.escape(w) for w in t.split()) for t in terms]
+    return re.compile("|".join(p for p in parts if p), re.IGNORECASE)
+
+
+def _compile_ids(ids: Iterable[str]) -> re.Pattern[str]:
+    return re.compile("|".join(re.escape(i) for i in sorted(ids, key=len, reverse=True)), re.IGNORECASE)
+
+
+def _number_digits(value: int | float | Decimal) -> str | None:
+    """The digits of a number without sign, fraction zeros or exponent, or None."""
+    try:
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return None
+            dec = Decimal(repr(value))
+        elif isinstance(value, Decimal):
+            dec = value
+        else:
+            return str(abs(value)) if value.bit_length() < 4000 else None
+        if not dec.is_finite() or dec.adjusted() > 40:
+            return None
+        text = format(abs(dec), "f")
+    except (ArithmeticError, ValueError):
+        return None
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
 class Redactor:
     """Turns raw callback / request arguments into JSON values with no account data.
 
@@ -178,17 +339,12 @@ class Redactor:
     """
 
     def __init__(self, private_values: Iterable[str] = ()) -> None:
-        values = sorted(
-            {_normalise(v) for v in private_values if isinstance(v, str) and v.strip()},
-            key=len, reverse=True,
-        )
-        self._private = (
-            re.compile("|".join(re.escape(v) for v in values), re.IGNORECASE) if values else None
-        )
+        self._private = _private_pattern(_private_terms(private_values))
         self._numbers: dict[str, int] = {}
         self._alias: dict[str, str] = {}  # normalised id or digit run -> normalised id
-        self._learned_re: re.Pattern[str] | None = None
-        self._digit_runs: tuple[str, ...] = ()
+        self._tiers: list[tuple[list[str], re.Pattern[str]]] = []
+        self._digit_set: set[str] = set()  # all-digit learned ids and digit runs
+        self._pattern_learned = 0
         self._leaves: list[str] = []  # text of every str and int leaf, in walk order
         self._wipe: set[int] = set()
         self._wipe_strings = False
@@ -210,22 +366,66 @@ class Redactor:
             number = self._numbers[key] = len(self._numbers) + 1
         return f"ACCOUNT-{number}"
 
-    def learn(self, token: str) -> None:
-        """Remember `token` as an account id of this session."""
+    def learn(self, token: str, *, from_pattern: bool = False) -> None:
+        """Remember `token` as an account id of this session.
+
+        Ids found by the pattern (`from_pattern`) stop being learned after
+        `MAX_PATTERN_IDS`; all others are always learned."""
         key = _norm_key(_normalise(token))
         if len(key) < 3 or key in self._alias:
             return
+        if from_pattern:
+            if self._pattern_learned >= MAX_PATTERN_IDS:
+                return
+            self._pattern_learned += 1
         self._alias[key] = key
+        new = [key]
         for run in re.findall(r"\d{5,}", key):
-            self._alias.setdefault(run, key)
-        ids = sorted(self._alias, key=len, reverse=True)
-        self._learned_re = re.compile("|".join(re.escape(i) for i in ids), re.IGNORECASE)
-        self._digit_runs = tuple(i for i in ids if i.isdigit())
+            if run not in self._alias:
+                self._alias[run] = key
+                new.append(run)
+        self._digit_set.update(i for i in new if i.isdigit())
+        if self._tiers and len(self._tiers[-1][0]) + len(new) <= _TIER_SIZE:
+            ids = self._tiers[-1][0]
+            ids.extend(new)
+            self._tiers[-1] = (ids, _compile_ids(ids))
+        else:
+            self._tiers.append((list(new), _compile_ids(new)))
 
     def _learn_text(self, text: str, *, everything: bool) -> None:
         for tok in _TOKEN.findall(_normalise(text)):
             if len(tok) >= 3 and (everything or (len(tok) >= 5 and any(c.isdigit() for c in tok))):
                 self.learn(tok)
+
+    def _learned_spans(self, text: str) -> list[tuple[int, int, str]]:
+        """Spans of learned ids in `text`, overlapping ones merged (with the longest id's text)."""
+        spans: list[tuple[int, int, str]] = []
+        for _ids, rx in self._tiers:
+            spans.extend((m.start(), m.end(), m.group(0)) for m in rx.finditer(text))
+        if len(spans) < 2:
+            return spans
+        spans.sort(key=lambda s: (s[0], -s[1]))
+        merged: list[tuple[int, int, str]] = [spans[0]]
+        for a, b, t in spans[1:]:
+            la, lb, lt = merged[-1]
+            if a < lb:
+                merged[-1] = (la, max(lb, b), t if len(t) > len(lt) else lt)
+            else:
+                merged.append((a, b, t))
+        return merged
+
+    def _learned_sub(self, text: str) -> str:
+        spans = self._learned_spans(text)
+        if not spans:
+            return text
+        out: list[str] = []
+        pos = 0
+        for a, b, t in spans:
+            out.append(text[pos:a])
+            out.append(self._placeholder(_norm_key(t)))
+            pos = b
+        out.append(text[pos:])
+        return "".join(out)
 
     # -- strings ---------------------------------------------------------------------
 
@@ -233,21 +433,40 @@ class Redactor:
         """Redact one string (headers, command lines)."""
         return self._redact_text(_normalise(text))
 
+    def scrub_command(self, command: str | Sequence[str]) -> str:
+        """The command line with paths replaced whole, never raw.
+
+        A string is scrubbed, then every whitespace-separated token with a path
+        separator is replaced. A sequence is taken as argv: each element that looks
+        like a path (also the value of `--flag=value`) is replaced whole."""
+        if isinstance(command, str):
+            return _PATHLIKE_TOKEN.sub("PATH-REDACTED", self.scrub(command))
+        parts: list[str] = []
+        for element in command:
+            text = _normalise(str(element))
+            flag = _ARGV_FLAG.fullmatch(text)
+            prefix, value = (flag.group(1), flag.group(2)) if flag else ("", text)
+            shown = "PATH-REDACTED" if _looks_like_path(value) else self._redact_text(value)
+            parts.append((self._redact_text(prefix) if prefix else "") + shown)
+        return " ".join(parts)
+
     def _redact_text(self, s: str) -> str:
+        if len(s) > MAX_STRING:
+            return _omitted(len(s))
         if self._private is not None:
             s = self._private.sub("REDACTED", s)
+        s = _scrub_paths(s)
         s = _EMAIL.sub("EMAIL-REDACTED", s)
-        s = _PATH.sub("PATH-REDACTED", s)
+        s = _IPV4_MAPPED.sub("IP-REDACTED", s)
         s = _IPV6.sub("IP-REDACTED", s)
         s = _IPV4.sub("IP-REDACTED", s)
-        if self._learned_re is not None:
-            s = self._learned_re.sub(lambda m: self._placeholder(_norm_key(m.group(0))), s)
+        s = self._learned_sub(s)
         occ = _occ_spans(s)
 
         def by_pattern(m: re.Match[str]) -> str:
             if _overlaps(m.span(), occ):
                 return m.group(0)
-            self.learn(m.group(0))  # the same id elsewhere in this session is then caught too
+            self.learn(m.group(0), from_pattern=True)  # the same id elsewhere is then caught too
             return self._placeholder(_norm_key(m.group(0)))
 
         return ACCOUNT_PATTERN.sub(by_pattern, s)
@@ -265,10 +484,32 @@ class Redactor:
 
     def leaks(self, text: str) -> bool:
         """Whether `text` still holds something account-shaped (the last check before a write)."""
-        if self._learned_re is not None and self._learned_re.search(text):
+        if self._learned_spans(text):
             return True
         occ = _occ_spans(text)
         return any(not _overlaps(m.span(), occ) for m in ACCOUNT_PATTERN.finditer(text))
+
+    def leaks_in_value(self, value: Any, depth: int = 0) -> bool:
+        """The last check before a write, on the JSON value itself: a string (or key) that
+        holds a learned id or the pattern, a number equal to a learned digit run. Any
+        type it does not know counts as a leak."""
+        if value is None or isinstance(value, bool):
+            return False
+        if isinstance(value, int | float | _NumText):
+            digits = _number_digits(Decimal(value) if isinstance(value, _NumText) else value)
+            return digits in self._digit_set
+        if isinstance(value, str):
+            return self.leaks(value)
+        if depth > _MAX_DEPTH + 2:
+            return True
+        if isinstance(value, list):
+            return any(self.leaks_in_value(v, depth + 1) for v in value)
+        if isinstance(value, dict):
+            return any(
+                not isinstance(k, str) or self.leaks(k) or self.leaks_in_value(v, depth + 1)
+                for k, v in value.items()
+            )
+        return True
 
     # -- walking values --------------------------------------------------------------
 
@@ -281,11 +522,11 @@ class Redactor:
         self._leaves.append(text if isinstance(v, int) else "")
         if index in self._wipe:
             return _WIPED
-        for run in self._digit_runs:
-            if run in text:
-                return self._placeholder(run)
+        digits = _number_digits(v)
+        if digits is not None and digits in self._digit_set:
+            return self._placeholder(digits)
         if isinstance(v, Decimal):
-            return text
+            return _NumText(text)
         if isinstance(v, float):
             return v if math.isfinite(v) else text
         return int(v)
@@ -314,11 +555,12 @@ class Redactor:
             return "<truncated>"
         if isinstance(v, bytes | bytearray | memoryview):
             raw = bytes(v)
-            text = "".join(chr(b) for b in raw if 32 <= b < 127)
-            return {
-                "__bytes__": len(raw),
-                "text": self._force_text(text) if force else self._redact_text(text),
-            }
+            if len(raw) > MAX_STRING:
+                text = _omitted(len(raw))
+            else:
+                text = "".join(chr(b) for b in raw if 32 <= b < 127)
+                text = self._force_text(text) if force else self._redact_text(text)
+            return {"__bytes__": len(raw), "text": text}
         if isinstance(v, type | types.ModuleType | types.FunctionType | types.BuiltinFunctionType
                       | types.MethodType) or callable(v):
             return f"<unserialisable {type(v).__name__}>"
@@ -388,6 +630,8 @@ class Redactor:
         args = tuple(args)
         names = self._param_names(kind, name)
         forced = {i for i, n in enumerate(names[: len(args)]) if _account_name(n)}
+        if kind == "raw":  # IB's own wall-clock stamp: zeroed, see the module docstring
+            args = tuple(0 if names[i : i + 1] == ("errorTime",) else a for i, a in enumerate(args))
         self._wipe, self._wipe_strings = set(), False
         if name == "managedAccounts":
             for a in args:
@@ -408,14 +652,14 @@ class Redactor:
 
     def leaks_in_text(self, text: str) -> list[tuple[int, int]]:
         """Spans in `text` of a learned id or of the account pattern (OCC symbols excepted)."""
-        spans = [m.span() for m in self._learned_re.finditer(text)] if self._learned_re else []
+        spans = [(a, b) for a, b, _t in self._learned_spans(text)]
         occ = _occ_spans(text)
         spans += [m.span() for m in ACCOUNT_PATTERN.finditer(text) if not _overlaps(m.span(), occ)]
         return spans
 
     def split_candidates(self, text: str) -> list[tuple[int, int]]:
         """Like `leaks_in_text`, but stricter about the pattern: used on joined arguments."""
-        spans = [m.span() for m in self._learned_re.finditer(text)] if self._learned_re else []
+        spans = [(a, b) for a, b, _t in self._learned_spans(text)]
         occ = _occ_spans(text)
         for m in _SPLIT_PATTERN.finditer(text):
             digits = re.sub(r"\D", "", m.group(0))
@@ -486,10 +730,11 @@ class SessionRecorder:
     """An `IbConnection` observer that records the session to `path` (see module docstring).
 
     `clock` is a monotonic seconds clock (inject a fake one in tests). `command` is
-    the command line (redacted like everything else), `port` the port connected to
-    (never the host), `start_utc` an ISO string the caller supplies, `private_values`
-    strings to remove wherever they occur (user name, host name, home folder).
-    Counters: `lines_written`, `failures` (events whose redaction failed or left a
+    the command line, a string or argv (redacted like everything else, paths whole),
+    `port` the port connected to (never the host), `start_utc` an ISO string the caller
+    supplies, `private_values` strings to remove wherever they occur: the caller must
+    pass the user name, the machine name, the home folder and the organisation folder
+    name. Counters: `lines_written`, `failures` (events whose redaction failed or left a
     leak), `write_failures`, `dropped` (events after `close`).
     """
 
@@ -498,7 +743,7 @@ class SessionRecorder:
         path: str | Path,
         *,
         clock: Callable[[], float],
-        command: str = "",
+        command: str | Sequence[str] = "",
         port: int | None = None,
         start_utc: str | None = None,
         private_values: Iterable[str] = (),
@@ -522,9 +767,10 @@ class SessionRecorder:
             "version": FORMAT_VERSION,
             "redaction": REDACTION_VERSION,
             "ibapi": version,
-            "command": self._redactor.scrub(command),
+            "command": self._redactor.scrub_command(command),
             "port": port if type(port) is int else None,
             "start_utc": self._redactor.scrub(start_utc) if isinstance(start_utc, str) else None,
+            "error_time": "zeroed",
         }
         self._write(_json_text(header))
 
@@ -581,9 +827,11 @@ class SessionRecorder:
                 shown_name = "<unknown>"
             marker: str | None = None
             try:
-                body = _json_text(self._redactor.sanitise(kind, str(name), args))
-                if self._redactor.leaks(_JSON_ESCAPE.sub(" ", body)):
+                out = self._redactor.sanitise(kind, str(name), args)
+                if self._redactor.leaks_in_value(out):
                     marker = "<redaction check failed>"
+                else:
+                    body = _json_text(out)
             except Exception as exc:
                 marker = f"<redaction failed: {type(exc).__name__}>"
             if marker is not None:
@@ -609,3 +857,202 @@ def _ibapi_version() -> str:
         return metadata.version("ibapi")
     except metadata.PackageNotFoundError:
         return "unknown"
+
+
+# -- the owner's checker --------------------------------------------------------------
+#
+# Deliberately written apart from `Redactor`: its own patterns, its own notion of a
+# known numeric position. It reports where to look, never what it found.
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One thing a reader should look at. `shown` is at most the first two characters of
+    the matched text and its length; `line` is 1-based, 0 for the file as a whole."""
+
+    line: int
+    reason: str
+    shown: str
+
+
+LONG_RUN_REASON = "run of six or more digits in an unknown position"
+_S_LETTERS_DIGITS = re.compile(r"(?<![A-Za-z])[A-Za-z]++[^A-Za-z0-9]?(?:\d[ .,\-_]?){4,}\d")
+_S_OCC = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,6} *)?\d{6}[CcPp]\d{8}(?![A-Za-z0-9])")
+_S_LONG_DIGITS = re.compile(r"\d{6,}")
+_S_EMAIL = re.compile(r"[\w.+-]@[\w-]")
+_S_IPV4 = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?!\d)")
+_S_IPV6 = re.compile(r"(?<![\w:])[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){1,7}(?![\w:])")
+_S_PATH = re.compile(
+    r"[A-Za-z]:[\\/]|\\\\|(?<![\w/.])/(?:[A-Za-z]|home|users|root|var|tmp|etc|opt|mnt|usr|private)/"
+    r"|(?<![\w.])~[\\/]|(?<![A-Za-z0-9])file:",
+    re.IGNORECASE,
+)
+# Fields the recording format names as numbers, epoch times or prices: a long digit run is expected there.
+_S_NUMERIC_NAMES = frozenset({
+    "seq", "t", "port", "version", "redaction", "__bytes__", "conId", "volume", "wap", "barCount",
+    "date", "time", "currentTime", "headTimestamp", "timestamp", "price", "size", "open", "high",
+    "low", "close", "count", "minTick", "minSize", "sizeIncrement", "suggestedSizeIncrement",
+    "orderId", "reqId", "tickerId", "tickType", "errorCode", "errorTime", "bidSize", "askSize",
+    "lastSize", "volume24Hr", "totalVolume",
+})
+# Fields that carry a date or a date and time as text: eight-digit dates are expected there.
+_S_DATE_NAMES = frozenset({
+    "startDateStr", "endDateStr", "endDateTime", "startDateTime", "tradingHours", "liquidHours",
+    "lastTradeDateOrContractMonth", "lastTradeDate", "contractMonth", "realExpirationDate",
+    "start_utc", "start", "end", "date",
+})
+_S_PLAIN_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+_S_EIGHT_DIGITS = re.compile(r"(?<!\d)\d{8}(?!\d)")
+
+
+def _s_shown(text: str) -> str:
+    n = len(text)
+    head = text[: min(2, n - 1)] if n > 1 else ""
+    return f"{head!r}.. ({n} chars)"
+
+
+def _s_text_findings(
+    text: str, line: int, name: str | None, words: Sequence[str], *, structured: bool,
+) -> list[Finding]:
+    found: list[Finding] = []
+    occ = [m.span() for m in _S_OCC.finditer(text)]
+    for m in _S_LETTERS_DIGITS.finditer(text):
+        if not _overlaps(m.span(), occ):
+            found.append(Finding(line, "letters then five or more digits", _s_shown(m.group(0))))
+    for rx, reason in (
+        (_S_EMAIL, "e-mail address"), (_S_IPV4, "IPv4 address"), (_S_PATH, "path"),
+    ):
+        m = rx.search(text)
+        if m:
+            found.append(Finding(line, reason, _s_shown(m.group(0))))
+    for m6 in _S_IPV6.finditer(text):
+        token = m6.group(0)
+        if "::" in token or token.count(":") >= 7:
+            found.append(Finding(line, "IPv6 address", _s_shown(token)))
+            break
+    if structured:
+        known_number = name in _S_NUMERIC_NAMES
+        for m in _S_LONG_DIGITS.finditer(text):
+            if known_number and _S_PLAIN_NUMBER.fullmatch(text):
+                continue  # the whole string is the number (an epoch, a volume, a conId, a price)
+            if _overlaps(m.span(), occ):
+                continue  # an option symbol in OCC shape
+            if name in _S_DATE_NAMES and len(m.group(0)) == 8 and _S_EIGHT_DIGITS.fullmatch(m.group(0)):
+                continue
+            found.append(Finding(line, LONG_RUN_REASON, _s_shown(m.group(0))))
+    low = text.casefold()
+    for i, word in enumerate(words, 1):
+        if word and word.casefold() in low:
+            found.append(Finding(line, f"caller-supplied word number {i}", _s_shown(word)))
+    return found
+
+
+def _s_walk(
+    value: Any, line: int, name: str | None, words: Sequence[str], depth: int = 0,
+) -> list[Finding]:
+    if depth > 40:
+        return [Finding(line, "nesting too deep to scan", "")]
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, int | float):
+        text = repr(value)
+        if isinstance(value, float):  # IB's "unset" value and tiny fractions have long digit runs
+            text = "" if "e" in text else text.partition(".")[0]
+        if name in _S_NUMERIC_NAMES or not _S_LONG_DIGITS.search(text):
+            return []
+        return [Finding(line, LONG_RUN_REASON, _s_shown(text))]
+    if isinstance(value, str):
+        return _s_text_findings(value, line, name, words, structured=True)
+    out: list[Finding] = []
+    if isinstance(value, list):
+        for v in value:
+            out.extend(_s_walk(v, line, name, words, depth + 1))
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            out.extend(_s_text_findings(str(k), line, None, words, structured=False))
+            out.extend(_s_walk(v, line, k if isinstance(k, str) else None, words, depth + 1))
+    else:
+        out.append(Finding(line, "unexpected JSON value", ""))
+    return out
+
+
+def _s_event_findings(event: dict[str, Any], line: int, words: Sequence[str]) -> list[Finding]:
+    out: list[Finding] = []
+    kind, name, args = event.get("kind"), event.get("name"), event.get("args")
+    if kind not in ("request", "raw") or not isinstance(name, str) or not isinstance(args, list):
+        out.append(Finding(line, "event line without kind, name and argument list", ""))
+    for key in ("seq", "t"):
+        if key in event:
+            out.extend(_s_walk(event[key], line, key, words))
+    if isinstance(name, str):
+        out.extend(_s_text_findings(name, line, None, words, structured=False))
+    if not isinstance(args, list):
+        out.extend(_s_walk(args, line, None, words))
+        return out
+    owner = EWrapper if kind == "raw" else EClient
+    fn = getattr(owner, name, None) if isinstance(name, str) and not name.startswith("_") else None
+    params: list[str] = []
+    if callable(fn):
+        try:
+            params = list(inspect.signature(fn).parameters)[1:]
+        except (TypeError, ValueError):
+            params = []
+    for i, arg in enumerate(args):
+        out.extend(_s_walk(arg, line, params[i] if i < len(params) else None, words))
+    return out
+
+
+def scan_recording(path: str | Path, words: Iterable[str] = ()) -> list[Finding]:
+    """Check a written recording for what must not be in it; an empty list means nothing found.
+
+    Flags, per line, with line number and a short reason (the matched text is never
+    shown in full: at most its first two characters and its length): letters, at most
+    one separator and five or more digits (an OCC option symbol excepted); a run of
+    six or more digits outside the places the format names as numbers (epoch times,
+    conId, prices, volumes, dates); an e-mail address, IP address or path; any of
+    `words` (case-insensitive: user name, machine name, folder names, the account
+    number); any line that is not valid JSON. It fails closed: a file that cannot be
+    read, is not UTF-8, is empty or has no session header is itself a finding.
+
+    It uses its own patterns, not the `Redactor`'s, so a blind spot of the recorder is
+    not shared. The command-line wiring is a later task.
+    """
+    wordlist = [w for w in words if isinstance(w, str)]
+    try:
+        raw = Path(path).read_bytes()
+    except Exception as exc:
+        return [Finding(0, f"file could not be read: {type(exc).__name__}", "")]
+    findings: list[Finding] = []
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        findings.append(Finding(0, "file is not valid UTF-8", ""))
+        text = raw.decode("utf-8", "replace")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        return [*findings, Finding(0, "file is empty", "")]
+    for number, content in enumerate(lines, 1):
+        try:
+            parsed = json.loads(content)
+        except (ValueError, RecursionError):
+            findings.append(Finding(number, "line is not valid JSON", _s_shown(content)))
+            findings.extend(_s_text_findings(content, number, None, wordlist, structured=False))
+            continue
+        if not isinstance(parsed, dict):
+            findings.append(Finding(number, "line is not a JSON object", ""))
+            findings.extend(_s_text_findings(content, number, None, wordlist, structured=False))
+        elif number == 1:
+            if parsed.get("format") != FORMAT_NAME:
+                findings.append(Finding(1, "first line is not a session header", ""))
+            findings.extend(_s_walk(parsed, number, None, wordlist))
+        else:
+            findings.extend(_s_event_findings(parsed, number, wordlist))
+    seen: set[tuple[int, str]] = set()
+    unique: list[Finding] = []
+    for f in findings:
+        if (f.line, f.reason) not in seen:
+            seen.add((f.line, f.reason))
+            unique.append(f)
+    return unique

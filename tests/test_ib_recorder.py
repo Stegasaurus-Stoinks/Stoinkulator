@@ -25,6 +25,7 @@ import pytest
 from ibapi.contract import Contract
 
 from MainStoinker.ib import events
+from MainStoinker.ib import recorder as rmod
 from MainStoinker.ib.client import DataOnlyClient
 from MainStoinker.ib.connection import (
     ConnectionLost,
@@ -34,13 +35,18 @@ from MainStoinker.ib.connection import (
 from MainStoinker.ib.recorder import (
     FORMAT_NAME,
     FORMAT_VERSION,
+    MAX_PATTERN_IDS,
+    MAX_STRING,
     REDACTION_VERSION,
     Redactor,
     SessionRecorder,
+    scan_recording,
 )
 from tests.fake_ib import FakeIbClient, make_bar
 from tests.ib_replay import (
+    Replay,
     ReplayExhausted,
+    ReplayUnavailable,
     handshake_kwargs,
     install,
     load_recording,
@@ -51,6 +57,8 @@ from tests.ib_replay import (
 ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS = ROOT / "tests" / "recordings"
 WAIT = 5.0
+T0 = 1704205800  # epoch seconds of the first fake bar
+SEED = 20241123
 
 
 def acct(prefix: str = "DU", number: int = 7654321) -> str:
@@ -144,10 +152,14 @@ def collect(conn: IbConnection, done: Callable[[list[Any]], bool]) -> list[Any]:
 
 
 def normalise_ids(evs: list[Any]) -> list[Any]:
-    """Replace each request id by the order in which ids first appear."""
+    """Replace each request id by the order in which ids first appear.
+
+    IB's `errorTime` is zeroed by the recorder, so it is zeroed here too."""
     order: dict[int, int] = {}
     out = []
     for ev in evs:
+        if hasattr(ev, "error_time_ms"):
+            ev = dataclasses.replace(ev, error_time_ms=0)
         rid = getattr(ev, "req_id", None)
         if rid is not None and rid >= 0:
             ev = dataclasses.replace(ev, req_id=order.setdefault(rid, len(order) + 1))
@@ -201,7 +213,7 @@ def script_ib(fake: FakeIbClient) -> None:
     def history(req_id: int, c: Contract, *_: Any) -> list[tuple[Any, ...]]:
         if c.symbol == "NOSUCH":
             return [("error", req_id, 1700000003000, 200, "No security definition has been found", "")]
-        bars = [make_bar(1704205800 + 60 * i, 187.0 + i, 187.5 + i, 186.5 + i, 187.2 + i, 100 + i)
+        bars = [make_bar(T0 + 60 * i, 187.0 + i, 187.5 + i, 186.5 + i, 187.2 + i, 100 + i)
                 for i in range(3)]
         return [("historicalData", req_id, b) for b in bars] + [
             ("historicalDataEnd", req_id, "20240102-14:30:00", "20240102-21:00:00")
@@ -374,14 +386,38 @@ def test_recording_round_trips_through_replay(tmp_path: Path) -> None:
     assert first_ids.isdisjoint(second_ids)  # the ids really were rewritten
 
 
+def committed_recorder_files() -> list[Path]:
+    """The recordings, the recorder, and every file under tests/ named for the recorder,
+    replay or recordings (a later task relies on this list covering new files too)."""
+    files = {p for p in RECORDINGS.rglob("*") if p.is_file()}
+    files |= {
+        p for p in (ROOT / "tests").rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts
+        and any(word in p.name for word in ("recorder", "replay", "recording"))
+    }
+    files |= {ROOT / "MainStoinker" / "ib" / "recorder.py", ROOT / "tests" / "ib_replay.py", Path(__file__)}
+    return sorted(files)
+
+
+def test_no_account_pattern_in_committed_recordings() -> None:
+    """The name the issue gives; T17 refers to it."""
+    test_no_account_pattern_in_committed_files()
+
+
+def test_committed_file_list_covers_every_recorder_replay_and_recording_file() -> None:
+    names = {p.name for p in committed_recorder_files()}
+    assert {"recorder.py", "ib_replay.py", "test_ib_recorder.py", "test_ib_recorder_extra.py",
+            "synthetic_history.jsonl"} <= names
+    on_disk = {
+        p.name for p in (ROOT / "tests").rglob("*.py")
+        if any(word in p.name for word in ("recorder", "replay", "recording"))
+    }
+    assert on_disk <= names
+
+
 def test_no_account_pattern_in_committed_files() -> None:
-    files = [p for p in RECORDINGS.rglob("*") if p.is_file()]
+    files = committed_recorder_files()
     assert any(p.name == "synthetic_history.jsonl" for p in files)
-    files += [
-        ROOT / "MainStoinker" / "ib" / "recorder.py",
-        ROOT / "tests" / "ib_replay.py",
-        Path(__file__),
-    ]
     red = Redactor()
     for p in files:
         text = p.read_text(encoding="utf-8")
@@ -430,7 +466,7 @@ def test_synthetic_recording_replays_by_request_id() -> None:
     assert by["HeadTimestamp"].req_id == r_head and by["HeadTimestamp"].timestamp == "345479400"
     bars = [e for e in evs if isinstance(e, events.HistoricalBar)]
     assert [b.req_id for b in bars] == [r_hist] * 3
-    assert [b.volume for b in bars] == [Decimal(12345), Decimal(9876), Decimal(7654)]
+    assert [b.volume for b in bars] == [Decimal("12345"), Decimal("9876"), Decimal("7654")]
     assert by["HistoricalDataEnd"].req_id == r_hist
     errors = [e for e in evs if isinstance(e, events.IbError) and e.code == 200]
     assert [e.req_id for e in errors] == [r_bad]
@@ -521,7 +557,7 @@ def corpus() -> list[tuple[str, str, tuple[Any, ...], bool]]:
         ("farm text", f"Account: {A}; Farm: usfarm"),
         ("underscore prefix", f"acct_{A}"),
         ("glued letters", f"xx{A}yy"),
-        ("glued digits", f"20240102{B}"),
+        ("glued digits", "20240102" + B),
         ("adjacent", f"{A}{B}"),
         ("dash joined", f"{A}-{B}"),
         ("dash inside", f"{A[:2]}-{A[2:]}"),
@@ -553,9 +589,11 @@ def corpus() -> list[tuple[str, str, tuple[Any, ...], bool]]:
     add("split dict values", "custom", ({"p": A[:2], "q": int(dig)},))
     add("only the digits", "error", (-1, 1, 1, f"account number {dig}", ""), True)
     add("digits as int", "custom", ("x", int(dig)), True)
-    add("digits as float", "custom", (float(dig) + 0.5,), True)
+    add("digits as float", "custom", (float(dig),), True)
     add("digits as Decimal", "custom", (Decimal(dig),), True)
-    add("digits inside number", "custom", (int("9" + dig + "9"),), True)
+    add("digits as negative int", "custom", (-int(dig),), True)
+    add("digits as Decimal with zeros", "custom", (Decimal(dig + ".00"),), True)
+    add("digits in a string with a number around them", "custom", (f"9{dig}9",), True)
     return cases
 
 
@@ -652,7 +690,7 @@ def _random_value(rng: random.Random, ids: list[str], depth: int = 0) -> Any:
 
 @pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
 def test_random_structures_leave_no_account_in_the_written_bytes(tmp_path: Path, warm: bool) -> None:
-    rng = random.Random(20241123 + warm)
+    rng = random.Random(SEED + warm)
     for n in range(150):
         ids = [_random_id(rng) for _ in range(rng.randrange(1, 4))]
         rec = SessionRecorder(tmp_path / f"r{n}.jsonl", clock=Clock())
@@ -685,6 +723,7 @@ def test_header_and_line_format(tmp_path: Path) -> None:
     assert header == {
         "format": FORMAT_NAME, "version": 1, "redaction": REDACTION_VERSION, "ibapi": "10.37.2",
         "command": "probe AAPL", "port": 7496, "start_utc": "2026-01-02T03:04:05Z",
+        "error_time": "zeroed",
     }
     assert req == {"seq": 1, "t": 1.0, "kind": "request", "name": "reqCurrentTime", "args": []}
     assert raw == {"seq": 2, "t": 2.0, "kind": "raw", "name": "currentTime", "args": [1700000000]}
@@ -692,7 +731,7 @@ def test_header_and_line_format(tmp_path: Path) -> None:
 
 def test_objects_and_decimals_are_serialised(tmp_path: Path) -> None:
     rec = recorder(tmp_path)
-    rec.on_raw("historicalData", (3, make_bar(1704205800, 1.5, 2.5, 1.0, 2.0, 42)))
+    rec.on_raw("historicalData", (3, make_bar(T0, 1.5, 2.5, 1.0, 2.0, 42)))
     rec.close()
     bar = read_lines(tmp_path / "rec.jsonl")[1]["args"][1]
     assert bar["__class__"] == "BarData" and bar["volume"] == "42" and bar["open"] == 1.5
@@ -872,3 +911,541 @@ def test_normalisation_defeats_look_alike_characters() -> None:
     for variant in (fullwidth(A), "\u200b".join(A), unicodedata.normalize("NFKD", A), A.swapcase()):
         assert A.lower() not in red.scrub(f"id {variant}").lower()
         assert digits_of(A) not in red.scrub(f"id {variant}")
+
+
+# -- fix round (T5 tester findings, issue 118): every input below is built at run time -------------
+
+NAMES = ("Zed", "Quux", "Acme", "Widgets")  # invented, never a real person or organisation
+
+
+def winpath(*parts: str, sep: str = "\\") -> str:
+    return sep.join(parts)
+
+
+def path_forms() -> dict[str, str]:
+    """The same invented home folder in every path style the recorder must consume whole."""
+    tail = ("Zed Quux", "OneDrive - Acme Widgets", "bars", "x.csv")
+    return {
+        "backslash": winpath("C:", "Users", *tail),
+        "forward": winpath("C:", "Users", *tail, sep="/"),
+        "git-bash": winpath("", "c", "Users", *tail, sep="/"),
+        "unc": "\\\\" + winpath("box", "share", *tail),
+        "tilde": winpath("~", *tail, sep="/"),
+        "home": winpath("", "home", *tail, sep="/"),
+        "file-uri": "file:///" + winpath("C:", "Users", *tail, sep="/"),
+    }
+
+
+def text_in_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def gone(text: str, *needles: str) -> bool:
+    return not forbidden_in(text, *needles)
+
+
+def occ(root: str = "AAPL  ", right: str = "C", strike: str = "00220000") -> str:
+    """An option symbol in OCC shape, built from parts (a literal would trip the committed-file scan)."""
+    return root + "240816" + right + strike
+
+
+@pytest.mark.parametrize("style", list(path_forms()))
+def test_a_path_with_spaces_is_consumed_whole_in_error_text(tmp_path: Path, style: str) -> None:
+    path = path_forms()[style]
+    rec = recorder(tmp_path)
+    rec.on_raw("error", (-1, 1, 1, f"cannot open {path} for reading", ""))
+    rec.on_raw("error", (-1, 2, 1, f'cannot open "{path}" now', ""))
+    rec.on_raw("error", (-1, 3, 1, f"cannot open '{path}' now", ""))
+    rec.on_raw("error", (-1, 4, 1, f"{path}", ""))
+    rec.close()
+    lines = read_lines(tmp_path / "rec.jsonl")
+    assert gone(text_in_file(tmp_path / "rec.jsonl"), *NAMES, "bars", "x.csv", "OneDrive")
+    assert lines[1]["args"][3] == "cannot open PATH-REDACTED"  # unquoted: the rest of the line goes too
+    assert lines[2]["args"][3] == 'cannot open "PATH-REDACTED" now'  # quoted: to the closing quote
+    assert lines[3]["args"][3] == "cannot open 'PATH-REDACTED' now"
+    assert lines[4]["args"][3] == "PATH-REDACTED"
+
+
+def test_a_path_ends_at_the_line_or_a_character_windows_paths_cannot_hold() -> None:
+    red = Redactor()
+    path = winpath("C:", "Users", "Zed Quux", "x.csv")
+    assert red.scrub(f"open {path}\nnext line stays") == "open PATH-REDACTED\nnext line stays"
+    assert red.scrub(f"open {path}|then") == "open PATH-REDACTED|then"
+    assert red.scrub(f"open {path}<tag>") == "open PATH-REDACTED<tag>"
+    assert red.scrub(f'open "{path}') == 'open "PATH-REDACTED'  # no closing quote: to the end
+    assert red.scrub(f'File "{path}", line 5') == 'File "PATH-REDACTED", line 5'
+
+
+def test_a_path_in_every_header_command_form_is_never_written_raw(tmp_path: Path) -> None:
+    path = path_forms()["backslash"]
+    forms: list[Any] = [
+        f"fetch --out {path} --days 5",
+        f'fetch --out "{path}" --days 5',
+        ["fetch", "--out", path, "--days", "5"],
+        ["fetch", f"--out={path}", "--days", "5"],
+        ["fetch", winpath("data", "zed quux", "x.csv", sep="/")],
+        f"fetch {winpath('data', 'zed', 'x.csv', sep='/')} --days 5",
+    ]
+    for n, command in enumerate(forms):
+        rec = recorder(tmp_path, f"c{n}.jsonl", command=command)
+        rec.close()
+        header = read_lines(tmp_path / f"c{n}.jsonl")[0]
+        assert gone(header["command"], *NAMES, "bars", "x.csv", "OneDrive", "data"), (n, header["command"])
+        assert header["command"].startswith("fetch ")
+    argv = read_lines(tmp_path / "c2.jsonl")[0]["command"]
+    assert argv == "fetch --out PATH-REDACTED --days 5"  # the other elements are kept
+    assert read_lines(tmp_path / "c3.jsonl")[0]["command"] == "fetch --out=PATH-REDACTED --days 5"
+
+
+def test_private_values_match_case_insensitively_as_substrings_components_and_words(tmp_path: Path) -> None:
+    home = winpath("C:", "Users", "Zed Quux")
+    org = "Acme Widgets - Gorilla"
+    rec = recorder(tmp_path, private_values=[home, org, "BOX-ZQ9"],
+                   command=["probe", "--who", "ZED"])
+    rec.on_raw("error", (-1, 1, 1, "hello zed, QUUX here; acme and WIDGETS and gorilla at box-zq9", ""))
+    rec.on_raw("custom", ({"owner ZedQuux": "zed.quux", "org": "acme_widgets"}, b"quux"))
+    rec.on_raw("error", (-1, 2, 1, "short words stay: al bo", ""))
+    rec.close()
+    text = text_in_file(tmp_path / "rec.jsonl")
+    assert gone(text, "zed", "quux", "acme", "widgets", "gorilla", "box-zq9")
+    assert "short words stay: al bo" in text
+    red = Redactor(private_values=["Al Bo"])
+    assert red.scrub("al bo and al") == "REDACTED and al"  # words of two characters are not removed alone
+
+
+def test_an_address_without_a_dot_and_a_mapped_address_are_whole() -> None:
+    red = Redactor()
+    ip = ".".join(("198", "51", "100", "77"))
+    assert red.scrub("mail zed@mailbox now") == "mail EMAIL-REDACTED now"
+    assert red.scrub(f"peer ::ffff:{ip} gone") == "peer IP-REDACTED gone"
+    assert red.scrub(f"peer 64:ff9b::{ip} gone") == "peer IP-REDACTED gone"
+    assert red.scrub("a@b@c.d") == "EMAIL-REDACTED"
+
+
+SEPARATORS = [" ", ".", ":", "/", " ", ",", "=", "|", "#", "'", '"', "\\", "\t", ";", "(", "+", "*", "-", "_"]
+
+
+@pytest.mark.parametrize("sep", SEPARATORS)
+@pytest.mark.parametrize("letters", ["U", "DU"])
+def test_cold_any_single_separator_between_letters_and_digits(tmp_path: Path, letters: str, sep: str) -> None:
+    digits = digits_of(A)
+    rec = recorder(tmp_path)
+    rec.on_raw("custom", (f"x{letters}{sep}{digits}y", f"{letters}{sep}{digits}"))
+    rec.close()
+    assert gone(text_in_file(tmp_path / "rec.jsonl"), digits)
+
+
+@pytest.mark.parametrize("sep", [" ", "-", ".", ",", "_"])
+def test_cold_separators_inside_the_digits_when_letters_are_present(tmp_path: Path, sep: str) -> None:
+    digits = digits_of(A)
+    rec = recorder(tmp_path)
+    rec.on_raw("custom", ("DU" + digits[:3] + sep + digits[3:], "U " + sep.join(digits)))
+    rec.on_request("custom", ("U" + sep.join((digits[:2], digits[2:4], digits[4:])),))
+    rec.close()
+    text = text_in_file(tmp_path / "rec.jsonl")
+    assert gone(text, digits, digits[:3], digits[3:])
+    for line in text.splitlines()[1:]:
+        assert "ACCOUNT-" in line
+
+
+def test_the_occ_option_symbol_exemption_is_exact() -> None:
+    red = Redactor()
+    for kept in (occ(), occ(root="AAPL ", right="P"), occ(root=""), occ(root="SPY   ", strike="00500000")):
+        assert red.scrub(f"sym {kept} end") == f"sym {kept} end"
+    for changed in (occ(right="X"), occ(strike="0022000"), occ(strike="002200000")):
+        assert "ACCOUNT-" in red.scrub(f"sym {changed} end")
+    assert red.known_accounts >= 1
+
+
+def test_the_cold_pattern_over_redacts_a_short_code_before_a_long_number() -> None:
+    """Accepted by the owner: a letter, one separator and five digits is taken for an id."""
+    assert Redactor().scrub("v" + " " + "12345") == "ACCOUNT-1"
+
+
+def test_regexes_only_ever_see_strings_below_the_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Item 4: the cost of one string is bounded because nothing longer reaches a pattern."""
+    seen: list[int] = []
+
+    class Spy:
+        def __init__(self, rx: Any) -> None:
+            self.rx = rx
+
+        def __getattr__(self, name: str) -> Any:
+            method = getattr(self.rx, name)
+
+            def call(*a: Any, **kw: Any) -> Any:
+                seen.append(max((len(x) for x in a if isinstance(x, str)), default=0))
+                return method(*a, **kw)
+            return call
+
+    for name in ("_EMAIL", "_IPV4", "_IPV4_MAPPED", "_IPV6", "_PATH_START", "_PATH_STOP", "ACCOUNT_PATTERN",
+                 "_OCC", "_SPLIT_PATTERN", "_PATHLIKE_TOKEN"):
+        monkeypatch.setattr(rmod, name, Spy(getattr(rmod, name)))
+    huge = "a" * (2 * 1024 * 1024)
+    rec = recorder(tmp_path, private_values=["zed"])
+    rec.on_raw("custom", (huge, huge.encode(), {huge: huge}, "short"))
+    rec.on_request("custom", ([huge, "x@" + huge],))
+    rec.close()
+    lines = read_lines(tmp_path / "rec.jsonl")
+    assert lines[1]["args"][0] == "<omitted: 2048 KiB>"
+    assert lines[1]["args"][1] == {"__bytes__": len(huge), "text": "<omitted: 2048 KiB>"}
+    assert lines[1]["args"][3] == "short" and rec.failures == 0
+    assert seen and max(seen) <= MAX_STRING
+    assert len(text_in_file(tmp_path / "rec.jsonl")) < 4096
+
+
+def test_a_string_at_the_cap_is_still_redacted_and_one_over_it_is_replaced() -> None:
+    red = Redactor()
+    pad = "a" * (MAX_STRING - 20)
+    assert red.scrub(f"{pad} zed@mailbox").endswith("EMAIL-REDACTED")
+    assert red.scrub(pad + " " * 100) == f"<omitted: {(MAX_STRING + 80) // 1024} KiB>"
+
+
+def test_the_email_pattern_starts_only_at_the_beginning_of_a_run_and_never_backtracks() -> None:
+    """Linear by construction: a lookbehind keeps every start at a run's first character and
+    the possessive quantifiers never give characters back. (The step-bound test above shows
+    no pattern sees more than the cap.)"""
+    pattern = rmod._EMAIL.pattern
+    assert pattern.startswith("(?<![") and "++" in pattern and "*+" in pattern
+    worst = ["a" * 60000, "a." * 30000, "a@" * 30000, "@" * 60000, ("a" * 63 + "@") * 900, "1" * 60000]
+    red = Redactor()
+    for text in worst:
+        assert len(red.scrub(text)) <= len(text) + 100  # completes, and never grows
+
+
+def test_learning_is_capped_for_pattern_hits_and_never_drops_named_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sizes: list[int] = []
+    real = rmod._compile_ids
+
+    def counting(ids: Any) -> Any:
+        ids = list(ids)
+        sizes.append(len(ids))
+        return real(ids)
+
+    monkeypatch.setattr(rmod, "_compile_ids", counting)
+    rec = recorder(tmp_path)
+    rng = random.Random(77)
+    letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    ids = ["".join(rng.choice(letters) for _ in range(2)) + f"{rng.randrange(10**6, 10**7)}"
+           for _ in range(3 * MAX_PATTERN_IDS)]
+    for n, one in enumerate(ids):
+        rec.on_raw("error", (-1, n, 1, f"seen {one}", ""))
+    first_core = acct("DU", 1122334)
+    rec.on_raw("managedAccounts", (first_core,))
+    rec.on_raw("custom", ({"accountName": acct("DU", 4433221)},))
+    rec.on_raw("error", (-1, 0, 1, f"after {first_core.lower()} and {digits_of(first_core)}", ""))
+    rec.close()
+    red = rec._redactor
+    assert red._pattern_learned == MAX_PATTERN_IDS
+    assert max(sizes) <= 32 + 2  # one id and its digit run join a small pattern, never a giant one
+    assert len(sizes) <= MAX_PATTERN_IDS + 4  # at most one small recompile per learned id
+    assert digits_of(first_core) in red._digit_set and acct("DU", 4433221) .upper() in red._alias
+    text = text_in_file(tmp_path / "rec.jsonl")
+    assert gone(text, *[digits_of(i) for i in ids], digits_of(first_core))  # all still redacted by shape
+    assert rec.failures == 0
+
+
+def test_a_long_run_of_learned_ids_across_many_small_patterns_matches_the_same_text() -> None:
+    red = Redactor()
+    named = [acct("DU", 1000000 + n * 7919) for n in range(100)]
+    red.sanitise("raw", "managedAccounts", (",".join(named),))
+    assert len(red._tiers) >= 3
+    text = " and ".join(n.lower() for n in named) + " and " + digits_of(named[-1])
+    out = red.scrub(text)
+    assert gone(out, *named, digits_of(named[-1])) and out.count("ACCOUNT-") == 101
+
+
+def test_the_split_check_and_the_final_check_do_not_blank_a_coincidence(tmp_path: Path) -> None:
+    """A conId, an epoch and a volume that contain a learned digit run stay readable and replayable."""
+    run = digits_of(A)
+    rec = recorder(tmp_path)
+    rec.on_raw("managedAccounts", (A,))
+    rec.on_request("reqHistoricalData", (9, contract(), "", "1 D", "1 min", "TRADES", 1, 2, False, []))
+    con = contract()
+    con.conId = int("1" + run)
+    rec.on_raw("historicalData", (9, make_bar(T0, 1.0, 2.0, 0.5, 1.5, int("3" + run) + 1)))
+    rec.on_raw("contractDetails", (9, con))
+    rec.close()
+    assert rec.failures == 0
+    recording = load_recording(tmp_path / "rec.jsonl")
+    assert recording.problems == []
+    bar = decode_event(recording, "historicalData")[1]
+    assert bar.date == str(T0) and bar.volume == Decimal(int("3" + run) + 1)
+    assert decode_event(recording, "contractDetails")[1].conId == int("1" + run)
+
+
+def decode_event(recording: Any, name: str) -> tuple[Any, ...]:
+    from tests.ib_replay import decode_callback
+
+    return decode_callback(next(e for e in recording.raw_events() if e.name == name))
+
+
+# -- replay robustness (item 5) ------------------------------------------------------------------------
+
+
+def synthetic_lines() -> list[str]:
+    return text_in_file(RECORDINGS / "synthetic_history.jsonl").splitlines()
+
+
+def line_with(lines: list[str], needle: str) -> int:
+    return next(i for i, ln in enumerate(lines) if needle in ln)
+
+
+def test_a_marker_for_a_request_marks_that_request_unreplayable() -> None:
+    lines = synthetic_lines()
+    i = line_with(lines, '"reqHeadTimeStamp"')
+    event = json.loads(lines[i])
+    event["args"] = "<redaction failed: RuntimeError>"
+    lines[i] = json.dumps(event)
+    rec = parse_recording("\n".join(lines))
+    assert [(p.line, p.method) for p in rec.problems] == [(i + 1, "reqHeadTimeStamp")]
+    assert "RuntimeError" in rec.problems[0].reason
+    replay = Replay(rec)
+    with pytest.raises(ReplayUnavailable, match="reqHeadTimeStamp.*RuntimeError"):
+        replay.handler("reqHeadTimeStamp")(2, contract(), "TRADES", 1, 2)
+    whole = Replay(parse_recording("\n".join(synthetic_lines()))).remaining()
+    assert replay.remaining() == whole - 1  # the others can still be asked
+
+
+def test_a_marker_for_a_callback_marks_the_latest_request_unreplayable() -> None:
+    lines = synthetic_lines()
+    i = line_with(lines, '"name":"historicalData"')
+    event = json.loads(lines[i])
+    event["args"] = "<redaction check failed>"
+    lines[i] = json.dumps(event)
+    rec = parse_recording("\n".join(lines))
+    bad = [r for r in rec.requests if r.problem]
+    assert [r.method for r in bad] == ["reqHistoricalData"] and len(rec.problems) == 1
+    good = Replay(rec)
+    with pytest.raises(ReplayUnavailable, match="check failed"):
+        good.handler("reqHistoricalData")(41, contract(), "20240102-21:00:00", "1 D", "1 min", "TRADES", 1, 2,
+                                          False, [])
+
+
+def test_a_torn_last_line_marks_the_last_request_and_the_rest_replays() -> None:
+    text = text_in_file(RECORDINGS / "synthetic_history.jsonl")
+    rec = parse_recording(text[:-30])
+    assert [p.reason for p in rec.problems] == ["torn last line"]
+    assert rec.requests[-1].problem == "torn last line"
+    assert all(r.problem is None for r in rec.requests[:-1])
+    assert len(rec.events) == len(synthetic_lines()) - 2  # header and the torn line are not events
+
+
+@pytest.mark.parametrize("what", ["volume", "high", "barCount", "wap", "open"])
+def test_a_value_redacted_inside_a_number_or_a_bar_skips_that_request_only(what: str) -> None:
+    lines = synthetic_lines()
+    i = line_with(lines, '"name":"historicalData"')
+    event = json.loads(lines[i])
+    bar = event["args"][1]
+    bar[what] = "ACCOUNT-1"
+    lines[i] = json.dumps(event)
+    rec = parse_recording("\n".join(lines))
+    assert [p.method for p in rec.problems] == ["reqHistoricalData"]
+    assert "redacted" in rec.problems[0].reason
+    replay = Replay(rec)
+    handler = replay.handler("reqHistoricalData")
+    with pytest.raises(ReplayUnavailable, match="redacted"):
+        handler(5, contract(), "20240102-21:00:00", "1 D", "1 min", "TRADES", 1, 2, False, [])
+    # the other recorded request of that method (the NOSUCH error) is still there
+    assert handler(6, contract("NOSUCH"), "20240102-21:00:00", "1 D", "1 min", "TRADES", 1, 2, False, [])
+
+
+def test_a_wiped_number_argument_is_reported_not_replayed() -> None:
+    lines = synthetic_lines()
+    i = line_with(lines, '"name":"historicalDataEnd"')
+    event = json.loads(lines[i])
+    event["args"][0] = "<redacted>"  # the request id wiped by the split-id check
+    lines[i] = json.dumps(event)
+    rec = parse_recording("\n".join(lines))
+    assert any("reqId is text" in p.reason for p in rec.problems)
+
+
+def test_an_unreadable_middle_line_is_reported_and_a_bad_header_still_raises() -> None:
+    lines = synthetic_lines()
+    lines.insert(8, "{not json")
+    rec = parse_recording("\n".join(lines))
+    assert [p.reason for p in rec.problems] == ["line is not a readable event"]
+    assert rec.problems[0].line == 9
+    with pytest.raises(ValueError):
+        parse_recording("{not json\n" + "\n".join(lines[1:]))
+
+
+def test_replay_of_an_unreplayable_request_through_a_real_connection_names_the_reason() -> None:
+    lines = synthetic_lines()
+    i = line_with(lines, '"name":"contractDetails"')
+    event = json.loads(lines[i])
+    event["args"][1]["contract"]["conId"] = "ACCOUNT-1"
+    lines[i] = json.dumps(event)
+    rec = parse_recording("\n".join(lines))
+    holder: dict[str, Replay] = {}
+
+    def setup(fake: FakeIbClient) -> None:
+        holder["replay"] = install(fake, rec)
+
+    with session(fake_kw=handshake_kwargs(rec), setup=setup) as (conn, _f):
+        rid = conn.next_request_id()
+        with pytest.raises(ReplayUnavailable, match="conId"):
+            conn.request("reqContractDetails", rid, contract())
+    holder["replay"].remaining()
+
+
+# -- scan_recording (item 8) ---------------------------------------------------------------------------
+
+
+def write_recording(tmp_path: Path, *events: dict[str, Any], header: dict[str, Any] | None = None,
+                    raw_lines: list[str] | None = None, name: str = "scan.jsonl") -> Path:
+    head = header if header is not None else {"format": FORMAT_NAME, "version": 1, "redaction": 2,
+                                              "ibapi": "10.37.2", "command": "x", "port": 7497,
+                                              "start_utc": None, "error_time": "zeroed"}
+    lines = [json.dumps(head)] + [json.dumps(e) for e in events] + (raw_lines or [])
+    path = tmp_path / name
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def ev(seq: int, name: str, *args: Any, kind: str = "raw") -> dict[str, Any]:
+    return {"seq": seq, "t": 0.5, "kind": kind, "name": name, "args": list(args)}
+
+
+LETTERS = "letters then five or more digits"
+LONG_RUN = "run of six or more digits in an unknown position"
+
+
+def reasons(findings: list[Any]) -> list[str]:
+    return [f.reason for f in findings]
+
+
+def test_scan_accepts_the_committed_synthetic_recording_and_a_real_recorder_session(tmp_path: Path) -> None:
+    assert scan_recording(RECORDINGS / "synthetic_history.jsonl") == []
+    rec = recorder(tmp_path, command="probe AAPL", port=7497)
+    with session(observers=(rec,), fake_kw={"managed_accounts": A}, setup=script_ib) as (conn, _f):
+        run_requests(conn)
+    rec.close()
+    assert scan_recording(tmp_path / "rec.jsonl", words=["probe-not-present"]) == []
+
+
+@pytest.mark.parametrize("sep", ["", " ", ".", ":", "/", " ", ",", "=", "|", "-"])
+def test_scan_flags_letters_a_separator_and_five_digits(tmp_path: Path, sep: str) -> None:
+    digits = digits_of(A)
+    path = write_recording(tmp_path, ev(1, "error", -1, 0, 1, f"note DU{sep}{digits}", ""))
+    found = scan_recording(path)
+    assert reasons(found) == [LETTERS, LONG_RUN] and found[0].line == 2
+    assert digits not in repr(found) and found[0].shown.startswith("'DU")
+    assert f"({len('DU' + sep + digits)} chars)" in found[0].shown
+
+
+def test_scan_flags_letters_with_a_separator_inside_the_digits_and_exempts_only_occ(tmp_path: Path) -> None:
+    digits = digits_of(A)
+    path = write_recording(
+        tmp_path,
+        ev(1, "error", -1, 0, 1, "DU" + digits[:3] + " " + digits[3:], ""),
+        ev(2, "error", -1, 0, 1, "sym " + occ() + " end", ""),
+        ev(3, "error", -1, 0, 1, "sym " + occ(right="X") + " end", ""),
+    )
+    assert [(f.line, f.reason) for f in scan_recording(path)] == [
+        (2, LETTERS), (4, LETTERS), (4, LONG_RUN),  # the OCC symbol on line 3 is exempt from both
+    ]
+
+
+def test_scan_flags_long_digit_runs_only_outside_the_known_numeric_positions(tmp_path: Path) -> None:
+    bar = {"__class__": "BarData", "date": str(T0), "open": 1.5, "volume": "1234567", "wap": "187.123456",
+           "barCount": 1000000}
+    con = {"__class__": "Contract", "conId": 265598, "symbol": "AAPL"}
+    path = write_recording(
+        tmp_path,
+        ev(1, "historicalData", 3, bar),
+        ev(2, "contractDetails", 3, {"__class__": "ContractDetails", "contract": con,
+                                     "tradingHours": "20240102:0400-20240102:2000"}),
+        ev(3, "currentTime", T0),
+        ev(4, "headTimestamp", 2, "345479400"),
+        ev(5, "custom", 1234567),
+        ev(6, "custom", {"note": "76" + "54321"}),
+        ev(7, "error", -1, 0, 1, "123456" + "789", ""),
+    )
+    found = scan_recording(path)
+    assert sorted({f.line for f in found}) == [6, 7, 8]
+    assert all(f.reason == LONG_RUN for f in found if f.line in (6, 7))
+    assert len(found) >= 3
+
+
+def test_scan_flags_addresses_emails_paths_and_caller_words(tmp_path: Path) -> None:
+    ip = ".".join(("198", "51", "100", "77"))
+    path = write_recording(
+        tmp_path,
+        ev(1, "error", -1, 0, 1, f"peer {ip} gone", ""),
+        ev(2, "error", -1, 0, 1, "mail zed@mailbox", ""),
+        ev(3, "error", -1, 0, 1, "see " + winpath("C:", "Users", "x"), ""),
+        ev(4, "error", -1, 0, 1, "see " + winpath("", "home", "x", sep="/"), ""),
+        ev(5, "error", -1, 0, 1, "peer fe80::1 gone", ""),
+        ev(6, "error", -1, 0, 1, "peer ::ffff:" + ip, ""),
+        ev(7, "error", -1, 0, 1, "Hello ZedQuux", ""),
+        ev(8, "custom", {"Machine-Name": 1}),
+        header={"format": FORMAT_NAME, "version": 1, "command": "run on ACME-BOX", "port": 7497},
+    )
+    found = scan_recording(path, words=["zedquux", "machine-name", "acme-box"])
+    assert {(f.line, f.reason) for f in found} >= {  # an event is on line number + 1
+        (1, "caller-supplied word number 3"), (2, "IPv4 address"), (3, "e-mail address"), (4, "path"),
+        (5, "path"), (6, "IPv6 address"), (7, "IPv6 address"), (8, "caller-supplied word number 1"),
+        (9, "caller-supplied word number 2"),
+    }
+    for f in found:
+        assert ip not in f.shown and "ZedQuux" not in f.shown and len(f.shown) < 40
+
+
+def test_scan_never_shows_more_than_two_characters_and_a_length(tmp_path: Path) -> None:
+    secret = "Zebra" + "Crossing"
+    path = write_recording(tmp_path, ev(1, "custom", {"k": f"hello {secret} ab q"}))
+    for f in scan_recording(path, words=[secret, "ab", "q"]):
+        assert secret not in f.shown and "hello" not in f.shown
+    shown = {f.reason: f.shown for f in scan_recording(path, words=[secret, "ab", "q"])}
+    assert shown["caller-supplied word number 1"] == f"'Ze'.. ({len(secret)} chars)"
+    assert shown["caller-supplied word number 2"] == "'a'.. (2 chars)"
+    assert shown["caller-supplied word number 3"] == "''.. (1 chars)"
+
+
+def test_scan_fails_closed_on_unreadable_and_broken_files(tmp_path: Path) -> None:
+    missing = scan_recording(tmp_path / "missing.jsonl")
+    assert reasons(missing) == ["file could not be read: FileNotFoundError"]
+    empty = tmp_path / "empty.jsonl"
+    empty.write_bytes(b"")
+    assert reasons(scan_recording(empty)) == ["file is empty"]
+    binary = tmp_path / "bin.jsonl"
+    binary.write_bytes(b"\xff\xfe\x00 not utf-8")
+    assert "file is not valid UTF-8" in reasons(scan_recording(binary))
+    assert "line is not valid JSON" in reasons(scan_recording(binary))
+    torn = text_in_file(RECORDINGS / "synthetic_history.jsonl")[:-25]
+    (tmp_path / "torn.jsonl").write_text(torn, encoding="utf-8")
+    assert [f.reason for f in scan_recording(tmp_path / "torn.jsonl")] == ["line is not valid JSON"]
+    odd = write_recording(tmp_path, raw_lines=["[1, 2]", "", "7"], name="odd.jsonl")
+    assert reasons(scan_recording(odd)).count("line is not a JSON object") == 2
+    assert "line is not valid JSON" in reasons(scan_recording(odd))  # the blank line in the middle
+    no_header = tmp_path / "nohead.jsonl"
+    no_header.write_text(json.dumps(ev(1, "custom")) + "\n", encoding="utf-8")
+    assert "first line is not a session header" in reasons(scan_recording(no_header))
+    weird = {"seq": 1, "t": 0.5, "kind": "weird", "name": "x", "args": 5}
+    bad_event = write_recording(tmp_path, weird, name="e.jsonl")
+    assert "event line without kind, name and argument list" in reasons(scan_recording(bad_event))
+
+
+def test_scan_still_reads_text_in_a_line_that_is_not_valid_json(tmp_path: Path) -> None:
+    digits = digits_of(A)
+    path = write_recording(tmp_path, raw_lines=['{"seq": 2, "args": ["DU' + digits + '"'], name="cut.jsonl")
+    found = scan_recording(path)
+    assert reasons(found) == ["line is not valid JSON", "letters then five or more digits"]
+    assert all(digits not in f.shown for f in found)
+
+
+def test_scan_does_not_use_the_redactors_patterns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blind spot in the Redactor's rules must not blind the checker too."""
+    digits = digits_of(A)
+    path = write_recording(tmp_path, ev(1, "error", -1, 0, 1, "xx" + digits, ""))
+    monkeypatch.setattr(rmod, "ACCOUNT_PATTERN", rmod.re.compile("(?!)"))
+    monkeypatch.setattr(rmod, "_OCC", rmod.re.compile("(?!)"))
+    assert reasons(scan_recording(path)) == [LETTERS, LONG_RUN]
+
+
+def test_scan_runs_on_a_two_megabyte_line_through_linear_patterns(tmp_path: Path) -> None:
+    path = write_recording(tmp_path, ev(1, "custom", "a" * 1_000_000, ["b."] * 500_000), name="big.jsonl")
+    assert scan_recording(path) == []
