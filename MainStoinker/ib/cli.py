@@ -34,6 +34,17 @@ is written by `SessionRecorder`, which removes account numbers and the private w
 built here (user name, machine name, home folder, cloud-sync folder names). After the run
 the file is checked with `scan_recording`; read it yourself before it is ever committed.
 
+Paper mode (`--paper`, both commands): a mode in which the command itself guarantees it only
+ever talks to a paper account. It is refused, before any connection object is built, unless
+the port is exactly 7497 (the default with `--paper`; 4002, 7496 and 4001 are refused even
+with `STOINK_ALLOW_LIVE_PORT` set), the host is exactly 127.0.0.1, and the environment does
+not contain `STOINK_ALLOW_LIVE_PORT` at all (`paper_refusal`). The connection is built with
+`require_paper=True`, and right after `open()` and before the first request the command checks
+`paper_verified` (`paper_session_ok`). A session that is not a verified paper session ends
+with its own exit code (5 for `fetch-bars`, 4 for `probe-data`), is never retried, and no
+account id is printed. Any other exception from `open()` is fatal in paper mode (no retry).
+Without `--paper` nothing here changes.
+
 Exit codes: see `EXIT_CODES_TEXT` (shown by `--help`).
 """
 
@@ -63,6 +74,7 @@ from MainStoinker.ib.connection import (
     ClientIdRefused,
     ConnectFailed,
     IbConnection,
+    NotPaperSession,
 )
 from MainStoinker.ib.fetch import (
     FetchEstimate,
@@ -83,16 +95,21 @@ EXIT_FAILED = 1
 EXIT_REFUSED = 2
 EXIT_NO_CONNECTION = 3
 EXIT_STOPPED = 4
+EXIT_NOT_PAPER_FETCH = 5
+EXIT_NOT_PAPER_PROBE = 4
 EXIT_INTERRUPTED = 130
 
 EXIT_CODES_TEXT = """\
 exit codes:
   0    complete: every day of every symbol is ok, no data (holiday) or already done
   1    finished, but some day failed or a symbol was not fetched (manifest, contract)
-  2    refused: console gate, port guard, bad arguments, unusable path, bad folder layout
+  2    refused: console gate, port guard, bad arguments, unusable path, bad folder layout,
+       or --paper conditions not met (port, host, STOINK_ALLOW_LIVE_PORT set)
   3    could not connect to TWS or IB Gateway
   4    stopped early: connection lost, pacing violation twice, or a fatal fault;
        what was finished is on disk, run the same command again to resume
+  5    --paper only: the account TWS is signed into is not a paper account; nothing was
+       requested; never retry
   130  interrupted with Ctrl-C (the connection and the recording were closed)
 """
 
@@ -100,10 +117,19 @@ PROBE_EXIT_CODES_TEXT = """\
 exit codes:
   0    every step was done (delayed data is still a success)
   1    connected, but a step failed (including NO data for a symbol)
-  2    refused: console gate, port guard, bad arguments, unusable path
+  2    refused: console gate, port guard, bad arguments, unusable path,
+       or --paper conditions not met (port, host, STOINK_ALLOW_LIVE_PORT set)
   3    could not connect to TWS or IB Gateway
+  4    --paper only: the account TWS is signed into is not a paper account; nothing was
+       requested; never retry
   130  interrupted with Ctrl-C (the connection and the recording were closed)
 """
+PAPER_PORT = 7497
+PAPER_HOST = "127.0.0.1"
+PAPER_MODE_LINE = f"paper mode: port {PAPER_PORT}, account check on"
+NOT_PAPER_LINE = ("The account TWS is signed into is not a paper account. Nothing was requested. "
+                  "Not retried.")
+NOT_PAPER_LABEL = "not a paper account, nothing was requested"
 FETCH_BARS = "fetch-bars"
 PROBE_DATA = "probe-data"
 PROBE_MAX_SYMBOLS = 5
@@ -179,10 +205,21 @@ def _iso_date(text: str) -> date:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _add_connection_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--port", type=int, required=True, help="TWS or Gateway API port (no default)")
-    parser.add_argument("--host", default="127.0.0.1")
+def _add_connection_arguments(parser: argparse.ArgumentParser, paper: bool = False) -> None:
+    parser.add_argument("--port", type=int, required=not paper,
+                        help=f"TWS or Gateway API port (no default; with --paper: {PAPER_PORT})")
+    parser.add_argument("--host", default=PAPER_HOST)
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
+    parser.add_argument("--paper", action="store_true",
+                        help=f"paper mode: only port {PAPER_PORT} on {PAPER_HOST} and with "
+                             f"{ALLOW_LIVE_ENV} not set in the environment; the account list IB "
+                             "sends must show a paper account before anything is requested "
+                             "(else exit code, see below; never retried)")
+
+
+def _wants_paper(argv: Sequence[str] | None) -> bool:
+    """True when the exact token `--paper` is in `argv` (only decides if `--port` may be left out)."""
+    return "--paper" in (sys.argv[1:] if argv is None else argv)
 
 
 def _add_record_arguments(parser: argparse.ArgumentParser) -> None:
@@ -196,6 +233,8 @@ def _add_record_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _check_connection_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.port is None:  # only possible with --paper
+        args.port = PAPER_PORT
     if not 1 <= args.port <= 65535:
         parser.error("--port must be 1 to 65535")
     if not 1 <= args.client_id <= MAX_CLIENT_ID or args.client_id in REFUSED_CLIENT_IDS:
@@ -204,9 +243,10 @@ def _check_connection_arguments(parser: argparse.ArgumentParser, args: argparse.
         parser.error(f"--connect-timeout must be above 0 and at most {MAX_CONNECT_TIMEOUT:g}")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(paper: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m MainStoinker fetch-bars",
+        allow_abbrev=False,  # `--paper` is matched exactly, here and in `_wants_paper`
         description=(
             "Owner-run: download 1-minute regular-hours bars through TWS or IB Gateway into "
             "one CSV file per symbol per month, resuming where an earlier run stopped. Sends "
@@ -222,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="tickers, comma or space separated, e.g. AAPL,MSFT,TSLA")
     parser.add_argument("--start", type=_iso_date, required=True, metavar="YYYY-MM-DD")
     parser.add_argument("--end", type=_iso_date, required=True, metavar="YYYY-MM-DD")
-    _add_connection_arguments(parser)
+    _add_connection_arguments(parser, paper)
     parser.add_argument("--out", default=None, metavar="DIR",
                         help=r"bars folder (default %%USERPROFILE%%\Stoinkulator\bars; "
                              "not in the repo or OneDrive)")
@@ -235,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = build_parser()
+    parser = build_parser(_wants_paper(argv))
     args = parser.parse_args(argv)
     names: list[str] = []
     for chunk in args.symbols:
@@ -262,9 +302,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
-def build_probe_parser() -> argparse.ArgumentParser:
+def build_probe_parser(paper: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m MainStoinker probe-data",
+        allow_abbrev=False,
         description=(
             "Owner-run: find out what market data this account gets. Connects, reads the "
             "data farms and IB's clock, resolves each symbol, streams quotes (live first, "
@@ -274,7 +315,7 @@ def build_probe_parser() -> argparse.ArgumentParser:
         epilog=PROBE_EXIT_CODES_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_connection_arguments(parser)
+    _add_connection_arguments(parser, paper)
     parser.add_argument("--symbols", default="AAPL", metavar="A,B",
                         help=f"tickers, comma separated, at most {PROBE_MAX_SYMBOLS} (default AAPL)")
     parser.add_argument("--quote-seconds", type=float, default=PROBE_QUOTE_SECONDS, metavar="S",
@@ -286,7 +327,7 @@ def build_probe_parser() -> argparse.ArgumentParser:
 
 
 def parse_probe_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = build_probe_parser()
+    parser = build_probe_parser(_wants_paper(argv))
     args = parser.parse_args(argv)
     names: list[str] = []
     for raw in args.symbols.split(","):
@@ -542,6 +583,33 @@ def gate(args: argparse.Namespace, stdin: TextIO, input_fn: Callable[[str], str]
     return True
 
 
+def paper_refusal(host: str, port: int, env: Mapping[str, str]) -> str | None:
+    """Why `--paper` is refused (None when allowed): the port must be exactly 7497, the host exactly
+    127.0.0.1, and `STOINK_ALLOW_LIVE_PORT` must not be in `env` at all (any value, even empty)."""
+    reasons: list[str] = []
+    if type(port) is not int or port != PAPER_PORT:
+        reasons.append(f"--paper allows only port {PAPER_PORT} (not {port}; no other port, "
+                       "not even a paper Gateway port, whatever the environment says)")
+    if host != PAPER_HOST:
+        reasons.append(f"--paper allows only the host {PAPER_HOST} (not {host!r})")
+    if ALLOW_LIVE_ENV in env:
+        reasons.append(f"{ALLOW_LIVE_ENV} is set in this environment; unset it for a --paper run")
+    if not reasons:
+        return None
+    return "Refused (--paper): " + "; ".join(reasons) + ". Nothing was started."
+
+
+def paper_session_ok(conn: IbConnection, say: _Say) -> bool:
+    """Right after `open()` and before the first request: True only when `paper_verified` is True.
+
+    Otherwise says one line, without any account id, and the caller closes and stops.
+    """
+    if conn.paper_verified is True:
+        return True
+    say(NOT_PAPER_LINE)
+    return False
+
+
 def port_refusal_text(exc: Exception) -> str:
     return (
         f"{exc}\n"
@@ -688,7 +756,18 @@ _LABELS = {
 }
 
 
-def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: list[str]) -> int | None:
+class _OpenFailed(Exception):
+    """In paper mode, `open()` raised something other than the known connect failures."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+
+
+OPEN_FAILED_LABEL = "the connection attempt failed unexpectedly, nothing was requested"
+
+
+def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: list[str],
+            paper: bool = False, not_paper_exit: int = EXIT_NOT_PAPER_FETCH) -> int | None:
     """None when connected, else the exit code (and the advice for the cause)."""
     say(f"Connecting to TWS at {args.host}:{args.port} (client id {args.client_id}, 2 attempts, "
         f"{args.connect_timeout:g} s each; TWS may ask you to accept the connection) ...")
@@ -697,6 +776,11 @@ def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: li
     except (BrokerPortRefused, ClientIdRefused, BrokerConnectionRefusedHere) as exc:
         say(f"REFUSED: {exc}")
         return EXIT_REFUSED
+    except NotPaperSession:
+        if not paper:
+            raise  # not expected without --paper: reported by the session as unexpected
+        say(NOT_PAPER_LINE)  # never the exception text, never retried
+        return not_paper_exit
     except ConnectFailed as exc:
         for failure in exc.failures:
             say(f"  {failure.describe()}")
@@ -704,6 +788,8 @@ def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: li
         advice.append(ADVICE_CLIENT_ID if isinstance(exc, ClientIdInUse) else ADVICE_CONNECT)
         return EXIT_NO_CONNECTION
     except Exception as exc:  # noqa: BLE001 - reported, not a traceback
+        if paper:
+            raise _OpenFailed(exc) from exc  # fatal in paper mode: never retried
         say(f"Could not connect: {type(exc).__name__}: {exc}")
         advice.append(ADVICE_CONNECT)
         return EXIT_NO_CONNECTION
@@ -777,32 +863,51 @@ def run_session(
     holds only the header, so this run deletes the file it made. Returns the exit code.
     """
     say = _Say(out)
+    paper = getattr(args, "paper", False) is True
+    not_paper_exit = getattr(args, "not_paper_exit", EXIT_NOT_PAPER_FETCH)
+    labels = {**kind.labels, not_paper_exit: NOT_PAPER_LABEL} if paper else kind.labels
     try:
         recorder = recorder_factory(args)
     except (OSError, PathRefused) as exc:
         say(f"Cannot start the session recording: {type(exc).__name__}: {exc}")
-        say(f"Result: {kind.labels[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
+        say(f"Result: {labels[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
         return EXIT_REFUSED
     conn: IbConnection | None = None
     code = kind.unexpected
     advice: list[str] = []
     not_connected = False
+    verified = False
+    open_failed = False
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
-        refused = _connect(say, conn, args, advice)
+        refused = _connect(say, conn, args, advice, paper, not_paper_exit)
         if refused is not None:
             code = refused
             not_connected = True
+        elif paper and not paper_session_ok(conn, say):  # before the market data client, before any request
+            code = not_paper_exit
         else:
+            verified = paper
             code = body(say, conn, market_data_factory(conn), advice)
     except KeyboardInterrupt:
         say()
         say(kind.interrupted)
         code = EXIT_INTERRUPTED
+    except _OpenFailed as exc:
+        say(f"Unexpected {exc}")
+        say("The connection attempt failed unexpectedly. Nothing was requested. Not retried.")
+        code = kind.unexpected
+        open_failed = True
     except Exception as exc:  # noqa: BLE001 - reported with the exit code, not a traceback
         say(f"Unexpected {type(exc).__name__}: {exc}")
         code = kind.unexpected
     finally:
+        if verified and conn is not None and conn.paper_verified is not True:
+            # the account list failed after READY: whatever the body saw, this is the result
+            say(NOT_PAPER_LINE)
+            code = not_paper_exit
+            verified = False
+            advice.clear()
         if conn is not None:
             try:
                 conn.close()
@@ -823,7 +928,8 @@ def run_session(
             findings = scan_recording(args.record, words)
             say(f"Recording: {args.record}")
             kind.report_findings(say, args.record, findings)
-    say(f"Result: {kind.labels[code]} (exit {code})")
+    label = OPEN_FAILED_LABEL if open_failed else labels[code]
+    say(f"Result: {label} (exit {code})" + ("; paper account verified" if verified else ""))
     say(PATHS_NOTE)
     return code
 
@@ -890,6 +996,13 @@ def main(
     variables: Mapping[str, str] = os.environ if env is None else env
     stream = sys.stdout if out is None else out
     say = _Say(stream)
+    if args.paper:
+        refusal = paper_refusal(args.host, args.port, variables)  # before anything else is built
+        if refusal is not None:
+            say(refusal)
+            return EXIT_REFUSED
+        args.not_paper_exit = EXIT_NOT_PAPER_PROBE if probe else EXIT_NOT_PAPER_FETCH
+        say(PAPER_MODE_LINE)
     try:
         resolve_paths(args, variables, today or date.today(), Path.cwd(), command)
     except PathRefused as exc:
@@ -962,6 +1075,7 @@ def _after_checks(
         return IbConnection(
             a.host, a.port, a.client_id, env=variables, attempts=2, retry_delay=3,
             connect_timeout=a.connect_timeout, ready_timeout=15, observers=observers,
+            require_paper=a.paper,
         )
 
     def real_recorder(a: Any) -> SessionRecorder | None:
