@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import base64
 import io
+import itertools
 import json
 import subprocess
 import sys
@@ -927,3 +929,1021 @@ def test_connecting_rule_is_fast_on_adversarial_input() -> None:
         start = time.perf_counter()
         hook.decide(cmd)
         assert time.perf_counter() - start < 5.0
+
+
+# --- T10 fix round: review findings of PR 133 ------------------------------------
+# Strings below are command text used as data; none of them is ever executed.
+
+_EXPAND = (
+    ("@P@", "MainStoinker"),
+    ("@F@", "fetch-bars"),
+    ("@R@", "probe-data"),
+    ("@N@", "\n"),
+    ("@T@", "\t"),
+    ("@Q@", "'"),
+    ("@BT@", "`"),
+    ("@BS@", "\\"),
+    ("@ZW@", "\u200b"),
+)
+
+
+def _x(raw: str) -> str:
+    for key, value in _EXPAND:
+        raw = raw.replace(key, value)
+    return raw
+
+
+def _table(text: str) -> list[tuple[str, str]]:
+    """Lines of `V command` (V = B blocked / A allowed) -> (V, expanded command)."""
+    rows = []
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            rows.append((line[0], line[2:]))
+    return rows
+
+
+# The reviewer's adversarial list: every row is a connecting command or a way
+# to hide one. B = must be blocked.
+ADV_TABLE = r"""
+B python -m @P@ @F@
+B python3 -m @P@ @F@
+B py -3 -m @P@ @F@
+B pythonw -m @P@ @F@
+B .venv@BS@Scripts@BS@python.exe -m @P@ @F@
+B ".venv@BS@Scripts@BS@python.exe" -m @P@ @F@
+B ../.venv/Scripts/Python.EXE -m @P@ @F@
+B uv run -m @P@ @F@
+B uv run --module @P@ @F@
+B pipx run --spec . python -m @P@ @F@
+B poetry run python -m @P@ @F@
+B conda run -n base python -m @P@ @F@
+B hatch run python -m @P@ @F@
+B start python -m @P@ @F@
+B start "" python -m @P@ @F@
+B cmd /c python -m @P@ @F@
+B call python -m @P@ @F@
+B wsl python3 -m @P@ @F@
+B bash -lc "python -m @P@ @F@"
+B sh -c @Q@python -m @P@ @F@@Q@
+B pwsh -c "python -m @P@ @F@"
+B Invoke-Expression "python -m @P@ @F@"
+B iex "python -m @P@ @F@"
+B Invoke-Expression ("python -m @P@ " + "@F@")
+B & "python" -m @P@ @F@
+B & $py -m @P@ @F@
+B Start-Process python -ArgumentList "-m @P@ @F@"
+B Start-Process python -ArgumentList @Q@-m@Q@,@Q@@P@@Q@,@Q@@F@@Q@
+B Start-Process python -ArgumentList @Q@-m@Q@, @Q@@P@@Q@, @Q@@F@@Q@
+B Start-Process -FilePath python -ArgumentList @("-m","@P@","@F@") -Wait
+B & python @("-m","@P@","@F@")
+B $a = @("-m","@P@","@F@"); & python @a
+B python -I -m @P@ @F@
+B python -X dev -W ignore -u -O -m @P@ @F@
+B python -OO -B -m@P@ @F@
+B python -m "@P@" "@F@"
+B python -m Main"Stoinker" fetch"-bars"
+B python -m @P@ $SUB
+B python -m @P@ ${SUB}
+B python -m @P@ $(cat sub.txt)
+B python -m @P@ @BS@@N@  @F@
+B python -m @P@ @BT@@N@  @F@
+B python -m @P@ --symbols AAPL @BT@@N@  @F@
+B python -m @P@ ^@N@@F@
+B cmd /c "python -m @P@ ^@N@@F@"
+A python -m @P@@N@@F@
+B python@T@-m@T@@P@@T@@F@
+B PYTHON -M MAINSTOINKER FETCH-BARS
+B cd @P@ && python __main__.py @F@
+B cd @P@; python . @F@
+B cd @P@ && python ib/cli.py
+B python __main__.py @F@
+B python . @F@
+B python ./@P@/. @F@
+B python @P@/./__main__.py @F@
+B .@BS@@P@@BS@__main__.py @F@
+B ./@P@/__main__.py @F@
+B & ".@BS@@P@@BS@__main__.py" @F@
+B python -m @P@.__main__ @F@
+B python -m @P@.engine.cli @F@
+B python -c "import runpy; runpy.run_module(@Q@@P@@Q@, run_name=@Q@__main__@Q@)" @F@
+B python -c "import importlib; importlib.import_module(@Q@@P@.__main__@Q@)" @F@
+B python -c "__import__(@Q@@P@.__main__@Q@)" @F@
+B python -c "exec(open(@Q@@P@/__main__.py@Q@).read())" @F@
+B python -c "import sys; sys.argv=[@Q@x@Q@,@Q@@F@@Q@]; import @P@.__main__"
+B python -c "from @P@.ib.cli import main; main([@Q@@F@@Q@])"
+B python -c "import @P@.__main__" @F@
+B python -c "from @P@ import __main__" @F@
+B python -c "from @P@ import __main__ as m"
+B python -c "import @P@.ib.cli as c; c.main([])"
+B python -c "from @P@ import ib"
+B python -c "from @P@ import (ib)"
+B python -c "from @P@ import engine, ib"
+B python -c "import @P@ .ib"
+B python -m @P@.ib.cli
+B python -m pdb @P@/__main__.py @F@
+B python -m cProfile @P@/__main__.py @F@
+B python -m cProfile -o x.prof @P@/__main__.py @F@
+B python -m debugpy --listen 5678 @P@/__main__.py @F@
+B python -m debugpy --listen 5678 -m @P@ @F@
+B python -m coverage run @P@/__main__.py @F@
+B python -m coverage run -m @P@ @F@
+B coverage run @P@/__main__.py @F@
+B coverage run -m @P@ @F@
+B python -m pdb @P@/ib/cli.py
+B python -m trace --count @P@/__main__.py @F@
+B python -m runpy @P@ @F@
+B echo @F@ | xargs python -m @P@
+B printf "@F@\n" | xargs python -m @P@
+B echo @F@ | xargs -I{} python -m @P@ {}
+B find . -maxdepth 0 -exec python -m @P@ @F@ ;
+B env python -m @P@ @F@
+B env -i PATH=x python -m @P@ @F@
+B nohup python -m @P@ @F@ &
+B timeout 60 python -m @P@ @F@
+B time python -m @P@ @F@
+B echo "python -m @P@ @F@" | bash
+B echo "python -m @P@ @F@" | sh
+B echo "import runpy; runpy.run_module(@Q@@P@@Q@)" | python -
+B echo "python -m @P@ @F@" | iex
+B "python -m @P@ @F@" | Invoke-Expression
+B bash <(echo "python -m @P@ @F@")
+B echo "python -m @P@ @F@" > x.sh && bash x.sh
+B echo "import @P@.ib.cli" > x.py && python x.py
+B printf "python -m @P@ @F@" > x.sh; sh x.sh
+B Set-Content x.ps1 "python -m @P@ @F@"; ./x.ps1
+B @"@N@python -m @P@ @F@@N@"@ | iex
+B python -m @P@ @F@ # comment
+B git status; python -m @P@ run
+B git commit -m "x" ; python -m @P@ run
+B gh pr view 1 --json body | python -m @P@ @F@
+B git config alias.fb "!python -m @P@ @F@" && git fb
+B git -c alias.fb="!python -m @P@ @F@" fb
+B vim -c "!python -m @P@ @F@" -c q
+A rg --pre ./fb.sh x
+B python -m @P@ --db x.db @F@
+B python -m @P@ -- @F@
+B python -m @P@ ""  @F@
+B python -m @P@ $null @F@
+B python -m @P@ 2>$null @F@
+B python -m @P@ 2> nul @F@
+B python -m @P@ >>log.txt @F@
+B python -m @P@ @R@
+B python -m @P@ run --port 7497
+B python -m @P@ paper
+B python -m @P@ backtest; python -m @P@ @F@
+B python -m @P@ backtest || python -m @P@ @F@
+B (python -m @P@ @F@)
+B powershell -EncodedCommand cAB5AHQAaABvAG4AIAAtAG0AIABNAGEAaQBuAFMAdABvAGkAbgBrAGUAcgAgAGYAZQB0AGMAaAAtAGIAYQByAHMA
+B python -m @P@ ba@ZW@cktest
+B python -m Main@ZW@Stoinker @F@
+"""  # noqa: E501
+
+# Rows the reviewer listed as holes that are not (or cannot be) blocked by text:
+#  * a bare line break after the module runs two commands, the second is not a
+#    program (`python -m MainStoinker`, then `fetch-bars`): not a hole;
+#  * `rg --pre ./fb.sh x` runs a script that this command does not name.
+ADV_NOT_BLOCKED = {"python -m @P@@N@@F@", "rg --pre ./fb.sh x"}
+
+# Commands that must stay allowed (the reviewer's false-positive list). The last
+# six are blocked ON PURPOSE or accepted, see FP_STILL_BLOCKED.
+FP_TABLE = r"""
+A uv pip install --python .venv@BS@Scripts@BS@python.exe -r requirements-dev.txt
+A uv pip install --python .venv@BS@Scripts@BS@python.exe -e .
+A .venv@BS@Scripts@BS@python.exe -m pytest
+A .venv@BS@Scripts@BS@python.exe -m pytest -m slow
+A .venv@BS@Scripts@BS@ruff.exe check .
+A .venv@BS@Scripts@BS@ruff.exe check tests @P@/engine @P@/__main__.py --select E,F,W,I,B
+A ruff check tests conftest.py @P@/engine @P@/api @P@/__main__.py @P@/ib --select E,F,W,I,B
+A .venv@BS@Scripts@BS@python.exe -m @P@ backtest --algos ALGOS.json --data OfflineData --out OUTDIR
+A .venv@BS@Scripts@BS@python.exe -m @P@ backtest --algos ALGOS.json --data OfflineData --out OUTDIR --db runs.db --log
+A .venv@BS@Scripts@BS@python.exe -m @P@ runs --db DB --json
+A .venv@BS@Scripts@BS@python.exe -m @P@ runs --db DB
+A .venv@BS@Scripts@BS@python.exe -m @P@ report RUN --db DB --json
+A .venv@BS@Scripts@BS@python.exe -m @P@ report 3 --db "C:@BS@x y@BS@runs.db"
+A .venv@BS@Scripts@BS@python.exe -m @P@ serve --port 8750
+A .venv@BS@Scripts@BS@python.exe -m @P@ backtest --help
+A python -m @P@ backtest --algos a.json --data OfflineData --out out 2>&1 | tail -20
+A RUN=$(python -m @P@ runs --db x.db --json | python -c "import json,sys; print(json.load(sys.stdin)[0][@Q@id@Q@])")
+A python -m @P@ report $RUN --db x.db
+A python -m pytest tests/test_ib_cli.py
+A python -m pytest tests/test_ib_cli.py -k "@F@ or @R@"
+A python -m pytest tests/test_ib_cli.py -k "test_@F@_refuses_without_tty"
+A python -m pytest tests/test_ib_cli.py::test_fetch_bars_help -q
+A python -m pytest tests/test_ib_subprocess_block.py
+A python -m pytest tests/test_ib_subprocess_block.py tests/test_ib_connection.py --cov=@P@.ib
+A python -m pytest tests/test_ib_subprocess_block.py @P@/testy
+A python -m ruff check @P@/ib tests/test_ib_subprocess_block.py --select E,F,W,I,B
+A ruff check @P@/ib tests/test_ib_subprocess_block.py
+A python -m pytest tests -k "subprocess and not slow" --cov=@P@
+A python -m pytest -p no:cacheprovider tests/test_engine_cli.py -k "@P@ and run"
+A python -m pytest tests/test_engine_cli.py -k "runs or report" --durations=5
+A python -m pytest -n 6 -x tests/test_ib_fetch.py
+A git add @P@/ib/cli.py @P@/__main__.py tests/test_ib_cli.py
+A git diff revival...HEAD -- @P@/ib @P@/__main__.py
+A git log --oneline -- @P@/ib/connection.py
+A git show origin/task/125:@P@/ib/cli.py
+A git commit -m "T13: add @F@ (python -m @P@ @F@)"
+A git commit -m "Dispatch @F@ to @P@.ib.cli; run with python -m @P@ @F@ --port 7497"
+A gh pr create --title "T13" --body "Run: python -m @P@ @F@ --symbols AAPL"
+A gh pr comment 133 --body-file review.md
+A gh issue view 125 --json body
+A grep -n "@F@" @P@/__main__.py
+A grep -rn "subprocess" @P@/ib
+A rg -n "importlib|runpy" @P@
+A rg -n "def main" @P@/ib/cli.py
+A sed -n 1,80p @P@/ib/cli.py
+A sed -n "/@F@/,/probe/p" @P@/__main__.py
+A cat @P@/ib/cli.py
+A ls @P@/ib
+A head -40 @P@/__main__.py
+A awk "/subprocess/" @P@/ib/connection.py
+A python -c "import @P@.engine.cli as c; print(c.build_parser().format_help())"
+A python -c "import @P@; print(@P@.__file__)"
+A python -c "import importlib.metadata as m; print(m.version(@Q@numpy@Q@))" && ls @P@
+A python tools/count_lines.py @P@/ib
+A python -m compileall -q @P@/ib
+A python -m py_compile @P@/ib/cli.py
+A python -m mypy @P@/ib
+A python -m pyright @P@/ib/cli.py
+A python -m pytest --pdb tests/test_ib_cli.py
+A echo "don@Q@t run python -m @P@ @F@"
+A Get-Content @P@/ib/cli.py | Select-String "@F@"
+A Select-String -Path @P@/__main__.py -Pattern "@R@"
+A python -m @P@ @F@ --help
+A python -m @P@ @R@ -h
+A python -m @P@.ib.cli --help
+A python -c "import @P@.ib.connection"
+"""  # noqa: E501
+
+# Still blocked. By the owner's ruling (they only print help, but a command
+# that can connect is judged by its name, not by its flags): the last four.
+# Accepted false positives of a command-text hook: the first two.
+FP_STILL_BLOCKED = {
+    "python tools/count_lines.py @P@/ib",
+    'echo "don@Q@t run python -m @P@ @F@"',
+    "python -m @P@ @F@ --help",
+    "python -m @P@ @R@ -h",
+    "python -m @P@.ib.cli --help",
+    'python -c "import @P@.ib.connection"',
+}
+
+CONT_TABLE = r"""
+A python -m @P@ @BS@@N@  backtest --algos a.json --data OfflineData --out out
+A .venv/Scripts/python.exe -m @P@ backtest @BS@@N@  --algos a.json @BS@@N@  --data OfflineData --out out
+A python -m @P@ @BT@@N@  backtest --algos a.json --data OfflineData --out out
+B python -m @P@ @BT@@N@  @F@ --symbols AAPL MSFT @BT@@N@  --start 2024-01-01
+B & .venv@BS@Scripts@BS@python.exe -m @P@ @BT@@N@    @F@ @BT@@N@    --symbols AAPL
+B python -m @P@ @BS@@N@@F@
+B python -m @P@ @BS@
+B python -m @P@ ^@N@@F@
+B cmd /c python -m @P@ ^^ @F@
+B python -m @P@ ``@F@
+B python -m @P@ backtest@N@python -m @P@ @F@
+B python -m @P@ --json @F@
+B python -m @P@ -h @F@
+B python -m @P@ --help @F@
+"""
+
+
+@pytest.mark.parametrize(("verdict", "raw"), _table(ADV_TABLE))
+def test_reviewer_adversarial_table(verdict: str, raw: str) -> None:
+    command = _x(raw)
+    expect_blocked = verdict == "B"
+    assert hook.decide(command)[0] is expect_blocked, command
+    if raw in ADV_NOT_BLOCKED:
+        assert verdict == "A"
+
+
+@pytest.mark.parametrize(("verdict", "raw"), _table(FP_TABLE))
+def test_reviewer_false_positive_table(verdict: str, raw: str) -> None:
+    command = _x(raw)
+    expect_blocked = raw in FP_STILL_BLOCKED
+    assert hook.decide(command)[0] is expect_blocked, command
+
+
+@pytest.mark.parametrize(("verdict", "raw"), _table(CONT_TABLE))
+def test_reviewer_continuation_table(verdict: str, raw: str) -> None:
+    command = _x(raw)
+    assert hook.decide(command)[0] is (verdict == "B"), command
+
+
+def test_claude_md_commands_are_allowed() -> None:
+    text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    section = text.split("## Commands", 1)[1]
+    block = section.split("```")[1]
+    commands = []
+    for line in block.splitlines():
+        line = line.split("  #", 1)[0].strip()
+        if line:
+            commands.append(line.replace("[", "").replace("]", ""))
+    assert len(commands) >= 9
+    assert any("-m MainStoinker backtest" in c for c in commands)
+    for command in commands:
+        assert hook.decide(command) == (False, ""), command
+
+
+# 1. continuation lines ------------------------------------------------------------
+
+
+def test_powershell_and_cmd_continuations_do_not_hide_the_subcommand() -> None:
+    for command in (
+        "python -m MainStoinker `\n  fetch-bars --symbols AAPL MSFT `\n  --start 2024-01-01",
+        "python -m MainStoinker `\r\n  fetch-bars `\r\n  --symbols AAPL",
+        "& .venv\\Scripts\\python.exe -m MainStoinker `\n    probe-data `\n    --symbols AAPL",
+        "python -m MainStoinker \\\n  fetch-bars --symbol AAPL",
+        "python -m MainStoinker \\  \n  fetch-bars",
+        "python -m MainStoinker ^\nfetch-bars",
+        "cmd /c \"python -m MainStoinker ^\nfetch-bars\"",
+        "python -m MainStoinker `\n`\nfetch-bars",
+    ):
+        assert hook.decide(command)[0] is True, command
+
+
+def test_bash_multiline_offline_command_is_allowed_again() -> None:
+    for command in (
+        "python -m MainStoinker \\\n  backtest --algos a.json --data OfflineData --out out",
+        "python -m MainStoinker \\\r\n  backtest --algos a.json \\\r\n  --data OfflineData",
+        ".venv/Scripts/python.exe -m MainStoinker backtest \\\n  --algos a.json \\\n  --out out",
+        "python -m MainStoinker `\n  report 3 --db x.db",
+        "python -m MainStoinker ^\nruns --db x.db",
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+def test_continuations_make_the_older_rules_stricter_only() -> None:
+    # The entry script and launcher rules also see the joined text: a run split
+    # over lines by a continuation is blocked (it was not before).
+    for command in (
+        f'python \\\n  "{ENTRY}"',
+        f'python `\n  "{ENTRY}"',
+        f'cmd /c ^\n"{BAT}"',
+        f'call `\n"{BAT}"',
+    ):
+        assert hook.decide(command)[0] is True, command
+    # and they still allow what they allowed
+    assert hook.decide(f'cat \\\n "{ENTRY}"') == (False, "")
+    assert hook.decide(f'Get-Content `\n "{ENTRY}"') == (False, "")
+
+
+# 2. PowerShell argument arrays and similar ---------------------------------------
+
+
+def test_powershell_argument_arrays_are_tokenised() -> None:
+    for command in (
+        "Start-Process python -ArgumentList '-m','MainStoinker','fetch-bars'",
+        "Start-Process python -ArgumentList '-m', 'MainStoinker', 'fetch-bars'",
+        'Start-Process -FilePath python -ArgumentList @("-m","MainStoinker","fetch-bars") -Wait',
+        '& python @("-m","MainStoinker","fetch-bars")',
+        '$a = @("-m","MainStoinker","fetch-bars"); & python @a',
+        '$a = @("-m","MainStoinker","fetch-bars")\n& python @a',
+        "$args2 = '-m','MainStoinker','probe-data'; & $py @args2",
+        '$a = @("-m","MainStoinker","run"); Start-Process python -ArgumentList $a',
+        '[string[]]$a = @("-m","MainStoinker","fetch-bars")',
+        '& python @("-m", "MainStoinker", @("fetch-bars"))',
+        "& python {-m,MainStoinker,fetch-bars}",
+    ):
+        assert hook.decide(command)[0] is True, command
+    for command in (
+        '$a = @("-m","MainStoinker","backtest","--algos","a.json"); & python @a',
+        "Start-Process python -ArgumentList '-m','MainStoinker','report','3'",
+        '& python @("-m","MainStoinker","runs","--db","x.db")',
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+# 3. other -m modules do not switch the script check off --------------------------
+
+
+def test_other_modules_do_not_switch_off_the_script_path_check() -> None:
+    for tool in ("pdb", "cProfile", "debugpy --listen 5678", "trace --count", "coverage run", "runpy"):
+        for target in ("MainStoinker/__main__.py fetch-bars", "MainStoinker/ib/cli.py"):
+            command = f"python -m {tool} {target}"
+            assert hook.decide(command)[0] is True, command
+    for command in (
+        "python -m cProfile -o x.prof MainStoinker/__main__.py fetch-bars",
+        "coverage run MainStoinker/__main__.py fetch-bars",
+        "coverage run --branch MainStoinker/__main__.py fetch-bars",
+        "python -m coverage run MainStoinker/ib/cli.py",
+        "python -m runpy MainStoinker fetch-bars",
+        "python -m pdb MainStoinker/__main__.py run",
+        "python -X dev -m trace -t MainStoinker/__main__.py probe-data",
+    ):
+        assert hook.decide(command)[0] is True, command
+
+
+def test_lint_and_test_runners_may_name_package_paths() -> None:
+    for command in (
+        "python -m pytest MainStoinker/__main__.py",
+        "python -m pytest MainStoinker/ib tests/test_ib_cli.py",
+        "python -m ruff check MainStoinker/__main__.py MainStoinker/ib",
+        ".venv\\Scripts\\ruff.exe check tests MainStoinker/engine MainStoinker/__main__.py",
+        "python -m mypy MainStoinker/ib/cli.py",
+        "python -m pyright MainStoinker/ib/cli.py",
+        "python -m black --check MainStoinker/ib",
+        "python -m isort MainStoinker/ib/cli.py",
+        "python -m flake8 MainStoinker/ib",
+        "python -m pylint MainStoinker/ib/cli.py",
+        "python -m compileall MainStoinker/ib",
+        "python -m py_compile MainStoinker/ib/cli.py",
+        "python -m coverage report",
+        "python -m coverage html",
+        "python -m coverage xml",
+        "python -m coverage combine",
+        "python -m coverage erase",
+        "coverage report --include=MainStoinker/ib/*",
+        "coverage html",
+        "coverage run -m pytest tests/test_ib_cli.py",
+    ):
+        assert hook.decide(command) == (False, ""), command
+    assert "coverage" not in hook._HARMLESS_TOOLS
+    assert hook._COVERAGE_READ == {"report", "html", "xml", "combine", "erase"}
+
+
+# 4. the error path fails closed for the package ----------------------------------
+
+
+def test_error_path_fails_closed_when_the_request_names_the_package(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cmd = "python -m MainStoinker fetch-bars"
+    # stdin that is not valid JSON
+    assert hook.main("{not json " + cmd) == 2
+    assert "MainStoinker" in capsys.readouterr().err
+    assert hook.main("{not json " + cmd.upper()) == 2
+    capsys.readouterr()
+    # no tool_input
+    assert hook.main(json.dumps({"tool_name": "Bash", "cmd": cmd})) == 2
+    # command that is not a string
+    assert hook.main(json.dumps({"tool_name": "Bash", "tool_input": {"command": [cmd]}})) == 2
+    assert hook.main(json.dumps({"tool_name": "PowerShell", "tool_input": {"command": [cmd]}})) == 2
+    capsys.readouterr()
+
+    # an internal exception anywhere
+    def boom(text: str) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hook, "_strip_message_args", boom)
+    for tool in ("Bash", "PowerShell"):
+        assert hook.main(_payload(cmd, tool)) == 2
+    capsys.readouterr()
+    # ... which does not block a request that does not name the package
+    assert hook.main(_payload("git status")) == 0
+    assert hook.main("{not json git status") == 0
+    capsys.readouterr()
+
+
+def test_run_stdin_fails_closed_for_the_package() -> None:
+    raw = b"{not json python -m MainStoinker fetch-bars"
+    assert hook.run_stdin(io.BytesIO(raw)) == 2
+
+    class Broken(io.BytesIO):
+        def read(self, *args: object) -> bytes:
+            raise OSError("broken pipe")
+
+    assert hook.run_stdin(Broken(raw)) == 0  # nothing was read, nothing to judge
+
+
+# 5. running from inside the package, path variants -------------------------------
+
+
+def test_runs_from_inside_the_package_directory_are_judged() -> None:
+    for command in (
+        "cd MainStoinker && python __main__.py fetch-bars",
+        "cd MainStoinker; python . fetch-bars",
+        "cd MainStoinker && python ib/cli.py",
+        "cd MainStoinker\npython __main__.py probe-data",
+        "Set-Location .\\MainStoinker; python __main__.py fetch-bars",
+        "Set-Location -Path .\\MainStoinker\n& python . fetch-bars",
+        "pushd MainStoinker && python tool.py fetch-bars",
+        "pushd MainStoinker\\ib && python cli.py",
+        "cd MainStoinker/ib && python anything.py",
+        "cd MainStoinker && cd ib && python cli.py",
+        'cd "C:\\Users\\x y\\Stonks\\MainStoinker" && python __main__.py run',
+        "cd /d C:\\x\\MainStoinker && python __main__.py fetch-bars",
+        "cd MainStoinker && uv run __main__.py fetch-bars",
+        "cd MainStoinker && python -m ib.cli",
+        "cd MainStoinker && python -m engine.cli fetch-bars",
+        'bash -c "cd MainStoinker" ; python ib/cli.py',
+        "git status && cd MainStoinker && python . fetch-bars",
+        "python __main__.py fetch-bars",
+        "python . fetch-bars",
+        "python -X dev ./__main__.py probe-data",
+    ):
+        assert hook.decide(command)[0] is True, command
+    for command in (
+        "cd MainStoinker && python __main__.py backtest --algos a.json",
+        "cd MainStoinker && python . serve",
+        "cd MainStoinker; python __main__.py",
+        "cd MainStoinker; python .",
+        "cd MainStoinker && python -m pytest tests",
+        "cd MainStoinker && python tool.py",
+        "cd MainStoinker/engine && python -m pytest",
+        "cd MainStoinker && ls && git status",
+        "python tools/build.py . release",
+        "python -m pytest .",
+        "python -m ruff check .",
+        "cd tests && python helper.py fetch-bars",
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+def test_direct_runs_without_an_interpreter_and_path_spellings() -> None:
+    for command in (
+        ".\\MainStoinker\\__main__.py fetch-bars",
+        "./MainStoinker/__main__.py fetch-bars",
+        "MainStoinker/__main__.py fetch-bars",
+        '& ".\\MainStoinker\\__main__.py" fetch-bars',
+        "& '.\\MainStoinker\\__main__.py' probe-data",
+        "python MainStoinker/./__main__.py fetch-bars",
+        "python MainStoinker//__main__.py fetch-bars",
+        "python ./MainStoinker/./__main__.py fetch-bars",
+        "python ./MainStoinker/. fetch-bars",
+        "python .\\MainStoinker\\.\\ fetch-bars",
+        "python MainStoinker/ib//cli.py",
+        "python MainStoinker/./ib/cli.py",
+        "start .\\MainStoinker\\__main__.py fetch-bars",
+        "coverage run MainStoinker/__main__.py fetch-bars",
+    ):
+        assert hook.decide(command)[0] is True, command
+    for command in (
+        ".\\MainStoinker\\__main__.py backtest --algos a.json",
+        "MainStoinker/__main__.py",
+        "python MainStoinker/./__main__.py backtest",
+        "python ./MainStoinker/. report 3",
+        "cat MainStoinker/./__main__.py",
+        "Get-Content .\\MainStoinker\\__main__.py",
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+# 6. transparent prefixes, xargs, text piped into a shell -------------------------
+
+_PREFIXES = [
+    "xargs",
+    "env",
+    "env -i PATH=x",
+    "nohup",
+    "timeout 60",
+    "time",
+    "start",
+    'start ""',
+    "call",
+    "conda run -n base",
+    "poetry run",
+    "hatch run",
+    "wsl",
+]
+
+
+@pytest.mark.parametrize("prefix", _PREFIXES)
+def test_transparent_prefixes_are_judged_through(prefix: str) -> None:
+    for sub in CONNECTING_SUBCOMMANDS:
+        for command in (
+            f"{prefix} python -m MainStoinker {sub}",
+            f"echo x | {prefix} python -m MainStoinker {sub}",
+            f"{prefix} python MainStoinker/__main__.py {sub}",
+            f"{prefix} bash -c 'python -m MainStoinker {sub}'",
+        ):
+            assert hook.decide(command)[0] is True, command
+    if prefix != "xargs":
+        assert hook.decide(f"{prefix} python -m MainStoinker backtest") == (False, "")
+
+
+def test_xargs_and_foreach_feeding_the_package_is_blocked_whatever_the_arguments() -> None:
+    for command in (
+        "echo fetch-bars | xargs python -m MainStoinker",
+        "echo backtest | xargs python -m MainStoinker",
+        "echo x | xargs -I{} python -m MainStoinker backtest {}",
+        "ls | xargs -n1 python MainStoinker/__main__.py",
+        "echo x | xargs -I{} python -m MainStoinker report {} --db x.db",
+        "'a','b' | ForEach-Object { python -m MainStoinker backtest $_ }",
+        "1..3 | % { & python -m MainStoinker report $_ }",
+        "Get-Content subs.txt | foreach { python -m MainStoinker $_ }",
+        "echo x | xargs python -m MainStoinker.ib.cli",
+        "echo x | xargs echo MainStoinker | xargs python -m MainStoinker",
+    ):
+        assert hook.decide(command)[0] is True, command
+    for command in (
+        "echo x | xargs echo done",
+        "git ls-files | xargs grep -n MainStoinker",
+        "git ls-files MainStoinker | xargs wc -l",
+        "'a','b' | ForEach-Object { Write-Output $_ }",
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+@pytest.mark.parametrize(
+    "shell", ["bash", "sh", "zsh", "iex", "Invoke-Expression", "cmd", "pwsh", "powershell", "python -"]
+)
+def test_text_piped_into_a_shell_is_judged(shell: str) -> None:
+    for text in (
+        "python -m MainStoinker fetch-bars",
+        "python -m MainStoinker probe-data --symbols AAPL",
+        "python -m MainStoinker.ib.cli",
+        "python MainStoinker/ib/cli.py",
+        "python -m MainStoinker run",
+    ):
+        assert hook.decide(f'echo "{text}" | {shell}')[0] is True, (shell, text)
+        assert hook.decide(f'printf "{text}" | {shell}')[0] is True, (shell, text)
+        assert hook.decide(f'Write-Output "{text}" | {shell}')[0] is True, (shell, text)
+    assert hook.decide(f'echo "import MainStoinker.ib.cli" | {shell}')[0] is True
+    # offline text, or text that does not name the package, may be piped
+    assert hook.decide(f'echo "python -m MainStoinker backtest" | {shell}') == (False, "")
+    assert hook.decide(f'echo "python -m pytest" | {shell}') == (False, "")
+    # the same text piped to something that does not run it
+    assert hook.decide('echo "python -m MainStoinker fetch-bars" | tee notes.txt') == (False, "")
+    assert hook.decide('echo "python -m MainStoinker fetch-bars" | wc -c') == (False, "")
+
+
+def test_text_written_into_a_script_file_is_judged() -> None:
+    for command in (
+        'echo "python -m MainStoinker fetch-bars" > run.sh',
+        'printf "python -m MainStoinker probe-data" >> go.ps1',
+        'echo "import MainStoinker.ib.cli" > x.py',
+        'Write-Output "python -m MainStoinker fetch-bars" > run.bat',
+    ):
+        assert hook.decide(command)[0] is True, command
+    for command in (
+        'echo "python -m MainStoinker fetch-bars" > notes.txt',
+        'echo "python -m MainStoinker backtest" > run.sh',
+        'echo "see MainStoinker" > x.py',
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+def test_git_alias_that_runs_a_command_is_judged() -> None:
+    assert hook.decide('git config alias.fb "!python -m MainStoinker fetch-bars"')[0]
+    assert hook.decide("git config --global alias.fb '!python -m MainStoinker run'")[0]
+    assert hook.decide('git config user.name "MainStoinker bot"') == (False, "")
+    assert hook.decide("git log --oneline -- MainStoinker/ib") == (False, "")
+
+
+# 7. PowerShell -EncodedCommand ---------------------------------------------------
+
+
+def _enc(text: str) -> str:
+    return base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+
+
+@pytest.mark.parametrize("flag", ["-EncodedCommand", "-encodedcommand", "-enc", "-ec", "-e", "-EncodedC"])
+@pytest.mark.parametrize("shell", ["powershell", "pwsh", "powershell.exe -NoProfile"])
+def test_encoded_command_is_decoded_and_judged(shell: str, flag: str) -> None:
+    for text in (
+        "python -m MainStoinker fetch-bars",
+        "python -m MainStoinker.ib.cli",
+        "& python MainStoinker/ib/cli.py",
+        f'python "{ENTRY}"',
+        'bash -c "python -m MainStoinker probe-data"',
+    ):
+        assert hook.decide(f"{shell} {flag} {_enc(text)}")[0] is True, (shell, flag, text)
+        assert hook.decide(f'{shell} {flag} "{_enc(text)}"')[0] is True
+        assert hook.decide(f"{shell} -NoProfile {flag} {_enc(text)} -NonInteractive")[0] is True
+    for text in ("python -m MainStoinker backtest --algos a.json", "Get-Date", "python -m pytest"):
+        assert hook.decide(f"{shell} {flag} {_enc(text)}") == (False, ""), (shell, flag, text)
+
+
+def test_undecodable_encoded_command_next_to_the_package_is_blocked() -> None:
+    assert hook.decide("powershell -EncodedCommand !!notbase64!! ; echo MainStoinker")[0] is True
+    assert hook.decide("powershell -enc QQ ; python -m MainStoinker backtest")[0] is True
+    odd = base64.b64encode(b"abc").decode("ascii")  # odd number of bytes: not UTF-16
+    assert hook.decide(f"powershell -enc {odd} MainStoinker")[0] is True
+    # no mention of the package: nothing to judge
+    assert hook.decide("powershell -enc !!notbase64!!") == (False, "")
+    # an option that merely starts with -e is not an encoded command
+    assert hook.decide("powershell -ExecutionPolicy Bypass -File x.ps1 MainStoinker") == (False, "")
+    assert hook.decide("grep -e MainStoinker README.md") == (False, "")
+    assert hook.decide("rg -e MainStoinker docs") == (False, "")
+
+
+# 8. marker words count only in code context ---------------------------------------
+
+
+def test_marker_words_in_file_names_and_selectors_are_not_code() -> None:
+    for command in (
+        "python -m pytest tests/test_ib_subprocess_block.py --cov=MainStoinker",
+        "python -m pytest tests/test_ib_subprocess_block.py tests/test_ib_cli.py --cov=MainStoinker.ib",
+        "python -m ruff check tests/test_ib_subprocess_block.py MainStoinker/ib",
+        "python -m ruff check MainStoinker/ib tests/test_ib_subprocess_block.py --select E,F,W,I,B",
+        'python -m pytest -k "subprocess and fetch_bars"',
+        'python -m pytest tests -k "subprocess and not slow" --cov=MainStoinker',
+        'python -m pytest -k "importlib or runpy or exec or eval" MainStoinker/testy',
+        "python -m pytest tests/test_runpy_helpers.py tests/test_importlib_shim.py --cov=MainStoinker",
+        "python -m mypy tests/test_os_system_guard.py MainStoinker/ib",
+        "python -m pytest tests/test_eval_exec.py MainStoinker/engine",
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+def test_marker_words_still_count_in_code_context() -> None:
+    for command in (
+        "python -c \"import subprocess; subprocess.run(['python','-m','MainStoinker','fetch-bars'])\"",
+        "python -c \"import runpy; runpy.run_module('MainStoinker')\"",
+        "python -c \"import importlib; importlib.import_module('MainStoinker.__main__')\"",
+        "python -c \"exec(open('MainStoinker/__main__.py').read())\"",
+        "python -c \"eval(compile(open('MainStoinker/__main__.py').read(), 'x', 'exec'))\"",
+        "python -c \"import os; os.system('python -m MainStoinker fetch-bars')\"",
+        "python -c \"import os; os.popen('python -m MainStoinker run')\"",
+        "python -c \"__import__('MainStoinker.__main__')\"",
+        "python -c \"import subprocess\" MainStoinker",
+        "python - <<'EOF'\nimport subprocess\nsubprocess.run(['MainStoinker'])\nEOF",
+        "python - <<'EOF'\nimport runpy\nx = 'MainStoinker'\nrunpy.run_module(x)\nEOF",
+        "python <<EOF\nimport importlib\nimportlib.import_module('MainStoinker.' + 'ib')\nEOF",
+        "bash <<'EOF'\necho MainStoinker.ib\npython -m MainStoinker.ib.cli\nEOF",
+        "python -c 'import runpy' -m MainStoinker run",
+    ):
+        assert hook.decide(command)[0] is True, command
+
+
+# 9. no quadratic behaviour --------------------------------------------------------
+
+
+def _timed(command: str) -> tuple[bool, float]:
+    start = time.perf_counter()
+    blocked = hook.decide(command)[0]
+    return blocked, time.perf_counter() - start
+
+
+_TIMING_BOUND = 3.0  # the real figures are a few hundredths of a second
+
+
+def test_decisions_are_fast_on_the_reviewers_timing_shapes() -> None:
+    p = "MainStoinker"
+    shapes = {
+        "harmless_5k": "python " + "x " * 5_000 + p,
+        "harmless_20k": "python " + "x " * 20_000 + p,
+        "paren_text_5k": "echo " + "(" * 5_000 + " " + p,
+        "paren_text_20k": "echo " + "(" * 20_000 + " " + p,
+        "from_import": "python -c " + ("from " + p + " import " + "a," * 50) * 2_000,
+        "dir_token": "python " + "a/" * 50_000 + p,
+        "segments": ("python -m " + p + " backtest; ") * 20_000,
+    }
+    for name, command in shapes.items():
+        _, took = _timed(command)
+        assert took < _TIMING_BOUND, (name, took)
+
+
+def test_decisions_are_fast_on_other_long_shapes() -> None:
+    p = "mainstoinker"
+    shapes = {
+        "module_flags": "python " + "-mmainstoinker " * 3_000,
+        "module_flags_ok": "python -m mainstoinker backtest " + "-mmainstoinker " * 3_000,
+        "nested_bash": "bash -c " * 6_000 + p,
+        "from_imports": "python -c " + "from mainstoinker import a," * 1_500,
+        "parens": "python " + "(" * 40_000 + " " + p,
+        "heredocs": ("python <<EOF\n" * 3_000) + p,
+        "pipes": "echo mainstoinker " + "| cat " * 8_000,
+        "cds": ("cd mainstoinker; " * 2_500) + "python . x",
+        "continuations": ("python \\\n" * 5_000) + p,
+        "backslash_spaces": "\\" + " " * 40_000 + p,
+        "encoded": "powershell " + "-e abcd " * 5_000 + p,
+        "no_mention_words": "x " * 100_000,
+        "no_mention_parens": "(" * 200_000,
+        "no_mention_git": "git commit -m x; " * 12_000,
+        "no_mention_heredocs": "cat <<EOF\n" * 20_000,
+        "no_mention_dots": ". " * 100_000,
+        "no_mention_python_dots": "python . " * 20_000,
+        "no_mention_quotes": "'" * 200_000,
+        "no_mention_continuations": "\\\n" * 100_000,
+        "no_mention_strings": '"a" ' * 50_000,
+    }
+    for name, command in shapes.items():
+        _, took = _timed(command)
+        assert took < _TIMING_BOUND, (name, took)
+
+
+def test_long_command_that_mentions_the_package_is_blocked_without_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def must_not_run(*args: object) -> None:
+        raise AssertionError("a command over the limit must not be analysed")
+
+    monkeypatch.setattr(hook, "_judge_connecting", must_not_run)
+    monkeypatch.setattr(hook, "_strip_message_args", must_not_run)
+    long_text = "python -m MainStoinker backtest " + "x " * 30_000
+    assert len(long_text) > 50_000
+    blocked, reason = hook.decide(long_text)
+    assert blocked is True
+    assert "owner" in reason
+    assert hook.decide("MAINSTOINKER " + "y" * 60_000)[0] is True
+    assert hook.decide("Main'Stoinker' " + "y" * 60_000)[0] is True
+    monkeypatch.undo()
+    # a long command that does not mention the package is analysed as usual
+    assert hook.decide("echo " + "y " * 100_000) == (False, "")
+    # at the limit the command is analysed (and this one is allowed)
+    at_limit = "python -m MainStoinker backtest " + "x" * (50_000 - 32)
+    assert len(at_limit) == 50_000
+    assert hook.decide(at_limit) == (False, "")
+
+
+# 10. the rule is pinned -----------------------------------------------------------
+
+
+def test_offline_allowlist_is_exactly_these_four_words() -> None:
+    assert hook._OFFLINE_SUBCOMMANDS == frozenset({"backtest", "runs", "report", "serve"})
+    for word in ("paper", "live", "trade", "run", "fetch-bars", "probe-data", "stage2"):
+        assert hook.decide(f"python -m MainStoinker {word}")[0] is True, word
+        assert hook.decide(f"python MainStoinker/__main__.py {word} --x")[0] is True, word
+        assert hook.decide(f"python -m MainStoinker.engine.cli {word}")[0] is True, word
+    for word in sorted(hook._OFFLINE_SUBCOMMANDS):
+        assert hook.decide(f"python -m MainStoinker {word}") == (False, "")
+
+
+def test_adding_a_word_to_the_allowlist_is_visible_to_these_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    widened = frozenset({"backtest", "runs", "report", "serve", "paper"})
+    monkeypatch.setattr(hook, "_OFFLINE_SUBCOMMANDS", widened)
+    # the pin above would fail, and the behaviour it protects has changed
+    assert hook._OFFLINE_SUBCOMMANDS != frozenset({"backtest", "runs", "report", "serve"})
+    assert hook.decide("python -m MainStoinker paper") == (False, "")
+    monkeypatch.setattr(hook, "_OFFLINE_SUBCOMMANDS", frozenset({"backtest", "runs", "report"}))
+    assert hook.decide("python -m MainStoinker serve")[0] is True
+
+
+def test_shell_wrapper_unwrapping_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Text inside a wrapper is judged as the command it is: an echo is text...
+    text_in_wrapper = (
+        'bash -c "echo python -m MainStoinker fetch-bars"',
+        "sh -c 'echo run python -m MainStoinker probe-data'",
+        'cmd /c "echo python -m MainStoinker fetch-bars"',
+        'powershell -Command "Write-Output \'python -m MainStoinker run\'"',
+    )
+    # ... and a cd inside a wrapper still counts for the commands after it.
+    cd_in_wrapper = (
+        'bash -c "cd MainStoinker" ; python ib/cli.py',
+        'cmd /c "cd MainStoinker" && python ib/cli.py',
+        'powershell -Command "Set-Location MainStoinker"; python tool.py fetch-bars',
+    )
+    for command in text_in_wrapper:
+        assert hook.decide(command) == (False, ""), command
+    for command in cd_in_wrapper:
+        assert hook.decide(command)[0] is True, command
+    assert hook._connecting_reason("bash -c echo python -m mainstoinker fetch-bars") is None
+    # With the unwrapping switched off every one of these verdicts flips.
+    monkeypatch.setattr(hook, "_SHELL_WRAPPERS", frozenset())
+    for command in text_in_wrapper:
+        assert hook.decide(command)[0] is True, command
+    for command in cd_in_wrapper:
+        assert hook.decide(command) == (False, ""), command
+
+
+def test_wrapped_connecting_commands_stay_blocked_at_any_depth() -> None:
+    for command in (
+        'bash -c "bash -c \'bash -c \\"python -m MainStoinker fetch-bars\\"\'"',
+        'cmd /c powershell -Command "bash -c \'python -m MainStoinker run\'"',
+        "bash -c " * 20 + "'python -m MainStoinker fetch-bars'",
+        "sh -c " * 8 + "python -m MainStoinker backtest",
+    ):
+        assert hook.decide(command)[0] is True, command
+
+
+# 11. module allowlist -------------------------------------------------------------
+
+
+def test_only_known_offline_modules_may_run_with_m() -> None:
+    assert hook._PACKAGE_MODULES == frozenset(
+        {
+            "mainstoinker",
+            "mainstoinker.__main__",
+            "mainstoinker.engine.cli",
+            "mainstoinker.engine.__main__",
+        }
+    )
+    # `python -m MainStoinker.api.serve` and `.engine.sim_broker` are asserted
+    # allowed by the T10 tests above; nothing else is.
+    assert hook._OTHER_OFFLINE_MODULES == frozenset(
+        {"mainstoinker.api.serve", "mainstoinker.engine.sim_broker"}
+    )
+    for module in (
+        "MainStoinker.engine.live",
+        "MainStoinker.engine.paper",
+        "MainStoinker.engine.broker",
+        "MainStoinker.api",
+        "MainStoinker.api.live",
+        "MainStoinker.api.serve.extra",
+        "MainStoinker.live",
+        "MainStoinker.MainStuff.main_utils",
+        "MainStoinker.DataCollection.apiApi",
+        "MainStoinker.TradeTools.trade",
+        "MainStoinker.Util.IBKRHelper",
+        "MainStoinker.Algos.Elliot.Elliot_Algo",
+        "MainStoinker.ibx",
+        "MainStoinker.",
+        "mainstoinker.something_new",
+    ):
+        for command in (
+            f"python -m {module}",
+            f"python -m {module} backtest",
+            f"python -m {module} --help",
+            f"python -m{module}",
+            f"uv run --module {module}",
+            f"VAR=1 python -m {module.upper()}",
+        ):
+            assert hook.decide(command)[0] is True, command
+    for command in (
+        "python -m MainStoinker",
+        "python -m MainStoinker.__main__ backtest",
+        "python -m MainStoinker.engine.cli report 3",
+        "python -m MainStoinker.api.serve",
+        "python -m MainStoinker.engine.sim_broker",
+    ):
+        assert hook.decide(command) == (False, ""), command
+
+
+# --- nothing blocked by revival is allowed now -------------------------------------
+
+
+def _load_revival_hook() -> types.ModuleType:
+    try:
+        source = subprocess.run(
+            ["git", "show", "origin/revival:.claude/hooks/block_live_launch.py"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        pytest.skip(f"origin/revival is not available here: {exc}")
+    module = types.ModuleType("revival_block_live_launch")
+    module.__file__ = "origin/revival:.claude/hooks/block_live_launch.py"
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def _generated_forms() -> set[str]:
+    def f(s: str) -> str:
+        return s.replace("~", "\\").replace("^", '"')
+
+    entry_win = ENTRY.replace("/", "\\")
+    interpreters = [
+        f(x)
+        for x in (
+            "python", "python3", "py", "py -3.14", "pythonw", "PYTHON.EXE",
+            ".venv~Scripts~python.exe", "^.venv~Scripts~python.exe^",
+            "& ^.venv/Scripts/python.exe^", "uv run", "uv run python", "pipx run",
+            "python -X dev", "python -u", "VAR=1 python", "nohup python",
+            "env python", "python -m debugpy --listen 5678",
+        )
+    ]  # fmt: skip
+    paths = [
+        f("^") + ENTRY + f("^"),
+        f("^") + entry_win + f("^"),
+        "'" + ENTRY + "'",
+        ENTRY.replace(" ", f("~ ")),
+        f("^") + ENTRY.upper() + f("^"),
+        f("^C:~x y~") + entry_win + f("^"),
+    ]
+    wraps = [
+        f(x)
+        for x in (
+            "{}", "git status; {}", "git status && {}", "echo hi | {}", "bash -c ^{}^",
+            "powershell -Command ^{}^", "cmd /c ^{}^", "(  {} )",
+        )
+    ]  # fmt: skip
+    forms = set()
+    for interp, path, wrap in itertools.product(interpreters, paths, wraps):
+        inner = interp + " " + path
+        if '"' in wrap:
+            inner = inner.replace('"', "'")
+        forms.add(wrap.format(inner))
+    bats = [
+        f(x)
+        for x in (
+            "^" + BAT + "^", ".~^" + BAT + "^", "& ^.~" + BAT + "^",
+            "./" + BAT.replace(" ", "~ "), "^C:~x y~" + BAT + "^", "^" + BAT.upper() + "^",
+        )
+    ]  # fmt: skip
+    bat_wraps = [
+        f(x)
+        for x in (
+            "{}", "cmd /c {}", "cmd.exe /c {}", "cmd //c {}", "call {}", "start ^^ {}",
+            "Start-Process {}", "Invoke-Item {}", "git status; {}", "git status && cmd /c {}",
+            "nohup {}", "timeout 5 {}",
+        )
+    ]  # fmt: skip
+    for bat, wrap in itertools.product(bats, bat_wraps):
+        forms.add(wrap.format(bat))
+    return forms
+
+
+def test_nothing_blocked_by_revival_is_allowed_by_this_hook() -> None:
+    revival = _load_revival_hook()
+    corpus: set[str] = set()
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            corpus.add(node.value)
+    for table in (ADV_TABLE, FP_TABLE, CONT_TABLE):
+        corpus.update(_x(raw) for _verdict, raw in _table(table))
+    corpus.update(BLOCKED)
+    corpus.update(_generated_forms())
+    assert len(corpus) > 1_000
+    blocked_by_revival = [c for c in sorted(corpus) if revival.decide(c)[0]]
+    assert len(blocked_by_revival) > 500
+    loosened = [c for c in blocked_by_revival if not hook.decide(c)[0]]
+    assert loosened == []
+    # the new rule only adds blocks
+    newly_blocked = [c for c in sorted(corpus) if hook.decide(c)[0] and not revival.decide(c)[0]]
+    assert len(newly_blocked) > 100
