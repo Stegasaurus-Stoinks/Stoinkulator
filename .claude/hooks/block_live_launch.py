@@ -1,5 +1,12 @@
 """PreToolUse hook: block shell commands that would launch the live trading program.
 
+Issue 155, the only two loosenings below: (1) ``MainStoinker/__main__.py`` after a VARIABLE command
+word (``"$R" check ...``) is no run if nothing feeds it and each later word is an option, redirect,
+literal path or non-bare option value. (2) ``python [-P -B -I -E -s -S -u -q] -c "<code>"`` of imports
+and ``print`` (chars ``A-Za-z0-9_ .,;()``) skips only the ``ib`` rule if the command has no other quote
+(assumed: the shell opens a string at the quote after ``-c``), ``$ ( ) < >`` or ``VAR=``, and only a
+pipe to a text tool follows (assumed: nothing runs the output). Else the old rules apply.
+
 This repo places real orders through Interactive Brokers. Two files start the
 live program and must never be executed by an agent (see CLAUDE.md):
 
@@ -40,17 +47,6 @@ piped into a shell, decodes ``-EncodedCommand``, follows a ``cd`` into the
 package directory, and blocks a command over 50,000 characters that mentions
 the package. Blocked by design, even though they only print help:
 ``fetch-bars --help``, ``probe-data -h``, ``python -c "import MainStoinker.ib; main()"``.
-Two exceptions (issue 155). A path to ``MainStoinker/__main__.py`` counts as
-running the package only when the segment has an interpreter token (a launch
-word or a ``py*`` program counts as one) or the path is the command word. When
-the command word is a variable or expression (``"$R"``, ``%PY%``) it counts
-unless the next word is an option or none, so a lint through ``"$R"`` passes.
-``python -c`` code is "import-only" if it is at most 2,000 ASCII characters with
-no ``$``, backtick, backslash or ``%`` and parses into only imports and ``print`` of names, attribute
-chains, str/number constants and f-strings of those (no ``*``, no ``print``
-alias, none of ``MainStoinker.__main__``/``.ib.cli``/``.ib.quick_probe``/``runpy``);
-for it only the "MainStoinker next to ib" rule is off (importing cannot connect:
-every connection goes through ``IbConnection.open()``), and any error blocks.
 Not seen: a script or file that itself imports and runs the package (written
 in one call, run in another), ``bash script.sh``, aliases/functions, a module
 name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
@@ -476,6 +472,7 @@ _DOTDOT_TOKEN = re.compile(r"[^\s;|&()]+")
 _PY_C_ARG = re.compile(r"(?<![\w-])-[a-z]*c[ \t]+(?=[\"'])", re.I)
 _IB_DOTTED = re.compile(r"mainstoinker\s*\.\s*ib(?![\w])")
 _IB_WORD = re.compile(r"(?<![\w])ib(?![\w])")
+_IB_WORD_ANY = re.compile(_IB_WORD.pattern, re.I)
 _IB_PATH = re.compile(r"mainstoinker/ib(?:/|(?![\w]))")
 # Code context only (a ``-c`` argument, a heredoc body, a line starting with
 # ``import``/``from``): marker words that run or import something by name.
@@ -546,6 +543,7 @@ class _Ctx:
         self.fed_loop = False  # a ForEach-Object / foreach / % came before
         self.fed_stream = False  # an xargs / parallel came before
         self.mentions = False  # the command names MainStoinker somewhere
+        self.piped = False  # the segment being judged gets a pipe as input
 
 
 def _join_continuations(text: str) -> str:
@@ -707,19 +705,41 @@ def _first_harmless(toks: list[str]) -> int | None:
     return None
 
 
-def _path_is_argument(segment: str, toks: list[str], i: int) -> bool:
-    """The package path ``toks[i]`` is no run: see the opening comment (issue 155)."""
+_SPECIAL = re.compile(r"[$(){}%!*?`'\"]")
+_OPTION = re.compile(r"-{1,2}[a-z0-9][a-z0-9_-]*(?:=[^$(){}%!*?`'\"]*)?")
+_BAREISH = re.compile(r"[./]*[a-z][a-z0-9-]*/*")  # ``fetch-bars``, ``fetch-bars/``: a subcommand?
+
+
+def _path_is_argument(segment: str) -> bool:
+    """Issue 155 rule 1: after a variable command word, every later word is harmless.
+
+    Harmless: an option, a redirect, a literal path (``a/b``) or the non-bare value after an option.
+    """
     words = segment.split()
     j = _command_index(words)
-    cw = _cmd_base(words[j].strip("\"'")) if j < len(words) else ""
-    if re.fullmatch(r"[a-z0-9_.:+-]+", cw):
-        return cw not in _LAUNCH_WORDS | _SHELL_WRAPPERS | _FEEDERS and not (
-            "python" in cw or cw.startswith("py")
-        )
-    k = i + 1
-    while k < len(toks) and "/" in toks[k]:
-        k += 1
-    return k >= len(toks) or toks[k].startswith("-")
+    if j >= len(words) or (
+        re.fullmatch(r"[a-z0-9_.:+-]+", _cmd_base(words[j])) and not re.search(r"[$%`(]", words[j])
+    ):
+        return False
+    k = next((n for n in range(j + 1, len(words)) if words[n].endswith("mainstoinker/__main__.py")), None)
+    if k is None:
+        return False
+    option = target = False  # after an option / after a bare redirect
+    for w in words[k + 1 :]:
+        special = _SPECIAL.search(w) is not None
+        if target:
+            ok, target, option = not special, False, False
+        elif _OPTION.fullmatch(w):
+            ok, option = True, "=" not in w
+        elif _REDIRECT.match(w) and not _ODD_OP.match(w) and not special:
+            ok, target, option = True, _REDIRECT_BARE.match(w) is not None, False
+        elif "/" in w and not special and not _BAREISH.fullmatch(w):  # a literal path
+            ok, option = True, False
+        else:  # the value of an option is no subcommand when it is not a bare word
+            ok, option = option and not special and not _BAREISH.fullmatch(w), False
+        if not ok:
+            return False
+    return True
 
 
 def _ib_from_import(text: str) -> bool:
@@ -737,12 +757,8 @@ def _ib_from_import(text: str) -> bool:
         pos = end  # later occurrences before `end` scan a part of the same span
 
 
-def _scan_code(text: str, import_only: bool = False) -> str | None:
-    """Judge text that is code (a ``-c`` argument or heredoc body).
-
-    """
-    if import_only:  # the word ``ib`` no longer counts
-        text = _IB_WORD.sub("x", text)
+def _scan_code(text: str) -> str | None:
+    """Judge text that is code (a ``-c`` argument or heredoc body): why it runs or imports MainStoinker."""
     if _CODE_WORD.search(text):
         return "running MainStoinker from code (runpy, import, exec, subprocess)"
     if _IB_DOTTED.search(text) or _ib_from_import(text) or _IB_PATH.search(text):
@@ -773,13 +789,26 @@ def _python_code_args(text: str) -> list[str]:
     return out
 
 
-# --- import-only ``python -c`` code (issue 155) -----------------------------------
-_IO_CHARS = re.compile(r"[A-Za-z0-9_ .,;:(){}'\"-]*")  # shell-inert: no $ ` \\ % ! newline
-_IO_C_FLAG = re.compile(r"(?<![\w-])-[BEIPRSOdbqsuv]*c[ \t]+(?=[\"'])")
+# --- import-only ``python -c`` code (issue 155, rule 2) ---------------------------
+_IO_CHARS = re.compile(r"[A-Za-z0-9_ .,;()]*")  # no quote, backslash, $, %, !, backtick
+_IO_C_FLAG = re.compile(r"(?<![\w-])-c[ \t]+(?=[\"'])")
 _IO_PY = r"(?i:python[\d.]*|pythonw|py|ipython)(?i:\.exe)?"
-_IO_LEAD = re.compile(  # [VAR=x] python [-P ...]; the path may be quoted
-    rf"\s*(?:\w+=\S*\s+)*(?:\"(?:[^\"]*[\\/])?{_IO_PY}\"|'(?:[^']*[\\/])?{_IO_PY}'"
-    rf"|(?:[^\s\"']*[\\/])?{_IO_PY})(?:\s+-[BEIPRSOdbqsuv]+)*\s*"
+_IO_LEAD = re.compile(  # [path/]python [-P -B -I -E -s -S -u -q]: no VAR=x, no quotes
+    rf"\s*(?:[^\s\"'`$()]*[\\/])?{_IO_PY}(?:[ \t]+-[PBIEsSuq])*\s*"
+)
+_IO_TOOLS = (  # text tools for the output (no tee, sort -o, rg --pre), at most one plain argument
+    r"(?:(?:tail|head)(?:[ \t]+-n?[ \t]*\d+)?|(?:grep|egrep|fgrep|rg|findstr|select-string)"
+    r"(?:[ \t]+(?!-)[\w.,:]+)?|less|more|cat|wc|sort|out-string)(?:\.exe)?(?![\w.-])"
+)
+_IO_TAIL = re.compile(  # after the code: [2>&1] [| text tool]..., then the end or a separator
+    rf"(?:[ \t]+2>&1)?(?:[ \t]*\|(?!\|)[ \t]*(?:[^\s|;&\\/]*[\\/])?{_IO_TOOLS})*"
+    r"(?=[ \t]*(?:$|[;&\n\r]|\|\|))",
+    re.I,
+)
+_IO_QUOTES = "\"'`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f"  # PowerShell quotes too
+_IO_OUTSIDE = re.compile(  # in the rest of the command: quotes, $, parens, redirects, VAR=
+    "[" + _IO_QUOTES + r"${}()<>]|(?<![\w-])(?:iex|invoke-expression)(?![\w-])|python\w*\s*=",
+    re.I,
 )
 _IO_DENIED = re.compile(  # entry points and ``runpy``, also as a prefix
     r"(?:mainstoinker\.(?:__main__|ib\.(?:cli|quick_probe))|runpy)(?![\w])", re.I
@@ -787,16 +816,9 @@ _IO_DENIED = re.compile(  # entry points and ``runpy``, also as a prefix
 
 
 def _io_value(n: ast.expr) -> bool:
-    """A str/number constant, a name or attribute chain on a name, or an f-string of those."""
+    """A number constant, or a name or attribute chain on a name."""
     if isinstance(n, ast.Constant):
-        return type(n.value) in (str, int, float)
-    if isinstance(n, ast.JoinedStr):
-        return all(
-            isinstance(v, ast.Constant)
-            or (v.conversion == -1 and v.format_spec is None and _io_value(v.value)
-                and isinstance(v.value, (ast.Name, ast.Attribute)))
-            for v in n.values
-        )
+        return type(n.value) in (int, float)
     while isinstance(n, ast.Attribute):
         n = n.value
     return isinstance(n, ast.Name)
@@ -831,24 +853,38 @@ def _import_only(code: str) -> bool:
     return not bound & {"print", "*"}
 
 
-def _import_only_spans(text: str) -> list[tuple[int, int]]:
-    """Spans of import-only code in ``python -c "..."`` arguments; [] on any error."""
-    spans: list[tuple[int, int]] = []
+def _import_only_spans(text: str, raw: str) -> list[tuple[int, int]]:
+    """Spans of import-only ``python -c`` code (opening comment, rule 2); [] on any error.
+
+    ``raw`` is the command before message/heredoc removal: no quote may hide in removed text."""
+    found: list[tuple[int, int, int]] = []  # code start, code end, end of what follows it
     try:
-        for m, _ in zip(_IO_C_FLAG.finditer(text), range(50)):
+        for count, m in enumerate(_IO_C_FLAG.finditer(text)):
             end = _quoted_at(text, m.end()) or 0  # 0 or -1: none or unterminated
             lead = max(text.rfind(c, 0, m.start()) for c in ";|&\n\r(") + 1
+            tail = _IO_TAIL.match(text, end) if end > 0 else None
             if (
-                end > 0
-                and text[end : end + 1] in " \t\r\n;|&)"  # one whole word
+                count < 50
+                and tail
                 and _IO_LEAD.fullmatch(text, lead, m.start())
-                and (not spans or m.end() >= spans[-1][1])
+                and (not found or m.end() >= found[-1][2])
                 and _import_only(text[m.end() + 1 : end - 1])
             ):
-                spans.append((m.end() + 1, end - 1))
+                found.append((m.end() + 1, end - 1, tail.end()))
+        outside = text
+        for a, _b, t in reversed(found):
+            outside = outside[: a - 1] + " " + outside[t:]
+        quotes = sum(text.count(c) for c in _IO_QUOTES)
+        if (
+            not found
+            or quotes != 2 * len(found)
+            or sum(raw.count(c) for c in _IO_QUOTES) != quotes
+            or _IO_OUTSIDE.search(outside)
+        ):
+            return []
     except Exception:  # noqa: BLE001 - no allowance on error: the old rule applies
         return []
-    return spans
+    return [(a, b) for a, b, _t in found]
 
 
 _QUOTE = re.compile(r"[\"']")
@@ -877,7 +913,7 @@ def _piped_code_args(text: str) -> list[str]:
     return out
 
 
-def _scan_connecting(segment: str) -> str | None:
+def _scan_connecting(segment: str, piped: bool = False) -> str | None:
     toks, marks = _tokenise(segment)
     n = len(toks)
     table = _Positionals(toks, marks)
@@ -943,13 +979,19 @@ def _scan_connecting(segment: str) -> str | None:
         if stop is not None and i > stop:
             break
         if tok.endswith("mainstoinker/__main__.py"):
-            # The entry file of the package: judged whatever runs it, unless
-            # the command is no run of it (a lint tool behind a variable).
-            if not (has_py or i == cmd0) and _path_is_argument(segment, toks, i):
+            # The entry file of the package: judged whatever runs it, unless it is
+            # an argument of a variable command (issue 155 rule 1), never when fed.
+            why = fed(i, i + 1)
+            if why:
+                return why
+            if (
+                feeder is None
+                and not piped
+                and not (has_py or i == cmd0)
+                and _path_is_argument(segment)
+            ):
                 continue
-            why = fed(i, i + 1) or _check_subcommand(
-                toks, table, i + 1, "MainStoinker/__main__.py"
-            )
+            why = _check_subcommand(toks, table, i + 1, "MainStoinker/__main__.py")
             if why:
                 return why
         elif not (has_py or i == cmd0):
@@ -1138,7 +1180,7 @@ def _connecting_reason(
         return None
     if weak:
         return _scan_in_package(segment, ctx, weak=True)
-    why = _scan_connecting(segment)
+    why = _scan_connecting(segment, ctx.piped)
     if not why and (ctx.fed_loop or ctx.fed_stream):
         # An earlier ForEach-Object / xargs feeds this command: its arguments
         # are not all visible. A loop is accepted when the subcommand is written
@@ -1194,17 +1236,17 @@ def _heredoc_bodies(text: str) -> list[str]:
     return bodies
 
 
-def _judge_connecting(text: str, resolve: bool = True) -> str | None:
+def _judge_connecting(text: str, resolve: bool = True, raw: str | None = None) -> str | None:
     """The T10 rule over a command whose continuation lines are joined."""
     mentions = "mainstoinker" in _normalise_connect(text, resolve)
     # An unbalanced quote means message removal may not have covered the text:
     # then nothing counts as "just text" any more.
     text_ok = text.count('"') % 2 == 0 and text.count("'") % 2 == 0
-    # Import-only ``python -c`` code is judged apart (below), the rest without it.
-    spans = _import_only_spans(text) if mentions else []
-    codes = [text[a:b] for a, b in spans]
+    # Import-only ``python -c`` code (rule 2): the word ``ib`` in it is masked, so the
+    # ib rule skips it; every other rule still sees the code as typed.
+    spans = _import_only_spans(text, text if raw is None else raw) if mentions else []
     for a, b in reversed(spans):
-        text = text[:a] + "x" + text[b:]
+        text = text[:a] + _IB_WORD_ANY.sub("x", text[a:b]) + text[b:]
     segs = _connect_segments(text, resolve)
     # A pipeline that ends in a shell or interpreter runs the text it is fed.
     feeds = [False] * len(segs)
@@ -1214,6 +1256,7 @@ def _judge_connecting(text: str, resolve: bool = True) -> str | None:
     ctx = _Ctx()
     ctx.mentions = mentions
     for i, (segment, _sep) in enumerate(segs):
+        ctx.piped = i > 0 and segs[i - 1][1] == "|"
         try:
             why = _connecting_reason(segment, text_ok, ctx, feeds[i])
         except Exception:  # noqa: BLE001 - a rule bug must fail closed
@@ -1236,10 +1279,6 @@ def _judge_connecting(text: str, resolve: bool = True) -> str | None:
             why = _scan_code(norm)
             if why:
                 return why
-    for code in codes:
-        why = _scan_code(_normalise_connect(code, resolve), import_only=True)
-        if why:
-            return why
     return None
 
 
@@ -1324,9 +1363,9 @@ def _decide_text(command: str, depth: int) -> tuple[bool, str]:
             what="an -EncodedCommand value that cannot be decoded, next to MainStoinker"
         )
     try:
-        why = _judge_connecting(joined)
+        why = _judge_connecting(joined, raw=command)
         if why is None and ".." in joined:
-            why = _judge_connecting(joined, resolve=False)  # as typed, too
+            why = _judge_connecting(joined, resolve=False, raw=command)  # as typed, too
     except Exception:  # noqa: BLE001 - a rule bug must fail closed
         why = "the hook could not analyse a MainStoinker command" if mentions else None
     if why:

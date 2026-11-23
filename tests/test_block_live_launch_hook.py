@@ -9,6 +9,7 @@ import io
 import itertools
 import json
 import random
+import re
 import subprocess
 import sys
 import time
@@ -2248,35 +2249,47 @@ def test_fix3_new_rules_are_linear_in_time() -> None:
         assert took < _TIMING_BOUND, (name, took)
 
 
-# --- issue 155: two false positives ---------------------------------------------
+# --- issue 155: two narrow allowances ---------------------------------------------
 # Every row is a command string used as data; nothing here is ever executed.
+# Rule 1: MainStoinker/__main__.py as an argument of a VARIABLE command word.
+# Rule 2: import-only ``python -c`` code, quote-free, with nothing else in the command.
 
 _R_EXE = "C:/x/.venv/Scripts/ruff.exe"
 _LINT_ARGS = "tests conftest.py MainStoinker/engine MainStoinker/api MainStoinker/ib"
-_REPORTED_LINT = (
-    f'R="{_R_EXE}"; "$R" check . 2>&1 | tail -5; '
-    f'"$R" check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B 2>&1 | tail -40'
-)
+_LINT_TAIL = f"{_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B"
+_REPORTED_LINT = f'R="{_R_EXE}"; "$R" check . ; "$R" check {_LINT_TAIL}'
+_TEXT_TOOLS = [
+    "tail -40", "tail", "head -5", "grep x", "rg x", "findstr x", "Select-String x",
+    "Out-String", "tee out.txt", "less", "more", "cat", "wc -l", "sort",
+]  # fmt: skip
+_RUNNERS = [
+    "bash", "sh", "zsh", "dash", "cmd", "pwsh", "powershell", "iex", "Invoke-Expression",
+    "python", "python -", "python3.14", ".venv\\Scripts\\python.exe", "py",
+]  # fmt: skip
 
 PATH_ARG_ALLOWED = [
     _REPORTED_LINT,
-    f'cd /x/work && R="{_R_EXE}"; "$R" check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B',
-    f"R={_R_EXE}; $R check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B",
-    f"& $ruff check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B",
+    _REPORTED_LINT + " 2>&1 | tail -40",
+    f'R="{_R_EXE}"; "$R" check . 2>&1 | tail -5; "$R" check {_LINT_TAIL} 2>&1 | tail -40',
+    f'cd /x/work && R="{_R_EXE}"; "$R" check {_LINT_TAIL}',
+    f"R={_R_EXE}; $R check {_LINT_TAIL}",
+    f"R={_R_EXE}; %R% check {_LINT_TAIL}",
+    f"& $ruff check {_LINT_TAIL}",
     '"$R" format --check MainStoinker/__main__.py',
+    '"$R" check MainStoinker/__main__.py --select E,F,W,I,B --output-format=concise',
+    '"$R" check MainStoinker/__main__.py --line-length 100 --select E,F',
     "$tool MainStoinker/__main__.py",
     "$tool MainStoinker\\__main__.py --check",
     "$d MainStoinker/__main__.py old/__main__.py",
     # an offline subcommand: what the hook does today for python .../__main__.py backtest
     "$x MainStoinker/__main__.py backtest",
     "python MainStoinker/__main__.py backtest",
-    # a literal tool that is no interpreter: the path is an argument
-    "diff MainStoinker/__main__.py other.py",
-    "wc -l MainStoinker/__main__.py",
+    "ruff check MainStoinker/__main__.py",
 ]
+PATH_ARG_ALLOWED += [f"{_REPORTED_LINT} 2>&1 | {t}" for t in _TEXT_TOOLS]
 
 PATH_ARG_BLOCKED = [
-    '$py MainStoinker/__main__.py fetch-bars',
+    "$py MainStoinker/__main__.py fetch-bars",
     '"$PY" MainStoinker/__main__.py probe-data --port 7497',
     "$py -m MainStoinker fetch-bars",
     "& $py MainStoinker/__main__.py fetch-bars",
@@ -2287,8 +2300,7 @@ PATH_ARG_BLOCKED = [
     "$x MainStoinker/__main__.py fetch-bars",
     "$(which python) MainStoinker/__main__.py fetch-bars",
     "`which python` MainStoinker/__main__.py fetch-bars",
-    '$t MainStoinker/__main__.py ./x fetch-bars',
-    # a literal command that can run it stays judged
+    "$t MainStoinker/__main__.py ./x fetch-bars",
     "pypy3 MainStoinker/__main__.py fetch-bars",
     "python3.14t MainStoinker/__main__.py fetch-bars",
     "start MainStoinker/__main__.py fetch-bars",
@@ -2296,11 +2308,20 @@ PATH_ARG_BLOCKED = [
     "bash MainStoinker/__main__.py fetch-bars",
     "cmd /c MainStoinker/__main__.py fetch-bars",
     "R=x; $R MainStoinker/__main__.py fetch-bars; $R check .",
+    # a LITERAL command word keeps the old rule entirely
+    "node MainStoinker/__main__.py fetch-bars",
+    # the lint line stays blocked when a subcommand-looking word follows the path
+    f'R="{_R_EXE}"; "$R" check MainStoinker/__main__.py --select E501',
+    f'R="{_R_EXE}"; "$R" check MainStoinker/__main__.py --output-format concise',
+    f'R="{_R_EXE}"; "$R" MainStoinker/__main__.py fetch-bars',
 ]
+# The lint line whose output goes into a shell or interpreter is judged as code.
+PATH_ARG_BLOCKED += [f"{_REPORTED_LINT} 2>&1 | {r}" for r in _RUNNERS]
+PATH_ARG_BLOCKED += [f"{_REPORTED_LINT} | {r}" for r in _RUNNERS]
 
 
 @pytest.mark.parametrize("command", PATH_ARG_ALLOWED)
-def test_issue155_path_argument_of_a_non_interpreter_is_allowed(command: str) -> None:
+def test_issue155_path_argument_of_a_variable_command_is_allowed(command: str) -> None:
     assert hook.decide(command) == (False, ""), command
 
 
@@ -2309,39 +2330,184 @@ def test_issue155_package_runs_stay_blocked(command: str) -> None:
     assert hook.decide(command)[0] is True, command
 
 
-_PYS = [
-    "python",
-    VENV_PY,
-    f'"{VENV_PY}"',
-    '"C:\\Program Files\\Python 3.14\\python.exe"',
-    "C:/x/.venv/Scripts/python.exe",
-    "VAR=1 python",
-    "py",
+# The review's constructions 1 to 7 of PR 157, as typed there, and variants. All were
+# blocked on revival; the first version of the PR allowed every one of them.
+I155_TABLE = r"""
+# 1 rule 2 hid the code from the pipe check
+B python -c "print(@Q@python -m @P@ @F@@Q@)" | bash
+B python -c "print(@Q@@P@.ib.cli.main()@Q@)" | python -
+B python -c "print(@Q@@P@.ib.cli.main()@Q@)" | iex
+B python -c "import @P@.ib.fetch as f; print(@Q@python -m @P@ @F@@Q@)" | bash
+B python -c "import @P@.ib.fetch as f; print(@Q@@P@.ib.cli.main()@Q@)" | python -
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | iex
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | Invoke-Expression
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | bash
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | sh
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | python
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | python -
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | tail -3 | bash
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" 2>&1 | bash
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | tee x.sh; bash x.sh
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | sort -o x.sh; bash x.sh
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | rg --pre ./x.sh y
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" > x.sh; bash x.sh
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" >> x.ps1; .\x.ps1
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" 2> err.txt
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" < cmds.txt
+B x=$(python -c "import @P@.ib.fetch as f; print(f.__file__)")
+B (python -c "import @P@.ib.fetch as f; print(f.__file__)")
+B $(python -c "import @P@.ib.fetch as f; print(f.__file__)")
+B @BT@python -c "import @P@.ib.fetch as f; print(f.__file__)"@BT@
+B iex (python -c "import @P@.ib.fetch as f; print(f.__file__)")
+B iex $(python -c "import @P@.ib.fetch as f; print(f.__file__)")
+B python -c "import @P@.ib.fetch as f; print(f.__file__)"; iex x
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" | & iex
+# 2 the quote after -c is not a string start for the shell
+B echo @Q@z; python -c "print(@Q@ ; python -m @P@ @F@ ; echo @Q@)" @Q@
+B echo "z; python -c @Q@print(" ; python -m @P@ @F@ ; echo ")@Q@ "
+B X=@Q@a python -c "print(@Q@ ; python -m @P@ @F@ ; echo @Q@)" @Q@
+B Write-Output @Q@z; python -c "print(@Q@ ; python -m @P@ @F@ ; echo @Q@)" @Q@
+B git log --grep @Q@z; python -c "print(@Q@ ; python -m @P@ @F@ ; echo @Q@)" @Q@
+B echo @Q@z; python -c "print(@Q@ ; python @P@/__main__.py @F@ ; echo @Q@)" @Q@
+B echo @Q@z; python -c "print(@Q@ ; python -m @P@.ib.cli ; echo @Q@)" @Q@
+B echo @Q@z; python -c "print(@Q@ ; python @P@/MainStuff/this is how we do it dum dum.py ; echo @Q@)" @Q@
+B echo @Q@z; python -c "print(@Q@ ; cmd /c Stonks data collect.bat ; echo @Q@)" @Q@
+B echo @Q@z; python -c "print(@Q@; python -m @P@ @F@ --port 7497; echo @Q@)" @Q@
+B echo @Q@a@Q@; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B echo "a"; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B echo @BT@a; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B echo ‘a’; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B echo “a”; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B git commit -m @Q@a@Q@; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -c "import @P@.ib.fetch as f; print(f.__file__)"; echo @Q@a@Q@
+B python -c "import @P@.ib.fetch as f; print(f.__file__)"; echo "a"
+# 3 Windows PowerShell 5.1 splits an argument that contains a double quote again
+B python -c @Q@print("1);import" "@P@.ib.connection;print(@P@.ib.connection.IbConnection")@Q@
+B python -c @Q@print("1);import" "@P@.ib.cli;@P@.ib.cli.main(")@Q@ --symbols AAPL --port 7497
+B & python -c @Q@print("1);import" "@P@.ib.cli;@P@.ib.cli.main(")@Q@ --port 7497
+B python -c @Q@print("1);from" "@P@.ib.connection" " import" " IbConnection;IbConnection(")@Q@
+B python -c @Q@print("1);import" "@P@.ib.cli;@P@.ib.cli.main(")@Q@
+B python -c "print(@Q@1);import@Q@ @Q@ @P@.ib.cli;@P@.ib.cli.main(@Q@)"
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" --symbols AAPL --port 7497
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" @F@
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" -c "import @P@.ib.cli"
+B python -c "import @P@.ib.fetch as f; print(f.__file__)" -m @P@ @F@
+# VAR=x prefixes and interpreter flags other than -P -B -I -E -s -S -u -q
+B PYTHONINSPECT=1 python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B PYTHONINSPECT=1 python -c "import @P@.ib.fetch as f; print(f.__file__)" < cmds.txt
+B PYTHONSTARTUP=evil.py python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B PYTHONPATH=evil python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B VAR=1 python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B export PYTHONINSPECT=1; python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B set PYTHONINSPECT=1 && python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B env PYTHONINSPECT=1 python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -i -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -X dev -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -W ignore -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -m foo -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -O -c "import @P@.ib.fetch as f; print(f.__file__)"
+B python -Pc "import @P@.ib.fetch as f; print(f.__file__)"
+B python -Ic "import @P@.ib.fetch as f; print(f.__file__)"
+B python script.py -c "import @P@.ib.fetch as f; print(f.__file__)"
+B sudo python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B $PYTHON -c "import @P@.ib.fetch as f; print(f.__file__)"
+B "C:\Program Files\Python 3.14\python.exe" -c "import @P@.ib.fetch as f; print(f.__file__)"
+B cmd /c python -c "import @P@.ib.fetch as f; print(f.__file__)"
+B bash -c "python -c @Q@import @P@.ib.fetch as f; print(f.__file__)@Q@"
+# 4 rule 1: a literal command word keeps the old rule
+B p() { python "$@"; }; p @P@/__main__.py @F@
+B function p { python @args }; p @P@/__main__.py @F@
+B Set-Alias p python; p @P@/__main__.py @F@
+B alias p=python; p @P@/__main__.py @F@
+B alias p=python@N@p @P@/__main__.py @F@
+B uv --quiet run @P@/__main__.py @F@
+B uv -q run @P@/__main__.py @F@
+B uv --project . run @P@/__main__.py @F@
+B uv run @P@/__main__.py @F@
+B pdm run @P@/__main__.py @F@
+B poetry run @P@/__main__.py @F@
+B hatch run @P@/__main__.py @F@
+B rye run @P@/__main__.py @F@
+B jython @P@/__main__.py @F@
+B graalpy @P@/__main__.py @F@
+B $VENV/Scripts/python.exe @P@/__main__.py @F@
+B "$VENV/Scripts/python.exe" @P@/__main__.py @F@
+# 5 rule 1: a feeder in front of the command
+B I=python; echo @F@ | xargs $I @P@/__main__.py
+B I=python; echo @F@ | xargs -I{} $I @P@/__main__.py {}
+B echo @F@ | xargs jython @P@/__main__.py
+B echo @F@ | parallel $I @P@/__main__.py
+B echo @F@ | ForEach-Object { & $I @P@/__main__.py $_ }
+B echo @F@ | % { & $I @P@/__main__.py $_ }
+B echo @F@ | "$R" check @P@/__main__.py a/b @F@
+# 6 rule 1: a word that contains a slash is not a literal path
+B & $x @P@/__main__.py (@Q@@F@/@Q@.TrimEnd(@Q@/@Q@))
+B & $x @P@/__main__.py @Q@@F@/@Q@.TrimEnd(@Q@/@Q@)
+B $x @P@/__main__.py $(echo @F@/ | tr -d /)
+B $x @P@/__main__.py $(basename /@F@)
+B $x @P@/__main__.py ${y%/}
+B $x @P@/__main__.py @F@/
+B $x @P@/__main__.py ./@F@
+B $x @P@/__main__.py a/b @F@
+# 7 rule 1: argv[0] is not the subcommand
+B $x @P@/__main__.py --verbose @F@
+B $x @P@/__main__.py -- @F@
+B $x @P@/__main__.py --port 7497 @F@
+B $x @P@/__main__.py --port=7497 @F@
+B $x @P@/__main__.py -X @F@
+B x=python; $x @P@/__main__.py @F@
+B x=python; $x @P@/__main__.py -- @F@
+B $x = "python"; & $x @P@/__main__.py @F@
+B $x = "python"; & $x @P@/__main__.py --verbose @F@
+B x=python; y=@F@x; $x @P@/__main__.py ${y/x/}
+B R="python -m @P@ @F@"; $R @P@/__main__.py
+"""
+
+
+_DATES = " --symbols AAPL --start 2026-01-02 --end 2026-01-03 --port 7497"
+I155_EXACT = [  # the review's strings with their trailing arguments, row by row
+    "B python -c @Q@print(\"1);import\" \"@P@.ib.cli;@P@.ib.cli.main(\")@Q@" + _DATES,
+    "B python -c \"import @P@.ib.fetch as f; print(f.__file__)\"" + _DATES,
 ]
 
+
+@pytest.mark.parametrize(
+    ("verdict", "raw"), _table(I155_TABLE) + _table("\n".join(I155_EXACT))
+)
+def test_issue155_review_constructions_are_blocked(verdict: str, raw: str) -> None:
+    command = _x(raw)
+    assert hook.decide(command)[0] is True, command
+    assert hook.main(_payload(command)) == 2, command  # the tool entry point agrees
+
+
+# Rule 2 allowed: quote-free import and print code, in every accepted spelling.
 IO_ALLOWED_CODE = [
     "import MainStoinker.ib.fetch as f; print(f.__file__)",
     "import MainStoinker.ib.fetch as f;print(f.__file__)",
     "from MainStoinker.ib import fetch; print(fetch.__file__)",
     "import MainStoinker.ib.fetch as f; import MainStoinker.ib.bars as b; print(f.__file__, b.__file__)",
-    "import MainStoinker.ib.fetch as f; print('ok')",
-    'import MainStoinker.ib.fetch as f; print("ok")',
     "import MainStoinker.ib.fetch as f; print(1, 2.5, f.a.b.c)",
-    "import MainStoinker as m; print(m.ib.__name__)",
-    'import MainStoinker.ib.fetch as f; print(f"{f.__file__} ok")',
+    "import MainStoinker.ib.fetch as f; print()",
     "import MainStoinker.ib",
-    "from MainStoinker import ib; print(ib.__file__)",
     "from MainStoinker.ib import (fetch)",
     "import os; import MainStoinker.ib.fetch as f; print(os.sep, f.__file__)",
 ]
+_PYS = ["python", VENV_PY, "C:/x/.venv/Scripts/python.exe", "py", "python3.14", "PYTHON.EXE"]
+_IO_FLAGS = ["", "-P ", "-B -I ", "-E -s -S -u -q ", "-I -P "]
+_IO_TAILS = [
+    "", " | tail -40", " | head -5", " 2>&1 | tail -3", " | Select-String x", " | grep x | tail -1",
+    " ; echo done", " && echo done", "\necho done",
+]  # fmt: skip
 
 
 def _c_forms(code: str, py: str) -> list[str]:
     forms = []
-    if '"' not in code:
-        forms += [f'{py} -c "{code}"', f'{py} -P -c "{code}"', f'& {py} -P -c "{code}"']
-    if "'" not in code:
-        forms += [f"{py} -c '{code}'", f"{py} -P -c '{code}'", f"& {py} -Ic '{code}'"]
+    for flags in _IO_FLAGS:
+        for lead in ("", "& "):
+            if '"' not in code:
+                forms.append(f'{lead}{py} {flags}-c "{code}"')
+            if "'" not in code:
+                forms.append(f"{lead}{py} {flags}-c '{code}'")
     return forms
 
 
@@ -2351,16 +2517,15 @@ def _io_commands(codes: list[str]) -> list[str]:
 
 def test_issue155_import_only_code_is_allowed() -> None:
     commands = _io_commands(IO_ALLOWED_CODE)
-    assert len(commands) > 300
+    assert len(commands) > 500
     wrong = [c for c in commands if hook.decide(c) != (False, "")]
     assert wrong == []
+    tailed = [c + tail for c in commands[:60] for tail in _IO_TAILS]
+    assert [c for c in tailed if hook.decide(c) != (False, "")] == []
     reported = 'python -P -c "import MainStoinker.ib.fetch as f; print(f.__file__)"'
     assert hook.main(_payload(reported)) == 0
     assert hook.main(_payload(reported, "PowerShell")) == 0
-    assert hook.decide(f'"{VENV_PY}" -P -c "import MainStoinker.ib.fetch as f; print(f.__file__)"') == (
-        False,
-        "",
-    )
+    assert hook.decide(reported + " ; " + reported) == (False, "")  # two spans in one command
 
 
 IO_BLOCKED_CODE = [
@@ -2374,7 +2539,6 @@ IO_BLOCKED_CODE = [
     "import MainStoinker.ib.fetch as f; getattr(f, 1)()",
     "import MainStoinker.ib.fetch as f; print(getattr(f, 1))",
     "import MainStoinker.ib.fetch as f; print(vars(f))",
-    "import MainStoinker.ib.fetch as f; print(dir(f))",
     "import MainStoinker.ib.fetch as f; print(repr(f))",
     "import MainStoinker.ib.fetch as f; open(1)",
     "import MainStoinker.ib.fetch as f; exec(1)",
@@ -2396,7 +2560,6 @@ IO_BLOCKED_CODE = [
     "__import__(1); import MainStoinker.ib.fetch",
     "import MainStoinker.ib.fetch; __import__(1)",
     "import os; os.system(1); import MainStoinker.ib.fetch",
-    "import MainStoinker.ib.fetch; import os; os.system(1)",
     "from MainStoinker.ib import *",
     "import MainStoinker.ib.fetch as print; print()",
     "from MainStoinker.ib import fetch as print; print(1)",
@@ -2408,119 +2571,89 @@ IO_BLOCKED_CODE = [
     "import MainStoinker.ib.fetch as f; print(1, end=2)",
     "import MainStoinker.ib.fetch as f; print(*f.a)",
     "import MainStoinker.ib.fetch as f; print(lambda: 1)",
-    "import MainStoinker.ib.fetch as f; print([f for f in 1])",
     "import MainStoinker.ib.fetch as f; print(f.a if f else 1)",
-    "import MainStoinker.ib.fetch as f; print(f'{f.a()}')",
-    "import MainStoinker.ib.fetch as f; print(f'{f.a!r}')",
-    "import MainStoinker.ib.fetch as f; print(f'{f.a:>10}')",
-    "import MainStoinker.ib.fetch as f; print(b'x')",
+    "import MainStoinker.ib.fetch as f; print(1j)",
     "import MainStoinker.ib.fetch as f; print(None)",
-    "import MainStoinker.ib.fetch as f; if f: print(1)",
-    "import MainStoinker.ib.fetch as f; class A: pass",
-    "import MainStoinker.ib.fetch as f; def g(): pass",
-    "import MainStoinker.ib.fetch as f; with f: pass",
-    "import MainStoinker.ib.fetch as f; for i in f: pass",
     "import MainStoinker.ib.fetch as f; print(f.__file__",
     "import MainStoinker.ib.fetch as f; print(f.__file__));",
     "import MainStoinker.ib.fetch as f; (f.main)()",
-    "import MainStoinker.ib.fetch as f; print(f.__file__) if 1 else f.main()",
-    "import MainStoinker.ib.fetch as f; assert f",
-    "import MainStoinker.ib.fetch as f; del f",
-    "import MainStoinker.ib.fetch as f; f.a = 1",
     "import MainStoinker.ib.fetch as f; print(f.__file__) or f.main()",
     "import MainStoinker.ib.fetch as f; print(f.a, f.main())",
-    "import MainStoinker.ib.fetch as f; print(f.a)  # x",
-    "import MainStoinker.ib.fetch as f; print(1)\n" + "x",
     "import MainStoinker.ib.fetch as f; print(f.__file__) ; " * 100,
-    "import MainStoinker.ib.fetch as f; print('" + "a" * 2000 + "')",
+    "import MainStoinker.ib.fetch as f; print(exec)",
+    "import MainStoinker.ib.fetch as f; import sys; print(sys.argv)",
+    # quote characters, strings and f-strings are no longer import-only (findings 2 and 3)
+    "import MainStoinker.ib.fetch as f; print('ok')",
+    'import MainStoinker.ib.fetch as f; print("ok")',
+    'import MainStoinker.ib.fetch as f; print(f"{f.__file__} ok")',
+    "import MainStoinker.ib.fetch as f; print(f'{f.__file__}')",
+    "import MainStoinker.ib.fetch as f; print('a' 'b')",
+    # characters outside [A-Za-z0-9_ .,;()]
     "import MainStoinker.ib.fetch as f; print(f.__file__) ; print($HOME)",
-    "import MainStoinker.ib.fetch as f; print('$HOME')",
-    "import MainStoinker.ib.fetch as f; print('%PATH%')",
-    "import MainStoinker.ib.fetch as f; print('\\x41')",
-    "import MainStoinker.ib.fetch as f; print('`x`')",
-    "import MainStoinker.ib.fetch as f; print('a!')",
-    "import MainStoinker.ib.fetch as f; print('é')",
-    "import MainStoinker.ib.fetch as f; print('a\\nb')",
+    "import MainStoinker.ib.fetch as f; print(f.__file__) # x",
+    "import MainStoinker.ib.fetch as f; print({f})",
+    "import MainStoinker.ib.fetch as f; print(f.a - 1)",
+    "import MainStoinker.ib.fetch as f; print(f.__file__)\\n",
+    "import MainStoinker.ib.fetch as f; print(f.__file__)\n",
+    # blocked as before: the package name itself is a token the other rules judge
+    "from MainStoinker import ib; print(ib.__file__)",
+    "import MainStoinker as m; print(m.ib.__name__)",
 ]
 
 
 def test_issue155_other_code_stays_blocked() -> None:
     commands = _io_commands(IO_BLOCKED_CODE)
-    assert len(commands) > 700
+    assert len(commands) > 1000
     wrong = [c for c in commands if not hook.decide(c)[0]]
     assert wrong == []
 
 
-def test_issue155_import_only_allowance_is_narrow() -> None:
-    ok = "import MainStoinker.ib.fetch as f; print(f.__file__)"
-    for command in (
-        # not python's own -c, or not one whole word
-        f'python -i -c "{ok}"',
-        f'python -m foo -c "{ok}"',
-        f'python script.py -c "{ok}"',
-        f'python -X dev -c "{ok}"',
-        f'python -W ignore -c "{ok}"',
-        f'sudo python -c "{ok}"',
-        f'bash -c "python -c \'{ok}\'"',
-        f"bash -c \"{VENV_PY} -c '{ok}'\"",
-        f'$PYTHON -c "{ok}"',
-        f"python -c '{ok}'\"; f.main()\"",
-        f"python -c '{ok}'\"; print(1)\"",
-        f"python -c \"{ok}\"'; f.main()'",
-        f'python -c "{ok}" ; python -c "import MainStoinker.ib.fetch as f; f.main()"',
-        f'python -c "{ok}" && python -c "import MainStoinker.ib.fetch as f; f.main()"',
-        f'python -c "{ok}" | python -c "import MainStoinker.ib.fetch as f; f.main()"',
-        # piped, heredoc, file, module: unchanged
-        f'echo "{ok}" | python -',
-        f'echo "{ok}" | python',
-        f'echo "{ok}" | bash',
-        f"python - <<'EOF'\n{ok}\nEOF",
-        f"python <<EOF\n{ok}\nEOF",
-        f"python - <<EOF\n{ok}\nEOF",
-        f"cat <<EOF | python\n{ok}\nEOF",
-        "python MainStoinker/ib/fetch.py",
-        "python -m MainStoinker.ib.fetch",
-        # every other rule still runs on the whole command
-        f'python -c "{ok}"; python -m MainStoinker fetch-bars',
-        f'python -c "{ok}"; python MainStoinker/__main__.py probe-data',
-        f'python -c "{ok}"; python -m MainStoinker.ib.cli',
-        f'python -c "{ok}"; python "{ENTRY}"',
-        f'python -c "{ok}"; cmd /c "{BAT}"',
-        f'python -c "{ok}; print(\'{ENTRY}\')"',
-        f'python -c "{ok}"; python -m $M',
-        f'python -c "{ok}" && python -c "import runpy; runpy.run_module(\'MainStoinker\')"',
-        f'python -c "{ok}"; python -c "import MainStoinker.ib.cli"',
-        f'python -c "{ok}"; echo "import MainStoinker.ib.cli" | python',
-        f"python -c \"{ok}\"; xargs python MainStoinker/__main__.py",
-        f'cd MainStoinker && python -c "{ok}"; python __main__.py fetch-bars',
-    ):
-        assert hook.decide(command)[0] is True, command
+_POISONS = [  # prefix, suffix: every one of them must leave the command blocked
+    ("echo 'a'; ", ""), ('echo "a"; ', ""), ("echo `a; ", ""), ("echo ‘a’; ", ""), ("", "; echo 'a'"),
+    ("$x = 1; ", ""), ("X=1 ", ""), ("PYTHONINSPECT=1; ", ""), ("iex ", ""), ("(", ")"), ("$(", ")"),
+    ("`", "`"), ("", " | bash"), ("", " | sh"), ("", " | python -"), ("", " | iex"), ("", " > out.sh"),
+    ("", " >> out.ps1"), ("", " 2> err"), ("", " < in"), ("", " --port 7497"), ("", " fetch-bars"),
+    ("", " | tail | bash"), ("", " | tee out.sh"), ("", " | sort -o out.sh"), ("", " | rg --pre x y"),
+    ("sudo ", ""), ("env ", ""), ("bash -c ", ""), ("cmd /c ", ""),
+    ("", "; python -m MainStoinker fetch-bars"),
+]  # fmt: skip
+
+
+def test_issue155_every_poison_keeps_the_import_only_form_blocked() -> None:
+    base = [c for c in _io_commands(IO_ALLOWED_CODE[:3]) if not c.startswith("&")]
+    assert len(base) > 100
+    assert [c for c in base if hook.decide(c) != (False, "")] == []
+    allowed_back = []
+    for prefix, suffix in _POISONS:
+        for command in base[:: len(base) // 40 or 1]:
+            poisoned = prefix + command + suffix
+            if not hook.decide(poisoned)[0]:
+                allowed_back.append(poisoned)
+    assert allowed_back == []
 
 
 _IO_BAD_SNIPPETS = [
     "f.main()", "f.fetch(1)", "getattr(f, 0)()", "os.system(0)", "print(f.fetch())",
-    "exec(0)", "eval(0)", "open(0)", "vars(f)", "dir(f)", "repr(f)", "__import__(0)",
+    "exec(0)", "eval(0)", "open(0)", "vars(f)", "repr(f)", "__import__(0)",
     "importlib.import_module(0)", "IbConnection()", "f.IbConnection().open()",
-    "print(f.a())", "print(f.a[0])", "x = f.a", "del f", "f.a = 1", "[f for f in 1]",
+    "print(f.a())", "print(f.a[0])", "x = f.a", "del f", "f.a = 1", "f.a; f.b()",
     "import MainStoinker.ib.cli", "import MainStoinker.__main__",
     "import MainStoinker.ib.quick_probe", "from MainStoinker.ib import cli",
     "from MainStoinker.ib.cli import main", "from MainStoinker import __main__",
     "import runpy", "import MainStoinker.ib.fetch as print", "from MainStoinker.ib import *",
-    "if f: pass", "lambda: 1",
+    "if f: pass", "lambda: 1", "print(1 if f else 2)",
 ]  # fmt: skip
 
 
 def test_issue155_seeded_mutations_of_allowed_code_are_never_allowed() -> None:
     rng = random.Random(155)
-    pys = [p for p in _PYS if "Program" not in p]
     done = 0
     allowed_back = []
     while done < 2000:
         parts = rng.choice(IO_ALLOWED_CODE).split("; ")
         for _ in range(rng.choice((1, 1, 2, 3))):
             parts.insert(rng.randint(0, len(parts)), rng.choice(_IO_BAD_SNIPPETS))
-        code = "; ".join(parts)
-        forms = _c_forms(code, rng.choice(pys))
+        forms = _c_forms("; ".join(parts), rng.choice(_PYS))
         if not forms:
             continue
         command = rng.choice(forms)
@@ -2534,55 +2667,276 @@ def test_issue155_big_or_odd_code_is_refused_fast() -> None:
     head = "import MainStoinker.ib.fetch as f; "
     assert hook._import_only("import MainStoinker.ib.fetch as f; print(f.__file__)") is True
     assert hook._import_only(head + "print(1); " * 400) is False  # over 2,000 characters
+    for bad in ("print('a')", 'print("a")', "print(f'{x}')", "print(a\\b)", "print(a:b)", "print(a%b)"):
+        assert hook._import_only(head + bad) is False, bad
     shapes = {
         "many_prints": head + "print(1); " * 5_000,
         "parens": head + "print(" + "(" * 20_000 + "1" + ")" * 20_000 + ")",
         "attrs": head + "print(f" + ".a" * 20_000 + ")",
         "many_c": ('python -c "' + head + 'print(1)" ') * 500,  # only 50 are looked at
+        "many_pipes": 'python -c "' + head + 'print(1)"' + " |" * 20_000,
     }
     for name, code in shapes.items():
-        command = code if name == "many_c" else f'python -c "{code}"'
+        command = code if name.startswith("many_") else f'python -c "{code}"'
         blocked, took = _timed(command)
         assert took < _TIMING_BOUND, (name, took)
         assert blocked is True, name
+    _blocked, took = _timed('python -c "' + head + 'print(1)"' + " | tail" * 5_000)
+    assert took < _TIMING_BOUND
 
 
-def test_issue155_errors_in_the_new_code_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "name", ["_import_only", "_io_value", "_import_only_spans", "_scan_code", "_quoted_at"]
+)
+def test_issue155_errors_in_rule_2_fail_closed(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     command = 'python -c "import MainStoinker.ib.fetch as f; print(f.__file__)"'
     assert hook.decide(command) == (False, "")
 
     def boom(*args: object, **kwargs: object) -> object:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(hook, "_import_only", boom)
+    monkeypatch.setattr(hook, name, boom)
     assert hook.decide(command)[0] is True  # no allowance: the ib rule applies
-    monkeypatch.undo()
-    monkeypatch.setattr(hook, "_io_value", boom)
-    assert hook.decide(command)[0] is True
-    monkeypatch.undo()
-    monkeypatch.setattr(hook, "_scan_code", boom)
-    assert hook.decide(command)[0] is True
-    monkeypatch.undo()
-    assert hook.decide(command) == (False, "")
-    # an unbalanced quote or an unterminated string is never import-only
+    assert hook.main(_payload(command)) == 2
+    assert hook.run_stdin(io.BytesIO(_payload(command).encode())) == 2
+
+
+def test_issue155_every_other_rule_still_runs_on_the_whole_command() -> None:
+    ok = "import MainStoinker.ib.fetch as f; print(f.__file__)"
+    for command in (
+        f'echo "{ok}" | python -',
+        f'echo "{ok}" | python',
+        f'echo "{ok}" | bash',
+        f"python - <<'EOF'\n{ok}\nEOF",
+        f"python <<EOF\n{ok}\nEOF",
+        f"cat <<EOF | python\n{ok}\nEOF",
+        "python MainStoinker/ib/fetch.py",
+        "python -m MainStoinker.ib.fetch",
+        f'python -c "{ok}" ; python -c "import MainStoinker.ib.fetch as f; f.main()"',
+        f'python -c "{ok}" && python -c "import MainStoinker.ib.fetch as f; f.main()"',
+        f'python -c "{ok}" | python -c "import MainStoinker.ib.fetch as f; f.main()"',
+        f'python -c "{ok}"; python -m MainStoinker fetch-bars',
+        f'python -c "{ok}"; python MainStoinker/__main__.py probe-data',
+        f'python -c "{ok}"; python -m MainStoinker.ib.cli',
+        f'python -c "{ok}"; python "{ENTRY}"',
+        f'python -c "{ok}"; cmd /c "{BAT}"',
+        f'python -c "{ok}"; python -m $M',
+        f'python -c "{ok}"; python -c "import MainStoinker.ib.cli"',
+        f'python -c "{ok}"; echo "import MainStoinker.ib.cli" | python',
+        f'python -c "{ok}"; xargs python MainStoinker/__main__.py',
+        f'cd MainStoinker && python -c "{ok}"; python __main__.py fetch-bars',
+        f'R=x; "$R" check MainStoinker/__main__.py; python -m MainStoinker fetch-bars; python -c "{ok}"',
+    ):
+        assert hook.decide(command)[0] is True, command
+
+
+def test_issue155_errors_in_rule_1_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert hook.decide(_REPORTED_LINT) == (False, "")
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hook, "_path_is_argument", boom)
+    assert hook.decide(_REPORTED_LINT)[0] is True
+    assert hook.main(_payload(_REPORTED_LINT)) == 2
+
+
+def test_issue155_unbalanced_or_odd_arguments_are_never_import_only() -> None:
     for bad in (
         'python -c "import MainStoinker.ib.fetch as f; print(f.__file__)',
         "python -c 'import MainStoinker.ib.fetch as f; print(f.__file__)",
         'python "C:\\a (x86)\\python.exe" -c "import MainStoinker.ib.fetch"',
+        'python -c "import MainStoinker.ib.fetch as f; print(f.__file__)""',
+        "python -c 'import MainStoinker.ib.fetch as f; print(f.__file__)''",
     ):
         assert hook.decide(bad)[0] is True, bad
 
 
-def test_issue155_allowed_code_still_checks_the_scan_without_ib() -> None:
-    # the helper that skips only the ib rules keeps every other code rule
-    assert hook._scan_code("import mainstoinker.ib.fetch", import_only=True) is None
+def test_issue155_the_ib_rule_alone_is_skipped_for_allowed_code() -> None:
+    # the code is masked only for the ``ib`` word; every other code rule still reads it
     assert hook._scan_code("import mainstoinker.ib.fetch") is not None
     for code in (
-        "import mainstoinker.ib.fetch; import runpy",
-        "import mainstoinker.ib.fetch; print(mainstoinker.__main__)",
-        "import mainstoinker.ib.fetch; import mainstoinker.__main__",
-        "import mainstoinker.ib.fetch; print(sys.argv)",
-        "import mainstoinker.ib.fetch; print(exec)",
-        "import mainstoinker.ib.fetch; import subprocess",
+        "import MainStoinker.ib.fetch as f; import runpy",
+        "import MainStoinker.ib.fetch as f; print(MainStoinker.__main__)",
+        "import MainStoinker.ib.fetch as f; import MainStoinker.__main__",
+        "import MainStoinker.ib.fetch as f; import sys; print(sys.argv)",
+        "import MainStoinker.ib.fetch as f; print(exec)",
+        "import MainStoinker.ib.fetch as f; import subprocess",
+        "import MainStoinker.ib.fetch as f; import importlib",
     ):
-        assert hook._scan_code(code, import_only=True) is not None, code
+        assert hook.decide(f'python -c "{code}"')[0] is True, code
+    # the spans are the quote-free import and print code only
+    command = 'python -c "import MainStoinker.ib.fetch as f; print(f.__file__)"'
+    assert hook._import_only_spans(command, command) == [(11, len(command) - 1)]
+    for blocked in (
+        "echo 'a'; " + command,
+        command + " | bash",
+        command + " > x",
+        "python -c \"import MainStoinker.ib.fetch as f; print('ok')\"",
+    ):
+        assert hook._import_only_spans(blocked, blocked) == [], blocked
+    assert hook._import_only_spans(command, command + "'") == []  # a quote hidden in removed text
+
+
+# --- the T10 baseline: nothing it blocks is allowed now, except the two allowances -----
+
+
+T10_BASELINE = REPO_ROOT / "tests" / "fixtures" / "hook_baseline" / "block_live_launch_t10.py.txt"
+# sha256 of the frozen copy of revival's hook at 37ece54 (line endings as LF).
+T10_SHA256 = "557fc1374bd6ff0a7dffab6fb07b3fac1e1cb92eca99f20303e18fb4b85a3bc0"
+CORPUS = REPO_ROOT / "tests" / "fixtures" / "hook_baseline" / "issue155_corpus.json"
+
+
+def _load_t10_hook() -> types.ModuleType:
+    """The frozen copy of the hook on revival at 37ece54 (it knows the MainStoinker rules)."""
+    data = T10_BASELINE.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(data).hexdigest() == T10_SHA256, "the frozen T10 baseline was edited"
+    first = data.split(b"\n")[0]
+    assert first.startswith(b"# FROZEN BASELINE:") and b"never executed as a hook" in first
+    module = types.ModuleType("t10_block_live_launch")
+    module.__file__ = str(T10_BASELINE)
+    exec(compile(data.decode("utf-8"), module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def _statements(command: str) -> list[str]:
+    """Split on ``;``, ``&&`` and newlines outside quotes (a small scanner, independent of the hook)."""
+    out, cur, quote, i = [], "", "", 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in ";\n" or command.startswith("&&", i):
+            out.append(cur.strip())
+            cur, i = "", i + (2 if ch == "&" else 1)
+            continue
+        cur += ch
+        i += 1
+    return [s for s in (*out, cur.strip()) if s]
+
+
+_TOOL = r"(?:tail|head|grep|egrep|fgrep|rg|findstr|select-string|less|more|cat|wc|sort|out-string|tee)"
+_PIPE_TOOL = re.compile(rf"(?:\S*[\\/])?{_TOOL}(?:\.exe)?(?: \S+)?", re.I)
+_VAR_WORD = re.compile(r'"?(?:\$\{?[\w/\\.:-]+\}?|%\w+%)"?')
+_WRAP = re.compile(
+    r"(?:(?:\w+=\S*|&|env|call|nohup|time|sudo|exec|command|builtin|cmd /c|bash -c|sh -c) )+"
+)
+_IMPORT_FORM = re.compile(
+    r"(?:& )?(?:[^\s\"'`$()]*[\\/])?(?:python[\d.]*|pythonw|py|ipython)(?:\.exe)?"
+    r"(?: -[PBIEsSuq])* -c ([\"'])[A-Za-z0-9_ .,;()]*\1(?: 2>&1)?",
+    re.I,
+)
+
+
+def _lint_form(stmt: str) -> bool:
+    """A variable command word, the package path, then options, redirects, paths and option values."""
+    stmt = _WRAP.sub("", stmt, count=1).strip("\"'") if _WRAP.match(stmt) else stmt
+    head, *pipes = stmt.split(" | ")
+    words = head.split()
+    entry = "mainstoinker/__main__.py"
+    path = [k for k, w in enumerate(words) if w.lower().replace("\\", "/").endswith(entry)]
+    if not (words and path and _VAR_WORD.fullmatch(words[0])):
+        return False
+    if not all(_PIPE_TOOL.fullmatch(p.strip()) for p in pipes):
+        return False
+    after_option = False
+    for w in words[path[0] + 1 :]:
+        slashed = w.replace("\\", "/")
+        if re.fullmatch(r"--?[A-Za-z0-9][\w-]*(=[\w.,:/-]*)?", w):
+            after_option = "=" not in w
+        elif re.fullmatch(r"\d?>&\d", w):
+            after_option = False
+        elif (
+            re.fullmatch(r"[\w./:-]+", slashed)
+            and "/" in slashed
+            and not re.fullmatch(r"[./]*[A-Za-z][A-Za-z0-9-]*/*", slashed)
+        ):
+            after_option = False
+        elif after_option and re.fullmatch(r"[\w.,:-]+", w) and not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", w):
+            after_option = False
+        else:
+            return False
+    return True
+
+
+def _import_form(stmt: str) -> bool:
+    """``python [-P ...] -c "<quote-free code>"`` with at most ``2>&1`` and text-tool pipes after it."""
+    head = stmt.split(" | ")
+    m = _IMPORT_FORM.match(head[0])
+    return bool(m) and m.end() == len(head[0]) and all(_PIPE_TOOL.fullmatch(p.strip()) for p in head[1:])
+
+
+def _issue155_exempt(command: str, t10: types.ModuleType) -> bool:
+    """The two allowances, enumerated here without the hook's own helpers."""
+    exempt = False
+    for stmt in _statements(command):
+        if _lint_form(stmt) or _import_form(stmt):
+            exempt = True
+        elif t10.decide(stmt)[0]:
+            return False  # a statement the baseline blocks and that is no allowed form
+    return exempt
+
+
+def _t10_corpus() -> list[str]:
+    corpus: set[str] = set()
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            corpus.add(node.value)
+    for table in (ADV_TABLE, FP_TABLE, CONT_TABLE, I155_TABLE):
+        corpus.update(_x(raw) for _verdict, raw in _table(table))
+    corpus.update(BLOCKED)
+    corpus.update(PATH_ARG_ALLOWED)
+    corpus.update(PATH_ARG_BLOCKED)
+    corpus.update(_generated_forms())
+    corpus.update(_io_commands(IO_ALLOWED_CODE))
+    corpus.update(_io_commands(IO_BLOCKED_CODE))
+    corpus.update(cmd for _blocked, cmd in json.loads(CORPUS.read_text(encoding="utf-8")))
+    return sorted(corpus)
+
+
+def test_nothing_blocked_by_the_t10_baseline_is_allowed_except_the_two_allowances() -> None:
+    t10 = _load_t10_hook()
+    corpus = _t10_corpus()
+    assert len(corpus) > 8_000
+    blocked_by_t10 = [c for c in corpus if t10.decide(c)[0]]
+    assert len(blocked_by_t10) > 4_000
+    loosened = [c for c in blocked_by_t10 if not hook.decide(c)[0]]
+    unexplained = [c for c in loosened if not _issue155_exempt(c, t10)]
+    assert unexplained == []
+    # the allowances are in use, so the check above is not vacuous, and they stay few
+    assert 100 < len(loosened) < len(blocked_by_t10) / 4
+
+
+def test_the_exemption_predicate_is_not_a_blanket() -> None:
+    t10 = _load_t10_hook()
+    reported = _REPORTED_LINT + " 2>&1 | tail -40"
+    assert t10.decide(reported)[0] is True and _issue155_exempt(reported, t10) is True
+    code = 'python -P -c "import MainStoinker.ib.fetch as f; print(f.__file__)"'
+    assert t10.decide(code)[0] is True and _issue155_exempt(code, t10) is True
+    for command in (
+        "$x MainStoinker/__main__.py fetch-bars",
+        "$x MainStoinker/__main__.py -- fetch-bars",
+        "python -c \"import MainStoinker.ib.fetch as f; print('ok')\"",
+        code + " | bash",
+        code + "; python -m MainStoinker fetch-bars",
+        "uv run MainStoinker/__main__.py fetch-bars",
+        "echo fetch-bars | $x MainStoinker/__main__.py fetch-bars",
+    ):
+        assert _issue155_exempt(command, t10) is False, command
+
+
+def test_issue155_corpus_verdicts_are_pinned() -> None:
+    """The reviewer's differential corpus (a deterministic sample), with this hook's verdict."""
+    rows = json.loads(CORPUS.read_text(encoding="utf-8"))
+    assert 3_000 < len(rows) <= 5_000
+    assert len({cmd for _blocked, cmd in rows}) == len(rows)
+    wrong = [cmd for blocked, cmd in rows if hook.decide(cmd)[0] is not bool(blocked)]
+    assert wrong == []
+    t10 = _load_t10_hook()
+    loosened = [cmd for blocked, cmd in rows if not blocked and t10.decide(cmd)[0]]
+    assert loosened and [c for c in loosened if not _issue155_exempt(c, t10)] == []
+    # the must-fix constructions (blocked on revival, allowed by the first PR head) are the bulk
+    assert sum(1 for blocked, _cmd in rows if blocked) > 2_500
