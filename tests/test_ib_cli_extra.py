@@ -429,7 +429,8 @@ def test_the_volume_note_states_the_settled_fact() -> None:
     assert "not settled" not in note
     assert "as ib sent" in note
     assert "unticked" in note and "global configuration, api, settings" in note
-    assert "cannot be converted back" in note and "fetch that data again" in note
+    assert "cannot be converted back" in note and "fetch that data again" not in note
+    assert "delete the symbol's folder under the output folder" in note and "new --out" in note
     assert "hundreds of thousands to millions" in note and "tens of thousands" in note
 
 
