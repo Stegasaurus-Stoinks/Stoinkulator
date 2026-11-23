@@ -11,18 +11,39 @@ that zone, so a full day has `SESSION_MINUTES` (390) one-minute bars, stamped
 There is deliberately no holiday calendar. A holiday is planned like any
 weekday; IB answers it with the previous session (or nothing), `filter_day`
 keeps only bars of the requested date, and an empty day is recorded as
-`no_data`, which resume does not ask for again. Half days come out of the gap
-report as `short`.
+`no_data`. Half days come out of the gap report as `short` (complete from 09:30
+to 12:59 and nothing after); any other missing tail is `partial`.
+
+Contract for the driver (the later task that talks to IB)
+---------------------------------------------------------
+* Per day: `Pacer.reserve(contract, request.key())` -> wait `reservation.wait`
+  seconds (the driver's own sleep) -> send -> `Pacer.sent(reservation)` right
+  after the send. If the send is abandoned call `Pacer.cancel(reservation)`.
+  Limits are checked against ACTUAL send times, so a late send delays the
+  following requests instead of breaking IB's limits.
+* Record every outcome in the `Manifest` and `save_manifest` it. A transient
+  failure (a pacing violation, error 162, a timeout, a disconnect, anything that
+  may succeed later) MUST be recorded as `failed`, never as `no_data`:
+  `no_data` means "IB has nothing for this day" and resume does NOT ask for it
+  again, `failed` is asked for again.
+* To force a refetch of days already recorded (a wrongly recorded `no_data`, or
+  the `no_data`/`short`/`partial` days of a gap report) use
+  `Manifest.mark_pending` / `Manifest.mark_gaps_pending`.
+* `plan_range` lists the days to fetch and the days skipped because their
+  session has not closed yet; report both.
+* Gap files are written per symbol folder: `write_gap_files(symbol_folder(...),
+  rows, symbol)`, one `gaps.csv` and `gaps_summary.txt` in each symbol's folder.
 """
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import json
+import math
 import os
 import tempfile
 import time
-from collections import deque
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -42,6 +63,7 @@ DATA_ZONE = "America/New_York"
 SESSION_OPEN = dtime(9, 30)
 SESSION_CLOSE = dtime(16, 0)
 SESSION_MINUTES = 390
+EARLY_CLOSE_MINUTES = 210  # an early close at 13:00 leaves bars 09:30 to 12:59
 DEFAULT_BAR_SIZE = "1 min"
 DEFAULT_WHAT_TO_SHOW = "TRADES"
 MANIFEST_NAME = "manifest.json"
@@ -53,6 +75,9 @@ STATUS_FAILED = "failed"
 DAY_STATUSES = (STATUS_OK, STATUS_NO_DATA, STATUS_FAILED)
 
 _UTC = timezone.utc
+_WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
 
 
 def _zone(name: str) -> ZoneInfo:
@@ -60,9 +85,26 @@ def _zone(name: str) -> ZoneInfo:
 
 
 def _aware(moment: datetime, what: str) -> datetime:
+    if not isinstance(moment, datetime):
+        raise TypeError(f"{what} must be a datetime")
     if moment.tzinfo is None or moment.utcoffset() is None:
         raise ValueError(f"{what} must be a timezone-aware datetime")
     return moment
+
+
+def check_symbol(symbol: str) -> str:
+    """`symbol` if it is safe as a folder name on every platform, else `ValueError`.
+
+    On top of `engine.feed`'s plain-ticker rule this refuses Windows reserved
+    device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, any
+    case, also with an extension such as `NUL.A`) and a trailing dot or space.
+    """
+    month_file_path(Path("."), symbol, 2000, 1)  # the shared plain-ticker rule
+    if symbol != symbol.rstrip(". "):
+        raise ValueError(f"invalid symbol {ascii(symbol)}: trailing dot or space")
+    if symbol.split(".")[0].rstrip().upper() in _WINDOWS_RESERVED:
+        raise ValueError(f"invalid symbol {ascii(symbol)}: reserved Windows device name")
+    return symbol
 
 
 def session_close_utc(day: date) -> datetime:
@@ -70,26 +112,57 @@ def session_close_utc(day: date) -> datetime:
     return datetime.combine(day, SESSION_CLOSE, tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
 
 
-def plan_days(start: date, end: date, server_now: datetime) -> list[date]:
-    """Weekdays from `start` to `end` inclusive, in order.
+@dataclass(frozen=True, slots=True)
+class DayPlan:
+    """Result of `plan_range`: the days to fetch and the trading days skipped as not yet closed."""
 
-    `server_now` is an aware datetime (the injected clock). If the regular
-    session of `end` (16:00 New York) has not closed by `server_now` the plan is
-    refused with `ValueError`. `start` after `end` is a `ValueError` too.
-    Holidays are not removed (see the module docstring).
+    days: list[date]
+    not_closed: list[date]
+
+
+def plan_range(start: date, end: date, server_now: datetime) -> DayPlan:
+    """Every closed trading day (weekday) from `start` to `end`, plus the ones not closed yet.
+
+    `server_now` is an aware datetime (the injected clock). A weekday is closed
+    once its regular session (16:00 New York) is over at `server_now`. Weekdays
+    whose session has not closed go into `not_closed` (in order) so the driver
+    can report them; they are never planned. The plan is refused with
+    `ValueError` only when the range holds trading days but none of them has
+    closed. A range of only weekend days plans nothing. `start` after `end` is a
+    `ValueError`. Holidays are not removed (see the module docstring).
     """
     _aware(server_now, "server_now")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
-    if session_close_utc(end) > server_now:
-        raise ValueError(f"the regular session of {end} has not closed yet at {server_now.isoformat()}")
-    days = []
+    days: list[date] = []
+    not_closed: list[date] = []
     current = start
     while current <= end:
         if current.weekday() < 5:
-            days.append(current)
+            (days if session_close_utc(current) <= server_now else not_closed).append(current)
         current += timedelta(days=1)
-    return days
+    if not_closed and not days:
+        raise ValueError(
+            f"no trading day from {start} to {end} has closed yet at {server_now.isoformat()}: "
+            f"session of {not_closed[0]} not closed")
+    return DayPlan(days, not_closed)
+
+
+def plan_days(start: date, end: date, server_now: datetime) -> list[date]:
+    """The closed trading days of `plan_range` (the skipped, not closed ones are dropped)."""
+    return plan_range(start, end, server_now).days
+
+
+def format_end_date_time(moment: datetime) -> str:
+    """The `endDateTime` string for `reqHistoricalData`, from an aware datetime.
+
+    IB documents two forms: `yyyymmdd-HH:mm:ss` in UTC and `yyyymmdd HH:mm:ss
+    <zone>` (a time zone name after a space). This uses the first, in UTC. The
+    older `ibapi` docstring only lists the second form, so the first owner
+    session of the driver task must confirm that TWS accepts this one; if not,
+    change it here, the only place that builds the string.
+    """
+    return _aware(moment, "moment").astimezone(_UTC).strftime("%Y%m%d-%H:%M:%S")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +170,7 @@ class DayRequest:
     """Arguments of one `reqHistoricalData` call for one trading day."""
 
     day: date
-    end_date_time: str  # "YYYYMMDD-HH:MM:SS", UTC
+    end_date_time: str  # see `format_end_date_time`
     duration: str
     bar_size: str
     what_to_show: str
@@ -112,9 +185,23 @@ class DayRequest:
 def day_request(
     day: date, *, bar_size: str = DEFAULT_BAR_SIZE, what_to_show: str = DEFAULT_WHAT_TO_SHOW,
 ) -> DayRequest:
-    """The request for the regular session of `day`: ends 16:00 New York (as UTC), "1 D", RTH only."""
-    end = session_close_utc(day)
-    return DayRequest(day, end.strftime("%Y%m%d-%H:%M:%S"), "1 D", bar_size, what_to_show, 1)
+    """The request for the regular session of `day`: ends 16:00 New York, "1 D", RTH only."""
+    return DayRequest(day, format_end_date_time(session_close_utc(day)), "1 D", bar_size,
+                      what_to_show, 1)
+
+
+def _bar_times(bars: pd.DataFrame, what: str) -> pd.Series:
+    """The `date` column as naive whole-minute datetimes; `ValueError` for anything else."""
+    if "date" not in bars.columns:
+        raise ValueError(f"{what}: bars have no date column")
+    dates = pd.to_datetime(bars["date"])
+    if getattr(dates.dt, "tz", None) is not None:
+        raise ValueError(f"{what}: the date column is timezone-aware, expected naive data-zone times")
+    if dates.isna().any():
+        raise ValueError(f"{what}: the date column holds missing timestamps")
+    if len(dates) and (dates != dates.dt.floor("min")).any():
+        raise ValueError(f"{what}: timestamps are not on whole minutes")
+    return dates
 
 
 def filter_day(
@@ -124,17 +211,49 @@ def filter_day(
     """Rows of `bars` (a `date` column of naive data-zone times, the bar start) for `day` only.
 
     On a holiday IB answers "1 D" with the previous session; those rows are
-    dropped. A bar whose minute had not ended at `server_now` is dropped as well
-    (it would still change). Returns a copy with a fresh RangeIndex.
+    dropped, as is anything outside 09:30 to 15:59 (New York, in `data_zone`
+    time) of `day`. A bar whose minute had not ended at `server_now` is dropped
+    as well (it would still change). Returns a copy with a fresh RangeIndex.
+    Nothing is repaired silently: a tz-aware `date` column, timestamps not on
+    whole minutes, duplicate timestamps or unsorted rows raise `ValueError`.
     """
     _aware(server_now, "server_now")
+    dates = _bar_times(bars, "filter_day")
+    if dates.duplicated().any():
+        raise ValueError("filter_day: duplicate timestamps in bars")
+    if not dates.is_monotonic_increasing:
+        raise ValueError("filter_day: bars are not sorted by time")
     now_local = server_now.astimezone(_zone(data_zone)).replace(tzinfo=None)
-    dates = pd.to_datetime(bars["date"])
-    keep = (dates.dt.date == day) & (dates + pd.Timedelta(minutes=bar_minutes) <= pd.Timestamp(now_local))
+    minutes = expected_minutes(day, data_zone)
+    keep = ((dates >= pd.Timestamp(minutes[0])) & (dates <= pd.Timestamp(minutes[-1]))
+            & (dates + pd.Timedelta(minutes=bar_minutes) <= pd.Timestamp(now_local)))
     return bars.loc[keep].reset_index(drop=True)
 
 
 # --- pacing -----------------------------------------------------------------
+
+
+def _number(value: float, name: str, *, minimum: float, inclusive: bool) -> None:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or value < minimum or (value == minimum and not inclusive)):
+        sign = ">=" if inclusive else ">"
+        raise ValueError(f"{name} must be a finite number {sign} {minimum}, got {value!r}")
+
+
+def _limit(value: int, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be an integer of at least 1, got {value!r}")
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Reservation:
+    """Token returned by `Pacer.reserve`; hand it back to `Pacer.sent` or `Pacer.cancel`."""
+
+    token: int
+    contract: Hashable
+    request: Hashable
+    planned: float  # clock time at which the send is allowed
+    wait: float  # seconds from the reserve call until then
 
 
 class Pacer:
@@ -144,9 +263,18 @@ class Pacer:
     requests, at most 60 per 10 minutes, fewer than 6 per contract per 2 s and
     no identical request within 15 s. Window limits keep `margin` seconds extra
     so that a window never holds more than its limit even when closed at both
-    ends. `reserve` returns the wait and books the request at `clock() + wait`;
-    the caller waits that long (its own sleep) before sending. Same calls and
-    clock readings give the same waits.
+    ends (`margin=0` drops that guarantee).
+
+    Driver contract, in four steps: `reserve(contract, request)` returns a
+    `Reservation` whose `wait` is the seconds to wait; the caller waits (its own
+    sleep), sends, and then calls `sent(reservation)`, which records the ACTUAL
+    send time from the clock. The limits are always checked against actual send
+    times, so a late send (a suspend, a blocked thread) pushes the following
+    requests back instead of breaking a limit. `cancel(reservation)` releases a
+    reservation that will not be sent. `reserve` itself commits nothing; while
+    a reservation is outstanding a further `reserve` treats it as sent at the
+    later of its planned time and now. Same calls and clock readings give the
+    same waits.
     """
 
     def __init__(
@@ -161,8 +289,13 @@ class Pacer:
         identical_gap: float = 15.0,
         margin: float = 1.0,
     ) -> None:
-        if min(max_in_window, max_per_contract) < 1:
-            raise ValueError("limits must be at least 1")
+        _number(min_gap, "min_gap", minimum=0.0, inclusive=True)
+        _number(window, "window", minimum=0.0, inclusive=False)
+        _number(contract_window, "contract_window", minimum=0.0, inclusive=False)
+        _number(identical_gap, "identical_gap", minimum=0.0, inclusive=True)
+        _number(margin, "margin", minimum=0.0, inclusive=True)
+        _limit(max_in_window, "max_in_window")
+        _limit(max_per_contract, "max_per_contract")
         self._clock = clock
         self.min_gap = min_gap
         self.window = window
@@ -171,33 +304,67 @@ class Pacer:
         self.max_per_contract = max_per_contract
         self.identical_gap = identical_gap
         self.margin = margin
-        self._all: deque[float] = deque(maxlen=max_in_window)
-        self._per_contract: dict[Hashable, deque[float]] = {}
+        self._all: list[float] = []  # actual send times, sorted, last max_in_window
+        self._per_contract: dict[Hashable, list[float]] = {}
         self._identical: dict[tuple[Hashable, Hashable], float] = {}
+        self._open: dict[int, Reservation] = {}
+        self._next_token = 0
 
     def earliest(self, contract: Hashable, request: Hashable = None) -> float:
-        """Earliest time (on the injected clock) the request may be sent; books nothing."""
-        t = self._clock()
-        if self._all:
-            t = max(t, self._all[-1] + self.min_gap)
-        if len(self._all) >= self.max_in_window:
-            t = max(t, self._all[0] + self.window + self.margin)
-        sent = self._per_contract.get(contract)
-        if sent is not None and len(sent) >= self.max_per_contract:
-            t = max(t, sent[0] + self.contract_window + self.margin)
-        last_same = self._identical.get((contract, request))
-        if last_same is not None:
-            t = max(t, last_same + self.identical_gap + self.margin)
+        """Earliest time (on the injected clock) the request may be sent; books nothing.
+
+        Outstanding reservations count as sent at the later of their planned
+        time and now.
+        """
+        now = self._clock()
+        virtual = [(max(r.planned, now), r.contract, r.request) for r in self._open.values()]
+        every = sorted(self._all + [v[0] for v in virtual])
+        t = now
+        if every:
+            t = max(t, every[-1] + self.min_gap)
+        if len(every) >= self.max_in_window:
+            t = max(t, every[-self.max_in_window] + self.window + self.margin)
+        mine = sorted(self._per_contract.get(contract, []) + [v[0] for v in virtual if v[1] == contract])
+        if len(mine) >= self.max_per_contract:
+            t = max(t, mine[-self.max_per_contract] + self.contract_window + self.margin)
+        same = [v[0] for v in virtual if v[1] == contract and v[2] == request]
+        last = self._identical.get((contract, request))
+        if last is not None:
+            same.append(last)
+        if same:
+            t = max(t, max(same) + self.identical_gap + self.margin)
         return t
 
-    def reserve(self, contract: Hashable, request: Hashable = None) -> float:
-        """Seconds to wait from now before sending; the request is booked at that time."""
+    def reserve(self, contract: Hashable, request: Hashable = None) -> Reservation:
+        """Plan one request: `.wait` seconds from now; nothing is booked until `sent`."""
         when = self.earliest(contract, request)
-        self._all.append(when)
-        self._per_contract.setdefault(
-            contract, deque(maxlen=self.max_per_contract)).append(when)
-        self._identical[(contract, request)] = when
-        return when - self._clock()
+        reservation = Reservation(self._next_token, contract, request, when, when - self._clock())
+        self._next_token += 1
+        self._open[reservation.token] = reservation
+        return reservation
+
+    def _settle(self, reservation: Reservation) -> Reservation:
+        known = self._open.pop(reservation.token, None)
+        if known is not reservation:
+            raise ValueError("unknown reservation (already sent or cancelled?)")
+        return known
+
+    def sent(self, reservation: Reservation) -> float:
+        """Record that the request was just sent: the send time is the clock now. Returns it."""
+        known = self._settle(reservation)
+        when = self._clock()
+        bisect.insort(self._all, when)
+        del self._all[:-self.max_in_window]
+        mine = self._per_contract.setdefault(known.contract, [])
+        bisect.insort(mine, when)
+        del mine[:-self.max_per_contract]
+        key = (known.contract, known.request)
+        self._identical[key] = max(self._identical.get(key, when), when)
+        return when
+
+    def cancel(self, reservation: Reservation) -> None:
+        """Release a reservation that was not sent; later reserves ignore it."""
+        self._settle(reservation)
 
 
 # --- manifest ---------------------------------------------------------------
@@ -210,6 +377,40 @@ class DayRecord:
     error_code: int | None = None
     error_text: str = ""
     fetched_utc: str = ""
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_day_fields(
+    status: object, bars: object, error_code: object, error_text: object, fetched_utc: object,
+) -> None:
+    """The one rule set for a day record, used by `Manifest.record` and by the loader.
+
+    `TypeError` for a wrong type, `ValueError` for a wrong value: status one of
+    `DAY_STATUSES`; bars an int of at least 0 (at least 1 for `ok`, exactly 0
+    for `no_data`); error_code `None` or an int; error_text and fetched_utc str.
+    """
+    if not isinstance(status, str):
+        raise TypeError(f"status must be a str, got {status!r}")
+    if status not in DAY_STATUSES:
+        raise ValueError(f"unknown day status {status!r}")
+    if not _is_int(bars):
+        raise TypeError(f"bars must be an int, got {bars!r}")
+    assert isinstance(bars, int)
+    if bars < 0:
+        raise ValueError("bars must not be negative")
+    if status == STATUS_OK and bars < 1:
+        raise ValueError("an ok day needs at least one bar")
+    if status == STATUS_NO_DATA and bars != 0:
+        raise ValueError("a no_data day has no bars")
+    if error_code is not None and not _is_int(error_code):
+        raise TypeError(f"error_code must be an int or None, got {error_code!r}")
+    if not isinstance(error_text, str):
+        raise TypeError(f"error_text must be a str, got {error_text!r}")
+    if not isinstance(fetched_utc, str):
+        raise TypeError(f"fetched_utc must be a str, got {fetched_utc!r}")
 
 
 @dataclass(slots=True)
@@ -228,14 +429,15 @@ class Manifest:
         self, day: date, status: str, *, bars: int = 0, error_code: int | None = None,
         error_text: str = "", fetched_utc: datetime,
     ) -> None:
-        """Set the record of `day`. `fetched_utc` must be aware; `ok` needs bars, `no_data` none."""
-        if status not in DAY_STATUSES:
-            raise ValueError(f"unknown day status {status!r}")
-        if status == STATUS_OK and bars < 1:
-            raise ValueError("an ok day needs at least one bar")
-        if status == STATUS_NO_DATA and bars != 0:
-            raise ValueError("a no_data day has no bars")
+        """Set the record of `day`; whatever is accepted here also loads back unchanged.
+
+        Rules are `validate_day_fields` (`TypeError` / `ValueError`); `fetched_utc`
+        must be aware. Record transient failures as `failed`, never `no_data`.
+        """
+        if not isinstance(day, date) or isinstance(day, datetime):
+            raise TypeError(f"day must be a date, got {day!r}")
         stamp = _aware(fetched_utc, "fetched_utc").astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        validate_day_fields(status, bars, error_code, error_text, stamp)
         self.days[day.isoformat()] = DayRecord(status, bars, error_code, error_text, stamp)
 
     def pending(self, days: Iterable[date]) -> list[date]:
@@ -243,6 +445,21 @@ class Manifest:
         done = (STATUS_OK, STATUS_NO_DATA)
         return [d for d in days
                 if (rec := self.days.get(d.isoformat())) is None or rec.status not in done]
+
+    def mark_pending(self, days: Iterable[date]) -> list[date]:
+        """Forget the records of `days` so `pending` asks for them again (a forced refetch).
+
+        Returns the days that had a record. Days without one are left alone.
+        """
+        removed = []
+        for d in days:
+            if self.days.pop(d.isoformat(), None) is not None:
+                removed.append(d)
+        return removed
+
+    def mark_gaps_pending(self, rows: Iterable[GapRow]) -> list[date]:
+        """`mark_pending` for every day of a gap report that is `no_data`, `short` or `partial`."""
+        return self.mark_pending(r.day for r in rows if r.status != GAP_COMPLETE)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -261,7 +478,13 @@ class Manifest:
 
 def manifest_path(data_dir: Path, symbol: str) -> Path:
     """`<data_dir>/<SYMBOL>/manifest.json`; `ValueError` for a symbol that is not a plain ticker."""
-    return month_file_path(data_dir, symbol, 2000, 1).parent / MANIFEST_NAME
+    return symbol_folder(data_dir, symbol) / MANIFEST_NAME
+
+
+def symbol_folder(data_dir: Path, symbol: str) -> Path:
+    """`<data_dir>/<SYMBOL>`, where the manifest, the bars and the gap files of one symbol live."""
+    check_symbol(symbol)
+    return month_file_path(data_dir, symbol, 2000, 1).parent
 
 
 def _parse_manifest(text: str, expected: Manifest) -> Manifest:
@@ -280,18 +503,39 @@ def _parse_manifest(text: str, expected: Manifest) -> Manifest:
     if not isinstance(days, dict):
         raise ValueError("manifest has no days")
     for key, rec in days.items():
-        date.fromisoformat(key)
-        if not isinstance(rec, dict) or rec.get("status") not in DAY_STATUSES:
+        day_key = date.fromisoformat(key).isoformat()  # also reads "20240311"; stored normalised
+        if day_key in result.days:
+            raise ValueError(f"day {day_key} appears twice")
+        if not isinstance(rec, dict):
             raise ValueError(f"bad record for {key}")
+        status = rec.get("status")
         bars, code = rec.get("bars", 0), rec.get("error_code")
-        if (isinstance(bars, bool) or not isinstance(bars, int) or bars < 0
-                or not (code is None or (isinstance(code, int) and not isinstance(code, bool)))
-                or not isinstance(rec.get("error_text", ""), str)
-                or not isinstance(rec.get("fetched_utc", ""), str)):
-            raise ValueError(f"bad record for {key}")
-        result.days[key] = DayRecord(rec["status"], bars, code, rec.get("error_text", ""),
-                                     rec.get("fetched_utc", ""))
+        text_, stamp = rec.get("error_text", ""), rec.get("fetched_utc", "")
+        try:
+            validate_day_fields(status, bars, code, text_, stamp)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"bad record for {key}: {exc}") from exc
+        result.days[day_key] = DayRecord(status, bars, code, text_, stamp)
     return result
+
+
+def _set_aside(path: Path) -> bool:
+    """Move `path` to the first free `<name>.unusable`, `.unusable.1`, `.unusable.2`, ...
+
+    Never overwrites or deletes an earlier set-aside file. False if it could not be moved.
+    """
+    for n in range(10_000):
+        target = path.with_name(path.name + (".unusable" if n == 0 else f".unusable.{n}"))
+        if target.exists():
+            continue
+        try:
+            os.rename(path, target)  # refuses an existing target on Windows
+        except FileExistsError:
+            continue
+        except OSError:
+            return False
+        return True
+    return False
 
 
 def load_manifest(path: Path, expected: Manifest) -> tuple[Manifest, str | None]:
@@ -299,7 +543,8 @@ def load_manifest(path: Path, expected: Manifest) -> tuple[Manifest, str | None]
 
     A missing file gives a fresh manifest and `None`. A truncated, unparseable,
     foreign or mismatching file (other symbol, conId, zone, bar size, ...) is
-    never trusted and never deleted: it is moved to `<path>.unusable`, the
+    never trusted and never deleted: it is moved to the first free
+    `<path>.unusable`, `<path>.unusable.1`, ... (earlier ones are kept), the
     result is fresh, and the second item says why.
     """
     path = Path(path)
@@ -316,8 +561,8 @@ def load_manifest(path: Path, expected: Manifest) -> tuple[Manifest, str | None]
             return _parse_manifest(text, expected), None
         except (ValueError, TypeError) as exc:  # JSONDecodeError is a ValueError
             reason = f"unusable {path.name}: {exc}"
-    with contextlib.suppress(OSError):
-        os.replace(path, path.with_name(path.name + ".unusable"))
+    if not _set_aside(path):
+        reason += " (it could not be set aside)"
     return fresh, reason
 
 
@@ -406,11 +651,15 @@ def gap_report(
     """One `GapRow` per day, in the order given, comparing `bars` (naive data-zone `date`) to the session.
 
     Status: `no_data` (no bar in the session minutes, so also a day that was
-    never fetched), `complete` (all 390 minutes), `short` (only the end of the
-    session is missing, as on a half day) or `partial` (a gap anywhere else).
-    Bars outside 09:30 to 15:59 are ignored.
+    never fetched), `complete` (all 390 minutes), `short` (bars complete from
+    09:30 to 12:59, an early close at 13:00, and nothing after) or `partial`
+    (any other gap: a hole, a missing tail such as only 15:59, a one-bar day).
+    Bars outside 09:30 to 15:59 are ignored; duplicates count once and order
+    does not matter. A tz-aware `date` column or timestamps not on whole minutes
+    raise `ValueError` (they would silently match nothing).
     """
-    present = set(pd.to_datetime(bars["date"]).dt.to_pydatetime()) if len(bars) else set()
+    dates = _bar_times(bars, "gap_report")
+    present = set(dates.dt.to_pydatetime()) if len(dates) else set()
     rows = []
     for day in days:
         minutes = expected_minutes(day, data_zone)
@@ -421,7 +670,7 @@ def gap_report(
             status = GAP_NO_DATA
         elif not missing:
             status = GAP_COMPLETE
-        elif len(ranges) == 1 and ranges[0][1] == minutes[-1]:
+        elif have == EARLY_CLOSE_MINUTES and missing == minutes[EARLY_CLOSE_MINUTES:]:
             status = GAP_SHORT
         else:
             status = GAP_PARTIAL
@@ -433,12 +682,14 @@ def _range_text(span: tuple[datetime, datetime]) -> str:
     return f"{span[0]:%H:%M}-{span[1]:%H:%M}"
 
 
-def gaps_csv_text(rows: Sequence[GapRow]) -> str:
-    """CSV with header `day,status,expected,present,missing,ranges` (ranges `HH:MM-HH:MM`, `;` separated)."""
-    lines = ["day,status,expected,present,missing,ranges"]
+def gaps_csv_text(rows: Sequence[GapRow], symbol: str) -> str:
+    """CSV text, header `symbol,day,status,expected,present,missing,ranges` (`;` joins ranges)."""
+    check_symbol(symbol)
+    lines = ["symbol,day,status,expected,present,missing,ranges"]
     for r in rows:
         ranges = ";".join(_range_text(s) for s in r.missing)
-        lines.append(f"{r.day.isoformat()},{r.status},{r.expected},{r.present},{r.missing_count},{ranges}")
+        lines.append(f"{symbol},{r.day.isoformat()},{r.status},{r.expected},{r.present},"
+                     f"{r.missing_count},{ranges}")
     return "\n".join(lines) + "\n"
 
 
@@ -459,12 +710,17 @@ def gaps_summary_text(rows: Sequence[GapRow], symbol: str = "") -> str:
 
 
 def write_gap_files(
-    folder: Path, rows: Sequence[GapRow], symbol: str = "", *,
+    symbol_folder_path: Path, rows: Sequence[GapRow], symbol: str, *,
     sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
 ) -> tuple[Path, Path]:
-    """Write `<folder>/gaps.csv` and `<folder>/gaps_summary.txt` atomically; returns both paths."""
-    folder = Path(folder)
+    """Write `gaps.csv` and `gaps_summary.txt` atomically into the symbol's own folder; returns both paths.
+
+    `symbol_folder_path` is that symbol's folder (see `symbol_folder`), given
+    explicitly. The driver writes one pair per symbol folder, so two symbols
+    never share a file; the csv also carries a leading `symbol` column.
+    """
+    folder = Path(symbol_folder_path)
     csv_path, text_path = folder / GAPS_CSV, folder / GAPS_SUMMARY
-    _write_text_atomic(csv_path, gaps_csv_text(rows), sleep=sleep, clock=clock)
+    _write_text_atomic(csv_path, gaps_csv_text(rows, symbol), sleep=sleep, clock=clock)
     _write_text_atomic(text_path, gaps_summary_text(rows, symbol), sleep=sleep, clock=clock)
     return csv_path, text_path

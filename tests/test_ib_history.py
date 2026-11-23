@@ -6,6 +6,7 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -29,6 +30,7 @@ from MainStoinker.ib.history import (
 )
 
 UTC = timezone.utc
+NY = ZoneInfo("America/New_York")
 LATE = datetime(2030, 1, 1, tzinfo=UTC)
 
 
@@ -40,8 +42,10 @@ class FakeClock:
         return self.now
 
     def send(self, pacer: Pacer, contract: str = "c", request: str = "r") -> float:
-        """Reserve, wait the returned time on the fake clock, return the send time."""
-        self.now += pacer.reserve(contract, request)
+        """Reserve, wait the returned time on the fake clock, send on time, return the send time."""
+        reservation = pacer.reserve(contract, request)
+        self.now += reservation.wait
+        pacer.sent(reservation)
         return self.now
 
 
@@ -62,6 +66,9 @@ def test_plan_skips_weekends() -> None:
 
 
 def test_plan_refuses_unclosed_session() -> None:
+    # Rule: a range is refused only when it holds trading days and none has closed. A range
+    # whose only trading day is unclosed is therefore still refused (this test's meaning); a
+    # range with a closed trading day is planned (see test_plan_range_*).
     day = date(2024, 3, 11)  # EDT: 16:00 is 20:00 UTC
     with pytest.raises(ValueError, match="not closed"):
         plan_days(day, day, datetime(2024, 3, 11, 19, 59, 59, tzinfo=UTC))
@@ -72,6 +79,24 @@ def test_plan_refuses_unclosed_session() -> None:
     # Same instant expressed in another zone.
     other = datetime(2024, 3, 11, 13, 0, tzinfo=timezone(timedelta(hours=-7)))
     assert plan_days(day, day, other) == [day]
+
+
+def test_plan_range_plans_closed_days_and_reports_unclosed_ones() -> None:
+    # Saturday noon: Friday has closed, so a range ending on the weekend is planned.
+    saturday_noon = datetime(2024, 3, 9, 17, 0, tzinfo=UTC)
+    plan = history.plan_range(date(2024, 3, 7), date(2024, 3, 10), saturday_noon)
+    assert plan.days == [date(2024, 3, 7), date(2024, 3, 8)] and plan.not_closed == []
+    assert plan_days(date(2024, 3, 7), date(2024, 3, 10), saturday_noon) == plan.days
+    # Monday 15:00 New York: Monday is not closed and is reported, earlier days are planned.
+    monday = datetime(2024, 3, 11, 15, 0, tzinfo=NY)
+    plan = history.plan_range(date(2024, 3, 7), date(2024, 3, 12), monday)
+    assert plan.days == [date(2024, 3, 7), date(2024, 3, 8)]
+    assert plan.not_closed == [date(2024, 3, 11), date(2024, 3, 12)]
+    # Only unclosed trading days (with a weekend in between): refused.
+    with pytest.raises(ValueError, match="not closed"):
+        history.plan_range(date(2024, 3, 11), date(2024, 3, 12), monday)
+    # No trading day at all is not a refusal.
+    assert history.plan_range(date(2024, 3, 9), date(2024, 3, 10), saturday_noon) == history.DayPlan([], [])
 
 
 def test_day_request_end_is_1600_new_york_in_utc_across_dst() -> None:
@@ -144,7 +169,7 @@ def test_pacer_contract_burst_limit() -> None:
     assert times[5] - times[0] > 2
     # Another contract is not held back by it.
     t0 = clock()
-    assert pacer.reserve("MSFT", "x") == pytest.approx(0.0)
+    assert pacer.reserve("MSFT", "x").wait == pytest.approx(0.0)
     assert clock() == t0
 
 
@@ -278,6 +303,24 @@ def test_gap_report_early_close_is_short() -> None:
     assert gap_report([day], bars_for(day, holed))[0].status == GAP_PARTIAL
 
 
+def test_gap_report_short_means_exactly_a_13_00_close() -> None:
+    day = date(2024, 11, 29)
+    minutes = expected_minutes(day)
+    assert minutes[210] == datetime(2024, 11, 29, 13, 0)  # the early close, first missing bar
+    status = {name: gap_report([day], bars_for(day, mins))[0].status for name, mins in {
+        "to_1259": minutes[:210],  # early close: short
+        "to_1258": minutes[:209],  # tail missing but not from 13:00
+        "to_1300": minutes[:211],
+        "only_1559_missing": minutes[:-1],
+        "one_bar": minutes[:1],
+        "one_bar_late": minutes[100:101],
+        "late_only": minutes[210:],
+    }.items()}
+    assert status == {"to_1259": GAP_SHORT, "to_1258": GAP_PARTIAL, "to_1300": GAP_PARTIAL,
+                      "only_1559_missing": GAP_PARTIAL, "one_bar": GAP_PARTIAL,
+                      "one_bar_late": GAP_PARTIAL, "late_only": GAP_PARTIAL}
+
+
 def test_gap_report_missing_day(tmp_path: Path) -> None:
     days = [date(2024, 3, 11), date(2024, 3, 12)]
     rows = gap_report(days, bars_for(days[0]))
@@ -288,9 +331,9 @@ def test_gap_report_missing_day(tmp_path: Path) -> None:
 
     csv_path, text_path = write_gap_files(tmp_path, rows, "AAPL")
     lines = csv_path.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "day,status,expected,present,missing,ranges"
-    assert lines[1] == "2024-03-11,complete,390,390,0,"
-    assert lines[2] == "2024-03-12,no_data,390,0,390,09:30-15:59"
+    assert lines[0] == "symbol,day,status,expected,present,missing,ranges"
+    assert lines[1] == "AAPL,2024-03-11,complete,390,390,0,"
+    assert lines[2] == "AAPL,2024-03-12,no_data,390,0,390,09:30-15:59"
     summary = text_path.read_text(encoding="utf-8")
     assert "no_data: 1" in summary and "complete: 1" in summary and "2024-03-12 no_data" in summary
     assert write_gap_files(tmp_path, rows, "AAPL") == (csv_path, text_path)  # rewrite is fine
