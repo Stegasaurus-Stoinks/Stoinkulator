@@ -14,6 +14,7 @@ from MainStoinker.engine.ledger import OrderEvent
 from MainStoinker.engine.stats import max_drawdown, run_statistics
 from MainStoinker.engine.store import RunData
 from tests.api_support import make_client, stored_run_database
+from tests.run_support import full_store_run
 from tests.test_api_thinning import Pt
 from tests.test_api_trades import get
 from tests.test_cli_store import stored
@@ -68,7 +69,8 @@ def test_thin_without_capital_uses_the_first_point() -> None:
 
 @pytest.fixture(scope="module")
 def realistic_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return stored_run_database(tmp_path_factory, "realistic")
+    # the thinning test needs more stored points than max_points for every account: full data
+    return full_store_run(tmp_path_factory, "realistic")[1]
 
 
 @pytest.fixture(scope="module")

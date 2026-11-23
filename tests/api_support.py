@@ -1,7 +1,8 @@
 """Helpers for the API tests: stored runs and a `TestClient`.
 
-`stored_run_database` reuses `full_store_run` (all fast golden cases, full data,
-one database per fill model, built once per session). Every database lives
+`stored_run_database` is `small_store_run` (the four fast golden algos on a short slice of the
+data, one database per fill model, built once per session across all xdist workers; tests that
+compare with the golden files use `full_store_run` instead). Every database lives
 under pytest's temporary folders. Nothing here reads `STOINK_DB` (the root
 `conftest.py` removes it for the whole session) and every call passes an
 explicit `env`, so the owner's real database and OneDrive settings are never
@@ -18,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from MainStoinker.api.app import create_app
-from tests.test_cli_store import full_store_run
+from tests.run_support import small_store_run
 
 NO_ENV: Mapping[str, str] = {}
 
@@ -27,7 +28,7 @@ def stored_run_database(
     tmp_path_factory: pytest.TempPathFactory, fills: Literal["realistic", "legacy"]
 ) -> Path:
     """The database of one stored backtest run of four algos (cached per session)."""
-    return full_store_run(tmp_path_factory, fills)[1]
+    return small_store_run(tmp_path_factory, fills)[1]
 
 
 def make_client(db: str | Path, env: Mapping[str, str] | None = None) -> TestClient:

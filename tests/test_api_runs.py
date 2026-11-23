@@ -19,8 +19,9 @@ from MainStoinker.api.routes_runs import last_folder_name
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.store import DataMeta, RunMeta, SqliteStore
 from tests.api_support import NO_ENV, make_client, stored_run_database
+from tests.run_support import FAST_CASES, full_store_run, small_store_run
 from tests.test_api_health import copy_database
-from tests.test_cli_store import FAST_CASES, GOLDEN_PAPER, full_store_run
+from tests.test_cli_store import GOLDEN_PAPER
 
 SHARED = ("trade_count", "wins", "commission", "net", "final_equity", "max_drawdown",
           "synthetic_closes", "ignored_events", "cancelled_entries")
@@ -158,7 +159,7 @@ def test_times_are_utc_and_money_is_strings(full_db: Path) -> None:
 def test_no_absolute_path_or_username_in_responses(
     tmp_path_factory: pytest.TempPathFactory, full_db: Path
 ) -> None:
-    full, database = full_store_run(tmp_path_factory, "realistic")
+    full, database = small_store_run(tmp_path_factory, "realistic")
     client = make_client(database)
     texts = [client.get("/api/runs").text, client.get("/api/runs/1").text,
              client.get("/api/runs/2").text]

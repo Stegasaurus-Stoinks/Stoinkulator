@@ -21,7 +21,9 @@ def test_stoink_db_is_removed_even_when_the_environment_sets_it(tmp_path: Path) 
     probe = REPO / "tests" / "env_isolation_probe.py"
     env = {**os.environ, "STOINK_DB": str(tmp_path / "must-not-be-used.db")}
     done = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", str(probe)],
+        # `-n 0`: the project default is `-n auto`, which would start a worker per core just to
+        # run one probe; the workers' side of this is checked in `test_xdist_guards.py`.
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-n", "0", str(probe)],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=120,
     )
     assert done.returncode == 0, done.stdout + done.stderr

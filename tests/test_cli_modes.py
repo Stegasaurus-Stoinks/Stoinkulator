@@ -17,48 +17,15 @@ import MainStoinker.engine.modes as modes
 from MainStoinker.engine.cli import CliError, main, validate_algo_config
 from MainStoinker.engine.ledger import Ledger
 from MainStoinker.engine.paper_broker import CostModel, PaperBroker
-from tests import harness
+from tests.run_support import EMA, FF, FVG, ORC, ROWS, Env, full_run, full_store_run
 
 GOLDEN = Path(__file__).parent / "golden"
-EMA = {"idname": "AAPL-10/30EMA", "ticker": "AAPL", "short": "10", "long": "30"}
 EMA_MSFT = {"idname": "MSFT-10/30EMA", "ticker": "MSFT", "short": "10", "long": "30"}
 FUNC_MSFT = {"idname": "MSFT-functest", "ticker": "MSFT", "RRRatio": 3}
-FVG = {"idname": "AAPL-fvg", "ticker": "AAPL", "RRRatio": 3}
-ROWS = 900
 LIVE_MESSAGE = (
     "error: algo 'AAPL-10/30EMA': mode 'live' is not available yet "
     "(needs the live broker, milestone 1 Phase B)"
 )
-
-
-class Env:
-    def __init__(self, root: Path, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
-        self.inputs = root / "inputs"
-        self.start = root / "start"
-        self.out = root / "out"
-        self.inputs.mkdir(parents=True)
-        self.start.mkdir()
-        self.algos = self.inputs / "algos.json"
-        self.data = self.inputs / "OfflineData"
-        if monkeypatch is not None:
-            monkeypatch.chdir(self.start)
-
-    def setup(self, algos: object, symbols: list[str], rows: int | None = ROWS) -> None:
-        harness.stage_offline_data(self.inputs, symbols, max_rows=rows)
-        self.algos.write_text(json.dumps(algos), encoding="utf-8")
-
-    def run(self, *extra: str) -> int:
-        return main(["backtest", "--algos", str(self.algos), "--data", str(self.data),
-                     "--out", str(self.out), "--quiet", *extra])
-
-    def trades_bytes(self) -> bytes:
-        return (self.out / "trades.json").read_bytes()
-
-    def trades(self) -> dict:
-        return json.loads(self.trades_bytes())
-
-    def ledger(self) -> dict:
-        return json.loads((self.out / "ledger.json").read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -382,18 +349,6 @@ def test_legacy_fills_writes_no_ledger_and_same_bytes_as_default(env):
     assert not (env.out / "ledger.json").exists()
 
 
-_runs: dict[str, Env] = {}
-
-
-def full_run(tmp_path_factory, key: str, algos: list[dict], symbols: list[str], *extra: str) -> Env:
-    if key not in _runs:
-        env = Env(tmp_path_factory.mktemp(key.replace("/", "_")))
-        env.setup(algos, symbols, rows=None)
-        assert env.run(*extra) == 0
-        _runs[key] = env
-    return _runs[key]
-
-
 def test_legacy_fills_output_byte_identical_to_golden(tmp_path_factory):
     env = full_run(tmp_path_factory, "ema-legacy", ema_config(mode="paper"), ["AAPL"])
     golden = json.loads((GOLDEN / "emacrossing_aapl.json").read_text())
@@ -500,8 +455,6 @@ def test_multi_algo_realistic_run(env, capsys):
 
 # ---- verification additions: refusal everywhere, golden pins, multi-algo, hand-computed costs ----
 
-ORC = {"idname": "AAPL-orc", "ticker": "AAPL", "RRRatio": 3}
-FF = {"idname": "TSLA-ff", "ticker": "TSLA", "RRRatio": 3}
 GOLDEN_PAPER = Path(__file__).parent / "golden_paper"
 # golden file name -> (algo id, config, symbols)
 FAST_CASES = {
@@ -512,11 +465,17 @@ FAST_CASES = {
 }
 
 
-def single_realistic(tmp_path_factory, case: str, *extra: str) -> Env:
+SLICE_ROWS = 1200  # enough bars for every fast golden algo to trade, a fraction of the full data
+
+
+def single_realistic(
+    tmp_path_factory, case: str, *extra: str, rows: int | None = SLICE_ROWS
+) -> Env:
+    """One realistic-fill run of one fast golden algo (the first `SLICE_ROWS` rows unless `rows`)."""
     algo_id, cfg, symbols = FAST_CASES[case]
-    key = f"case-{case}-realistic" + "".join(extra)
+    key = f"case-{case}-realistic-{rows}" + "".join(extra)
     return full_run(tmp_path_factory, key, [{"ID": algo_id, "data": [cfg]}], symbols,
-                    "--fills", "realistic", *extra)
+                    "--fills", "realistic", *extra, rows=rows)
 
 
 def _live_in(position: str, mode: object) -> list[dict]:
@@ -568,13 +527,13 @@ def test_realistic_cli_output_matches_golden_paper(tmp_path_factory, case):
     """`ledger.json` shares its numbers and format with the golden: its per-algo
     `summary` and `round_trips` equal the golden's `summary` and `trades` exactly."""
     cfg = FAST_CASES[case][1]
-    env = single_realistic(tmp_path_factory, case)
+    # the full-data four-algo run shared with the store tests (each algo has its own account)
+    env, _ = full_store_run(tmp_path_factory, "realistic")
     golden = json.loads((GOLDEN_PAPER / f"{case}.json").read_text())
     doc = env.ledger()
     account = doc["accounts"][cfg["idname"]]
     assert account["summary"] == golden["summary"]
     assert account["round_trips"] == golden["trades"]
-    assert doc["summary"] == golden["summary"]  # one algo: the total is the algo
     assert doc["capital"] == golden["capital"] and doc["costs"] == golden["costs"]
     assert account["symbol"] == golden["ticker"]
     records = env.trades()[cfg["idname"]]
@@ -582,12 +541,22 @@ def test_realistic_cli_output_matches_golden_paper(tmp_path_factory, case):
     assert all("status" not in record for record in records)
 
 
+@pytest.mark.parametrize("case", sorted(FAST_CASES))
+def test_single_algo_run_total_is_the_algo(tmp_path_factory, case):
+    """With one algo the run's total row is that algo's account (a short run, not the golden)."""
+    doc = single_realistic(tmp_path_factory, case).ledger()
+    (account,) = doc["accounts"].values()
+    assert doc["summary"] == account["summary"] and account["round_trips"]
+
+
 def test_multi_algo_run_equals_the_single_algo_runs(tmp_path_factory):
-    cases = sorted(FAST_CASES)
+    cases = list(FAST_CASES)  # the order of the four-algo runs' config
     config = [{"ID": FAST_CASES[c][0], "data": [FAST_CASES[c][1]]} for c in cases]
-    realistic = full_run(tmp_path_factory, "multi4-realistic", config, ["AAPL", "TSLA"],
-                         "--fills", "realistic")
-    legacy = full_run(tmp_path_factory, "multi4-legacy", config, ["AAPL", "TSLA"])
+    realistic = full_run(tmp_path_factory, f"multi4-realistic-{SLICE_ROWS}", config,
+                         ["AAPL", "TSLA"], "--fills", "realistic", rows=SLICE_ROWS)
+    # the legacy leg is against the golden files, so it uses the full-data four-algo legacy run
+    # that `full_store_run` shares with the store tests
+    legacy, _ = full_store_run(tmp_path_factory, "legacy")
     doc, trades, legacy_trades = realistic.ledger(), realistic.trades(), legacy.trades()
     total_trades = 0
     total_net = Decimal(0)
@@ -626,8 +595,10 @@ def test_commission_minimum_zero_charges_per_share_on_every_fill(env):
 @pytest.mark.parametrize("case", ["openingrangecandle_aapl", "fridayfrenzy_tsla"])
 def test_slippage_worsens_market_and_stop_fills_only(tmp_path_factory, case):
     free = ("--commission-per-share", "0", "--commission-min", "0")
-    base = single_realistic(tmp_path_factory, case, *free)
-    slipped = single_realistic(tmp_path_factory, case, *free, "--slippage-per-share", "0.01")
+    # the full data: the property needs both stop and target exits, which a short slice lacks
+    base = single_realistic(tmp_path_factory, case, *free, rows=None)
+    slipped = single_realistic(tmp_path_factory, case, *free, "--slippage-per-share", "0.01",
+                               rows=None)
     idname = FAST_CASES[case][1]["idname"]
     a = base.ledger()["accounts"][idname]["round_trips"]
     b = slipped.ledger()["accounts"][idname]["round_trips"]
@@ -681,7 +652,7 @@ def _parse(env, *extra: str):
 def test_output_source_follows_the_fill_model_not_the_ledger(env, monkeypatch):
     """With a ledger attached to a legacy run (B8 will do that for every run),
     `trades.json` still comes from the algos' own trades and no `ledger.json`
-    is written; the bytes equal the committed legacy golden."""
+    is written; the bytes equal those of a run without a ledger."""
     attached: list[Ledger] = []
 
     class SpyLedger(Ledger):
@@ -690,12 +661,16 @@ def test_output_source_follows_the_fill_model_not_the_ledger(env, monkeypatch):
             attached.append(self)
 
     monkeypatch.setattr(cli, "Ledger", SpyLedger)
-    env.setup(ema_config(), ["AAPL"], rows=None)
+    env.setup(ema_config(), ["AAPL"], rows=ROWS)
     assert cli.run_backtest_command(_parse(env), attach_ledger=True) == 0
     assert len(attached) == 1 and attached[0].accounts  # a ledger really was attached
-    golden = json.loads((GOLDEN / "emacrossing_aapl.json").read_text())
-    assert env.trades_bytes() == (json.dumps({EMA["idname"]: golden}, indent=1) + "\n").encode()
+    with_ledger = env.trades_bytes()
+    assert "status" in json.loads(with_ledger)[EMA["idname"]][0]  # the legacy shape
     assert not (env.out / "ledger.json").exists()
+    # the same bytes as a plain legacy run (which attaches nothing); that these equal the committed
+    # golden on the full data is `test_legacy_fills_output_byte_identical_to_golden`
+    assert env.run() == 0 and len(attached) == 1
+    assert env.trades_bytes() == with_ledger
     # a realistic run through the same seam still writes both, from the ledger
     assert cli.run_backtest_command(_parse(env, "--fills", "realistic"), attach_ledger=True) == 0
     assert "status" not in env.trades()[EMA["idname"]][0]

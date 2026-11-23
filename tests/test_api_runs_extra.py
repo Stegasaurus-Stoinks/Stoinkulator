@@ -21,9 +21,9 @@ from MainStoinker.api.errors import UNAVAILABLE
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.store import DataMeta, RunMeta, SqliteStore
 from tests.api_support import NO_ENV, make_client, stored_run_database
+from tests.run_support import small_store_run
 from tests.test_api_health import copy_database
 from tests.test_api_runs import T0, cli_json, make_run
-from tests.test_cli_store import full_store_run
 
 
 def digest(path: Path) -> str:
@@ -132,7 +132,7 @@ def test_inputs(tmp_path: Path) -> None:
 def test_no_leaks_in_any_body_or_header(
     tmp_path_factory: pytest.TempPathFactory, tmp_path: Path
 ) -> None:
-    full, source = full_store_run(tmp_path_factory, "realistic")
+    full, source = small_store_run(tmp_path_factory, "realistic")
     db = copy_database(source, tmp_path / "leaks.db")
     ids = [1, make_run(db, directory=str(full.data), status="running"), add_failed_run(db),
            add_run_without_trades(db), make_run(db, directory="\\\\server\\share\\" + str(full.data))]

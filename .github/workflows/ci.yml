@@ -13,9 +13,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    # Windows + Python 3.14 to match the trading machine and the vendored
-    # TA-Lib wheel in requirements.txt.
+  # The fast and the slow suite run as two jobs at the same time (two runners), each in
+  # parallel across the cores of its runner with pytest-xdist.
+  #
+  # Windows + Python 3.14 to match the trading machine and the vendored TA-Lib wheel in
+  # requirements.txt. Node is pinned (an LTS release) because the static front-end tests run
+  # JavaScript modules with `node`, and must not depend on what the runner image ships.
+  fast:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -24,6 +28,10 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
+          cache-dependency-path: requirements*.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - name: Install
         run: |
           python -m pip install -r requirements-dev.txt
@@ -34,5 +42,23 @@ jobs:
         run: ruff check tests conftest.py MainStoinker/engine MainStoinker/api MainStoinker/__main__.py --select E,F,W,I,B
       - name: Tests
         run: pytest
+
+  slow:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e .
       - name: Slow golden backtests
-        run: pytest -m slow
+        run: pytest -m slow -n auto
