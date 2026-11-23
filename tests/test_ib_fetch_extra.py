@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -650,10 +651,11 @@ def test_a_hand_damaged_month_file_fails_the_first_day_stops_the_symbol_and_is_l
     with make_rig() as rig2:
         result = rig2.run(["AAPL"], WEEK[0], WEEK[2], out)  # does not raise
     sym = result.symbols["AAPL"]
-    # adapted: the first failing day now stops the symbol (it used to fail both remaining days)
+    # adapted: the damage is found before the first request, so no request is sent at all
+    # (it was one request, and before that both remaining days failed)
     assert (sym.ok, sym.failed, sym.state) == (0, 1, "stopped")
     assert {f.reason for f in sym.failures} == {"damaged_file"}
-    assert rig2.days_requested() == [WEEK[1]]
+    assert rig2.days_requested() == []
     assert path.read_text(encoding="utf-8") == bad  # left exactly as the owner's hand left it
     assert manifest_days(out) == {WEEK[0].isoformat(): "ok", WEEK[1].isoformat(): "failed"}
     assert_no_stray_files(out)
@@ -930,7 +932,7 @@ def test_already_present_short_days_are_listed_too(out: Path) -> None:
     assert again.days_with_gaps == 1
 
 
-def test_a_damaged_month_file_stops_that_symbol_after_one_request_and_the_others_go_on(
+def test_a_damaged_month_file_stops_that_symbol_before_any_request_and_the_others_go_on(
         out: Path) -> None:
     with make_rig() as rig:
         assert rig.run(["AAPL"], WEEK[0], WEEK[0], out).complete
@@ -940,7 +942,8 @@ def test_a_damaged_month_file_stops_that_symbol_after_one_request_and_the_others
     with make_rig() as rig2:
         result = rig2.run(["AAPL", "MSFT"], WEEK[0], WEEK[4], out)
     aapl, msft = result.symbols["AAPL"], result.symbols["MSFT"]
-    assert rig2.days_requested(CON_IDS["AAPL"]) == [WEEK[1]]  # exactly one request after the damage
+    # adapted: was exactly one request after the damage; now none (the file is checked first)
+    assert rig2.days_requested(CON_IDS["AAPL"]) == []
     assert (aapl.state, aapl.ok, aapl.failed) == ("stopped", 0, 1)
     assert path.name in aapl.message and "untouched" in aapl.message
     assert path.read_bytes() == bad
@@ -949,3 +952,182 @@ def test_a_damaged_month_file_stops_that_symbol_after_one_request_and_the_others
     assert result.stop_reason is None and not result.complete  # AAPL did not finish
     assert any(e.kind == "symbol_stopped" and e.symbol == "AAPL" for e in rig2.events)
     assert_paced(rig2.requests)
+
+
+# -- T12 fix round 2: the month file is checked before a request is spent ---------------------
+
+
+def damage_august(out: Path, kind: str) -> tuple[Path, bytes]:
+    """Fetch AAPL 2024-08-12, then damage the August file in the way `kind` says."""
+    with make_rig() as rig:
+        assert rig.run(["AAPL"], WEEK[0], WEEK[0], out).complete
+    path = month_file_path(out, "AAPL", 2024, 8)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if kind == "other_month":  # a row of July in the August file
+        stray = ",".join(["2024-07-31 15:59:00", *lines[1].split(",")[1:]])
+        new = [lines[0], stray, *lines[1:]]
+    elif kind == "zone_aware":  # every date carries a UTC offset
+        new = [lines[0], *(ln.split(",", 1)[0] + "-04:00," + ln.split(",", 1)[1] for ln in lines[1:])]
+    else:
+        new = ["this is not a csv\x00\x01 at all"]
+    path.write_text("\n".join(new) + "\n", encoding="utf-8", newline="")
+    return path, path.read_bytes()
+
+
+@pytest.mark.parametrize("kind", ["other_month", "zone_aware"])
+def test_a_month_file_with_a_stray_row_or_zone_aware_dates_stops_only_that_symbol(
+        out: Path, kind: str) -> None:
+    path, bad = damage_august(out, kind)
+    with make_rig() as rig:
+        result = rig.run(["AAPL", "MSFT"], WEEK[0], WEEK[2], out)  # must not raise
+    aapl, msft = result.symbols["AAPL"], result.symbols["MSFT"]
+    assert rig.days_requested(CON_IDS["AAPL"]) == []  # nothing was sent for the damaged symbol
+    assert (aapl.state, aapl.ok, aapl.failed) == ("stopped", 0, 1)
+    assert [(f.day, f.reason) for f in aapl.failures] == [(WEEK[1], "damaged_file")]
+    assert path.name in aapl.message and "untouched" in aapl.message
+    assert path.read_bytes() == bad
+    assert manifest_days(out) == {WEEK[0].isoformat(): "ok", WEEK[1].isoformat(): "failed"}
+    assert (msft.state, msft.ok, msft.failed) == ("done", 3, 0)
+    assert rig.days_requested(CON_IDS["MSFT"]) == weekdays(WEEK[0], WEEK[2])
+    assert result.stop_reason is None and not result.complete
+
+
+def test_a_garbage_month_file_costs_no_request_even_for_days_that_would_fail(out: Path) -> None:
+    path, bad = damage_august(out, "garbage")
+    with make_rig() as rig:
+        for day in WEEK[1:4]:
+            rig.script(day, error_behaviour(200, "No security definition has been found"))
+        result = rig.run(["AAPL"], WEEK[0], WEEK[4], out)
+    assert rig.requests == []  # it used to be four requests
+    sym = result.symbols["AAPL"]
+    assert (sym.state, sym.failed, sym.planned) == ("stopped", 1, 4)
+    assert [f.reason for f in sym.failures] == ["damaged_file"] and sym.remaining == 3
+    assert path.read_bytes() == bad
+
+
+@pytest.mark.parametrize("kind", ["other_month", "zone_aware"])
+def test_the_merge_time_catch_is_a_second_line_behind_the_check(
+        out: Path, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the up-front check switched off, the same files still cannot make `fetch` raise."""
+    path, bad = damage_august(out, kind)
+    monkeypatch.setattr(fetch_module, "check_month_file", lambda *a, **k: None)
+    with make_rig() as rig:
+        result = rig.run(["AAPL", "MSFT"], WEEK[0], WEEK[2], out)
+    aapl = result.symbols["AAPL"]
+    assert rig.days_requested(CON_IDS["AAPL"]) == [WEEK[1]]  # one request, then it stops
+    assert (aapl.state, aapl.failed) == ("stopped", 1)
+    assert [f.reason for f in aapl.failures] == ["damaged_file"]
+    assert path.read_bytes() == bad
+    assert result.symbols["MSFT"].state == "done"
+
+
+def test_a_healthy_month_file_is_read_once_per_symbol_month_for_the_check(
+        out: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    start, end = date(2024, 7, 29), date(2024, 8, 2)
+    later = after(date(2024, 9, 3))
+    with make_rig(server_now=later) as rig:
+        script_range(rig, start, end, short_day(5))
+        assert rig.run(["AAPL", "MSFT"], date(2024, 7, 31), date(2024, 8, 1), out).complete
+    checked: list[str] = []
+    real = fetch_module.check_month_file
+
+    def spy(path: Path, year: int, month: int) -> None:
+        checked.append(path.name)
+        real(path, year, month)
+
+    monkeypatch.setattr(fetch_module, "check_month_file", spy)
+    with make_rig(server_now=later) as rig2:
+        script_range(rig2, start, end, short_day(5))
+        result = rig2.run(["AAPL", "MSFT"], start, end, out)
+    assert result.complete
+    assert sorted(checked) == ["AAPL_2024-07.csv", "AAPL_2024-08.csv",
+                               "MSFT_2024-07.csv", "MSFT_2024-08.csv"]  # many days, one check each
+
+
+# -- a 1100 in the last slice of a pacing wait ------------------------------------------------
+
+
+def test_a_1100_in_the_last_slice_of_a_pacing_wait_sends_nothing(out: Path) -> None:
+    from tests.test_ib_fetch import SpyPacer
+
+    state = {"waited": 0.0, "dropped": False}
+
+    with make_rig() as rig:
+        pacer = SpyPacer(rig.clock)
+
+        def sleep(seconds: float) -> None:
+            rig.clock.sleep(seconds)
+            waits = [e for e in rig.events if e.kind == "pacing_wait"]
+            if not waits or state["dropped"]:
+                return
+            state["waited"] += seconds
+            if state["waited"] >= float(waits[-1].detail["seconds"]) - 1e-9:  # the last slice is over
+                state["dropped"] = True
+                rig.fake.drop(1100)
+                for _ in range(2000):
+                    if rig.conn.state.name == "LOST":
+                        break
+                    time.sleep(0.001)
+
+        result = rig.run(["AAPL"], WEEK[0], WEEK[2], out, sleep=sleep, pacer=pacer)
+    assert state["dropped"]
+    assert rig.days_requested() == [WEEK[0]]  # the second request was never sent
+    assert [n for n, _ in pacer.log] == ["reserve", "sent", "reserve", "cancel"]
+    assert result.connection_lost and result.stop_reason == "connection lost"
+    assert manifest_days(out) == {WEEK[0].isoformat(): "ok"}
+    assert result.symbols["AAPL"].remaining == 2
+
+
+# -- IB empty for a day that is on disk; no data yet keeps IB's code --------------------------
+
+
+def manifest_record(out: Path, day: date) -> dict[str, Any]:
+    raw = json.loads((out / "AAPL" / "manifest.json").read_text(encoding="utf-8"))
+    return raw["days"][day.isoformat()]  # type: ignore[no-any-return]
+
+
+@pytest.mark.parametrize("how", ["empty_end", "no_data_162"])
+def test_an_empty_answer_for_a_day_with_bars_on_disk_is_failed_and_the_bars_stay(
+        out: Path, how: str) -> None:
+    with make_rig() as rig:
+        assert rig.run(["AAPL"], WEEK[0], WEEK[1], out).complete
+    (out / "AAPL" / "manifest.json").unlink()
+    before = month_bytes(out)
+    behaviour = empty_end if how == "empty_end" else error_behaviour(162, NO_DATA_TEXT)
+    with make_rig() as rig2:
+        rig2.script(WEEK[1], behaviour)
+        result = rig2.run(["AAPL"], WEEK[0], WEEK[1], out)
+    sym = result.symbols["AAPL"]
+    assert (sym.ok, sym.no_data, sym.failed) == (1, 0, 1) and not result.complete
+    failure = sym.failures[0]
+    assert (failure.day, failure.reason) == (WEEK[1], "no_data_but_bars_on_disk")
+    assert "kept" in failure.text and "390 bar" in failure.text
+    if how == "no_data_162":
+        assert failure.code == 162 and NO_DATA_TEXT in failure.text
+    assert month_bytes(out) == before  # the bars stay, byte for byte
+    assert manifest_days(out) == {WEEK[0].isoformat(): "ok", WEEK[1].isoformat(): "failed"}
+
+
+def test_no_data_for_a_day_without_bars_on_disk_is_still_no_data(out: Path) -> None:
+    with make_rig() as rig:
+        assert rig.run(["AAPL"], WEEK[0], WEEK[0], out).complete
+        rig.script(WEEK[1], empty_end)
+        result = rig.run(["AAPL"], WEEK[0], WEEK[1], out)
+    assert result.symbols["AAPL"].no_data == 1 and result.complete
+
+
+def test_no_data_yet_keeps_ib_code_and_text(out: Path) -> None:
+    day = date(2024, 8, 20)
+    with make_rig(server_now=minutes_after_close(day, 600)) as rig:
+        rig.script(day, error_behaviour(162, NO_DATA_TEXT))
+        result = rig.run(["AAPL"], day, day, out)
+    failure = result.symbols["AAPL"].failures[0]
+    assert failure.reason == "no_data_yet" and failure.code == 162
+    assert failure.text.startswith(NO_DATA_TEXT) and "no data yet" in failure.text
+    record = manifest_record(out, day)
+    assert record["status"] == "failed" and record["error_code"] == 162
+    assert NO_DATA_TEXT in record["error_text"]
+    with make_rig(server_now=minutes_after_close(day, 600)) as rig2:  # an empty end has no IB code
+        rig2.script(day, empty_end)
+        again = rig2.run(["AAPL"], day, day, out)
+    assert again.symbols["AAPL"].failures[0].code is None

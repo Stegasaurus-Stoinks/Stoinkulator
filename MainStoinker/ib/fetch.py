@@ -61,9 +61,14 @@ code 1101 (`data_lost`)                              cancel, discard, ask again 
 timeout, any other IB error (162 with other text,    `failed` with the code and IB's text, never
 200, 321, 354, 366, 504, 10089, 10167, ...), a       `no_data`; the next run asks again
 `BadBar`, a `filter_day` error
-a month file that cannot be merged into (damaged     day `failed`, THAT SYMBOL stops (state `stopped`,
-or inconsistent)                                     file untouched, no more requests for it), the
-                                                     next symbol goes on
+no data (end marker, or 162 "no data") for a day     `failed` (`no_data_but_bars_on_disk`, IB's code and
+that already has bars in its month file              text kept; the bars stay), never `no_data`
+a month file that `engine.feed` would refuse         first pending day of that month `failed`
+(columns, zone-aware dates, a row outside its        (`damaged_file`), THAT SYMBOL stops (state
+month, times not strictly increasing), found         `stopped`, file untouched, NO request sent for
+BEFORE the first request of a symbol's month         it), the next symbol goes on; a file that
+(once per symbol and month); or one that cannot      cannot be merged into later is treated the same
+be merged into or read later
 ==================================================== ===========================================
 
 Verbatim texts
@@ -228,7 +233,10 @@ class DayFailure:
     day: date
     code: int | None
     text: str
-    reason: str  # error, timeout, pacing, data_lost, bad_bar, invalid_data, lost, closed, damaged_file
+    # reason: error, timeout, pacing, data_lost, bad_bar, invalid_data, lost, closed, disk,
+    # no_data_yet (closed less than `settle_seconds` ago), damaged_file (month file refused or
+    # not mergeable; the symbol stops), no_data_but_bars_on_disk (IB empty, bars already stored)
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +406,29 @@ def _same_rows(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     return len(a) == len(b) and all(a[c].tolist() == b[c].tolist() for c in COLUMNS)
 
 
+def check_month_file(path: Path, year: int, month: int) -> None:
+    """Raise `ValueError` if `engine.feed.read_symbol_bars` would refuse the month file at `path`.
+
+    The rules it applies to a month file: the columns and parseable data
+    (`read_offline_bars`), naive dates, every row inside `year`-`month`, strictly
+    increasing dates. Reads the file once; `path` must exist.
+    """
+    frame = read_offline_bars(path)
+    dates = frame["date"]
+    try:
+        zone = dates.dt.tz
+    except AttributeError:  # mixed offsets leave an object column
+        raise ValueError(f"month file {path.name} has time-zone aware dates") from None
+    if zone is not None:
+        raise ValueError(f"month file {path.name} has time-zone aware dates")
+    outside = (dates.dt.year != year) | (dates.dt.month != month)
+    if outside.any():
+        raise ValueError(f"month file {path.name} has a row outside {year:04d}-{month:02d}: "
+                         f"{dates[outside].iloc[0]}")
+    if not dates.is_monotonic_increasing or dates.duplicated().any():
+        raise ValueError(f"month file {path.name} has dates that are not strictly increasing")
+
+
 def merge_day(path: Path, day: date, new: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     """The month frame with `day` replaced by `new`, and whether it differs from the file.
 
@@ -419,6 +450,16 @@ def merge_day(path: Path, day: date, new: pd.DataFrame) -> tuple[pd.DataFrame, b
     if merged["date"].duplicated().any() or not merged["date"].is_monotonic_increasing:
         raise ValueError(f"merging {day} into {path.name} would not give strictly increasing times")
     return merged, not _same_rows(existing, merged)
+
+
+def _with_ib_text(ib_text: str, explanation: str) -> str:
+    """IB's own text (if any) followed by our explanation."""
+    return f"{ib_text}; {explanation}" if ib_text else explanation
+
+
+def _on_disk_text(ib_text: str, count: int, day: date) -> str:
+    return _with_ib_text(ib_text, f"IB returned no bars for {day} but the month file already holds "
+                         f"{count} bar(s) of that day; the existing bars were kept")
 
 
 class _Run:
@@ -447,6 +488,7 @@ class _Run:
         self.pacing_hits = 0
         self.days: list[date] = []
         self.current: _Symbol | None = None
+        self.checked_months: set[Path] = set()  # month files read and found usable in this run
 
     # -- helpers ----------------------------------------------------------------
 
@@ -626,6 +668,7 @@ class _Run:
                 self.emit("pacing_wait", f"waiting {reservation.wait:.1f} s for IB's pacing limits",
                           sym.result.symbol, day, seconds=reservation.wait)
                 self.pause(reservation.wait)
+                self.guard_connection()  # 1100 or a close in the last slice: send nothing
             req_id = self.md.request_history(
                 sym.info.contract(), session_close_utc(day), request.duration, use_rth=bool(request.use_rth))
         except NotConnected:
@@ -692,7 +735,9 @@ class _Run:
     def _day(self, sym: _Symbol, day: date) -> bool:
         """Fetch and store one day; False when this symbol must not go on (damaged month file)."""
         res = sym.result
-        answer = self._answer(sym, day)
+        damage = self._month_damage(sym, day)  # before any request is spent on this month
+        answer = (self._answer(sym, day) if damage is None
+                  else _Answer("failed", "damaged_file", None, damage))
         status, bars, code, text, reason = self._settle(sym, day, answer)
         if status == STATUS_OK:
             res.ok += 1
@@ -712,6 +757,28 @@ class _Run:
                            "the file yourself, then run again.")
             return False
         return True
+
+    def _month_damage(self, sym: _Symbol, day: date) -> str | None:
+        """The failure text if the month file of `day` is refused, else None (checked once per month)."""
+        path = month_file_path(self.out_dir, sym.result.symbol, day.year, day.month)
+        if path in self.checked_months:
+            return None
+        if path.is_file():
+            try:
+                check_month_file(path, day.year, day.month)
+            except (OSError, ValueError, TypeError) as exc:
+                return f"month file {path.name} is damaged: {exc}"
+        self.checked_months.add(path)
+        return None
+
+    def _bars_on_disk(self, path: Path, day: date) -> int:
+        """How many bars of `day` the month file at `path` holds (0 if absent or unreadable)."""
+        if not path.is_file():
+            return 0
+        try:
+            return int((read_offline_bars(path)["date"].dt.date == day).sum())
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0
 
     def _too_soon(self, day: date) -> str | None:
         """The failure text when `day`'s session closed less than `settle_seconds` ago, else None."""
@@ -743,10 +810,16 @@ class _Run:
             self._record(sym, day, STATUS_FAILED, code=answer.code, text=answer.text)
             self._first(sym, day, STATUS_FAILED, None, None, first)
             return STATUS_FAILED, 0, answer.code, answer.text, answer.reason
+        path = month_file_path(self.out_dir, symbol, day.year, day.month)
         if answer.kind == "no_data":
             soon = self._too_soon(day)
             if soon is not None:
-                return self._fail(sym, day, soon, "no_data_yet", first)
+                return self._fail(sym, day, _with_ib_text(answer.text, soon), "no_data_yet", first,
+                                  code=answer.code)
+            on_disk = self._bars_on_disk(path, day)
+            if on_disk:
+                return self._fail(sym, day, _on_disk_text(answer.text, on_disk, day),
+                                  "no_data_but_bars_on_disk", first, code=answer.code)
             self._record(sym, day, STATUS_NO_DATA, code=answer.code, text=answer.text)
             self._first(sym, day, STATUS_NO_DATA, None, None, first)
             return STATUS_NO_DATA, 0, answer.code, answer.text, ""
@@ -767,26 +840,34 @@ class _Run:
                 return self._fail(sym, day, soon, "no_data_yet", first, raw)
             text = (f"complete answer without bars for {day}"
                     + (f" ({len(raw)} bar(s) of other dates dropped)" if len(raw) else ""))
+            on_disk = self._bars_on_disk(path, day)
+            if on_disk:
+                return self._fail(sym, day, _on_disk_text(text, on_disk, day),
+                                  "no_data_but_bars_on_disk", first, raw)
             self._record(sym, day, STATUS_NO_DATA, text=text)
             self._first(sym, day, STATUS_NO_DATA, raw, kept, first)
             return STATUS_NO_DATA, 0, None, text, ""
-        path = month_file_path(self.out_dir, symbol, day.year, day.month)
         try:
             merged, changed = merge_day(path, day, kept)
-        except ValueError as exc:
+        except (OSError, ValueError, TypeError) as exc:  # second line behind `_month_damage`
             return self._fail(sym, day, f"month file {path.name} is damaged: {exc}", "damaged_file",
                               first, raw)
         if changed:
-            write_month_file(path, merged, sleep=self.sleep, clock=self.clock)
+            try:
+                write_month_file(path, merged, sleep=self.sleep, clock=self.clock)
+            except (ValueError, TypeError) as exc:  # a frame the writer refuses; OSError is a disk fault
+                return self._fail(sym, day, f"month file {path.name} is damaged: {exc}",
+                                  "damaged_file", first, raw)
         self._record(sym, day, STATUS_OK, bars=len(kept))
         self._first(sym, day, STATUS_OK, raw, kept, first)
         return STATUS_OK, len(kept), None, "", ""
 
     def _fail(self, sym: _Symbol, day: date, text: str, reason: str, first: bool,
-              raw: pd.DataFrame | None = None) -> tuple[str, int, int | None, str, str]:
-        self._record(sym, day, STATUS_FAILED, text=text)
+              raw: pd.DataFrame | None = None, *, code: int | None = None,
+              ) -> tuple[str, int, int | None, str, str]:
+        self._record(sym, day, STATUS_FAILED, code=code, text=text)
         self._first(sym, day, STATUS_FAILED, raw, None, first)
-        return STATUS_FAILED, 0, None, text, reason
+        return STATUS_FAILED, 0, code, text, reason
 
     def _first(self, sym: _Symbol, day: date, status: str, raw: pd.DataFrame | None,
                kept: pd.DataFrame | None, first: bool) -> None:
