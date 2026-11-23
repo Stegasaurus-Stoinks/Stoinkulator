@@ -47,6 +47,8 @@ def stock(symbol: str, primary_exchange: str = "", con_id: int = 0) -> Contract:
     can never share and mutate one.
     """
     check_symbol(symbol)
+    if symbol != symbol.upper():
+        raise ValueError(f"invalid symbol {ascii(symbol)}: IB symbols are upper case")
     check_primary_exchange(primary_exchange)
     if isinstance(con_id, bool) or not isinstance(con_id, int) or con_id < 0:
         raise ValueError(f"con_id must be an int of 0 or more, got {con_id!r}")

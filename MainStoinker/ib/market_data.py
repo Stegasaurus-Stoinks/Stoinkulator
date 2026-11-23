@@ -193,7 +193,9 @@ class IbMarketData:
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = 0.05,
     ) -> None:
-        if not (isinstance(poll_interval, int | float) and 0 < poll_interval <= 10):
+        if isinstance(poll_interval, bool) or not (
+            isinstance(poll_interval, int | float) and 0 < poll_interval <= 10
+        ):
             raise ValueError(f"poll_interval must be above 0 and at most 10, got {poll_interval!r}")
         self._connection = connection
         self._clock = clock
@@ -264,7 +266,7 @@ class IbMarketData:
 
     def set_market_data_type(self, market_data_type: int) -> None:
         """Choose live (1), frozen (2), delayed (3) or delayed frozen (4) quotes."""
-        if isinstance(market_data_type, bool) or market_data_type not in MARKET_DATA_TYPES:
+        if type(market_data_type) is not int or market_data_type not in MARKET_DATA_TYPES:
             raise ValueError(
                 f"market data type must be one of {MARKET_DATA_TYPES}, got {market_data_type!r}"
             )
