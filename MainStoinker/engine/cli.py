@@ -625,15 +625,30 @@ def run_backtest_command(
         feed = CsvBarFeed(data_dir, config_symbols(entries), args.warmup_days)
     except (ValueError, FileNotFoundError) as exc:
         raise CliError(str(exc)) from exc
+    # A symbol with no replay bars while another has some is an input problem (it would
+    # only show as one "no bar at N of N minutes" line). When NO symbol has any, the run
+    # stays a run of zero bars as before: many existing tests use data shorter than the
+    # warm-up on purpose.
+    counts = feed.replay_counts()
+    if any(counts.values()):
+        for symbol, count in counts.items():
+            if count == 0:
+                raise CliError(
+                    f"symbol {symbol} has no bars in the replay window (its data is all "
+                    f"warm-up or empty; check the data and --warmup-days {args.warmup_days})"
+                )
     # One pass over the batches (they are in memory): count them and note the
     # first and last replayed bar, which the stored run records.
     bar_count = 0
-    replay_times: list[datetime] = []
+    # Per symbol, the times of its own replayed bars: an algo's series history is
+    # its symbol's warm-up bars then these (a symbol can miss minutes others have).
+    replay_times: dict[str, list[datetime]] = {symbol: [] for symbol in feed.symbols()}
     first_bar: datetime | None = None
     last_bar: datetime | None = None
-    for stamp, _bars in feed:
+    for stamp, bars in feed:
         bar_count += 1
-        replay_times.append(stamp)
+        for symbol in bars:
+            replay_times[symbol].append(stamp)
         if first_bar is None:
             first_bar = stamp
         last_bar = stamp
@@ -770,7 +785,8 @@ def run_backtest_command(
                 # part-way leaves the earlier algos' series stored and the run marked failed.
                 for algo in algos:
                     try:
-                        history = [*feed.warmup(algo.ticker)["date"].tolist(), *replay_times]
+                        history = [*feed.warmup(algo.ticker)["date"].tolist(),
+                                   *replay_times[algo.ticker]]
                         infos, points = extract_series(algo, history)
                     except StoreError:
                         raise
@@ -797,6 +813,9 @@ def run_backtest_command(
             store.close()
 
     print(f"replayed {bar_count} bars for {', '.join(feed.symbols())}")
+    for symbol, count in feed.missing_counts().items():
+        if count:
+            print(f"{symbol}: no bar at {count} of {bar_count} minutes (skipped for those minutes)")
     for idname, records in result.items():
         extra = f" ({summary[idname]})" if idname in summary else ""
         print(f"{idname}: {len(records)} trades{extra}")

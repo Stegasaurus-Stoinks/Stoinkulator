@@ -153,21 +153,56 @@ def test_synthetic_aligned_files_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "bad_stamps", "needle"),
+    ("name", "bad_stamps", "absent"),
     [
+        # BAD lacks one replay timestamp in the middle
         ("gap", STAMPS[:8] + STAMPS[9:], "2024-01-05 00:00:00"),
+        # BAD lacks the last one
         ("shorter", STAMPS[:-1], "2024-01-06 12:00:00"),
-        ("shifted_warmup", STAMPS[1:], "2024-01-03"),
+        # BAD starts 12 h later, so its warm-up (2 days from its first row) also ends
+        # 12 h later and GOOD's first replay bar has no BAD partner
+        ("shifted_warmup", STAMPS[1:], "2024-01-03 00:00:00"),
     ],
 )
-def test_misaligned_symbols_raise(
-    tmp_path: Path, name: str, bad_stamps: list[str], needle: str
+def test_misaligned_symbols_skip_the_missing_minute(
+    tmp_path: Path, name: str, bad_stamps: list[str], absent: str
 ) -> None:
+    """Symbols that do not line up are no longer refused: batches are the union, BAD is
+    absent from the one timestamp it lacks."""
     write_csv(tmp_path, "GOOD", STAMPS)
     write_csv(tmp_path, "BAD", bad_stamps)
+    feed = CsvBarFeed(tmp_path, ["GOOD", "BAD"])
+    batches = list(feed)
+    assert [stamp for stamp, _ in batches] == [pd.Timestamp(s) for s in STAMPS[4:]], name
+    for stamp, bars in batches:
+        assert list(bars) == (["GOOD"] if stamp == pd.Timestamp(absent) else ["GOOD", "BAD"])
+    assert feed.missing_counts() == {"GOOD": 0, "BAD": 1}
+
+
+def test_shuffled_flat_file_among_two_symbols_is_refused(tmp_path: Path) -> None:
+    write_csv(tmp_path, "GOOD", STAMPS)
+    shuffled = [STAMPS[i] for i in (0, 5, 2, 9, 1, 3, 4, 6, 7, 8, 10, 11)]
+    write_csv(tmp_path, "BAD", shuffled)
     with pytest.raises(ValueError, match="BAD") as info:
         CsvBarFeed(tmp_path, ["GOOD", "BAD"])
-    assert needle in str(info.value), name
+    message = str(info.value)
+    assert "_BAD_offlinedata_" in message and "data row 3 " in message  # 5 then 2
+    assert STAMPS[2] in message
+
+
+def test_the_sorted_check_leaves_read_offline_bars_alone(tmp_path: Path) -> None:
+    """`read_offline_bars` (also used by the API's bars route) still returns file order."""
+    write_csv(tmp_path, "BAD", [STAMPS[1], STAMPS[0]])
+    frame = read_offline_bars(tmp_path / "_BAD_offlinedata_")
+    assert list(frame["date"]) == [pd.Timestamp(STAMPS[1]), pd.Timestamp(STAMPS[0])]
+
+
+def test_replay_counts(tmp_path: Path) -> None:
+    write_csv(tmp_path, "GOOD", STAMPS)
+    write_csv(tmp_path, "BAD", STAMPS[:5])  # all inside GOOD's 2-day warm-up window, but BAD's
+    feed = CsvBarFeed(tmp_path, ["GOOD", "BAD"], warmup_days=2)
+    assert feed.replay_counts() == {"GOOD": 8, "BAD": 1}
+    assert feed.replay_counts() is not feed.replay_counts()
 
 
 def test_missing_file_raises_file_not_found(tmp_path: Path) -> None:
