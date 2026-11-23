@@ -241,8 +241,10 @@ def test_fake_never_opens_a_socket(monkeypatch: pytest.MonkeyPatch, rec: Recorde
                 getattr(f, method)(*args)
             f.isConnected()
             f.serverVersion()
-            f.run_in_thread()
-            f.drop("connectionClosed")
+            run_thread = f.run_in_thread()
+            f.drop("connectionClosed")  # a peer close: run() drains its queue, then ends
+            run_thread.join(WAIT)  # joined before the block ends: close() must not race run()
+            assert not run_thread.is_alive()
     # ... and the same requests while not connected (the 504 path).
     unconnected = FakeIbClient(rec)
     for method, args in REQUEST_ARGS.items():

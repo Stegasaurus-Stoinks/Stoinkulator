@@ -67,9 +67,11 @@ timing, so a peer close happens on the thread that calls ``drop`` (or
 ``connect`` usually still sees True. ``disconnect()`` claims the connection
 atomically, so two threads disconnecting at once report one ``connectionClosed``
 in total, where real ibapi can report two or raise. A hung connect released by
-``disconnect()`` always raises ``AttributeError``, where real ibapi may return
-cleanly if its loop runs in the narrow window between the socket close and
-``reset()``. ``host``, ``port`` and ``clientId`` are kept after a disconnect
+``disconnect()`` always raises ``AttributeError`` in the fake. Real ibapi may
+either raise it or return cleanly with ``isConnected()`` False: which happens
+depends on timing and on what the wrapper's ``connectionClosed`` handler does
+(the connecting thread races it and ``reset()``). Code under test must handle
+both.``host``, ``port`` and ``clientId`` are kept after a disconnect
 (real ``reset()`` clears them). The message that makes ``run`` raise
 ``TypeError`` is dropped; no other decoder failure (``BadMessage``, over-long
 messages) is modelled. The 1101, 1102 and 2110 texts of ``drop`` are IB's
@@ -286,6 +288,8 @@ class FakeIbClient:
         self._behaviors: list[ConnectBehavior] = []
         self._handlers: dict[str, Handler | list[Played]] = {}
         self._threads: list[threading.Thread] = []
+        self.run_errors: list[BaseException] = []  # what ended run_in_thread threads
+        self._expected_run_errors: list[type[BaseException]] = []
         self.script_connect(connect_behavior)
 
     # -- scripting -----------------------------------------------------------
@@ -355,26 +359,59 @@ class FakeIbClient:
             return [c.name for c in self.calls]
 
     def run_in_thread(self) -> threading.Thread:
-        """Run ``run()`` on a daemon thread that ``close`` joins."""
-        t = threading.Thread(target=self.run, name="fake-ib-run", daemon=True)
+        """Run ``run()`` on a daemon thread that ``close`` joins.
+
+        An exception ``run()`` raises (such as the ``TypeError`` real ibapi raises
+        for a message dequeued after a caller ``disconnect()``) is appended to
+        ``run_errors``. ``close()`` raises if one is there that the test did not
+        announce with ``expect_run_error``.
+        """
+
+        def target() -> None:
+            try:
+                self.run()
+            except BaseException as exc:  # noqa: BLE001 - recorded, re-raised by close()
+                with self._lock:
+                    self.run_errors.append(exc)
+
+        t = threading.Thread(target=target, name="fake-ib-run", daemon=True)
         self._threads.append(t)
         t.start()
         return t
 
-    def close(self, timeout: float = 5.0) -> None:
-        """Disconnect and join every thread started by ``run_in_thread``."""
+    def expect_run_error(self, *types: type[BaseException]) -> None:
+        """Declare that a run thread may end with one of ``types``; ``close`` then accepts it."""
+        with self._lock:
+            self._expected_run_errors.extend(types)
+
+    def close(self, timeout: float = 5.0, *, check_run_errors: bool = True) -> None:
+        """Disconnect and join every thread started by ``run_in_thread``.
+
+        Raises ``AssertionError`` if a run thread ended with an exception that is not
+        an instance of a type given to ``expect_run_error``. ``run_errors`` is cleared.
+        """
         self._disconnect()
         for t in self._threads:
             t.join(timeout)
             if t.is_alive():  # pragma: no cover - only on a broken test
                 raise RuntimeError(f"thread {t.name} did not end within {timeout}s")
         self._threads.clear()
+        with self._lock:
+            errors, self.run_errors = self.run_errors, []
+            expected = tuple(self._expected_run_errors)
+        unexpected = [e for e in errors if not isinstance(e, expected)]
+        if unexpected and check_run_errors:
+            raise AssertionError(
+                f"run() on a thread ended with an unexpected exception: {unexpected[0]!r}; "
+                "drain the queue before close() or call expect_run_error()"
+            ) from unexpected[0]
 
     def __enter__(self) -> "FakeIbClient":
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *exc: object) -> None:
+        # While another exception propagates, do not mask it with a run-thread error.
+        self.close(check_run_errors=exc_type is None)
 
     # -- EClient surface -----------------------------------------------------
     @_recorded
