@@ -52,7 +52,7 @@ MUST_BE_FORBIDDEN = (
     "MainStoinker.DataCollection", "MainStoinker.Algos",
     "MainStoinker.engine.cli", "MainStoinker.engine.engine", "MainStoinker.engine.algos",
     "MainStoinker.engine.modes", "MainStoinker.engine.paper_broker",
-    "MainStoinker.engine.broker", "MainStoinker.engine.router", "ibapi",
+    "MainStoinker.engine.broker", "MainStoinker.engine.router", "MainStoinker.ib", "ibapi",
 )
 # Loaded transitively by an allowed module (`report`), not importable by the API directly.
 TRANSITIVE_OK = frozenset({"MainStoinker.engine.paper_broker", "MainStoinker.engine.broker"})
