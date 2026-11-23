@@ -49,7 +49,8 @@ the package. Blocked by design, even though they only print help:
 
 The ONE allowance (``allowed_paper_data_command``, owner decision 2026-11-23): an agent
 may run a DATA session against the PAPER account, written as one whole plain command
-``<venv python> [-P] -m MainStoinker (fetch-bars|probe-data) <args>``. ``<venv python>``
+``<venv python> -P -m MainStoinker (fetch-bars|probe-data) <args>`` (``-P`` is mandatory:
+the current directory is never put first on ``sys.path``). ``<venv python>``
 is exactly ``.venv\\Scripts\\python.exe`` (or ``.venv/Scripts/python.exe``) or a
 drive-absolute path ``X:\\...\\.venv\\Scripts\\python.exe`` (no ``..``, no ``=``, no other
 colon; never a UNC or ``/c/...`` path), optionally double-quoted, optionally preceded by
@@ -578,7 +579,7 @@ _CONNECT_MESSAGE = (
     "runs, report and serve are allowed) and only the owner runs connecting "
     "commands (see CLAUDE.md safety rules). The one exception is a DATA session on "
     "the PAPER account, written as ONE plain command and nothing else: "
-    ".venv\\Scripts\\python.exe [-P] -m MainStoinker fetch-bars|probe-data "
+    ".venv\\Scripts\\python.exe -P -m MainStoinker fetch-bars|probe-data "
     "<args> with --paper and --no-prompt among the args (--port only 7497, --host only "
     "127.0.0.1; quote a symbol list: --symbols \"AAPL,MSFT\"; no --help). A "
     "drive-absolute path ending in .venv\\Scripts\\python.exe also works, in double "
@@ -1211,7 +1212,7 @@ def _decode_encoded(value: str) -> str | None:
 _PAPER_CHARS = r"A-Za-z0-9_,.:=\\/-"
 _PAPER_TOKEN = rf'(?:"[ {_PAPER_CHARS}]*"|[{_PAPER_CHARS}]+)'
 _PAPER_COMMAND = re.compile(
-    rf"(?:& +)?(?P<py>{_PAPER_TOKEN})(?: +-P)? +-m +MainStoinker +"
+    rf"(?:& +)?(?P<py>{_PAPER_TOKEN}) +-P +-m +MainStoinker +"
     rf"(?P<sub>fetch-bars|probe-data)(?P<args>(?: +{_PAPER_TOKEN})+)"
 )
 _PAPER_TOKEN_RE = re.compile(_PAPER_TOKEN)

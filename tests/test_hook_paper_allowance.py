@@ -1,7 +1,7 @@
 """The one allowance of the live-launch hook: an unattended paper DATA run.
 
 Every command here is a string fed to the hook's decision functions (never run). The shape
-is `<venv python> [-P] -m MainStoinker (fetch-bars|probe-data) <args>` with `--paper` and
+is `<venv python> -P -m MainStoinker (fetch-bars|probe-data) <args>` with `--paper` and
 `--no-prompt` among plain args, as ONE whole command; everything else stays as blocked as it
 was (the frozen baseline test in `test_block_live_launch_hook.py` pins that independently).
 """
@@ -57,11 +57,11 @@ FETCH_ARGS = f"--symbols AAPL,MSFT,TSLA {DATES} --paper --no-prompt"
 PROBE_ARGS = "--symbols AAPL,MSFT --paper --no-prompt"
 
 
-def fetch(py: str = UP, args: str = FETCH_ARGS, mid: str = "") -> str:
+def fetch(py: str = UP, args: str = FETCH_ARGS, mid: str = " -P") -> str:
     return f"{py}{mid} {MODULE} fetch-bars {args}"
 
 
-def probe(py: str = UP, args: str = PROBE_ARGS, mid: str = "") -> str:
+def probe(py: str = UP, args: str = PROBE_ARGS, mid: str = " -P") -> str:
     return f"{py}{mid} {MODULE} probe-data {args}"
 
 
@@ -118,8 +118,25 @@ def refused_table() -> list[str]:
     def add(*items: str) -> None:
         out.extend(items)
 
+    UP = ".venv\\Scripts\\python.exe -P"  # noqa: N806 - here every literal command carries the mandatory -P
     base = fetch()
     base_p = probe()
+    # -P is mandatory: the current directory must never come first on sys.path
+    for py in (".venv\\Scripts\\python.exe", ".venv/Scripts/python.exe", QP, "& " + QP, QPF):
+        add(fetch(py, mid=""), probe(py, mid=""))
+    add(
+        fetch(mid=" -p"), fetch(mid=" -PP"), fetch(mid=" -P -P"), fetch(mid=" -Pm"), fetch(mid=" -P x"),
+        fetch(mid=" \\-P"), fetch(mid=" -\\P"), fetch(mid=' "-P"'), fetch(mid=" --P"), fetch(mid=" -P,"),
+        fetch(mid=" -Ｐ"), fetch(mid=" ‑P"),
+        f"{UP[:-3]} -m MainStoinker -P fetch-bars {FETCH_ARGS}",
+        f"{UP[:-3]} -u -m MainStoinker fetch-bars {FETCH_ARGS}",
+        f"{UP[:-3]} -I -m MainStoinker fetch-bars {FETCH_ARGS}",
+        # a quoted value whose backslash-stripped form starts with a dash is an option in bash
+        fetch(args=f'{FETCH_ARGS} --out "\\-x"'),
+        fetch(args=f'{FETCH_ARGS} "\\--port" 7496'),
+        fetch(args=f'{FETCH_ARGS} "\\\\--port=7496"'),
+        fetch(args=f'{FETCH_ARGS} --out "\\\\-x"'),
+    )
     # missing or altered flags
     add(
         fetch(args=f"--symbols AAPL {DATES} --no-prompt"),
@@ -541,9 +558,9 @@ def test_the_block_message_teaches_the_allowed_form() -> None:
     for word in ("--paper", "--no-prompt", ".venv", "7497", "127.0.0.1", "fetch-bars|probe-data", "PAPER"):
         assert word in reason
     # the form shown parses in PowerShell as typed: relative, no quotes around the interpreter
-    assert ".venv\\Scripts\\python.exe [-P] -m MainStoinker fetch-bars|probe-data" in reason
+    assert ".venv\\Scripts\\python.exe -P -m MainStoinker fetch-bars|probe-data" in reason
     assert '"<project>' not in reason
-    shown = ".venv\\Scripts\\python.exe -m MainStoinker fetch-bars --symbols \"AAPL,MSFT\" "
+    shown = ".venv\\Scripts\\python.exe -P -m MainStoinker fetch-bars --symbols \"AAPL,MSFT\" "
     assert hook.allowed_paper_data_command(shown + "--start 2024-08-16 --end 2024-08-26 --paper --no-prompt")
     assert ENV_NAME not in reason
 
@@ -571,6 +588,8 @@ def test_claude_md_states_the_paper_rules() -> None:
         "A paper session is run only by the main session, from the main checkout at an unmodified "
         "`origin/revival` commit",
         "clean `git status` for tracked files, `HEAD` equal to or contained in `origin/revival`",
+        "and no untracked `.py` files in the repo root or under `MainStoinker/`",
+        "`.venv\\Scripts\\python.exe -P -m MainStoinker fetch-bars|probe-data <args>`",
         "never from a task branch or worktree and never with uncommitted changes",
         "code that connects must have been reviewed and merged before it talks to TWS",
         "The hook cannot check this; the rule does.",
