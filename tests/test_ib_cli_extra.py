@@ -8,6 +8,7 @@ passed in, every file is under `tmp_path`, and nothing opens a socket. Nothing h
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from collections.abc import Iterator
 from datetime import date
@@ -23,7 +24,8 @@ from MainStoinker.ib.recorder import SessionRecorder, scan_recording
 from tests.fake_ib import ConnectBehavior, FakeIbClient
 from tests.ib_replay import handshake_kwargs, install, load_recording
 from tests.test_ib_cli import DAYS, LOADED, REPO, Session, Tty, child
-from tests.test_ib_fetch import SERVER_NOW, error_behaviour
+from tests.test_ib_cli import real_home_untouched as real_home_untouched  # noqa: F401  (autouse here too)
+from tests.test_ib_fetch import SERVER_NOW, SimClock, details, error_behaviour
 
 OPT_IN = "STOINK_ALLOW_LIVE_PORT"
 
@@ -190,14 +192,68 @@ def test_a_recording_path_that_is_a_folder_is_refused_before_the_gate(sess: Sess
     untouched(sess)
 
 
-def test_a_recording_that_cannot_be_created_exits_2_with_nothing_connected(sess: Session) -> None:
+def test_a_recording_under_a_file_exits_2_before_the_gate_with_nothing_connected(sess: Session) -> None:
     blocker = sess.tmp / "blocker"
     blocker.write_text("a file where a folder is needed", encoding="utf-8")
     code = sess.main(*argv_for(sess, "7497", "AAPL", "--record", str(blocker / "r.jsonl")))
     assert code == 2
-    assert "Cannot start the session recording" in sess.text
-    assert "Result: refused" in sess.text
-    assert not sess.connections and not sess.fakes
+    assert "is a file" in sess.text and "recording folder" in sess.text
+    assert not sess.prompts and not sess.connections and not sess.fakes
+    assert not (sess.tmp / "bars").exists()
+
+
+def test_a_recording_folder_that_cannot_be_made_is_refused_before_the_gate_and_removes_what_was_made(
+        sess: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check is by file type; this is the other kind: the folder cannot be created at all."""
+    real_mkdir = Path.mkdir
+    target = sess.tmp / "rec" / "deep"
+
+    def mkdir(self: Path, *a: Any, **kw: Any) -> None:
+        if self == target:
+            raise PermissionError("denied")
+        real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    code = sess.main(*argv_for(sess, "7497", "AAPL", "--record", str(target / "r.jsonl")))
+    assert code == 2 and not sess.prompts and not sess.connections
+    assert "cannot create the folder" in sess.text
+    assert not (sess.tmp / "bars").exists() and not (sess.tmp / "rec").exists()
+
+
+def test_folders_made_before_a_refused_gate_are_removed_when_empty(sess: Session) -> None:
+    sess.typed = "no"
+    record = sess.tmp / "r1" / "r2" / "x.jsonl"
+    assert sess.main(*argv_for(sess, "7497", "AAPL", "--record", str(record))) == 2
+    assert not (sess.tmp / "bars").exists() and not (sess.tmp / "r1").exists()
+
+
+def test_a_folder_that_held_something_before_is_never_removed(sess: Session) -> None:
+    (sess.tmp / "bars").mkdir()
+    (sess.tmp / "bars" / "keep.txt").write_text("x", encoding="utf-8")
+    sess.typed = "no"
+    assert sess.main(*argv_for(sess)) == 2
+    assert (sess.tmp / "bars" / "keep.txt").is_file()
+    (sess.tmp / "bars" / "keep.txt").unlink()
+    assert sess.main(*argv_for(sess)) == 2
+    assert (sess.tmp / "bars").is_dir()  # it was there before: it stays
+    assert not (sess.tmp / "home" / "Stoinkulator").exists()  # made by this run, empty: removed
+
+
+def test_a_recording_parent_that_is_a_file_is_refused_before_the_port_guard(sess: Session) -> None:
+    blocker = sess.tmp / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    code = sess.main(*argv_for(sess, "7496", "AAPL", "--record", str(blocker / "r.jsonl")))
+    assert code == 2 and "is a file" in sess.text
+    assert "STOINK_ALLOW_LIVE_PORT" not in sess.text  # refused on the path, before the port guard
+    untouched(sess)
+
+
+def test_a_recording_folder_under_a_file_says_so(sess: Session) -> None:
+    blocker = sess.tmp / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    code = sess.main(*argv_for(sess, "7497", "AAPL", "--record", str(blocker / "sub" / "r.jsonl")))
+    assert code == 2 and "lies under the file" in sess.text
+    untouched(sess)
 
 
 def test_relative_paths_are_taken_from_the_current_folder(sess: Session) -> None:
@@ -207,15 +263,17 @@ def test_relative_paths_are_taken_from_the_current_folder(sess: Session) -> None
     assert (Path.cwd() / "relative_bars" / "AAPL").is_dir() and (Path.cwd() / "relative_rec.jsonl").is_file()
 
 
-@pytest.mark.xfail(strict=True, reason="defect: --out naming a file passes the gate, connects to TWS, "
-                                       "then exits 4; it should be refused (exit 2) before the gate")
 @pytest.mark.parametrize("shape", ["file", "under_file"])
-def test_an_output_path_that_is_a_file_is_refused_before_the_gate(sess: Session, shape: str) -> None:
+@pytest.mark.parametrize("port", ["7497", "7496"])
+def test_an_output_path_that_is_a_file_is_refused_before_the_port_guard_and_the_gate(
+        sess: Session, shape: str, port: str) -> None:
     blocker = sess.tmp / "afile"
     blocker.write_text("x", encoding="utf-8")
     out = blocker if shape == "file" else blocker / "sub"
-    code = sess.main("--symbols", "AAPL", *DAYS, "--port", "7497", "--out", str(out))
-    assert code == 2 and not sess.prompts and not sess.connections
+    code = sess.main("--symbols", "AAPL", *DAYS, "--port", port, "--out", str(out))
+    assert code == 2 and not sess.prompts and not sess.connections and not sess.fakes
+    assert "STOINK_ALLOW_LIVE_PORT" not in sess.text and "bars folder" in sess.text
+    assert blocker.read_text(encoding="utf-8") == "x"
 
 
 # -- arguments --------------------------------------------------------------------------------------
@@ -264,7 +322,7 @@ def test_bad_option_values_are_usage_errors(flag: str, value: str,
 def test_there_is_no_option_that_skips_the_gate() -> None:
     options = {o for action in cli.build_parser()._actions for o in action.option_strings}
     assert options == {"-h", "--help", "--symbols", "--start", "--end", "--port", "--host", "--client-id",
-                       "--out", "--record", "--no-record", "--connect-timeout"}
+                       "--out", "--record", "--no-record", "--connect-timeout", "--settle-hours"}
 
 
 @pytest.mark.parametrize("flag", ["--yes", "-y", "--force", "--no-gate", "--skip-gate", "--assume-yes",
@@ -295,11 +353,37 @@ def test_a_single_day_is_a_valid_range(sess: Session, start: str, end: str) -> N
     assert code == 0 and "1 ok" in sess.text
 
 
-def test_a_range_wholly_in_the_future_writes_nothing_and_says_why(sess: Session) -> None:
+def test_a_range_wholly_in_the_future_is_refused_before_connecting_as_a_pre_check(sess: Session) -> None:
     code = sess.main("--symbols", "AAPL", "--start", "2030-01-07", "--end", "2030-01-11", "--port", "7497",
                      "--out", str(sess.tmp / "bars"))
-    assert "not closed" in sess.text and "Result:" in sess.text
-    assert code in (2, 4)
+    assert code == 2
+    assert "pre-check" in sess.text and "after today in New York (2024-08-21)" in sess.text
+    assert not sess.prompts and not sess.connections and not sess.fakes
+    assert not (sess.tmp / "bars").exists()
+
+
+def test_a_range_starting_today_in_new_york_is_not_refused_by_the_pre_check(sess: Session) -> None:
+    """Only a start after today is refused from the clock; the authoritative check is IB's server time."""
+    code = sess.main("--symbols", "AAPL", "--start", "2024-08-21", "--end", "2024-08-21", "--port", "7497",
+                     "--out", str(sess.tmp / "bars"))
+    assert "pre-check" not in sess.text and sess.connections
+    assert code in (0, 1, 4)
+
+
+def test_a_weekend_only_range_is_refused_before_connecting_and_says_so(sess: Session) -> None:
+    code = sess.main("--symbols", "AAPL", "--start", "2024-08-17", "--end", "2024-08-18", "--port", "7497",
+                     "--out", str(sess.tmp / "bars"))
+    assert code == 2 and "no weekday" in sess.text and "pre-check" in sess.text
+    untouched(sess)
+
+
+def test_a_range_that_starts_in_the_future_by_server_time_is_still_stopped_after_connecting(
+        sess: Session) -> None:
+    """The authoritative check stays: the clock of the machine says a day has started, IB's says not."""
+    code = sess.main("--symbols", "AAPL", "--start", "2024-08-20", "--end", "2024-08-20", "--port", "7497",
+                     "--out", str(sess.tmp / "bars"))
+    assert code == 4  # IB's server time (SERVER_NOW: the morning of 2024-08-20) says it is not closed
+    assert "not closed" in sess.text and "pre-check" not in sess.text
     assert not list((sess.tmp / "bars").rglob("*.csv"))
     assert sess.connections[0].state is ConnState.CLOSED
 
@@ -307,17 +391,16 @@ def test_a_range_wholly_in_the_future_writes_nothing_and_says_why(sess: Session)
 # -- what is printed ---------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="defect: VOLUME_NOTE still says the unit is not settled; the owner's "
-                                       "fact is that volumes are shares with the lots setting unticked")
 def test_the_volume_note_states_the_settled_fact() -> None:
     note = cli.VOLUME_NOTE.lower()
+    assert len(note.splitlines()) == 3
     assert "not settled" not in note
-    assert "as ib sends" in note or "as ib sent" in note
-    assert "unticked" in note or "not ticked" in note
-    assert "tens of thousands" in note
+    assert "as ib sent" in note
+    assert "unticked" in note and "global configuration, api, settings" in note
+    assert "cannot be converted back" in note and "fetch that data again" in note
+    assert "hundreds of thousands to millions" in note and "tens of thousands" in note
 
 
-@pytest.mark.xfail(strict=True, reason="defect: a failure without an IB code prints 'failed, None: ...'")
 def test_a_failure_without_a_code_does_not_print_none(sess: Session) -> None:
     def lose(req_id: int, day: date, symbol: str) -> list[Any]:
         sess.fakes[-1].drop("connectionClosed")
@@ -326,6 +409,16 @@ def test_a_failure_without_a_code_does_not_print_none(sess: Session) -> None:
     sess.rig.script(date(2024, 8, 14), lose)
     sess.fetch(symbols="AAPL")
     assert "None" not in sess.text
+    assert "2024-08-14: failed: " in sess.text and "failed, IB" not in sess.text.split("Summary")[0]
+
+
+def test_failure_text_with_and_without_a_code() -> None:
+    assert cli.failure_text(None, "the connection closed") == "failed: the connection closed"
+    assert cli.failure_text(162, "pacing") == "failed, IB 162: pacing"
+    assert cli.failure_text(0, "zero is a code") == "failed, IB 0: zero is a code"
+    assert cli.failure_text(None, "x", "no_data_yet") == f"failed: {cli.NO_DATA_YET_TEXT}"
+    damaged = cli.failure_text(None, "month file AAPL_2024-08.csv is damaged: bad", "damaged_file")
+    assert "left untouched" in damaged and "AAPL_2024-08.csv" in damaged
 
 
 def test_a_nonzero_scan_result_is_printed_not_hidden(sess: Session) -> None:
@@ -388,22 +481,307 @@ def test_the_real_recorder_gets_the_private_words_and_the_header_holds_none(
     assert "Recording check:" in sess.text
 
 
-@pytest.mark.xfail(strict=True, reason="defect: the header command holds --start/--end dates, which the "
-                                       "recording scan reports as 2 findings, so every real run ends with a "
-                                       "false 'Recording check: 2 finding(s)'")
-def test_a_clean_run_with_the_real_recorder_reports_no_findings(sess: Session,
-                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+def real_recorder_main(sess: Session, monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
+    """`main` with the REAL recorder (no recorder factory) and the fake connection."""
     def connection(host: str, port: int, client_id: int, **kw: Any) -> IbConnection:
         return sess.connection_factory(type("A", (), {"host": host, "port": port, "client_id": client_id}),
                                        kw["observers"])
 
     monkeypatch.setattr(cli, "IbConnection", connection)
-    code = cli.main(
-        argv_for(sess), env=sess.env, stdin=Tty(True), input_fn=sess.input_fn, out=sess.out,
+    return cli.main(
+        list(argv) or argv_for(sess), env=sess.env, stdin=Tty(True), input_fn=sess.input_fn, out=sess.out,
         market_data_factory=sess.market_data_factory, clock=sess.clock, sleep=sess.sleep,
         today=date(2024, 8, 21))
-    assert code == 0
+
+
+def test_a_clean_run_with_the_real_recorder_reports_no_findings(sess: Session,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    assert real_recorder_main(sess, monkeypatch) == 0
     assert "Recording check: 0 finding(s)" in sess.text
+    assert "Where to look" not in sess.text
+
+
+def test_the_recording_header_holds_the_subcommand_and_the_symbols_only(
+        sess: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    argv = ["--symbols", "AAPL,MSFT", *DAYS, "--port", "7497", "--host", "127.0.0.1", "--client-id", "33",
+            "--out", str(sess.tmp / "bars")]
+    assert real_recorder_main(sess, monkeypatch, *argv) == 0
+    header = json.loads(next((sess.tmp / "home" / "Stoinkulator" / "recordings").glob("*.jsonl"))
+                        .read_text(encoding="utf-8").splitlines()[0])
+    assert header["command"] == "fetch-bars AAPL MSFT"
+
+
+def test_findings_are_listed_by_line_and_reason_never_by_the_matched_text(sess: Session) -> None:
+    user = "zq" + "uux"
+    sess.env["USERNAME"] = user
+
+    def bare_recorder(args: Any) -> SessionRecorder:
+        args.record.parent.mkdir(parents=True, exist_ok=True)
+        recorder = SessionRecorder(args.record, clock=sess.clock, command=["fetch-bars"], port=args.port)
+        sess.recorders.append(recorder)
+        return recorder
+
+    for day in (13, 14):
+        sess.rig.script(date(2024, 8, day), error_behaviour(321, f"bad request from {user}"))
+    code = cli.main(
+        argv_for(sess), env=sess.env, stdin=Tty(True), input_fn=sess.input_fn, out=sess.out,
+        connection_factory=sess.connection_factory, market_data_factory=sess.market_data_factory,
+        recorder_factory=bare_recorder, clock=sess.clock, sleep=sess.sleep, today=date(2024, 8, 21))
+    assert code == 1
+    shown = [line for line in sess.text.splitlines() if line.startswith("  line ")]
+    assert shown and len(shown) <= cli.SHOWN_FINDINGS
+    assert "Where to look" in sess.text
+    assert all(user not in line for line in shown)  # line number and reason only
+
+
+# -- fix round: the new driver states, advice, the symbol cap, the settle option ---------------------------
+
+
+def test_the_help_states_the_estimate_rule_the_cap_and_the_settle_option(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--help"])
+    shown = " ".join(capsys.readouterr().out.split())
+    assert "about 10 seconds per symbol-day" in shown
+    assert "At most 20 symbols" in shown and "--settle-hours" in shown
+
+
+def test_at_most_twenty_symbols(capsys: pytest.CaptureFixture[str]) -> None:
+    twenty = ",".join(f"S{n:02d}" for n in range(20))
+    assert len(cli.parse_args(["--symbols", twenty, *DAYS, "--port", "7497"]).symbols) == 20
+    with pytest.raises(SystemExit) as info:
+        cli.parse_args(["--symbols", twenty + ",EXTRA", *DAYS, "--port", "7497"])
+    assert info.value.code == 2
+    assert "at most 20" in capsys.readouterr().err
+    # duplicates do not count twice
+    again = cli.parse_args(["--symbols", twenty + ",s00,S01", *DAYS, "--port", "7497"])
+    assert len(again.symbols) == 20
+
+
+def test_too_many_symbols_never_reach_the_gate(sess: Session, capsys: pytest.CaptureFixture[str]) -> None:
+    many = ",".join(f"S{n:02d}" for n in range(21))
+    with pytest.raises(SystemExit) as info:
+        sess.main("--symbols", many, *DAYS, "--port", "7497")
+    assert info.value.code == 2 and not sess.prompts
+    untouched(sess)
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("value, ok", [("0", True), ("3", True), ("24", True), ("0.5", True), ("-0.1", False),
+                                       ("24.01", False), ("nan", False), ("inf", False), ("x", False)])
+def test_settle_hours_runs_from_0_to_24(value: str, ok: bool, capsys: pytest.CaptureFixture[str]) -> None:
+    argv = ["--symbols", "AAPL", *DAYS, "--port", "7497", "--settle-hours", value]
+    if ok:
+        assert cli.parse_args(argv).settle_hours == float(value)
+    else:
+        with pytest.raises(SystemExit) as info:
+            cli.parse_args(argv)
+        assert info.value.code == 2
+    capsys.readouterr()
+    assert cli.parse_args(["--symbols", "AAPL", *DAYS, "--port", "7497"]).settle_hours == 3.0
+
+
+def test_settle_hours_reaches_the_driver_as_seconds(sess: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[float] = []
+    real = cli.fetch
+
+    def spy(*a: Any, **kw: Any) -> Any:
+        seen.append(kw["settle_seconds"])
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli, "fetch", spy)
+    assert sess.fetch("--settle-hours", "1.5", symbols="AAPL") == 0
+    assert sess.fetch(symbols="AAPL") == 0
+    assert seen == [5400.0, 10800.0]
+
+
+def test_a_day_without_data_is_retried_when_it_closed_less_than_settle_hours_ago(sess: Session) -> None:
+    """2024-08-19 closed 16 hours before the fake's server time: a holiday at 3 h, 'not yet' at 24 h."""
+    from tests.test_ib_fetch import empty_end
+
+    sess.rig.script(date(2024, 8, 19), empty_end)
+    argv = ["--symbols", "AAPL", "--start", "2024-08-19", "--end", "2024-08-19", "--port", "7497", "--out",
+            str(sess.tmp / "bars")]
+    assert sess.main(*argv) == 0 and "1 no data" in sess.text
+    sess.out.truncate(0)
+    sess.out.seek(0)
+    shutil.rmtree(sess.tmp / "bars")
+    assert sess.main(*argv, "--settle-hours", "24") == 1
+    assert "failed: IB had no data for this day yet; it will be retried next run" in sess.text
+    assert "None" not in sess.text and "no data yet (session closed" not in sess.text
+
+
+def test_short_and_partial_days_and_the_run_total_are_listed(sess: Session) -> None:
+    from tests.test_ib_fetch import bars_played, day_rows, end_played
+
+    def short(req_id: int, day: date, symbol: str) -> list[Any]:
+        rows = day_rows(day, minutes=210, symbol=symbol)
+        return [*bars_played(req_id, rows), end_played(req_id)]
+
+    def partial(req_id: int, day: date, symbol: str) -> list[Any]:
+        return [*bars_played(req_id, day_rows(day, minutes=1, symbol=symbol)), end_played(req_id)]
+
+    sess.rig.script(date(2024, 8, 13), short)
+    sess.rig.script(date(2024, 8, 14), partial)
+    assert sess.fetch(symbols="AAPL") == 0  # missing minutes are data, not a failure
+    assert "Days with missing minutes (short or partial, bars kept): 2" in sess.text
+    assert "AAPL: 2024-08-13 210 bars (short), 2024-08-14 1 bars (partial)" in sess.text
+
+
+def test_a_clean_run_says_zero_days_with_missing_minutes(sess: Session) -> None:
+    assert sess.fetch() == 0
+    assert "Days with missing minutes (short or partial, bars kept): 0" in sess.text
+
+
+def test_a_damaged_month_file_names_the_file_says_untouched_gives_exit_1_and_the_other_symbol_goes_on(
+        sess: Session) -> None:
+    from MainStoinker.engine.feed import month_file_path
+
+    path = month_file_path(sess.tmp / "bars", "AAPL", 2024, 8)
+    path.parent.mkdir(parents=True)
+    bad = ("date,time,open,high,low,close,volume\n2024-08-13 09:31:00,1,1,2,0.5,1,1\n"
+           "2024-08-13 09:30:00,1,1,2,0.5,1,1\n")
+    path.write_text(bad, encoding="utf-8")
+    assert sess.fetch(symbols="AAPL,MSFT") == cli.EXIT_FAILED
+    text = sess.text
+    assert "AAPL_2024-08.csv" in text and "left untouched" in text
+    assert "[stopped]" in text and "MSFT: 3 ok" in text
+    assert path.read_text(encoding="utf-8") == bad
+    assert "(exit 1)" in text and "What to do:" not in text
+
+
+@pytest.mark.parametrize("state", ["stopped", "manifest", "resolve_failed"])
+def test_a_symbol_in_a_bad_state_is_exit_1_unless_the_run_stopped(state: str) -> None:
+    from MainStoinker.ib.fetch import FetchResult, SymbolResult
+
+    result = FetchResult(symbols={"AAPL": SymbolResult("AAPL", state="done"),
+                                  "MSFT": SymbolResult("MSFT", state=state)})
+    assert cli.exit_code_for(result) == cli.EXIT_FAILED
+    result.stop_reason = "connection lost"
+    assert cli.exit_code_for(result) == cli.EXIT_STOPPED
+    result.stop_reason = None
+    result.fatal = "disk"
+    assert cli.exit_code_for(result) == cli.EXIT_STOPPED
+    ok = FetchResult(symbols={"AAPL": SymbolResult("AAPL", state="done")})
+    assert cli.exit_code_for(ok) == cli.EXIT_OK
+
+
+def test_a_resolve_failure_is_exit_1_and_the_other_symbol_goes_on(sess: Session) -> None:
+    original = sess.client_factory
+
+    def refuse_msft(**kw: Any) -> FakeIbClient:
+        fake = original(**kw)
+        fake.respond("reqContractDetails", lambda req_id, contract: (
+            [("error", req_id, 1_700_000_000_000, 200, "No security definition has been found", "")]
+            if contract.symbol == "MSFT" else
+            [("contractDetails", req_id, details(contract.symbol)), ("contractDetailsEnd", req_id)]))
+        return fake
+
+    sess.client_factory = refuse_msft  # type: ignore[method-assign]
+    assert sess.fetch(symbols="MSFT,AAPL") == cli.EXIT_FAILED
+    assert "[resolve_failed]" in sess.text and "AAPL: 3 ok" in sess.text
+
+
+def lose_connection(sess: Session, day: int = 14) -> None:
+    def lose(req_id: int, d: date, symbol: str) -> list[Any]:
+        sess.fakes[-1].drop("connectionClosed")
+        return []
+
+    sess.rig.script(date(2024, 8, day), lose)
+
+
+def advice_lines(sess: Session) -> list[str]:
+    return [line for line in sess.text.splitlines() if line.startswith("What to do:")]
+
+
+def test_connection_lost_gives_one_advice_line(sess: Session) -> None:
+    lose_connection(sess)
+    assert sess.fetch(symbols="AAPL,MSFT") == cli.EXIT_STOPPED
+    assert advice_lines(sess) == [f"What to do: {cli.ADVICE_LOST}"]
+    assert "TWS is running and logged in" in sess.text and "run the same command again to resume" in sess.text
+
+
+def test_a_second_pacing_violation_advises_waiting_ten_minutes(sess: Session) -> None:
+    text = "Historical Market Data Service error message:Historical data request pacing violation"
+    sess.rig.script(date(2024, 8, 13), error_behaviour(162, text))
+    assert sess.fetch(symbols="AAPL") == cli.EXIT_STOPPED
+    assert advice_lines(sess) == [f"What to do: {cli.ADVICE_PACING}"]
+    assert "at least 10 minutes" in sess.text
+
+
+def test_a_client_id_in_use_advises_closing_the_other_client(sess: Session) -> None:
+    sess.behavior = ConnectBehavior.CLIENT_ID_IN_USE
+    assert sess.fetch() == cli.EXIT_NO_CONNECTION
+    assert advice_lines(sess) == [f"What to do: {cli.ADVICE_CLIENT_ID}"]
+    assert "--client-id" in sess.text
+
+
+def test_a_refused_connection_advises_checking_the_port_and_the_api(sess: Session) -> None:
+    sess.behavior = ConnectBehavior.REFUSE
+    assert sess.fetch() == cli.EXIT_NO_CONNECTION
+    assert advice_lines(sess) == [f"What to do: {cli.ADVICE_CONNECT}"]
+    assert "check the port and that the API is enabled in TWS" in sess.text
+
+
+def test_no_historical_farm_advises_waiting_a_minute(sess: Session) -> None:
+    sess.farm = False
+    sess.clock.tick = SimClock.FAST
+    assert sess.fetch(symbols="AAPL") == cli.EXIT_STOPPED
+    assert advice_lines(sess) == [f"What to do: {cli.ADVICE_FARM}"]
+    assert "history service" in sess.text and not sess.rig.requests
+
+
+def test_advice_lines_are_distinct_when_causes_repeat(sess: Session) -> None:
+    from MainStoinker.ib.fetch import FetchResult
+
+    result = FetchResult(connection_lost=True, pacing_stopped=True, stop_reason="no data farm")
+    assert cli.advice_for(result) == [cli.ADVICE_LOST, cli.ADVICE_PACING, cli.ADVICE_FARM]
+    assert cli.advice_for(FetchResult()) == []
+
+
+def test_a_clean_run_has_no_advice_and_ends_with_the_paths_note(sess: Session) -> None:
+    assert sess.fetch() == 0
+    assert advice_lines(sess) == []
+    assert sess.text.rstrip().splitlines()[-1] == (
+        "Note: this output shows local paths. Read it before sharing it.")
+
+
+@pytest.mark.parametrize("code", [cli.EXIT_FAILED, cli.EXIT_STOPPED, cli.EXIT_NO_CONNECTION])
+def test_the_paths_note_is_the_last_line_after_a_failure_or_stop_too(sess: Session, code: int) -> None:
+    if code == cli.EXIT_FAILED:
+        sess.rig.script(date(2024, 8, 13), error_behaviour(200, "nope"))
+    elif code == cli.EXIT_STOPPED:
+        lose_connection(sess)
+    else:
+        sess.behavior = ConnectBehavior.REFUSE
+    assert sess.fetch(symbols="AAPL") == code
+    assert sess.text.rstrip().splitlines()[-1] == cli.PATHS_NOTE
+    assert sess.text.rstrip().splitlines()[-2].startswith("Result:")
+
+
+def test_the_gate_text_is_one_fact_per_short_line(sess: Session) -> None:
+    sess.typed = "no"
+    sess.main(*argv_for(sess, "7497", "AAPL,MSFT"))
+    lines = [line.strip() for line in sess.text.splitlines()]
+    for start in ("Connects to:", "Client id:", "Symbols:", "Dates:", "Output folder:", "Recording file:",
+                  "Estimate:"):
+        assert sum(line.startswith(start) for line in lines) == 1, start
+    assert "Connects to:      127.0.0.1:7497" in sess.text
+    assert "It sends data requests only" in sess.text
+    assert max(len(line) for line in sess.text.splitlines() if "folder" not in line.lower()
+               and "file" not in line.lower()) < 100
+
+
+@pytest.mark.parametrize("seconds, text", [(0, "0 s"), (50, "50 s"), (59.9, "59 s"), (60, "1 min 00 s"),
+                                           (425, "7 min 05 s"), (3599, "59 min 59 s"), (3600, "1 h 00 min"),
+                                           (5400, "1 h 30 min")])
+def test_durations_under_a_minute_are_shown_in_seconds(seconds: float, text: str) -> None:
+    assert cli.format_duration(seconds) == text
+
+
+def test_the_gate_and_the_progress_estimate_never_show_a_zero_hour_duration(sess: Session) -> None:
+    assert sess.fetch() == 0
+    assert "0 h" not in sess.text and "at least 50 s" in sess.text  # 6 requests: five 10 s gaps
 
 
 # -- sessions that end badly ----------------------------------------------------------------------------
@@ -574,7 +952,7 @@ def test_runs_in_one_process_leave_no_thread_and_do_not_disturb_each_other(tmp_p
     for number, behaviour in enumerate(behaviours):
         s = Session(tmp_path / str(number), behaviour)
         try:
-            results.append((s.fetch(symbols="AAPL"), s.text.rstrip().splitlines()[-1].split("(")[0]))
+            results.append((s.fetch(symbols="AAPL"), s.text.rstrip().splitlines()[-2].split("(")[0]))
         finally:
             for conn in s.connections:
                 conn.close()

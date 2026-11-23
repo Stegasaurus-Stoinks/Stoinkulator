@@ -39,6 +39,57 @@ CLI_SOURCE = REPO / "MainStoinker" / "ib" / "cli.py"
 DAYS = ["--start", "2024-08-12", "--end", "2024-08-14"]  # Monday to Wednesday, closed at SERVER_NOW
 
 
+# -- the real home folder is never touched -------------------------------------------------------
+
+
+def _real_home() -> Path | None:
+    """The real profile folder, read once when this module is imported (before any test runs)."""
+    for key in ("USERPROFILE", "HOME"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return Path(value)
+    return None
+
+
+def _listing(home: Path | None) -> dict[str, tuple[bool, int]]:
+    """Name and modification time of every entry of the real `Stoinkulator/bars` and `recordings`."""
+    seen: dict[str, tuple[bool, int]] = {}
+    if home is None:
+        return seen
+    for name in ("bars", "recordings"):
+        folder = home / "Stoinkulator" / name
+        try:
+            seen[name] = (folder.is_dir(), folder.stat().st_mtime_ns)
+        except OSError:
+            seen[name] = (False, 0)
+        if folder.is_dir():
+            for entry in folder.rglob("*"):
+                try:
+                    seen[str(entry)] = (entry.is_dir(), entry.stat().st_mtime_ns)
+                except OSError:
+                    seen[str(entry)] = (False, 0)
+    return seen
+
+
+REAL_HOME = _real_home()
+REAL_LISTING_AT_START = _listing(REAL_HOME)
+
+
+@pytest.fixture(autouse=True)
+def real_home_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """No test of this command may reach the real profile: the process environment is pointed at
+    `tmp_path` for the test, and afterwards the real `Stoinkulator` folders must be as at the start."""
+    fake_home = tmp_path / "process-home"
+    fake_home.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("HOME", str(fake_home))
+    yield
+    after = _listing(REAL_HOME)
+    assert after == REAL_LISTING_AT_START, (
+        "A TEST WROTE INTO THE REAL HOME FOLDER: "
+        f"changed {sorted(set(after.items()) ^ set(REAL_LISTING_AT_START.items()))}")
+
+
 class Tty(io.StringIO):
     def __init__(self, interactive: bool = True) -> None:
         super().__init__()
@@ -54,6 +105,7 @@ class Session:
     def __init__(self, tmp_path: Path, behavior: ConnectBehavior = ConnectBehavior.ACCEPT) -> None:
         self.tmp = tmp_path
         self.behavior = behavior
+        self.farm = True  # False: the historical data farm never reports ready
         self.clock = SimClock()
         self.rig = Rig(None, None, None, self.clock)  # type: ignore[arg-type]
         self.fakes: list[FakeIbClient] = []
@@ -61,14 +113,14 @@ class Session:
         self.recorders: list[SessionRecorder] = []
         self.prompts: list[str] = []
         self.out = io.StringIO()
-        self.env = {"USERPROFILE": str(tmp_path / "home")}
+        self.env = {"USERPROFILE": str(tmp_path / "home"), "HOME": str(tmp_path / "home")}
         self.sleep: Callable[[float], None] = self.clock.sleep
 
     # -- factories ---------------------------------------------------------------
 
     def client_factory(self, *, env: Any, on_event: Any, on_raw: Any, logger: Any) -> FakeIbClient:
         fake = FakeIbClient(DataOnlyClient(env, on_event, on_raw, logger), connect_behavior=self.behavior,
-                            farm_messages=FARM_MESSAGES)
+                            farm_messages=FARM_MESSAGES if self.farm else ())
         fake.respond("reqContractDetails", lambda req_id, contract: [
             ("contractDetails", req_id, details(contract.symbol)), ("contractDetailsEnd", req_id)])
         fake.respond("reqHistoricalData", self.rig.handler)
@@ -221,7 +273,8 @@ def test_the_gate_needs_the_port_typed(session: Session, typed: str) -> None:
 def test_the_gate_describes_the_session_with_requests_and_minimum_duration(session: Session) -> None:
     session.typed = "nope"
     session.fetch()
-    for word in ("6 requests", "at least", "AAPL, MSFT", "data requests only", "2024-08-12", "recorded to"):
+    for word in ("6 requests", "at least", "AAPL, MSFT", "data requests only", "2024-08-12",
+                 "Recording file"):
         assert word in session.text, word
 
 
@@ -268,6 +321,56 @@ def test_a_default_under_a_onedrive_home_is_refused(session: Session) -> None:
     nothing_built(session)
 
 
+def test_a_mapping_without_a_home_folder_is_refused_before_the_gate_and_creates_nothing(
+        session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_home(*args: Any, **kw: Any) -> Path:
+        raise AssertionError("the machine's own home folder was asked for")
+
+    monkeypatch.setattr(Path, "home", no_home)
+    monkeypatch.setattr(os.path, "expanduser", no_home)
+    session.env.clear()
+    before = sorted(session.tmp.rglob("*"))
+    for argv in (["--symbols", "AAPL", *DAYS, "--port", "7497"],  # every default
+                 ["--symbols", "AAPL", *DAYS, "--port", "7497", "--out", str(session.tmp / "bars"),
+                  "--no-record"]):  # even with both paths given
+        assert session.main(*argv) == cli.EXIT_REFUSED
+    assert "USERPROFILE" in session.text and "HOME" in session.text
+    assert not session.prompts
+    nothing_built(session)
+    assert sorted(session.tmp.rglob("*")) == before and not (session.tmp / "bars").exists()
+
+
+def test_a_blank_home_variable_counts_as_missing(session: Session) -> None:
+    session.env.update({"USERPROFILE": "  ", "HOME": ""})
+    assert session.main("--symbols", "AAPL", *DAYS, "--port", "7497") == cli.EXIT_REFUSED
+    nothing_built(session)
+
+
+def test_home_is_used_when_userprofile_is_missing(session: Session) -> None:
+    del session.env["USERPROFILE"]
+    assert session.main("--symbols", "AAPL", *DAYS, "--port", "7497", "--no-record") == cli.EXIT_OK
+    assert (session.tmp / "home" / "Stoinkulator" / "bars" / "AAPL").is_dir()
+
+
+def test_userprofile_wins_over_home(session: Session) -> None:
+    session.env["HOME"] = str(session.tmp / "other")
+    assert session.main("--symbols", "AAPL", *DAYS, "--port", "7497", "--no-record") == cli.EXIT_OK
+    assert (session.tmp / "home" / "Stoinkulator" / "bars").is_dir() and not (session.tmp / "other").exists()
+
+
+def test_the_process_environment_is_pointed_into_tmp_for_every_test(tmp_path: Path) -> None:
+    assert Path(os.environ["USERPROFILE"]).is_relative_to(tmp_path)
+    assert Path(os.environ["HOME"]).is_relative_to(tmp_path)
+    assert Path.home().is_relative_to(tmp_path)
+
+
+def test_the_guard_compares_the_real_folder_with_its_state_at_the_start() -> None:
+    """The listing helper sees a change (so the autouse check after each test would fail loudly)."""
+    assert REAL_HOME is not None
+    assert not Path(os.environ["USERPROFILE"]).samefile(REAL_HOME)
+    assert _listing(REAL_HOME) == REAL_LISTING_AT_START
+
+
 def test_an_existing_recording_file_is_never_overwritten(session: Session) -> None:
     record = session.tmp / "rec" / "mine.jsonl"
     record.parent.mkdir()
@@ -311,11 +414,12 @@ def test_happy_path_two_symbols_three_days(session: Session) -> None:
     for symbol in ("AAPL", "MSFT"):
         assert (f"{symbol} 2024-08-12: ok; first bar 09:30, last bar 15:59, 390 bars, first bar volume 1000, "
                 "day total volume 617565") in text
-    assert "stored exactly as IB sent them" in text and "100-share lots" in text
+    assert "stored exactly as IB sent them" in text and "UNTICKED" in text and "not settled" not in text
     assert "gaps:" in text and "gaps.csv" in text
     assert f"Recording: {session.recording}" in text
     assert "Recording check: 0 finding(s). Read the file yourself before it is ever committed." in text
-    assert text.rstrip().endswith("Result: complete (exit 0)")
+    assert text.rstrip().splitlines()[-2] == "Result: complete (exit 0)"
+    assert text.rstrip().splitlines()[-1] == cli.PATHS_NOTE
     assert session.recording.name == "fetch-bars-2024-08-21-001.jsonl"
     assert session.recording.read_text(encoding="utf-8").count("\n") > 10
     assert session.connections[0].state is ConnState.CLOSED
@@ -336,7 +440,7 @@ def test_the_default_bars_folder_is_under_the_home_folder(session: Session) -> N
     assert code == cli.EXIT_OK
     assert len(read_symbol_bars(session.tmp / "home" / "Stoinkulator" / "bars", "AAPL")) == 3 * 390
     assert not (session.tmp / "home" / "Stoinkulator" / "recordings").exists()
-    assert "Recording" not in session.text
+    assert "Recording check" not in session.text and "none (--no-record)" in session.text
 
 
 def test_a_failed_day_gives_exit_1_and_is_listed(session: Session) -> None:
@@ -344,7 +448,8 @@ def test_a_failed_day_gives_exit_1_and_is_listed(session: Session) -> None:
     assert session.fetch(symbols="AAPL") == cli.EXIT_FAILED
     text = session.text
     assert "2 ok, 0 no data, 1 failed" in text
-    assert "failed 2024-08-13: 200: No security definition has been found" in text
+    assert "2024-08-13: failed, IB 200: No security definition has been found" in text
+    assert "None" not in text
     assert "IB error 200: No security definition has been found" in text
     assert "Result: finished with failed days" in text and "(exit 1)" in text
 
