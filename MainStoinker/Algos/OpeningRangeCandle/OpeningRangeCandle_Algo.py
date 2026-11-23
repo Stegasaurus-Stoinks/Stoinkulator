@@ -29,10 +29,10 @@ set 2:1 RR trade with stop at opposite side of "fair value range"
 
 '''
 
-# End-of-day cut-off as (hour, minute), in the data's LOCAL time (US Pacific; the session
-# runs 06:30-12:59). Five minutes before the session end; confirmed by the repo owner.
+# End-of-day cut-off as (hour, minute), in the data's time (naive America/New_York; the
+# session runs 09:30-15:59). Five minutes before the session end; confirmed by the repo owner.
 # A trade still open on a bar after this minute is closed, and nothing is opened at or after it.
-END_OF_DAY_CUTOFF = (12, 55)
+END_OF_DAY_CUTOFF = (15, 55)
 
 class Algo(ParentAlgo):
     def __init__(self, algoConfigData):

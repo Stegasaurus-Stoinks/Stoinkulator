@@ -1,0 +1,160 @@
+{
+ "algo": "Elliot",
+ "capital": "10000.0000",
+ "costs": {
+  "commission_minimum": "1.0000",
+  "commission_per_share": "0.0050",
+  "slippage_per_share": "0.0000"
+ },
+ "equity_points": 2340,
+ "equity_sha256": "2b1f7da4eb0918943bd2cf3fe7fa366c0b4a1baad5b6bc4737fbd56114871229",
+ "idname": "elliot-msft",
+ "summary": {
+  "cancelled_entries": 0,
+  "commission": "20.0000",
+  "final_equity": "9960.4000",
+  "ignored_events": {
+   "close": 0,
+   "modify_stop": 0,
+   "take_profit": 0
+  },
+  "max_drawdown": "121.2000",
+  "net": "-39.6000",
+  "synthetic_closes": 1,
+  "trade_count": 10,
+  "wins": 7
+ },
+ "ticker": "MSFT",
+ "trades": [
+  {
+   "commission": "2.0000",
+   "entry_price": "419.0100",
+   "entry_time": "2024-08-19 07:10:00",
+   "exit_price": "420.3800",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-19 11:48:00",
+   "gross": "13.7000",
+   "net": "11.7000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "419.9300",
+   "entry_time": "2024-08-19 12:11:00",
+   "exit_price": "420.9000",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-19 12:56:00",
+   "gross": "9.7000",
+   "net": "7.7000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "423.3100",
+   "entry_time": "2024-08-20 07:06:00",
+   "exit_price": "423.8300",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-20 09:54:00",
+   "gross": "5.2000",
+   "net": "3.2000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "423.4300",
+   "entry_time": "2024-08-20 10:04:00",
+   "exit_price": "424.1200",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-20 10:50:00",
+   "gross": "6.9000",
+   "net": "4.9000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "424.9400",
+   "entry_time": "2024-08-20 11:52:00",
+   "exit_price": "426.1500",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-21 07:47:00",
+   "gross": "12.1000",
+   "net": "10.1000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "423.5900",
+   "entry_time": "2024-08-21 08:38:00",
+   "exit_price": "424.7200",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-22 06:33:00",
+   "gross": "11.3000",
+   "net": "9.3000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "424.9200",
+   "entry_time": "2024-08-22 06:50:00",
+   "exit_price": "420.6800",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-22 08:19:00",
+   "gross": "-42.4000",
+   "net": "-44.4000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "416.6500",
+   "entry_time": "2024-08-23 06:48:00",
+   "exit_price": "418.1100",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-23 07:02:00",
+   "gross": "14.6000",
+   "net": "12.6000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "418.6200",
+   "entry_time": "2024-08-23 07:25:00",
+   "exit_price": "414.4500",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-23 07:47:00",
+   "gross": "-41.7000",
+   "net": "-43.7000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "414.5100",
+   "entry_time": "2024-08-23 07:48:00",
+   "exit_price": "413.6100",
+   "exit_reason": "end_of_data",
+   "exit_time": "2024-08-26 12:59:00",
+   "gross": "-9.0000",
+   "net": "-11.0000",
+   "quantity": "10.0000",
+   "side": "long",
+   "synthetic": true
+  }
+ ]
+}
