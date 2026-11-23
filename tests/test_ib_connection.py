@@ -47,6 +47,7 @@ from tests.fake_ib import (
     FakeIbClient,
     HangNeverReleased,
 )
+from tests.test_ib_subprocess_block import environment_problems
 
 WAIT = 5.0
 CONNECTION_PATH = Path(__file__).resolve().parent.parent / "MainStoinker" / "ib" / "connection.py"
@@ -420,7 +421,12 @@ def test_client_id_in_use_is_fatal_without_retry(build: Callable[..., Rig]) -> N
     assert "disconnect" in rig.fake.call_names
 
 
-def test_pytest_block_propagates_through_ib_connection(caplog: pytest.LogCaptureFixture) -> None:
+def test_pytest_block_propagates_through_ib_connection(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session variable would refuse earlier (tests/test_ib_subprocess_block.py); remove it here
+    # so this still proves that the older in-process block works on its own.
+    monkeypatch.delenv("STOINK_BROKER_BLOCKED")
     clock = Clock()
     conn = IbConnection("127.0.0.1", 7497, 21, env={}, clock=clock, sleep=clock.sleep, poll_interval=0.002)
     with pytest.raises(BrokerConnectionBlockedUnderPytest):
@@ -723,13 +729,15 @@ def test_observers_given_to_the_constructor_and_a_failing_one_is_counted(build: 
 
 
 def test_module_reads_no_environment_and_builds_no_raw_client() -> None:
+    # `os` and `os.environ` are allowed in exactly one place (`_broker_blocked_here`, one key);
+    # the exact rule, and a test that it catches a second read, is in test_ib_subprocess_block.py.
     tree = ast.parse(CONNECTION_PATH.read_text(encoding="utf-8"))
     imported = {
         a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names
     } | {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert "os" not in imported
     assert "ibapi" not in imported
+    assert environment_problems(CONNECTION_PATH.read_text(encoding="utf-8")) == []
     attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     names_used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    assert not {"environ", "_inner", "socket", "_conn", "conn"} & attrs
+    assert not {"_inner", "socket", "_conn", "conn"} & attrs
     assert not {"EClient", "Connection"} & names_used
