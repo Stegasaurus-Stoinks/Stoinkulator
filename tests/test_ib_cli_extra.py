@@ -322,7 +322,8 @@ def test_bad_option_values_are_usage_errors(flag: str, value: str,
 def test_there_is_no_option_that_skips_the_gate() -> None:
     options = {o for action in cli.build_parser()._actions for o in action.option_strings}
     assert options == {"-h", "--help", "--symbols", "--start", "--end", "--port", "--host", "--client-id",
-                       "--out", "--record", "--no-record", "--connect-timeout", "--settle-hours"}
+                       "--out", "--record", "--no-record", "--connect-timeout", "--settle-hours",
+                       "--paper"}  # --paper only adds checks; the gate stays (tests/test_ib_cli_paper.py)
 
 
 @pytest.mark.parametrize("flag", ["--yes", "-y", "--force", "--no-gate", "--skip-gate", "--assume-yes",
