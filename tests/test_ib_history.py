@@ -41,7 +41,7 @@ class FakeClock:
     def __call__(self) -> float:
         return self.now
 
-    def send(self, pacer: Pacer, contract: str = "c", request: str = "r") -> float:
+    def send(self, pacer: Pacer, contract: int = 1, request: str = "r") -> float:
         """Reserve, wait the returned time on the fake clock, send on time, return the send time."""
         reservation = pacer.reserve(contract, request)
         self.now += reservation.wait
@@ -136,7 +136,7 @@ def test_pacer_never_exceeds_60_per_10_minutes() -> None:
     for kwargs in ({}, {"min_gap": 1.0}):  # defaults, and a short gap so the window rule binds
         clock = FakeClock()
         pacer = Pacer(clock, **kwargs)
-        times = [clock.send(pacer, "c", f"r{i}") for i in range(61)]
+        times = [clock.send(pacer, 1, f"r{i}") for i in range(61)]
         for i, t in enumerate(times):
             in_window = [u for u in times if t <= u <= t + 600]
             assert len(in_window) <= 60, (kwargs, i)
@@ -144,7 +144,7 @@ def test_pacer_never_exceeds_60_per_10_minutes() -> None:
     # The window rule alone (no gap) is what delays the 61st request.
     clock = FakeClock()
     pacer = Pacer(clock, min_gap=0.0, max_per_contract=1000)
-    times = [clock.send(pacer, "c", f"r{i}") for i in range(61)]
+    times = [clock.send(pacer, 1, f"r{i}") for i in range(61)]
     assert times[59] == times[0]  # 60 go out at once
     assert times[60] - times[0] > 600
 
@@ -152,24 +152,24 @@ def test_pacer_never_exceeds_60_per_10_minutes() -> None:
 def test_pacer_no_identical_request_within_15s() -> None:
     clock = FakeClock()
     pacer = Pacer(clock, min_gap=0.0)
-    first = clock.send(pacer, "c", "same")
-    other = clock.send(pacer, "c", "different")
-    again = clock.send(pacer, "c", "same")
+    first = clock.send(pacer, 1, "same")
+    other = clock.send(pacer, 1, "different")
+    again = clock.send(pacer, 1, "same")
     assert other == first
     assert again - first > 15
-    assert pacer.earliest("c", "same") - clock() > 14  # booked, so waiting again is needed
+    assert pacer.earliest(1, "same") - clock() > 14  # booked, so waiting again is needed
 
 
 def test_pacer_contract_burst_limit() -> None:
     clock = FakeClock()
     pacer = Pacer(clock, min_gap=0.0)
-    times = [clock.send(pacer, "AAPL", f"r{i}") for i in range(12)]
+    times = [clock.send(pacer, 265598, f"r{i}") for i in range(12)]
     for t in times:
         assert len([u for u in times if t <= u <= t + 2]) <= 5
     assert times[5] - times[0] > 2
     # Another contract is not held back by it.
     t0 = clock()
-    assert pacer.reserve("MSFT", "x").wait == pytest.approx(0.0)
+    assert pacer.reserve(272093, "x").wait == pytest.approx(0.0)
     assert clock() == t0
 
 
@@ -184,7 +184,7 @@ def test_manifest_resume_skips_done_and_retries_failed(tmp_path: Path) -> None:
     manifest = _manifest()
     assert manifest.pending(days) == days
     manifest.record(days[0], "ok", bars=390, fetched_utc=LATE)
-    manifest.record(days[1], "no_data", fetched_utc=LATE)
+    manifest.record(days[1], "no_data", fetched_utc=LATE, complete_answer=True)
     manifest.record(days[2], "failed", error_code=162, error_text="pacing violation", fetched_utc=LATE)
     save_manifest(path, manifest)
 
@@ -204,7 +204,7 @@ def test_manifest_resume_skips_done_and_retries_failed(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         loaded.record(days[3], "ok", bars=0, fetched_utc=LATE)
     with pytest.raises(ValueError):
-        loaded.record(days[3], "no_data", bars=5, fetched_utc=LATE)
+        loaded.record(days[3], "no_data", bars=5, fetched_utc=LATE, complete_answer=True)
     with pytest.raises(ValueError):
         loaded.record(days[3], "maybe", fetched_utc=LATE)
 

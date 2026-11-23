@@ -16,23 +16,35 @@ to 12:59 and nothing after); any other missing tail is `partial`.
 
 Contract for the driver (the later task that talks to IB)
 ---------------------------------------------------------
-* Per day: `Pacer.reserve(contract, request.key())` -> wait `reservation.wait`
-  seconds (the driver's own sleep) -> send -> `Pacer.sent(reservation)` right
-  after the send. If the send is abandoned call `Pacer.cancel(reservation)`.
-  Limits are checked against ACTUAL send times, so a late send delays the
-  following requests instead of breaking IB's limits.
-* Record every outcome in the `Manifest` and `save_manifest` it. A transient
-  failure (a pacing violation, error 162, a timeout, a disconnect, anything that
-  may succeed later) MUST be recorded as `failed`, never as `no_data`:
-  `no_data` means "IB has nothing for this day" and resume does NOT ask for it
-  again, `failed` is asked for again.
-* To force a refetch of days already recorded (a wrongly recorded `no_data`, or
-  the `no_data`/`short`/`partial` days of a gap report) use
-  `Manifest.mark_pending` / `Manifest.mark_gaps_pending`.
-* `plan_range` lists the days to fetch and the days skipped because their
-  session has not closed yet; report both.
-* Gap files are written per symbol folder: `write_gap_files(symbol_folder(...),
-  rows, symbol)`, one `gaps.csv` and `gaps_summary.txt` in each symbol's folder.
+1. One reservation at a time: `Pacer.reserve(con_id, pacing_request_key(con_id,
+   request))` -> wait `reservation.wait` seconds (the driver's own sleep) ->
+   send -> `Pacer.sent(reservation)`; call `Pacer.cancel(reservation)` in a
+   `finally` if the send did not happen. A second `reserve` before `sent` or
+   `cancel` raises `ReservationOutstanding`. `sent` before the wait has elapsed
+   records the send and raises `SentTooEarly`; the driver must stop on it.
+2. The clock is monotonic (`time.monotonic` in the driver, never wall time).
+3. One thread: the pacer is not thread-safe.
+4. The contract key is the `int` conId, never an `ibapi` `Contract` (those
+   compare by identity). The request key is `pacing_request_key`.
+5. One pacer per TWS session, shared by every history request (retries too).
+6. Write the month file first, then `Manifest.record(day, "ok", ...)` and
+   `save_manifest`. After a crash the day is simply fetched again.
+7. Convert bar times to naive `America/New_York` from epoch seconds
+   (`formatDate=2`) before `filter_day`. Bars are stamped at the START of the
+   minute. `filter_day` raises on bars of the requested day outside 09:30 to
+   15:59: a time-zone mistake must not look like a short day.
+8. Record every outcome in the `Manifest` and `save_manifest` it. IB error 162
+   means BOTH "pacing violation" and "HMDS query returned no data", told apart
+   only by the text. A pacing violation is `failed` (and the run should back
+   off). `no_data` is only for a complete answer with zero bars on the day and
+   needs `complete_answer=True`; it is never asked for again. Timeouts,
+   disconnects and anything else that may succeed later are `failed`.
+9. To force a refetch of recorded days use `Manifest.mark_pending` /
+   `Manifest.mark_gaps_pending`.
+10. `plan_range` lists the days to fetch and the days skipped because their
+    session has not closed yet; report both.
+11. Gap files are written per symbol folder: `write_gap_files(symbol_folder(...),
+    rows, symbol)`.
 """
 
 from __future__ import annotations
@@ -44,7 +56,7 @@ import math
 import os
 import tempfile
 import time
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
@@ -182,6 +194,13 @@ class DayRequest:
                          self.what_to_show, str(self.use_rth)))
 
 
+def pacing_request_key(con_id: int, request: DayRequest) -> str:
+    """The pacer's request key for `request` on contract `con_id` (the conId is part of it)."""
+    if isinstance(con_id, bool) or not isinstance(con_id, int):
+        raise TypeError(f"con_id must be an int, got {con_id!r}")
+    return f"{con_id}|{request.key()}"
+
+
 def day_request(
     day: date, *, bar_size: str = DEFAULT_BAR_SIZE, what_to_show: str = DEFAULT_WHAT_TO_SHOW,
 ) -> DayRequest:
@@ -210,12 +229,14 @@ def filter_day(
 ) -> pd.DataFrame:
     """Rows of `bars` (a `date` column of naive data-zone times, the bar start) for `day` only.
 
-    On a holiday IB answers "1 D" with the previous session; those rows are
-    dropped, as is anything outside 09:30 to 15:59 (New York, in `data_zone`
-    time) of `day`. A bar whose minute had not ended at `server_now` is dropped
-    as well (it would still change). Returns a copy with a fresh RangeIndex.
-    Nothing is repaired silently: a tz-aware `date` column, timestamps not on
-    whole minutes, duplicate timestamps or unsorted rows raise `ValueError`.
+    On a holiday IB answers "1 D" with the previous session; bars of other
+    dates are dropped quietly. A bar whose minute had not ended at `server_now`
+    is dropped as well (it would still change). A bar of `day` itself outside
+    09:30 to 15:59 New York raises `ValueError`: a `useRTH=1` answer never has
+    one, so such times mean the stamps are in the wrong zone. Returns a copy
+    with a fresh RangeIndex. Nothing else is repaired silently: a tz-aware
+    `date` column, timestamps not on whole minutes, duplicate timestamps or
+    unsorted rows raise `ValueError`.
     """
     _aware(server_now, "server_now")
     dates = _bar_times(bars, "filter_day")
@@ -225,8 +246,18 @@ def filter_day(
         raise ValueError("filter_day: bars are not sorted by time")
     now_local = server_now.astimezone(_zone(data_zone)).replace(tzinfo=None)
     minutes = expected_minutes(day, data_zone)
-    keep = ((dates >= pd.Timestamp(minutes[0])) & (dates <= pd.Timestamp(minutes[-1]))
-            & (dates + pd.Timedelta(minutes=bar_minutes) <= pd.Timestamp(now_local)))
+    in_session = (dates >= pd.Timestamp(minutes[0])) & (dates <= pd.Timestamp(minutes[-1]))
+    new_york = (dates.dt.tz_localize(data_zone, ambiguous="NaT", nonexistent="NaT")
+                .dt.tz_convert(DATA_ZONE))
+    on_day = new_york.dt.date == day
+    stray = on_day & ~in_session
+    if stray.any():
+        first = dates[stray].iloc[0]
+        raise ValueError(
+            f"filter_day: {int(stray.sum())} bar(s) of {day} outside 09:30 to 15:59 New York "
+            f"(first at {first}); the times do not look like regular-hours New York times "
+            f"(a useRTH=1 answer never contains such bars), check the time zone conversion")
+    keep = in_session & (dates + pd.Timedelta(minutes=bar_minutes) <= pd.Timestamp(now_local))
     return bars.loc[keep].reset_index(drop=True)
 
 
@@ -245,15 +276,33 @@ def _limit(value: int, name: str) -> None:
         raise ValueError(f"{name} must be an integer of at least 1, got {value!r}")
 
 
+class ReservationOutstanding(RuntimeError):
+    """`Pacer.reserve` was called while an earlier reservation is neither sent nor cancelled."""
+
+
+class SentTooEarly(RuntimeError):
+    """`Pacer.sent` was called before the planned time; the early send HAS been recorded."""
+
+    def __init__(self, early_by: float) -> None:
+        super().__init__(f"request sent {early_by:.3f} s before the end of its wait")
+        self.early_by = early_by
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class Reservation:
     """Token returned by `Pacer.reserve`; hand it back to `Pacer.sent` or `Pacer.cancel`."""
 
-    token: int
-    contract: Hashable
-    request: Hashable
+    contract: int
+    request: str
     planned: float  # clock time at which the send is allowed
     wait: float  # seconds from the reserve call until then
+
+
+def _check_keys(contract: object, request: object) -> None:
+    if isinstance(contract, bool) or not isinstance(contract, int):
+        raise TypeError(f"the contract key must be an int conId, got {contract!r}")
+    if not isinstance(request, str):
+        raise TypeError(f"the request key must be a str, got {request!r}")
 
 
 class Pacer:
@@ -265,17 +314,23 @@ class Pacer:
     so that a window never holds more than its limit even when closed at both
     ends (`margin=0` drops that guarantee).
 
-    Driver contract, in four steps: `reserve(contract, request)` returns a
-    `Reservation` whose `wait` is the seconds to wait; the caller waits (its own
-    sleep), sends, and then calls `sent(reservation)`, which records the ACTUAL
-    send time from the clock. The limits are always checked against actual send
-    times, so a late send (a suspend, a blocked thread) pushes the following
-    requests back instead of breaking a limit. `cancel(reservation)` releases a
-    reservation that will not be sent. `reserve` itself commits nothing; while
-    a reservation is outstanding a further `reserve` treats it as sent at the
-    later of its planned time and now. Same calls and clock readings give the
-    same waits.
+    Use: at most ONE reservation at a time. `reserve(con_id, request_key)`
+    returns a `Reservation` whose `wait` is the seconds to wait
+    (`ReservationOutstanding` if another is still open); the caller waits (its
+    own sleep), sends, and calls `sent(reservation)`, which records the ACTUAL
+    send time from the clock, or `cancel(reservation)` if nothing was sent (put
+    it in a `finally`). Every plan is computed from actual send times only, so a
+    late send pushes the following requests back. A send before the wait
+    elapsed is recorded and then raises `SentTooEarly`; the next `reserve`
+    already accounts for it. The contract key must be the `int` conId and the
+    request key a `str` (`TypeError` otherwise): `ibapi` `Contract` objects
+    compare by identity and would defeat the per-contract and identical rules.
+    The clock must be monotonic (`time.monotonic`). The class is not
+    thread-safe: use one thread. History older than the longest window is
+    dropped, so memory stays bounded.
     """
+
+    EARLY_TOLERANCE = 1e-6  # seconds of float noise allowed before a send counts as early
 
     def __init__(
         self,
@@ -304,53 +359,60 @@ class Pacer:
         self.max_per_contract = max_per_contract
         self.identical_gap = identical_gap
         self.margin = margin
-        self._all: list[float] = []  # actual send times, sorted, last max_in_window
-        self._per_contract: dict[Hashable, list[float]] = {}
-        self._identical: dict[tuple[Hashable, Hashable], float] = {}
-        self._open: dict[int, Reservation] = {}
-        self._next_token = 0
+        self._all: list[float] = []  # actual send times, sorted
+        self._per_contract: dict[int, list[float]] = {}
+        self._identical: dict[tuple[int, str], float] = {}
+        self._outstanding: Reservation | None = None
 
-    def earliest(self, contract: Hashable, request: Hashable = None) -> float:
-        """Earliest time (on the injected clock) the request may be sent; books nothing.
-
-        Outstanding reservations count as sent at the later of their planned
-        time and now.
-        """
-        now = self._clock()
-        virtual = [(max(r.planned, now), r.contract, r.request) for r in self._open.values()]
-        every = sorted(self._all + [v[0] for v in virtual])
-        t = now
-        if every:
-            t = max(t, every[-1] + self.min_gap)
-        if len(every) >= self.max_in_window:
-            t = max(t, every[-self.max_in_window] + self.window + self.margin)
-        mine = sorted(self._per_contract.get(contract, []) + [v[0] for v in virtual if v[1] == contract])
+    def earliest(self, contract: int, request: str) -> float:
+        """Earliest time (on the injected clock) the request may be sent; books nothing."""
+        _check_keys(contract, request)
+        t = self._clock()
+        if self._all:
+            t = max(t, self._all[-1] + self.min_gap)
+        if len(self._all) >= self.max_in_window:
+            t = max(t, self._all[-self.max_in_window] + self.window + self.margin)
+        mine = self._per_contract.get(contract, [])
         if len(mine) >= self.max_per_contract:
             t = max(t, mine[-self.max_per_contract] + self.contract_window + self.margin)
-        same = [v[0] for v in virtual if v[1] == contract and v[2] == request]
         last = self._identical.get((contract, request))
         if last is not None:
-            same.append(last)
-        if same:
-            t = max(t, max(same) + self.identical_gap + self.margin)
+            t = max(t, last + self.identical_gap + self.margin)
         return t
 
-    def reserve(self, contract: Hashable, request: Hashable = None) -> Reservation:
+    def reserve(self, contract: int, request: str) -> Reservation:
         """Plan one request: `.wait` seconds from now; nothing is booked until `sent`."""
+        _check_keys(contract, request)
+        if self._outstanding is not None:
+            raise ReservationOutstanding(
+                "a reservation is still outstanding: call sent() or cancel() first")
         when = self.earliest(contract, request)
-        reservation = Reservation(self._next_token, contract, request, when, when - self._clock())
-        self._next_token += 1
-        self._open[reservation.token] = reservation
-        return reservation
+        self._outstanding = Reservation(contract, request, when, when - self._clock())
+        return self._outstanding
 
     def _settle(self, reservation: Reservation) -> Reservation:
-        known = self._open.pop(reservation.token, None)
-        if known is not reservation:
+        if reservation is not self._outstanding:
             raise ValueError("unknown reservation (already sent or cancelled?)")
-        return known
+        self._outstanding = None
+        return reservation
+
+    def _prune(self, now: float) -> None:
+        """Forget sends older than the window that could still matter (the clock is monotonic)."""
+        horizon = now - (max(self.min_gap, self.window) + self.margin)
+        del self._all[:bisect.bisect_left(self._all, horizon)]
+        horizon = now - (self.contract_window + self.margin)
+        for key in [k for k, v in self._per_contract.items() if v[-1] < horizon]:
+            del self._per_contract[key]
+        horizon = now - (self.identical_gap + self.margin)
+        for key in [k for k, v in self._identical.items() if v < horizon]:
+            del self._identical[key]
 
     def sent(self, reservation: Reservation) -> float:
-        """Record that the request was just sent: the send time is the clock now. Returns it."""
+        """Record that the request was just sent: the send time is the clock now. Returns it.
+
+        An early send (before `reservation.planned`) is recorded too, then
+        `SentTooEarly` is raised.
+        """
         known = self._settle(reservation)
         when = self._clock()
         bisect.insort(self._all, when)
@@ -360,10 +422,14 @@ class Pacer:
         del mine[:-self.max_per_contract]
         key = (known.contract, known.request)
         self._identical[key] = max(self._identical.get(key, when), when)
+        self._prune(when)
+        early = known.planned - when
+        if early > self.EARLY_TOLERANCE:
+            raise SentTooEarly(early)
         return when
 
     def cancel(self, reservation: Reservation) -> None:
-        """Release a reservation that was not sent; later reserves ignore it."""
+        """Release a reservation that was not sent; it leaves no trace."""
         self._settle(reservation)
 
 
@@ -427,13 +493,19 @@ class Manifest:
 
     def record(
         self, day: date, status: str, *, bars: int = 0, error_code: int | None = None,
-        error_text: str = "", fetched_utc: datetime,
+        error_text: str = "", fetched_utc: datetime, complete_answer: bool = False,
     ) -> None:
         """Set the record of `day`; whatever is accepted here also loads back unchanged.
 
         Rules are `validate_day_fields` (`TypeError` / `ValueError`); `fetched_utc`
-        must be aware. Record transient failures as `failed`, never `no_data`.
+        must be aware. `no_data` is evidence-based: it needs `complete_answer=True`
+        (IB gave a complete answer with no bars for the day), else `ValueError`.
+        Record transient failures, and a pacing violation (error 162 with that
+        text), as `failed`, never `no_data`.
         """
+        if status == STATUS_NO_DATA and complete_answer is not True:
+            raise ValueError("no_data needs complete_answer=True: only a complete answer "
+                             "with no bars is no_data; anything else is failed")
         if not isinstance(day, date) or isinstance(day, datetime):
             raise TypeError(f"day must be a date, got {day!r}")
         stamp = _aware(fetched_utc, "fetched_utc").astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

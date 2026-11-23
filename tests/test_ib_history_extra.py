@@ -42,7 +42,7 @@ def frame(stamps: list[datetime]) -> pd.DataFrame:
 # --- pacing: an independent checker over many requests -----------------------
 
 
-def violations(events: list[tuple[float, str, str]], min_gap: float = 10.0) -> list[str]:
+def violations(events: list[tuple[float, int, str]], min_gap: float = 10.0) -> list[str]:
     """Rule breaks in (send time, contract, request) events; every window is closed at both ends."""
     ordered = sorted(events)
     times = [e[0] for e in ordered]
@@ -53,8 +53,8 @@ def violations(events: list[tuple[float, str, str]], min_gap: float = 10.0) -> l
     for i in range(1, len(times)):
         if times[i] - times[i - 1] < min_gap - 1e-6:  # float noise from summing waits
             found.append(f"gap {times[i] - times[i - 1]} at {times[i]}")
-    per_contract: dict[str, list[float]] = defaultdict(list)
-    identical: dict[tuple[str, str], list[float]] = defaultdict(list)
+    per_contract: dict[int, list[float]] = defaultdict(list)
+    identical: dict[tuple[int, str], list[float]] = defaultdict(list)
     for t, contract, request in ordered:
         per_contract[contract].append(t)
         identical[(contract, request)].append(t)
@@ -69,24 +69,24 @@ def violations(events: list[tuple[float, str, str]], min_gap: float = 10.0) -> l
     return found
 
 
-def punctual_send(pacer: Pacer, now: list[float], contract: str, request: str) -> None:
+def punctual_send(pacer: Pacer, now: list[float], contract: int, request: str) -> None:
     reservation = pacer.reserve(contract, request)
     now[0] += reservation.wait
     pacer.sent(reservation)
 
 
-def drive(count: int, seed: int, pattern: str, **kwargs: float) -> list[tuple[float, str, str]]:
+def drive(count: int, seed: int, pattern: str, **kwargs: float) -> list[tuple[float, int, str]]:
     """Punctual caller: idles at random, reserves, waits exactly the answer, sends."""
     rnd = random.Random(seed)
     now = [1000.0]
     pacer = Pacer(lambda: now[0], **kwargs)
-    symbols = ["AAPL", "MSFT", "TSLA", "X", "Y"]
+    symbols = [1, 2, 3, 4, 5]
     events = []
     for i in range(count):
         if pattern == "same":
-            contract, request = "AAPL", "r"
+            contract, request = 1, "r"
         elif pattern == "one_contract":
-            contract, request = "AAPL", f"r{i}"
+            contract, request = 1, f"r{i}"
         elif pattern == "alternate":
             contract, request = symbols[i % 2], f"r{i % 2}"
         elif pattern == "random_repeats":
@@ -106,7 +106,7 @@ def drive(count: int, seed: int, pattern: str, **kwargs: float) -> list[tuple[fl
     return events
 
 
-def drive_late(count: int, seed: int, pattern: str, **kwargs: float) -> list[tuple[float, str, str]]:
+def drive_late(count: int, seed: int, pattern: str, **kwargs: float) -> list[tuple[float, int, str]]:
     """Sloppy caller: 5% of sends up to 30 s late, one 20 minute suspend, ~3% of reservations cancelled.
 
     Returns the ACTUAL send times (the clock when `sent` was called).
@@ -114,13 +114,13 @@ def drive_late(count: int, seed: int, pattern: str, **kwargs: float) -> list[tup
     rnd = random.Random(seed)
     now = [1000.0]
     pacer = Pacer(lambda: now[0], **kwargs)
-    symbols = ["AAPL", "MSFT", "TSLA", "X", "Y"]
+    symbols = [1, 2, 3, 4, 5]
     events = []
     for i in range(count):
         if pattern == "same":
-            contract, request = "AAPL", "r"
+            contract, request = 1, "r"
         elif pattern == "one_contract":
-            contract, request = "AAPL", f"r{i}"
+            contract, request = 1, f"r{i}"
         elif pattern == "alternate":
             contract, request = symbols[i % 2], f"r{i % 2}"
         else:
@@ -153,39 +153,147 @@ def test_pacer_late_sends_cancels_and_a_suspend_never_break_a_limit(
 def test_pacer_late_send_delays_the_next_request() -> None:
     now = [0.0]
     pacer = Pacer(lambda: now[0])
-    first = pacer.reserve("c", "a")
+    first = pacer.reserve(1, "a")
     assert first.wait == 0.0
     now[0] += 25.0  # the send is 25 s late
     pacer.sent(first)
-    assert pacer.reserve("d", "b").wait == pytest.approx(10.0)  # 10 s after the REAL send
+    assert pacer.reserve(2, "b").wait == pytest.approx(10.0)  # 10 s after the REAL send
 
 
-def test_pacer_outstanding_reservation_counts_as_sent_at_the_later_of_planned_and_now() -> None:
-    now = [100.0]
+def test_pacer_second_reserve_raises_until_sent_or_cancelled() -> None:
+    now = [0.0]
     pacer = Pacer(lambda: now[0])
-    first = pacer.reserve("c", "a")
-    now[0] = 140.0  # never sent yet, 40 s later
-    assert pacer.reserve("d", "b").wait == pytest.approx(10.0)  # 10 s after "now", not after 100
-    # An outstanding reservation planned in the future counts at its planned time.
-    pacer.cancel(first)
-    second = pacer.reserve("c", "x")
-    assert second.wait == pytest.approx(20.0)  # "b" is planned at 150, so 10 s after that
+    first = pacer.reserve(1, "a")
+    with pytest.raises(history.ReservationOutstanding):
+        pacer.reserve(2, "b")
+    assert issubclass(history.ReservationOutstanding, RuntimeError)
+    pacer.sent(first)
+    now[0] += 10.0
+    second = pacer.reserve(2, "b")  # works after sent()
+    with pytest.raises(history.ReservationOutstanding):
+        pacer.reserve(2, "c")
+    pacer.cancel(second)
+    third = pacer.reserve(2, "c")  # works after cancel()
+    assert third.wait == 0.0
+    pacer.cancel(third)
+
+
+def test_pacer_the_reviewers_four_traces_cannot_be_expressed() -> None:
+    # Late first send, identical key, out of order and 61 at once all need two open reservations.
+    pacer = Pacer(lambda: 0.0)
+    pacer.reserve(1, "k")
+    for contract, request in ((2, "k2"), (1, "k"), (1, "other")):
+        with pytest.raises(history.ReservationOutstanding):
+            pacer.reserve(contract, request)
+    # Taken one at a time and sent when due, 61 requests stay within the limits, whatever the lateness.
+    now = [0.0]
+    one = Pacer(lambda: now[0], min_gap=1.0)
+    events = []
+    for i in range(61):
+        reservation = one.reserve(1 + i % 2, "k" if i % 3 == 0 else f"k{i}")
+        now[0] += reservation.wait + (14.0 if i in (0, 7) else 0.0)  # two late sends
+        one.sent(reservation)
+        events.append((now[0], 1 + i % 2, "k" if i % 3 == 0 else f"k{i}"))
+    assert violations(events, min_gap=1.0) == []
 
 
 def test_pacer_cancel_releases_and_tokens_are_single_use() -> None:
     now = [0.0]
     pacer = Pacer(lambda: now[0])
-    held = pacer.reserve("c", "a")
+    held = pacer.reserve(1, "a")
     pacer.cancel(held)
-    assert pacer.reserve("c", "a").wait == 0.0  # the cancelled one left no trace
+    again = pacer.reserve(1, "a")
+    assert again.wait == 0.0  # the cancelled one left no trace
     with pytest.raises(ValueError):
         pacer.cancel(held)
     with pytest.raises(ValueError):
         pacer.sent(held)
-    again = pacer.reserve("c", "z")
     pacer.sent(again)
     with pytest.raises(ValueError):
         pacer.sent(again)
+
+
+def test_pacer_early_send_is_recorded_then_raises_and_the_next_wait_counts_it() -> None:
+    now = [0.0]
+    pacer = Pacer(lambda: now[0])
+    pacer.sent(pacer.reserve(1, "a"))  # at 0
+    now[0] = 4.0
+    second = pacer.reserve(2, "b")
+    assert second.wait == pytest.approx(6.0)
+    now[0] = 5.0  # sent 5 s early
+    with pytest.raises(history.SentTooEarly, match="5.000") as excinfo:
+        pacer.sent(second)
+    assert excinfo.value.early_by == pytest.approx(5.0)
+    assert isinstance(excinfo.value, RuntimeError)
+    # History is truthful: the early send at 5 is recorded, so the next wait is 10 s after it.
+    third = pacer.reserve(3, "c")
+    assert third.planned == pytest.approx(15.0)
+    pacer.cancel(third)
+    # The reservation was settled: no second sent() and a new reserve is possible.
+    with pytest.raises(ValueError):
+        pacer.sent(second)
+
+
+def test_pacer_on_time_send_does_not_raise_and_float_noise_is_tolerated() -> None:
+    now = [0.1]
+    pacer = Pacer(lambda: now[0])
+    pacer.sent(pacer.reserve(1, "a"))
+    second = pacer.reserve(2, "b")
+    now[0] += second.wait  # float sums may land an ulp below planned
+    pacer.sent(second)
+
+
+def test_pacer_per_contract_window_is_two_seconds_not_one_and_a_half() -> None:
+    now = [0.0]
+    pacer = Pacer(lambda: now[0], min_gap=0.0, margin=0.0)
+    for i in range(5):
+        pacer.sent(pacer.reserve(1, f"r{i}"))
+    sixth = pacer.reserve(1, "r5")
+    assert sixth.wait == pytest.approx(2.0)  # fails if the window is 1.5 s
+    pacer.cancel(sixth)
+
+
+@pytest.mark.parametrize("contract, request_key", [
+    ("AAPL", "k"), (1.0, "k"), (True, "k"), (None, "k"), (object(), "k"),
+    (1, 5), (1, None), (1, b"k"), (1, ("a", "b")),
+])
+def test_pacer_accepts_only_int_conid_and_str_request(contract: object, request_key: object) -> None:
+    pacer = Pacer(lambda: 0.0)
+    with pytest.raises(TypeError):
+        pacer.reserve(contract, request_key)  # type: ignore[arg-type]
+    pacer.cancel(pacer.reserve(1, "k"))  # nothing was left outstanding by the refused calls
+
+
+def test_pacing_request_key_includes_the_conid_and_the_per_contract_rules_hold() -> None:
+    request = day_request(date(2024, 3, 11))
+    assert history.pacing_request_key(265598, request) == f"265598|{request.key()}"
+    assert history.pacing_request_key(265598, request) != history.pacing_request_key(272093, request)
+    with pytest.raises(TypeError):
+        history.pacing_request_key("265598", request)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        history.pacing_request_key(True, request)  # type: ignore[arg-type]
+    # The same day for two contracts is not identical; the same day twice for one is.
+    now = [0.0]
+    pacer = Pacer(lambda: now[0], min_gap=0.0)
+    for con_id in (265598, 272093):
+        reservation = pacer.reserve(con_id, history.pacing_request_key(con_id, request))
+        assert reservation.wait == 0.0
+        pacer.sent(reservation)
+    again = pacer.reserve(265598, history.pacing_request_key(265598, request))
+    assert again.wait == pytest.approx(16.0)
+    pacer.cancel(again)
+
+
+def test_pacer_memory_stays_bounded_over_100000_requests() -> None:
+    now = [0.0]
+    pacer = Pacer(lambda: now[0], min_gap=0.0)
+    for i in range(100_000):
+        reservation = pacer.reserve(i, f"r{i}")  # a new contract and request every time
+        now[0] += reservation.wait
+        pacer.sent(reservation)
+    assert len(pacer._all) <= pacer.max_in_window
+    assert len(pacer._per_contract) < 200
+    assert len(pacer._identical) < 200
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -218,7 +326,7 @@ def test_pacer_year_of_three_symbols_takes_about_two_hours() -> None:
     now = [0.0]
     pacer = Pacer(lambda: now[0])
     for i in range(252 * 3):
-        punctual_send(pacer, now, ["AAPL", "MSFT", "TSLA"][i % 3], f"day{i}")
+        punctual_send(pacer, now, [1, 2, 3][i % 3], f"day{i}")
     assert 7500 <= now[0] <= 7600  # 756 requests, 10 s apart plus the 1 s window margin
 
 
@@ -226,20 +334,25 @@ def test_pacer_long_idle_forgets_the_past() -> None:
     now = [0.0]
     pacer = Pacer(lambda: now[0])
     for i in range(60):
-        punctual_send(pacer, now, "c", f"r{i}")
+        punctual_send(pacer, now, 1, f"r{i}")
     now[0] += 100_000
-    assert pacer.reserve("c", "r0").wait == 0.0
-    assert pacer.reserve("d", "r0").wait == pytest.approx(10.0)  # only the global gap remains
+    first = pacer.reserve(1, "r0")
+    assert first.wait == 0.0
+    pacer.cancel(first)
+    again = pacer.reserve(1, "r0")
+    assert again.wait == 0.0  # nothing of the past remains
+    pacer.sent(again)
+    assert pacer.reserve(2, "r0").wait == pytest.approx(10.0)  # only the global gap
 
 
 def test_pacer_backwards_clock_never_shortens_a_wait() -> None:
     now = [100.0]
     pacer = Pacer(lambda: now[0])
-    first = pacer.reserve("c", "r1")
+    first = pacer.reserve(1, "r1")
     assert first.wait == 0.0
     pacer.sent(first)
     now[0] = 50.0  # clock jumps back 50 s
-    assert 50.0 + pacer.reserve("c", "r2").wait >= 110.0  # still 10 s after the send at 100.0
+    assert 50.0 + pacer.reserve(1, "r2").wait >= 110.0  # still 10 s after the send at 100.0
 
 
 # --- day planning edges -----------------------------------------------------
@@ -415,7 +528,7 @@ def test_manifest_record_rejects_what_the_loader_rejects(tmp_path: Path) -> None
             manifest.record(day, "failed", fetched_utc=LATE, **kwargs)  # type: ignore[arg-type]
     for status, bars in (("failed", -1), ("ok", 0), ("no_data", 3), ("bogus", 0)):
         with pytest.raises(ValueError):
-            manifest.record(day, status, bars=bars, fetched_utc=LATE)
+            manifest.record(day, status, bars=bars, fetched_utc=LATE, complete_answer=True)
     with pytest.raises(TypeError):
         manifest.record(datetime(2024, 3, 12), "ok", bars=1, fetched_utc=LATE)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
@@ -439,7 +552,8 @@ def test_manifest_anything_record_accepts_loads_back_equal(tmp_path: Path) -> No
                       "error_text": rnd.choice(text_pool)}
             moment = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(seconds=rnd.randrange(10**8))
             try:
-                manifest.record(date(2024, 1, 1) + timedelta(days=i), status, fetched_utc=moment,  # type: ignore[arg-type]
+                manifest.record(date(2024, 1, 1) + timedelta(days=i), status,  # type: ignore[arg-type]
+                                fetched_utc=moment, complete_answer=True,
                                 **kwargs)  # type: ignore[arg-type]
                 accepted += 1
             except (TypeError, ValueError):
@@ -481,7 +595,7 @@ def test_manifest_mark_pending_forces_a_refetch() -> None:
     days = [date(2024, 3, 8), date(2024, 3, 11), date(2024, 3, 12), date(2024, 3, 13)]
     manifest = Manifest("AAPL", 1)
     manifest.record(days[0], "ok", bars=390, fetched_utc=LATE)
-    manifest.record(days[1], "no_data", fetched_utc=LATE)
+    manifest.record(days[1], "no_data", fetched_utc=LATE, complete_answer=True)
     manifest.record(days[2], "ok", bars=100, fetched_utc=LATE)
     assert manifest.pending(days) == [days[3]]
     assert manifest.mark_pending([days[1], days[3]]) == [days[1]]  # days[3] had no record
@@ -605,13 +719,18 @@ def test_bad_bar_input_raises_instead_of_silently_matching_nothing(call: object)
         call(frame([minutes[0] + timedelta(microseconds=1), minutes[1]]))  # type: ignore[operator]
 
 
-def test_filter_day_drops_bars_outside_the_session_and_refuses_duplicates_and_unsorted() -> None:
+def test_filter_day_raises_on_bars_of_the_day_outside_the_session_but_drops_other_dates() -> None:
     day = date(2024, 3, 11)
     minutes = expected_minutes(day)
-    outside = [datetime(2024, 3, 11, 9, 29), *minutes, datetime(2024, 3, 11, 16, 0),
-               datetime(2024, 3, 11, 20, 0)]
-    kept = filter_day(frame(outside), day, LATE)
-    assert list(kept["date"]) == minutes
+    for stray in (datetime(2024, 3, 11, 9, 29), datetime(2024, 3, 11, 16, 0),
+                  datetime(2024, 3, 11, 20, 0), datetime(2024, 3, 11, 4, 0)):
+        stamps = sorted([*minutes, stray])
+        with pytest.raises(ValueError, match="regular-hours New York"):
+            filter_day(frame(stamps), day, LATE)
+    # Bars of other dates (the previous session, the next day) go quietly, whatever their time.
+    other = [datetime(2024, 3, 8, 9, 29), datetime(2024, 3, 8, 15, 59), *minutes,
+             datetime(2024, 3, 12, 9, 30), datetime(2024, 3, 12, 20, 0)]
+    assert list(filter_day(frame(other), day, LATE)["date"]) == minutes
     with pytest.raises(ValueError, match="duplicate"):
         filter_day(frame([minutes[0], minutes[1], minutes[1]]), day, LATE)
     with pytest.raises(ValueError, match="not sorted"):
@@ -632,3 +751,37 @@ def test_history_module_reads_no_clock_and_opens_nothing() -> None:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
             assert not any(n.split(".")[0] in {"ibapi", "socket", "requests", "urllib"} for n in names)
+
+
+def test_filter_day_pacific_stamped_session_read_as_new_york_raises_not_a_half_day() -> None:
+    day = date(2024, 3, 11)
+    # A full session stamped in Pacific wall time: 06:30 to 12:59.
+    pacific = [m - timedelta(hours=3) for m in expected_minutes(day)]
+    with pytest.raises(ValueError, match="do not look like regular-hours New York times"):
+        filter_day(frame(pacific), day, LATE)
+    # Read as the zone it really is, the same bars are a full day.
+    kept = filter_day(frame(pacific), day, LATE, data_zone="America/Los_Angeles")
+    assert len(kept) == 390
+
+
+def test_filter_day_in_other_data_zone_still_drops_other_sessions_quietly() -> None:
+    day = date(2024, 3, 11)
+    zone = "Asia/Tokyo"  # the session crosses local midnight
+    today = expected_minutes(day, zone)
+    friday = expected_minutes(date(2024, 3, 8), zone)
+    assert list(filter_day(frame(friday + today), day, LATE, data_zone=zone)["date"]) == today
+
+
+def test_manifest_no_data_needs_a_complete_answer() -> None:
+    manifest = Manifest("AAPL", 1)
+    day = date(2024, 3, 12)
+    with pytest.raises(ValueError, match="complete_answer"):
+        manifest.record(day, "no_data", fetched_utc=LATE)
+    with pytest.raises(ValueError, match="complete_answer"):
+        manifest.record(day, "no_data", fetched_utc=LATE, complete_answer=False)
+    assert manifest.days == {}
+    manifest.record(day, "no_data", fetched_utc=LATE, complete_answer=True)
+    assert manifest.days["2024-03-12"].status == "no_data"
+    # A pacing violation (error 162 with that text) is a failure and needs no such flag.
+    manifest.record(day, "failed", error_code=162, error_text="pacing violation", fetched_utc=LATE)
+    assert manifest.pending([day]) == [day]
