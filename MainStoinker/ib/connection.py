@@ -2,8 +2,8 @@
 
 `IbConnection` is built on `DataOnlyClient` (through an injectable client
 factory, so tests pass the scripted fake) and adds the lifecycle the client
-leaves out. It builds no `EClient` or `Connection` of its own, reads no
-environment (the `env` mapping is passed in) and sends no order: its `request`
+leaves out. It builds no `EClient` or `Connection` of its own, reads the environment
+only in `_broker_blocked_here` (the `env` mapping is passed in) and sends no order: its `request`
 takes only an allowlist of data requests, and the client refuses the rest.
 
 Facts about ibapi 10.37.2 the design rests on
@@ -119,6 +119,7 @@ from __future__ import annotations
 import enum
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -210,6 +211,13 @@ class ConnectionClosedDuringOpen(ConnectFailed):
     """`close()` was called while `open()` was running; `open()` stopped and cleaned up."""
 
 
+class BrokerConnectionRefusedHere(RuntimeError):
+    """This process runs under a pytest session (see `_broker_blocked_here`).
+
+    Deliberately neither a `ConnectFailed` nor an `OSError`: no retry path may swallow it.
+    """
+
+
 class ClientIdRefused(ValueError):
     """The client id is not allowed (0 and 123, or not an int from 1 to 2147483647)."""
 
@@ -290,6 +298,19 @@ class _Attempt:
         self.dead = False  # set when the attempt is over: later callbacks are ignored
 
 
+_EClient = next(c for c in DataOnlyClient.__mro__ if c.__name__ == "EClient")
+"""ibapi's `EClient`, found through `DataOnlyClient` (this module imports no `ibapi`)."""
+
+
+def _broker_blocked_here(env: Mapping[str, str]) -> bool:
+    """True when `STOINK_BROKER_BLOCKED` is present (any value, even empty) in the process
+    environment or in `env`. The tests' `pytest_configure` sets it for a whole pytest session,
+    so a child process of a test inherits it. The only read of `os.environ` in this package
+    outside the command line; the process environment is read on purpose, whatever `env` says.
+    """
+    return "STOINK_BROKER_BLOCKED" in os.environ or "STOINK_BROKER_BLOCKED" in env
+
+
 def _positive_number(name: str, value: Any, maximum: float) -> None:
     if (
         isinstance(value, bool)
@@ -323,7 +344,13 @@ class IbConnection:
     connection" dialog and wait for a person to click it; the handshake is then not
     answered and each abandoned attempt can leave another dialog behind. A command
     that expects this should raise `connect_timeout` (the caller of the constructor
-    decides; nothing here reads the environment).
+    decides; nothing here reads the environment except the pytest block below).
+
+    Pytest block. If `STOINK_BROKER_BLOCKED` is present (any value) in the process environment
+    or in `env`, `open()` raises `BrokerConnectionRefusedHere` and the state is CLOSED. It
+    applies only to a real client: a client factory that is an `EClient` class (checked
+    before the port guard, without calling it) or one that returns an `EClient` instance
+    (checked before `connect`). There is no way to switch it off.
 
     State LOST (IB code 1100, connectivity between TWS and IB lost) still allows
     `request()`. The socket to TWS is up, `request()` sends only data requests (no
@@ -455,6 +482,9 @@ class IbConnection:
 
         Raises `ConnectionClosedDuringOpen` if `close()` is called meanwhile.
         """
+        factory = self._factory
+        if isinstance(factory, type) and issubclass(factory, _EClient):
+            self._refuse_if_blocked()  # before the port guard, the factory and any thread
         if type(self.port) is not int:
             raise BrokerPortRefused(f"Refusing to connect: broker port {self.port!r} is not an int.")
         check_broker_port(self.port, self._env)
@@ -496,6 +526,16 @@ class IbConnection:
             with self._lock:
                 self._opener = None
             self._open_done.set()
+
+    def _refuse_if_blocked(self) -> None:
+        """Only reached for a real client (an `EClient` class or instance): a scripted fake
+        cannot reach a broker. Leaves the connection CLOSED."""
+        if _broker_blocked_here(self._env):
+            self._set_phase(ConnState.CLOSED)
+            raise BrokerConnectionRefusedHere(
+                "Broker connections are blocked in this process because it runs under a "
+                "pytest session; no connection to TWS or IB Gateway was attempted."
+            )
 
     def _open_attempts(self) -> None:
         failures: list[AttemptFailure] = []
@@ -571,12 +611,15 @@ class IbConnection:
             self.attempts_made = n
             self.next_valid_id = None
         self._backlog.clear()
-        att.client = self._factory(
+        client = self._factory(
             env=self._env,
             on_event=lambda event: self._on_event(att, event),
             on_raw=lambda name, args: self._on_raw(att, name, args),
             logger=self._log,
         )
+        if isinstance(client, _EClient):
+            self._refuse_if_blocked()  # a factory function that builds a real client; before connect
+        att.client = client
         return att
 
     def _set_phase(self, new: ConnState, att: _Attempt | None = None) -> bool:
