@@ -51,9 +51,39 @@ dead and ignores further callbacks.
 
 If a thread of an old client (the connect helper or the reader) is still alive
 `join_timeout` after its `disconnect()`, that is logged at warning level and recorded
-in the failure list, and the next attempt goes on with a new client. More than
-`MAX_STUCK_THREADS` such threads alive at once makes `open()` fail (`ConnectFailed`),
-so that threads cannot pile up.
+in the failure list, and the next attempt goes on with a new client. The rule: `open()`
+fails (`ConnectFailed`, carrying every failure so far) as soon as the stuck threads of
+this open that are still alive exceed `MAX_STUCK_THREADS` (1), so a second stuck thread
+ends the open and threads cannot pile up. A stuck thread costs up to twice
+`join_timeout` (it is joined when the attempt ends and again in cleanup).
+
+State changes (`_phase`; LOST is READY with the attempt's lost flag, derived)
+-----------------------------------------------------------------------------
+Every change goes through `_set_phase`, under the lock, which enforces
+NEW -> CONNECTING -> READY -> CLOSED (CLOSED is final; READY only from CONNECTING, for
+the live current attempt whose reader still runs, with no close seen and no `close()`
+started; a refused READY fails the attempt, which is retried like any other failure).
+
+=======================  =============================================================
+caller                   change
+=======================  =============================================================
+`open()`                 NEW -> CONNECTING; any failure or abort -> CLOSED
+`_await_ready`           CONNECTING -> READY, on `nextValidId` (if `_set_phase` agrees)
+`_on_event`              READY -> CLOSED, on the `ConnectionClosed` of the current attempt
+`close()`                any -> CLOSED, at the end of its cleanup
+=======================  =============================================================
+
+Per-attempt lifecycle, in order: (1) the factory builds a fresh client; (2) the port
+guard (inside `DataOnlyClient.connect`, and once for `open()` before any client);
+(3) the connect helper thread runs `connect`, bounded by `connect_timeout`; (4) the
+reader thread runs `run()`; (5) the ready wait for `nextValidId`, bounded by
+`ready_timeout`; (6) `_end_attempt` disconnects, joins the threads and retires the
+attempt (on failure, before any retry).
+
+Known `ibapi` caveat: a Ctrl-C that lands inside `Connection.sendMsg` between taking
+its lock and its `try` leaves that lock held and can deadlock `close()` in
+`Connection.disconnect`. If a Ctrl-C hangs, close the console window and check in TWS
+that the client id is gone.
 
 Threads: callbacks only put events on a queue; the caller thread consumes them
 (`next_event`). Observers see every request and every raw callback, on the thread
@@ -122,8 +152,9 @@ FARM_KINDS: dict[str, frozenset[int]] = {
 
 DATA_FARM_CODES: frozenset[int] = frozenset().union(*FARM_KINDS.values())
 MAX_ATTEMPTS = 100
-MAX_STUCK_THREADS = 3
-"""More abandoned threads than this still alive makes `open()` fail."""
+MAX_STUCK_THREADS = 1
+"""`open()` fails as soon as more than this many threads of old attempts are still
+alive: with 1, a second stuck thread ends the open (reachable with the default 3 attempts)."""
 MAX_REQUESTS_PER_SECOND = 50  # IB documents 50 messages per second
 MAX_CLIENT_ID = 2**31 - 1
 CLIENT_ID_IN_USE = 326
@@ -149,6 +180,15 @@ class ConnState(enum.Enum):
     READY = "ready"
     LOST = "lost"  # 1100: IB has lost its connection; the socket may still be up
     CLOSED = "closed"  # closed by close(), by the peer, or after a failed open
+
+
+_TRANSITIONS: dict[ConnState, frozenset[ConnState]] = {
+    ConnState.NEW: frozenset({ConnState.CONNECTING, ConnState.CLOSED}),
+    ConnState.CONNECTING: frozenset({ConnState.READY, ConnState.CLOSED}),
+    ConnState.READY: frozenset({ConnState.CLOSED}),
+    ConnState.CLOSED: frozenset(),
+}
+"""The stored phases (LOST is derived from READY and the attempt's lost flag)."""
 
 
 class ConnectFailed(RuntimeError):
@@ -427,19 +467,19 @@ class IbConnection:
         with self._lock:
             if self._phase is not ConnState.NEW or self._close_started:
                 raise RuntimeError(f"open() on a connection that is {self._phase.value}")
-            self._phase = ConnState.CONNECTING
+            self._set_phase(ConnState.CONNECTING)
             self._opener = threading.current_thread()
             self._open_done.clear()
         try:
             self._open_attempts()
-        except BaseException:
-            try:
+            with self._lock:
+                # A close() that ran on this thread after READY (a signal handler) ended in
+                # CLOSED; open() must not report success for it.
                 if self._close_evt.is_set():
-                    # close() is (or was) running: make sure nothing of ours stays open.
-                    self._end_attempt(self._att)
-            finally:
-                with self._lock:
-                    self._phase = ConnState.CLOSED
+                    raise self._closed_error()
+        except BaseException:
+            # Every attempt has been ended by `_open_attempts`; only the state is left.
+            self._set_phase(ConnState.CLOSED)
             raise
         finally:
             with self._lock:
@@ -449,7 +489,7 @@ class IbConnection:
     def _open_attempts(self) -> None:
         failures: list[AttemptFailure] = []
         for n in range(1, self._attempts + 1):
-            self._check_open()
+            self._check_open()  # adds: no client is built for an attempt that would never connect
             att = self._begin_attempt(n)
             try:
                 failure, fatal = self._attempt_once(att)
@@ -472,7 +512,7 @@ class IbConnection:
                         "disconnect(); abandoned (the next attempt uses a new client)",
                     )
                 )
-            self._check_open()
+            self._check_open()  # adds: a close() during the cleanup above is reported as a close
             if fatal:
                 raise ClientIdInUse(
                     f"IB client id {self.client_id} is already in use by another API "
@@ -528,12 +568,43 @@ class IbConnection:
         )
         return att
 
+    def _set_phase(self, new: ConnState, att: _Attempt | None = None) -> bool:
+        """The only place `_phase` changes. Returns False when the change is refused.
+
+        Allowed: NEW to CONNECTING, CONNECTING to READY, and any of them to CLOSED, which
+        is final (CLOSED to CLOSED is a no-op that returns True; a change out of CLOSED
+        is refused). Anything else is a programming error. READY needs the live current
+        attempt `att` with its reader still running and no close seen, and no `close()`
+        started: otherwise it is refused and the phase stays as it was.
+        """
+        with self._lock:
+            old = self._phase
+            if old is new is ConnState.CLOSED:
+                return True
+            if new not in _TRANSITIONS[old]:
+                if old is ConnState.CLOSED:
+                    return False
+                raise RuntimeError(f"illegal connection state change {old.value} -> {new.value}")
+            if new is ConnState.READY and (
+                att is None
+                or att is not self._att
+                or att.dead
+                or att.closed_seen
+                or att.reader is None
+                or not att.reader.is_alive()
+                or self._close_started
+                or self._close_evt.is_set()
+            ):
+                return False
+            self._phase = new
+            return True
+
     def _disconnect(self, att: _Attempt) -> None:
         """`disconnect()` the attempt's client. A client that is already closed may raise."""
         try:
             att.client.disconnect()
-        except (AttributeError, OSError, TypeError) as exc:
-            self._log.debug(
+        except (AttributeError, OSError) as exc:
+            self._log.info(
                 "IB client of attempt %d: disconnect() raised %r; treated as already closed",
                 att.number, exc,
             )
@@ -577,8 +648,10 @@ class IbConnection:
         except BaseException as exc:  # handed to the caller thread, which decides
             box.error = exc
         finally:
-            if self._close_evt.is_set():
-                self._disconnect(att)  # a connect that finished after close() must not stay open
+            if self._close_evt.is_set() or att.dead:
+                # a connect that finished after close() or after the attempt was abandoned
+                # must not stay open: it would hold the client id
+                self._disconnect(att)
             box.done.set()
 
     def _attempt_once(self, att: _Attempt) -> tuple[AttemptFailure | None, bool]:
@@ -651,11 +724,14 @@ class IbConnection:
             self._backlog.append(ev)
             if isinstance(ev, events.NextValidId):
                 with self._lock:
-                    if self._close_evt.is_set():  # close() won: never end READY after it
-                        raise self._closed_error()
-                    self.next_valid_id = ev.order_id
-                    self._phase = ConnState.READY
-                return None, False
+                    # Refused after a close() or when this attempt's connection already
+                    # closed (the peer closed right after nextValidId): never READY then.
+                    if self._set_phase(ConnState.READY, att):
+                        self.next_valid_id = ev.order_id
+                        return None, False
+                if self._close_evt.is_set():
+                    raise self._closed_error()
+                return AttemptFailure(n, None, "connection closed right after nextValidId"), False
             if isinstance(ev, events.IbError):
                 if ev.code == CLIENT_ID_IN_USE:
                     return AttemptFailure(n, ev.code, ev.message), True
@@ -721,7 +797,7 @@ class IbConnection:
                     return
                 att.closed_seen = True
                 if att is self._att and self._phase is ConnState.READY:
-                    self._phase = ConnState.CLOSED
+                    self._set_phase(ConnState.CLOSED)
         att.queue.put(event)
         if derived is not None:
             if isinstance(derived, ConnectionRestored) and derived.data_lost:
@@ -771,7 +847,9 @@ class IbConnection:
         2158), which does not mean the historical farm is up. `farm` is `"market"`,
         `"historical"` or `"secdef"` to wait for that kind (see `FARM_KINDS`); anything
         else raises `ValueError`. Does not consume events: they stay for `next_event`.
-        Only the messages of the current attempt count.
+        Only the messages of the current attempt count. Returns False at once (no
+        exception, no warning wait) when the connection is CLOSED: after `close()`, after
+        a peer close or after a failed `open()` the codes of the dead attempt are ignored.
         """
         if farm is None:
             wanted = DATA_FARM_CODES
@@ -783,7 +861,9 @@ class IbConnection:
         with self._farm_cond:
             while True:
                 att = self._att
-                if att is not None and att.farm_codes & wanted:
+                if self._phase is ConnState.CLOSED:
+                    return False  # closed or never opened: a dead attempt's codes do not count
+                if att is not None and att.farm_codes & wanted and self._phase is ConnState.READY:
                     return True
                 if self._clock() >= deadline:
                     self._log.warning(
@@ -882,12 +962,11 @@ class IbConnection:
             with self._lock:
                 att = self._att  # open() may have begun a newer attempt before it saw the flag
             if att is not None:
-                if att.client is not None and (att is not first or att.client.isConnected()):
-                    self._disconnect(att)
+                if att.client is not None:
+                    self._disconnect(att)  # unconditional: a client still in connect() is not "connected"
                 self._join_threads(att)
                 att.dead = True
-            with self._lock:
-                self._phase = ConnState.CLOSED
+            self._set_phase(ConnState.CLOSED)
 
     def _running_threads(self) -> str:
         names = [
