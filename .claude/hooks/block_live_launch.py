@@ -15,6 +15,12 @@ Exit-code contract:
     2  the tool call is BLOCKED; stderr is shown to the model as the reason
     any other code is a non-blocking hook error (the call proceeds)
 
+A legacy-broker-script rule (the scripts are deleted; this is a backstop): a segment
+with an interpreter token, or a path as command word, that names ``MainStoinker/testy/
+<x>.py``, ``IBAPI_TESTING.py`` or ``MainStoinker.testy`` is blocked, and so is a bare
+``testy.py`` after a ``cd`` into ``MainStoinker/testy``. Not followed: a ``cd`` made in
+an earlier call. Like the entry script, ``python -m ruff check <that .py>`` is blocked.
+
 A third rule blocks connecting ``MainStoinker`` commands (allowlist): running
 the package (``-m MainStoinker``, ``MainStoinker/__main__.py``, the directory,
 ``runpy``) is blocked unless its first positional argument is one of
@@ -82,6 +88,7 @@ from __future__ import annotations
 
 import base64
 import json
+import posixpath
 import re
 import sys
 import unicodedata
@@ -154,6 +161,13 @@ _BLOCK_MESSAGE = (
     "connect to Interactive Brokers and place real orders (see CLAUDE.md safety "
     "rules). Reading, searching, diffing or editing the file is fine."
 )
+_LEGACY_MESSAGE = (
+    "Blocked: legacy broker test script (connects to the broker when run or imported)."
+)
+_LEGACY_PATH = re.compile(r"mainstoinker/+(?:\./+)*testy/+[\w.-]+\.py\b|ibapi_testing\.py")
+_LEGACY_MODULE = re.compile(r"mainstoinker\.testy\b")
+_LEGACY_BARE = re.compile(r"(?<![\w./-])(?:\./+)?testy(?:_advanced)?\.py\b")
+_CD_WORDS = frozenset({"cd", "chdir", "pushd", "set-location", "sl"})
 _PARSE_BLOCK_MESSAGE = (
     "Blocked: the live-launch hook could not parse this tool request, and the "
     "request mentions a protected live-trading file (dum dum / data collect.bat) "
@@ -352,6 +366,21 @@ def _git_runs_args(words: list[str]) -> bool:
         if w == "-c" and i + 1 < len(words) and "=" in words[i + 1]:
             return True
     return False
+
+
+def _runs_legacy_script(segment: str, in_testy: bool) -> bool:
+    """True when an interpreter (or a path as command word) names a legacy broker script."""
+    seg = segment
+    if ".." in seg:  # resolve a/../ per token (linear)
+        seg = " ".join(posixpath.normpath(t) if ".." in t else t for t in seg.split())
+    if not (
+        _LEGACY_PATH.search(seg)
+        or _LEGACY_MODULE.search(seg)
+        or (in_testy and _LEGACY_BARE.search(seg))
+    ):
+        return False
+    words = [w for w in seg.split() if w not in _TRANSPARENT and not _ASSIGN.match(w)]
+    return _has_interpreter(seg) or bool(words and words[0].endswith(".py"))
 
 
 def _executes_launcher(segment: str) -> bool:
@@ -1181,7 +1210,13 @@ def _decide_text(command: str, depth: int) -> tuple[bool, str]:
     # The two older rules look at the text as typed and with continuation lines
     # joined: the joined form can only add blocks.
     for text in (cleaned,) if joined == cleaned else (cleaned, joined):
+        in_testy = False
         for segment in _segments(text):
+            words = segment.split()
+            if words and words[0] in _CD_WORDS:
+                in_testy = segment.rstrip("/").endswith("mainstoinker/testy")
+            elif _runs_legacy_script(segment, in_testy):
+                return True, _LEGACY_MESSAGE
             if ENTRY_NAME in segment and _has_interpreter(segment):
                 return True, _BLOCK_MESSAGE.format(what="live entry script")
             if LAUNCHER_NAME in segment and _executes_launcher(segment):
@@ -1214,7 +1249,8 @@ def _decide_text(command: str, depth: int) -> tuple[bool, str]:
 
 def _mentions_protected(text: str) -> bool:
     raw = text.lower()
-    return "dum dum" in raw or "data collect.bat" in raw
+    legacy = ("ibapi_testing", "testy.py", "testy_advanced.py")
+    return "dum dum" in raw or "data collect.bat" in raw or any(n in raw for n in legacy)
 
 
 def _mentions_package(text: str) -> bool:
