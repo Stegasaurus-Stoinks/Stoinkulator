@@ -653,7 +653,7 @@ def run_fetch_bars(
                 say(f"Closing the connection raised {type(exc).__name__}: {exc}")
         if recorder is not None:
             recorder.close()
-    for line in dict.fromkeys(advice):  # one line per distinct cause
+    for line in advice:  # each cause is added once, so each line is distinct
         say(f"What to do: {line}")
     if args.record is not None and recorder is not None:
         words = [w for w in args.private if len(w) >= 3]

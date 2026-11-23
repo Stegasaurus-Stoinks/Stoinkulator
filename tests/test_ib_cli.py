@@ -343,6 +343,7 @@ def test_a_mapping_without_a_home_folder_is_refused_before_the_gate_and_creates_
 def test_a_blank_home_variable_counts_as_missing(session: Session) -> None:
     session.env.update({"USERPROFILE": "  ", "HOME": ""})
     assert session.main("--symbols", "AAPL", *DAYS, "--port", "7497") == cli.EXIT_REFUSED
+    assert "neither USERPROFILE nor HOME" in session.text
     nothing_built(session)
 
 

@@ -370,6 +370,38 @@ def test_a_range_starting_today_in_new_york_is_not_refused_by_the_pre_check(sess
     assert code in (0, 1, 4)
 
 
+def test_a_range_that_only_ends_in_the_future_is_not_refused_by_the_pre_check(sess: Session) -> None:
+    sess.main("--symbols", "AAPL", "--start", "2024-08-12", "--end", "2030-01-11", "--port", "7497",
+              "--out", str(sess.tmp / "bars"))
+    assert "pre-check" not in sess.text and sess.connections
+
+
+def test_a_default_recording_folder_under_a_file_is_refused_before_the_gate(sess: Session) -> None:
+    home = Path(sess.env["USERPROFILE"])
+    home.mkdir(parents=True)
+    (home / "Stoinkulator").write_text("a file", encoding="utf-8")
+    assert sess.main(*argv_for(sess)) == 2
+    assert "recording folder" in sess.text and "lies under the file" in sess.text
+    assert not sess.prompts and not sess.connections
+    assert not (sess.tmp / "bars").exists()
+
+
+def test_a_connect_that_raises_something_unexpected_advises_checking_the_port(sess: Session) -> None:
+    class Broken:
+        def open(self) -> None:
+            raise RuntimeError("boom")
+
+        def close(self) -> None:
+            pass
+
+    code = cli.main(argv_for(sess), env=sess.env, stdin=Tty(True), input_fn=sess.input_fn, out=sess.out,
+                    connection_factory=lambda a, o: Broken(),  # type: ignore[arg-type,return-value]
+                    market_data_factory=sess.market_data_factory, recorder_factory=sess.recorder_factory,
+                    clock=sess.clock, sleep=sess.sleep, today=date(2024, 8, 21))
+    assert code == cli.EXIT_NO_CONNECTION
+    assert advice_lines(sess) == [f"What to do: {cli.ADVICE_CONNECT}"]
+
+
 def test_a_weekend_only_range_is_refused_before_connecting_and_says_so(sess: Session) -> None:
     code = sess.main("--symbols", "AAPL", "--start", "2024-08-17", "--end", "2024-08-18", "--port", "7497",
                      "--out", str(sess.tmp / "bars"))
@@ -521,17 +553,21 @@ def test_findings_are_listed_by_line_and_reason_never_by_the_matched_text(sess: 
         sess.recorders.append(recorder)
         return recorder
 
-    for day in (13, 14):
+    for day in (12, 13, 14, 15, 16):
         sess.rig.script(date(2024, 8, day), error_behaviour(321, f"bad request from {user}"))
     code = cli.main(
-        argv_for(sess), env=sess.env, stdin=Tty(True), input_fn=sess.input_fn, out=sess.out,
-        connection_factory=sess.connection_factory, market_data_factory=sess.market_data_factory,
-        recorder_factory=bare_recorder, clock=sess.clock, sleep=sess.sleep, today=date(2024, 8, 21))
+        ["--symbols", "AAPL,MSFT", "--start", "2024-08-12", "--end", "2024-08-16", "--port", "7497",
+         "--out", str(sess.tmp / "bars")], env=sess.env, stdin=Tty(True), input_fn=sess.input_fn,
+        out=sess.out, connection_factory=sess.connection_factory,
+        market_data_factory=sess.market_data_factory, recorder_factory=bare_recorder,
+        clock=sess.clock, sleep=sess.sleep, today=date(2024, 8, 21))
     assert code == 1
     shown = [line for line in sess.text.splitlines() if line.startswith("  line ")]
-    assert shown and len(shown) <= cli.SHOWN_FINDINGS
+    found = scan_recording(sess.recording, [user])
+    assert len(found) > cli.SHOWN_FINDINGS  # more than are shown
+    assert shown == [f"  line {f.line}: {f.reason}" for f in found[:cli.SHOWN_FINDINGS]]  # nothing else
+    assert f"  ... and {len(found) - cli.SHOWN_FINDINGS} more" in sess.text
     assert "Where to look" in sess.text
-    assert all(user not in line for line in shown)  # line number and reason only
 
 
 # -- fix round: the new driver states, advice, the symbol cap, the settle option ---------------------------
