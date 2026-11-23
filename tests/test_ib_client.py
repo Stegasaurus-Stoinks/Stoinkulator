@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from ibapi import message as ibapi_message
 from ibapi.client import EClient
-from ibapi.common import PROTOBUF_MSG_ID, BarData, TickAttrib
+from ibapi.common import PROTOBUF_MSG_ID, PROTOBUF_MSG_IDS, BarData, TickAttrib
 from ibapi.contract import Contract, ContractDetails
 from ibapi.order import Order
 from ibapi.order_cancel import OrderCancel
@@ -25,10 +25,10 @@ from ibapi.wrapper import EWrapper
 
 from MainStoinker.ib import events
 from MainStoinker.ib.client import (
+    ALLOWED_MESSAGE_IDS,
     ORDER_MESSAGE_IDS,
-    REFUSED_MESSAGE_IDS,
     DataOnlyClient,
-    OrderPathRefused,
+    MessageRefused,
 )
 from MainStoinker.Util.broker_guard import BrokerPortRefused
 from tests.conftest import BrokerConnectionBlockedUnderPytest
@@ -165,12 +165,39 @@ def _eclient_methods_sending_order_messages() -> set[str]:
             if uses.search(inspect.getsource(fn))}
 
 
-def test_refused_ids_cover_every_order_message_of_the_installed_ibapi():
+ORDER_AND_PROTOBUF_IDS = sorted(
+    set(ORDER_MESSAGE_IDS) | {i + PROTOBUF_MSG_ID for i in ORDER_MESSAGE_IDS}
+)
+
+
+def test_order_ids_cover_every_order_message_of_the_installed_ibapi():
     ids = set(_order_message_names().values())
     assert ids == {3, 4, 21, 58}
     assert set(ORDER_MESSAGE_IDS) == ids
-    assert set(REFUSED_MESSAGE_IDS) == ids | {i + PROTOBUF_MSG_ID for i in ids}
     assert PROTOBUF_MSG_ID == 200
+    assert not (set(ORDER_AND_PROTOBUF_IDS) & ALLOWED_MESSAGE_IDS)
+
+
+def test_allowlist_is_exactly_the_ten_stage_one_ids_by_number():
+    # An ibapi upgrade that renumbers OUT must fail here, not silently re-point the list.
+    named = {
+        "REQ_MKT_DATA": 1, "CANCEL_MKT_DATA": 2, "REQ_CONTRACT_DATA": 9,
+        "REQ_HISTORICAL_DATA": 20, "CANCEL_HISTORICAL_DATA": 25, "REQ_CURRENT_TIME": 49,
+        "REQ_MARKET_DATA_TYPE": 59, "START_API": 71, "REQ_HEAD_TIMESTAMP": 87,
+        "CANCEL_HEAD_TIMESTAMP": 90,
+    }
+    for name, number in named.items():
+        assert getattr(ibapi_message.OUT, name) == number, name
+    assert ALLOWED_MESSAGE_IDS == frozenset(named.values())
+    assert isinstance(ALLOWED_MESSAGE_IDS, frozenset)
+
+
+def test_no_allowed_id_has_a_protobuf_form_in_the_installed_ibapi():
+    # sendMsgProtoBuf refuses everything. If an upgrade gives an allowed id a
+    # protobuf form, a human must decide how to allow it.
+    assert not (set(PROTOBUF_MSG_IDS) & ALLOWED_MESSAGE_IDS)
+    assert set(PROTOBUF_MSG_IDS) == {
+        ibapi_message.OUT.REQ_EXECUTIONS, 3, 4, 58}
 
 
 def test_every_eclient_order_method_is_known_to_this_test():
@@ -207,19 +234,19 @@ class _Proto:
 def test_order_messages_refused_before_the_socket(method, server_version):
     client, _ = make_client()
     stub = with_stub(client, server_version)
-    with pytest.raises(OrderPathRefused):
+    with pytest.raises(MessageRefused):
         _order_calls(client)[method]()
     assert stub.sent == []
 
 
 @pytest.mark.parametrize("server_version", [BELOW_PROTOBUF, AT_PROTOBUF])
-@pytest.mark.parametrize("msg_id", sorted(REFUSED_MESSAGE_IDS))
+@pytest.mark.parametrize("msg_id", ORDER_AND_PROTOBUF_IDS)
 def test_send_paths_refuse_every_order_message_id(msg_id, server_version):
     client, _ = make_client()
     stub = with_stub(client, server_version)
-    with pytest.raises(OrderPathRefused):
+    with pytest.raises(MessageRefused):
         client.sendMsg(msg_id, "x")
-    with pytest.raises(OrderPathRefused):
+    with pytest.raises(MessageRefused):
         client.sendMsgProtoBuf(msg_id, b"x")
     assert stub.sent == []
 
@@ -228,7 +255,7 @@ def test_send_paths_refuse_every_order_message_id(msg_id, server_version):
 def test_send_paths_fail_closed_on_non_int_ids(bad_id):
     client, _ = make_client()
     stub = with_stub(client, AT_PROTOBUF)
-    with pytest.raises(OrderPathRefused):
+    with pytest.raises(MessageRefused):
         client.sendMsg(bad_id, "x")
     assert stub.sent == []
 
@@ -248,8 +275,8 @@ def test_data_messages_pass_the_filter(server_version):
 
 
 def test_refusal_is_not_an_oserror():
-    assert issubclass(OrderPathRefused, RuntimeError)
-    assert not issubclass(OrderPathRefused, OSError)
+    assert issubclass(MessageRefused, RuntimeError)
+    assert not issubclass(MessageRefused, OSError)
 
 
 # -- callbacks ----------------------------------------------------------------
