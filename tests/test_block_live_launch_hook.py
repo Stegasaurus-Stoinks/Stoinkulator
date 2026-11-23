@@ -526,3 +526,404 @@ def test_script_uses_only_stdlib() -> None:
             modules.add(node.module.split(".")[0])
     assert modules
     assert modules <= set(sys.stdlib_module_names)
+
+
+# --- T10: connecting MainStoinker commands -------------------------------------
+# Allowlist rule: a MainStoinker program run is blocked unless its first
+# positional argument is backtest / runs / report / serve (or absent).
+
+VENV_PY = ".venv\\Scripts\\python.exe"
+SPACED_PY = '"C:\\Program Files\\Python 3.14\\python.exe"'
+CONNECTING_SUBCOMMANDS = ["fetch-bars", "probe-data", "run", "frobnicate", "Fetch-Bars"]
+OFFLINE_SUBCOMMANDS = ["backtest", "runs", "report", "serve"]
+
+_INTERPRETER_PREFIXES = [
+    "python",
+    "python3",
+    "python3.14",
+    "py -3.14",
+    "py",
+    "pythonw",
+    "PYTHON.EXE",
+    VENV_PY,
+    ".venv/Scripts/python.exe",
+    f'"{VENV_PY}"',
+    f"& \"{VENV_PY}\"",
+    SPACED_PY,
+    "C:/Users/x/AppData/Local/Python/pythoncore-3.14-64/python.exe",
+    "python -X dev",
+    "python -X utf8 -W ignore -u",
+    "python -B -I",
+    "uv run python",
+    "uv run --python .venv/Scripts/python.exe python",
+    "uv run",
+    "pipx run python",
+    "VAR=x python",
+    "PYTHONPATH=. PYTHONUTF8=1 python",
+    "env FOO=1 python",
+    "nohup python",
+    "timeout 5 python",
+    "sudo python",
+    "  python",
+]
+
+
+def _mod(prefix: str, sub: str, module: str = "MainStoinker") -> str:
+    return f"{prefix} -m {module} {sub}".rstrip()
+
+
+def test_blocks_connecting_subcommands() -> None:
+    for sub in CONNECTING_SUBCOMMANDS:
+        for prefix in _INTERPRETER_PREFIXES:
+            cmd = _mod(prefix, sub)
+            assert hook.decide(cmd)[0] is True, cmd
+        forms = [
+            f"python -m MainStoinker {sub} --symbol AAPL --month 2026-01",
+            f"python -m  MainStoinker   {sub}",
+            f"python\t-m MainStoinker {sub}",
+            f"python -m mainstoinker {sub}",
+            f"python -m MAINSTOINKER {sub.upper()}",
+            f"python -mMainStoinker {sub}",
+            f"python -Im MainStoinker {sub}",
+            f"python -m MainStoinker.__main__ {sub}",
+            f"python -m MainStoinker.engine.cli {sub}",
+            f"python -X dev -m MainStoinker {sub}",
+            f"python -W error -X utf8 -m MainStoinker {sub}",
+            f"py -3.14 -m MainStoinker {sub}",
+            f"python -m MainStoinker --verbose {sub}",
+            f"python -m MainStoinker -- {sub}",
+            f"python -m MainStoinker --db x.db {sub}",
+            f'python -m MainStoinker "{sub}"',
+            f"python -m MainStoinker '{sub}'",
+            f"python -m MainStoinker {sub} 2>&1",
+            f"python -m MainStoinker 2>&1 {sub}",
+            f"python -m MainStoinker > out.txt {sub}",
+            f"(python -m MainStoinker {sub})",
+            f"$(python -m MainStoinker {sub})",
+            f"{{ python -m MainStoinker {sub}; }}",
+            f"python -m MainStoinker {sub} &",
+            # chaining
+            f"git status; python -m MainStoinker {sub}",
+            f"git status && python -m MainStoinker {sub}",
+            f"git status || python -m MainStoinker {sub}",
+            f"git status | python -m MainStoinker {sub}",
+            f"git status & python -m MainStoinker {sub}",
+            f"echo hi\npython -m MainStoinker {sub}\necho done",
+            f"python -m MainStoinker backtest ; python -m MainStoinker {sub}",
+            f"python -m MainStoinker {sub} && git status",
+            # environment-variable prefixes
+            f'$env:STOINK_X="1"; python -m MainStoinker {sub}',
+            f'$env:STOINK_X = "1"; & "{VENV_PY}" -m MainStoinker {sub}',
+            f"set STOINK_X=1 && python -m MainStoinker {sub}",
+            f"VAR=x python -m MainStoinker {sub}",
+            # nesting
+            f'bash -c "python -m MainStoinker {sub}"',
+            f"bash -c 'git status; python -m MainStoinker {sub}'",
+            f'bash -lc "python -m MainStoinker {sub}"',
+            f'sh -c "{VENV_PY} -m MainStoinker {sub}"',
+            f'cmd /c "python -m MainStoinker {sub}"',
+            f'cmd.exe /d /s /c "python -m MainStoinker {sub}"',
+            f'cmd //c "python -m MainStoinker {sub}"',
+            f'powershell -Command "python -m MainStoinker {sub}"',
+            f"powershell.exe -NoProfile -Command \"& '{VENV_PY}' -m MainStoinker {sub}\"",
+            f'pwsh -c "python -m MainStoinker {sub}"',
+            f'powershell -Command "$env:X=\'1\'; python -m MainStoinker {sub}"',
+            f"bash -c \"bash -c 'python -m MainStoinker {sub}'\"",
+            f'cmd /c powershell -Command "python -m MainStoinker {sub}"',
+            f'eval "python -m MainStoinker {sub}"',
+            f"xargs python -m MainStoinker {sub}",
+            f"find . -name x -exec python -m MainStoinker {sub} ;",
+            f'git -c alias.x="!python -m MainStoinker {sub}" x',
+            # paths with spaces, both slashes, upper and lower case
+            f'python "MainStoinker/__main__.py" {sub}',
+            f'python "MainStoinker\\__main__.py" {sub}',
+            f"python MainStoinker/__main__.py {sub}",
+            f"python MAINSTOINKER\\__MAIN__.PY {sub}",
+            f'python "C:\\Users\\Paul Wilda\\Documents\\Stonks\\MainStoinker\\__main__.py" {sub}',
+            f'{VENV_PY} "C:/Users/Paul Wilda/OneDrive - 28 Gorilla/Stonks/MainStoinker/__main__.py" {sub}',
+            f"& \"{VENV_PY}\" 'C:\\x y\\MainStoinker\\__main__.py' {sub}",
+            f"python -X dev MainStoinker/__main__.py {sub}",
+            f"uv run MainStoinker/__main__.py {sub}",
+            f"python MainStoinker {sub}",
+            f"python MainStoinker/ {sub}",
+            f'python "C:\\x y\\MainStoinker" {sub}',
+            f"python -u .\\MainStoinker {sub}",
+            # the subcommand hidden from the text
+            "python -m MainStoinker $SUB",
+            'python -m MainStoinker "$@"',
+            "python -m MainStoinker $env:SUB",
+            "python -m MainStoinker %SUB%",
+            "python -m MainStoinker $1",
+            "python -m MainStoinker $(echo fetch-bars)",
+            "python -m MainStoinker `echo fetch-bars`",
+        ]
+        for cmd in forms:
+            assert hook.decide(cmd)[0] is True, cmd
+
+
+def test_blocked_connecting_message_names_why_and_owner() -> None:
+    blocked, reason = hook.decide("python -m MainStoinker fetch-bars")
+    assert blocked
+    assert "\n" not in reason.strip()
+    assert "fetch-bars" in reason
+    assert "owner" in reason
+
+
+def test_blocks_connecting_main_payload(capsys: pytest.CaptureFixture[str]) -> None:
+    for tool in ("Bash", "PowerShell"):
+        assert hook.main(_payload("python -m MainStoinker probe-data", tool)) == 2
+        assert "owner" in capsys.readouterr().err
+    assert hook.main(_payload("python -m MainStoinker backtest --help")) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_allows_offline_subcommands() -> None:
+    for sub in OFFLINE_SUBCOMMANDS:
+        for prefix in _INTERPRETER_PREFIXES:
+            cmd = _mod(prefix, sub)
+            assert hook.decide(cmd) == (False, ""), cmd
+        for cmd in (
+            f"python -m MainStoinker {sub} --db x.db --json",
+            f"git status && python -m mainstoinker {sub}",
+            f'bash -c "python -m MainStoinker {sub}"',
+            f'powershell -Command "python -m MainStoinker {sub}"',
+            f"python MainStoinker/__main__.py {sub}",
+            f'python "C:\\x y\\MainStoinker\\__main__.py" {sub}',
+            f"python -X dev -m MainStoinker {sub} 2>&1",
+            f"(python -m MainStoinker {sub})",
+            f"python -m MainStoinker --version {sub}",
+        ):
+            assert hook.decide(cmd) == (False, ""), cmd
+    for cmd in (
+        "python -m MainStoinker",
+        "python -m MainStoinker --help",
+        "python -m MainStoinker -h",
+        "python -m MainStoinker 2>&1",
+        f"{VENV_PY} -m MainStoinker",
+        "py -3.14 -m MainStoinker --help",
+        'bash -c "python -m MainStoinker"',
+        "python -m MainStoinker.api.serve",
+        "python -m MainStoinker.engine.sim_broker",
+        "python -m pytest tests/test_engine_cli.py",
+        "python -m pytest -m slow",
+        "python -m ruff check MainStoinker/__main__.py",
+        "uv run ruff check MainStoinker/__main__.py",
+        "uv run pytest MainStoinker/__main__.py",
+        "ruff check tests MainStoinker/engine MainStoinker/__main__.py --select E,F,W,I,B",
+        f"{VENV_PY} -m ruff check MainStoinker/engine",
+        f"{VENV_PY} -m pytest MainStoinker",
+        "python -m pytest MainStoinker/testy",
+        "python tools/lint.py MainStoinker/engine",
+    ):
+        assert hook.decide(cmd) == (False, ""), cmd
+
+
+IB_BLOCKED = [
+    "python -m MainStoinker.ib",
+    "python -m MainStoinker.ib.cli",
+    "python -m MainStoinker.ib.cli fetch-bars",
+    "python -m MainStoinker.ib.connection --help",
+    "python -m mainstoinker.ib.cli",
+    "python -m MAINSTOINKER.IB.CLI",
+    "python -mMainStoinker.ib.cli",
+    "python -X dev -m MainStoinker.ib.cli",
+    "py -3.14 -m MainStoinker.ib.cli",
+    f"{VENV_PY} -m MainStoinker.ib.cli",
+    f'"{VENV_PY}" -m MainStoinker.ib.cli',
+    f"& \"{VENV_PY}\" -m MainStoinker.ib.cli",
+    f"{SPACED_PY} -m MainStoinker.ib.cli",
+    "uv run -m MainStoinker.ib.cli",
+    "uv run python -m MainStoinker.ib.cli",
+    "pipx run python -m MainStoinker.ib.cli",
+    "VAR=x python -m MainStoinker.ib.cli",
+    '$env:X="1"; python -m MainStoinker.ib.cli',
+    "git status; python -m MainStoinker.ib.cli",
+    "git status && python -m MainStoinker.ib.cli",
+    "git status || python -m MainStoinker.ib.cli",
+    "git status | python -m MainStoinker.ib.cli",
+    'bash -c "python -m MainStoinker.ib.cli"',
+    'sh -c "python -m MainStoinker.ib.cli"',
+    'cmd /c "python -m MainStoinker.ib.cli"',
+    'powershell -Command "python -m MainStoinker.ib.cli"',
+    'pwsh -c "python -m MainStoinker.ib.cli"',
+    'python -c "import MainStoinker.ib.connection"',
+    "python -c 'import MainStoinker.ib.connection'",
+    'python -c "from MainStoinker.ib import connection"',
+    'python -c "from MainStoinker.ib.connection import Conn; Conn().connect()"',
+    'python -c "from MainStoinker import ib"',
+    'python -c "import MainStoinker.ib"',
+    'python -c "import MainStoinker . ib"',
+    'python -c "import os; import MainStoinker.ib.cli as c"',
+    'python -c "import os; from MainStoinker.ib import connection"',
+    "python -c \"import importlib; importlib.import_module('MainStoinker.ib.connection')\"",
+    "python -c \"__import__('MainStoinker.ib.connection')\"",
+    "python -c \"import runpy; runpy.run_module('MainStoinker.ib.cli', run_name='__main__')\"",
+    "python -c \"import runpy; runpy.run_path('MainStoinker/ib/cli.py')\"",
+    "python MainStoinker/ib/cli.py",
+    "python MainStoinker\\ib\\cli.py fetch-bars",
+    '"C:\\Program Files\\Python\\python.exe" "C:\\Users\\Paul Wilda\\Stonks\\MainStoinker\\ib\\cli.py"',
+    "python -X dev MainStoinker/ib/cli.py",
+    "python - <<'EOF'\nimport MainStoinker.ib.connection\nEOF",
+    "python <<EOF\nfrom MainStoinker.ib import connection\nEOF",
+    'python -i -c "import MainStoinker.ib.connection"',
+    f"bash -c \"{VENV_PY} -c 'import MainStoinker.ib.connection'\"",
+    'git status; python -c "import MainStoinker.ib.connection"',
+]
+
+
+@pytest.mark.parametrize("command", IB_BLOCKED)
+def test_blocks_ib_module_runs(command: str) -> None:
+    blocked, reason = hook.decide(command)
+    assert blocked is True, command
+    assert "owner" in reason
+
+
+# Runs of the package from code: the subcommand is not visible in the text,
+# so the hook blocks them all rather than guess.
+RUNPY_BLOCKED = [
+    "python -c \"import runpy; runpy.run_module('MainStoinker', run_name='__main__')\"",
+    "python -c \"import runpy; runpy.run_module('MainStoinker')\" fetch-bars",
+    "python -c \"import runpy as r; r.run_module('MainStoinker', run_name='__main__')\"",
+    "python -c \"import sys; sys.argv=['x','fetch-bars']; import runpy; "
+    "runpy.run_module('MainStoinker', run_name='__main__')\"",
+    "python -c \"import runpy; runpy.run_path('MainStoinker/__main__.py', run_name='__main__')\"",
+    "python -c \"import runpy; runpy.run_path('MainStoinker\\\\__main__.py')\"",
+    "python -c \"import importlib; importlib.import_module('MainStoinker.__main__')\"",
+    'python -c "import MainStoinker.__main__"',
+    "python -c \"exec(open('MainStoinker/__main__.py').read())\"",
+    "python -c \"import subprocess; subprocess.run(['python','-m','MainStoinker','fetch-bars'])\"",
+    "python -c \"import os; os.system('python -m MainStoinker fetch-bars')\"",
+    "uv run python -c \"import runpy; runpy.run_module('MainStoinker')\"",
+    f"{VENV_PY} -c \"import runpy; runpy.run_module('MainStoinker')\"",
+    "python - <<'EOF'\nimport runpy\nrunpy.run_module('MainStoinker')\nEOF",
+]
+
+
+@pytest.mark.parametrize("command", RUNPY_BLOCKED)
+def test_blocks_runpy_runs_of_the_package(command: str) -> None:
+    assert hook.decide(command)[0] is True, command
+
+
+def test_allows_pytest_and_ruff_on_ib_files() -> None:
+    for cmd in (
+        "python -m pytest tests/test_ib_connection.py",
+        "python -m pytest tests/test_ib_connection.py -q -x",
+        f"{VENV_PY} -m pytest tests/test_ib_connection.py",
+        f"{VENV_PY} -m pytest MainStoinker/ib",
+        "python -m pytest MainStoinker/ib/tests",
+        "python -m pytest -m slow tests/test_ib_cli.py",
+        "python -m pytest tests/ -k ib",
+        "python -m pytest --cov=MainStoinker.ib tests/test_ib_connection.py",
+        "python -m pytest tests/test_ib_connection.py::test_connect",
+        "ruff check MainStoinker/ib",
+        "ruff check MainStoinker\\ib tests",
+        f"{VENV_PY.replace('python', 'ruff')} check MainStoinker/ib",
+        f"{VENV_PY} -m ruff check MainStoinker/ib",
+        "python -m ruff check MainStoinker/ib --select E,F,W,I,B",
+        "python -m ruff format MainStoinker/ib/connection.py",
+        "uv run ruff check MainStoinker/ib",
+        "uv run pytest tests/test_ib_connection.py",
+        "ruff check tests MainStoinker/engine MainStoinker/ib --select E,F,W,I,B",
+        "python -m mypy MainStoinker/ib",
+        "git add MainStoinker/ib/connection.py tests/test_ib_connection.py",
+        "git diff -- MainStoinker/ib",
+        "cat MainStoinker/ib/connection.py",
+        "grep -rn connect MainStoinker/ib",
+        'rg -n "import MainStoinker.ib" tests',
+        'rg "from MainStoinker.ib import" .',
+        "git grep -n MainStoinker.ib",
+        'Select-String -Path tests/*.py -Pattern "MainStoinker.ib"',
+        "Get-Content MainStoinker/ib/connection.py",
+        "ls MainStoinker/ib",
+        "code MainStoinker/ib/connection.py",
+        "git status && python -m pytest tests/test_ib_connection.py",
+        'bash -c "python -m pytest tests/test_ib_connection.py"',
+        'powershell -Command "ruff check MainStoinker/ib"',
+    ):
+        assert hook.decide(cmd) == (False, ""), cmd
+
+
+def test_commit_message_naming_fetch_bars_allowed() -> None:
+    for cmd in (
+        'git commit -m "Add fetch-bars: python -m MainStoinker fetch-bars writes monthly files"',
+        'git commit -m "x" -m "python -m MainStoinker probe-data and MainStoinker.ib.cli"',
+        'git commit -am "python -m MainStoinker run"',
+        'git commit --message="python -m MainStoinker fetch-bars"',
+        "git commit -q -F - <<'EOF'\npython -m MainStoinker fetch-bars\nEOF",
+        "git commit -m \"$(cat <<'EOF'\nfix: python -m MainStoinker.ib.cli\nEOF\n)\"",
+        'gh pr create --title "T10" --body "Blocks python -m MainStoinker fetch-bars"',
+        'gh issue comment 123 --body "python -m MainStoinker run is blocked"',
+        "gh pr create --body-file - <<'X'\npython -m MainStoinker run\nX",
+        'echo "python -m MainStoinker fetch-bars"',
+        "echo run python -m MainStoinker probe-data",
+        'printf "python -m MainStoinker run"',
+        'Write-Output "python -m MainStoinker fetch-bars"',
+        'grep -rn "python -m MainStoinker fetch-bars" docs',
+        "grep -n 'MainStoinker.ib' -r .",
+        'rg -n "-m MainStoinker run" docs',
+        'rg "MainStoinker fetch-bars"',
+        'Select-String -Path docs/*.md -Pattern "-m MainStoinker run"',
+        'git log --grep="fetch-bars"',
+        'git log -S "python -m MainStoinker fetch-bars"',
+        'git grep -n "python -m MainStoinker run"',
+        "cat docs/specs/live-side.md",
+        "head -50 MainStoinker/__main__.py",
+        "git diff -- MainStoinker/__main__.py",
+        "git show HEAD:MainStoinker/__main__.py",
+        "ls MainStoinker",
+        "python -m pytest tests -k fetch_bars",
+        "python -m pytest tests/test_fetch_bars.py tests/test_probe_data.py",
+        'echo "python -m MainStoinker fetch-bars"; git status',
+    ):
+        assert hook.decide(cmd) == (False, ""), cmd
+
+
+def test_message_text_does_not_hide_a_real_run() -> None:
+    for cmd in (
+        'git commit -m "x" && python -m MainStoinker fetch-bars',
+        'git commit -m "x"; python -m MainStoinker run',
+        "gh pr view 1 && python -m MainStoinker probe-data",
+        'git commit -m "$(python -m MainStoinker fetch-bars)"',
+        'echo "$(python -m MainStoinker fetch-bars)"',
+        "echo `python -m MainStoinker fetch-bars`",
+        "echo hi | python -m MainStoinker fetch-bars",
+        "echo hi; python -m MainStoinker fetch-bars",
+        "echo (python -m MainStoinker fetch-bars)",
+        "git commit -F - <<'EOF'\nmsg\nEOF\npython -m MainStoinker fetch-bars",
+        "bash <<'EOF'\npython -m MainStoinker fetch-bars\nEOF",
+        'git -c core.editor="python -m MainStoinker fetch-bars" commit',
+        'git rebase --exec="python -m MainStoinker run" HEAD~1',
+        'git commit -m "python -m MainStoinker fetch-bars',  # unterminated: scanned
+    ):
+        assert hook.decide(cmd)[0] is True, cmd
+
+
+def test_existing_rules_still_fire_alongside_the_new_one() -> None:
+    assert hook.decide(f'python "{ENTRY}"')[0] is True
+    assert hook.decide(f'cmd /c "{BAT}"')[0] is True
+    assert hook.decide("python -m MainStoinker backtest && python -m MainStoinker run")[0]
+
+
+def test_connecting_rule_fails_closed_on_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(segment: str) -> str | None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hook, "_scan_connecting", boom)
+    assert hook.decide("python -m MainStoinker backtest")[0] is True
+    assert hook.decide("git status") == (False, "")
+
+
+def test_connecting_rule_is_fast_on_adversarial_input() -> None:
+    for cmd in (
+        "python -m MainStoinker " + "-x " * 100_000,
+        "python -m MainStoinker " + "> " * 100_000,
+        ("python -m MainStoinker backtest; " * 20_000),
+        "MainStoinker " * 100_000,
+        "python " + "MainStoinker/ib " * 50_000,
+        "echo " + "mainstoinker.ib " * 50_000,
+    ):
+        start = time.perf_counter()
+        hook.decide(cmd)
+        assert time.perf_counter() - start < 5.0

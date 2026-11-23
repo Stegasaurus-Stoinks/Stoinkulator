@@ -15,6 +15,16 @@ Exit-code contract:
     2  the tool call is BLOCKED; stderr is shown to the model as the reason
     any other code is a non-blocking hook error (the call proceeds)
 
+A third rule blocks connecting ``MainStoinker`` commands (allowlist): running
+the package (``-m MainStoinker``, ``MainStoinker/__main__.py``, the directory,
+``runpy``) is blocked unless its first positional argument is one of
+``backtest``, ``runs``, ``report``, ``serve`` (or there is none); anything under
+``MainStoinker.ib`` run or imported from code is blocked; runpy/import/exec/
+subprocess text that names MainStoinker is blocked, because the subcommand is
+not visible there. Only the owner runs connecting commands. Not seen: a script
+or file that itself imports and runs the package, ``-EncodedCommand``,
+``bash script.sh``, aliases/functions, building the module name dynamically.
+
 Reading, searching, diffing, linting and editing the protected files is
 allowed; only EXECUTING them is blocked. Commit / issue / PR message text of
 ``git`` and ``gh`` commands (``-m``, ``--message``, ``-b``, ``--body``, ``-t``,
@@ -363,14 +373,189 @@ def _executes_launcher(segment: str) -> bool:
     return pre.endswith("/") and ("/" in pre_tokens[0] or ":" in pre_tokens[0])
 
 
+# --- connecting MainStoinker commands -----------------------------------------
+# Allowlist: only these subcommands of ``python -m MainStoinker`` are known to
+# work offline. Any other first positional argument (fetch-bars, probe-data,
+# run, a future command, a variable) is blocked, as is anything under
+# ``MainStoinker.ib``. Segments are already lower-cased, forward-slashed and
+# unquoted (see ``_normalise``).
+_OFFLINE_SUBCOMMANDS = frozenset({"backtest", "runs", "report", "serve"})
+_PACKAGE_MODULES = frozenset(
+    {
+        "mainstoinker",
+        "mainstoinker.__main__",
+        "mainstoinker.engine.cli",
+        "mainstoinker.engine.__main__",
+    }
+)
+_SHELL_WRAPPERS = frozenset(
+    {"bash", "sh", "zsh", "dash", "cmd", "powershell", "pwsh", "eval"}
+)
+_WRAPPER_SWITCH = re.compile(r"^(?:-[a-z]*c|-command|-c|/[ck]|//[ck])$", re.I)
+_MODULE_FLAG = re.compile(r"^(?:-[a-z]*m|--module)$")
+_MODULE_ATTACHED = re.compile(r"^-[a-z]*m(mainstoinker\S*)$")
+_CODE_FLAG = re.compile(r"^-[a-z]*c$")
+_REDIRECT = re.compile(r"^(?:\d*[<>]|&>)")
+_REDIRECT_BARE = re.compile(r"^(?:\d*>>?|\d*<|&>>?)$")
+_IB_DOTTED = re.compile(r"mainstoinker\s*\.\s*ib(?![\w])")
+_IB_FROM_IMPORT = re.compile(r"from mainstoinker import [^;]*(?<![\w])ib(?![\w])")
+_IB_PATH = re.compile(r"mainstoinker/ib(?:/|(?![\w]))")
+_CODE_MARKERS = (
+    "runpy", "run_module", "run_path", "import_module", "__import__",
+    "importlib", "exec(", "eval(", "subprocess", "os.system", "os.exec",
+    "os.spawn", "os.popen",
+)  # fmt: skip
+# Read-only commands whose arguments are text, not code (``sed`` and ``awk``
+# can run commands, so they do not count).
+_TEXT_COMMANDS = _READERS - {"sed", "awk"}
+_EXECUTING_TEXT = re.compile(r"\$\(|`|\(\s*(?:&\s*)?\S*(?:python|py\b|uv |pipx )")
+_HARMLESS_TOOLS = frozenset(
+    {
+        "ruff", "pytest", "py.test", "mypy", "pyright", "flake8", "black",
+        "isort", "pylint", "check", "format", "coverage", "compileall",
+    }
+)  # fmt: skip
+_CONNECT_MESSAGE = (
+    "Blocked: {what}. It can connect to Interactive Brokers (only backtest, "
+    "runs, report and serve are allowed) and only the owner runs connecting "
+    "commands (see CLAUDE.md safety rules)."
+)
+
+
+def _first_positional(args: list[str]) -> str | None:
+    """First argument that is not an option or a redirect; None when there is none."""
+    skip = False
+    for raw in args:
+        if skip:
+            skip = False
+            continue
+        if _REDIRECT_BARE.match(raw):
+            skip = True
+            continue
+        if _REDIRECT.match(raw) or raw.startswith("-"):
+            continue
+        word = raw.rstrip(")}`;")
+        if word:
+            return word
+    return None
+
+
+def _check_subcommand(args: list[str], what: str) -> str | None:
+    sub = _first_positional(args)
+    if sub is None or sub in _OFFLINE_SUBCOMMANDS:
+        return None
+    return f"`{what}` with subcommand `{sub}`"
+
+
+def _harmless_before(toks: list[str], idx: int) -> bool:
+    """A lint/test tool named before position idx (``ruff check <file>``)."""
+    for k in range(idx):
+        if toks[k] in _HARMLESS_TOOLS and not (k and toks[k - 1].startswith("-")):
+            return True
+    return False
+
+
+def _scan_connecting(segment: str) -> str | None:
+    toks = segment.split()
+    # Module runs: -m MainStoinker[.x] / -mMainStoinker.
+    module_mode = False
+    for i, tok in enumerate(toks):
+        mod = None
+        rest_at = i + 1
+        if _MODULE_FLAG.match(tok) and i + 1 < len(toks):
+            mod = toks[i + 1]
+            rest_at = i + 2
+        else:
+            attached = _MODULE_ATTACHED.match(tok)
+            if attached:
+                mod = attached.group(1)
+        if mod is None:
+            continue
+        module_mode = True
+        mod = mod.strip("()[],;'`")
+        if mod == "mainstoinker.ib" or mod.startswith("mainstoinker.ib."):
+            return f"`-m {mod}` runs the broker (MainStoinker.ib) code"
+        if mod in _PACKAGE_MODULES:
+            why = _check_subcommand(toks[rest_at:], "-m MainStoinker")
+            if why:
+                return why
+    # Script runs: .../MainStoinker/__main__.py, the package directory, and
+    # files under MainStoinker/ib. Not when the program is a module (-m ruff)
+    # or a lint/test tool named before the path.
+    if not module_mode and _has_interpreter(segment):
+        for i, tok in enumerate(toks):
+            if _harmless_before(toks, i):
+                break
+            if tok.endswith("mainstoinker/__main__.py"):
+                why = _check_subcommand(toks[i + 1 :], "MainStoinker/__main__.py")
+                if why:
+                    return why
+            elif re.fullmatch(r"(?:.*/)?mainstoinker/?", tok):
+                why = _check_subcommand(toks[i + 1 :], "the MainStoinker directory")
+                if why:
+                    return why
+            elif _IB_PATH.search(tok):
+                return "running a file under MainStoinker/ib (broker code)"
+    # Code: runpy / import of the package, or of MainStoinker.ib.
+    marker = any(m in segment for m in _CODE_MARKERS)
+    in_code = (
+        marker
+        or segment.startswith(("import ", "from "))
+        or (_has_interpreter(segment) and any(_CODE_FLAG.match(t) for t in toks))
+    )
+    if in_code:
+        if marker:
+            return "running MainStoinker from code (runpy, import, exec, subprocess)"
+        if (
+            _IB_DOTTED.search(segment)
+            or _IB_FROM_IMPORT.search(segment)
+            or _IB_PATH.search(segment)
+        ):
+            return "importing MainStoinker.ib (broker code)"
+        if "mainstoinker.__main__" in segment or "mainstoinker/__main__" in segment:
+            return "importing MainStoinker.__main__"
+    return None
+
+
+def _connecting_reason(segment: str, text_ok: bool = True) -> str | None:
+    """Why this segment runs a connecting MainStoinker command, else None."""
+    if "mainstoinker" not in segment:
+        return None
+    base = _first_word(segment)
+    if base in _SHELL_WRAPPERS:
+        toks = segment.split()
+        for i, tok in enumerate(toks):
+            if _WRAPPER_SWITCH.match(tok) and i > 0:
+                return _connecting_reason(" ".join(toks[i + 1 :]), text_ok)
+    if (
+        text_ok
+        and base in _TEXT_COMMANDS
+        and not _EXECUTING_TEXT.search(segment)
+        and not (base == "git" and _git_runs_args(segment.split()))
+    ):
+        return None
+    return _scan_connecting(segment)
+
+
 def decide(command: str) -> tuple[bool, str]:
     """Return (blocked, reason) for a shell command line."""
     cleaned = _strip_message_args(_strip_heredocs(command))
-    for segment in _segments(cleaned):
+    segments = _segments(cleaned)
+    # An unbalanced quote means message removal may not have covered the text:
+    # then nothing counts as "just text" any more.
+    text_ok = cleaned.count('"') % 2 == 0 and cleaned.count("'") % 2 == 0
+    for segment in segments:
         if ENTRY_NAME in segment and _has_interpreter(segment):
             return True, _BLOCK_MESSAGE.format(what="live entry script")
         if LAUNCHER_NAME in segment and _executes_launcher(segment):
             return True, _BLOCK_MESSAGE.format(what="launcher batch file")
+    for segment in segments:
+        try:
+            why = _connecting_reason(segment, text_ok)
+        except Exception:  # noqa: BLE001 - a rule bug must fail closed
+            why = "the hook could not analyse a MainStoinker command"
+        if why:
+            return True, _CONNECT_MESSAGE.format(what=why)
     return False, ""
 
 
