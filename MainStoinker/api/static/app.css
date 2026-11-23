@@ -210,6 +210,23 @@ td.num { font-family: var(--mono); font-size: 13px; }
   .health { margin-left: 0; width: 100%; }
 }
 
+/* Compare view */
+.compare-links { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 12px; }
+.compare-warnings { margin: 0; padding-left: 20px; }
+.compare-warnings li { margin-bottom: 4px; color: var(--warn-text); }
+.panel.compare-note { background: var(--warn-bg); color: var(--warn-text); }
+.table-wrap td.differs, .table-wrap th.differs { background: var(--warn-bg); color: var(--warn-text); font-weight: 600; }
+td.cmp-start { border-top: 2px solid var(--control-border); }
+tbody tr:first-child td.cmp-start { border-top: none; }
+td.cmp-diff { background: var(--surface-2); font-style: italic; }
+td.cmp-a, td.cmp-b { font-weight: 400; }
+td.cmp-a.total, td.cmp-b.total, td.cmp-diff.total { font-weight: 600; }
+.table-wrap td.not-compared, .table-wrap th.not-compared { color: var(--muted); }
+/* In the TOTAL block (td.total, further down, shades every total cell alike) the B - A row stays distinct:
+   the Run A and Run B rows sit on the plain surface, the difference row is shaded and italic. */
+.table-wrap td.cmp-a.total, .table-wrap td.cmp-b.total { background: var(--surface); }
+.table-wrap td.cmp-diff.total { background: var(--surface-2); font-style: italic; }
+
 /* Run overview and charts */
 .view h3 { margin: 0 0 8px; font-size: 15px; }
 
