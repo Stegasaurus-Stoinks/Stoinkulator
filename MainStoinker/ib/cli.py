@@ -950,7 +950,7 @@ def _after_checks(
     sleep: Callable[[float], None] | None,
     wall: Callable[[], datetime] | None = None,
 ) -> int:
-    tty =sys.stdin if stdin is None else stdin
+    tty = sys.stdin if stdin is None else stdin
     ask = input if input_fn is None else input_fn
     probe = command == PROBE_DATA
     if not gate(args, tty, ask, say, describe_probe if probe else describe_session):

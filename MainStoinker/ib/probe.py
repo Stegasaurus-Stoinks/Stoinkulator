@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 from collections import Counter
 from collections.abc import Callable
@@ -66,7 +67,7 @@ from MainStoinker.ib.market_data import (
     Outcome,
     ResolveFailed,
 )
-from MainStoinker.ib.recorder import Finding
+from MainStoinker.ib.recorder import LONG_RUN_REASON, SEPARATED_RUN_REASON, Finding
 
 NY = ZoneInfo("America/New_York")
 FIRST_TICK_WAIT = 8.0
@@ -99,7 +100,17 @@ _HEADLINES = {
     3: "DELAYED data (15 min)",
     4: "DELAYED data (15 min, frozen)",
 }
-_FARM_CODES = {2104: "market", 2106: "historical", 2158: "security definitions"}
+_FARM_CODES = {
+    2104: "market", 2108: "market",
+    2106: "historical", 2107: "historical",
+    2158: "security definitions",
+}
+_FARM_KINDS_SHOWN = ("market", "historical", "security definitions")
+_DEMAND_MARK = "upon demand."
+_DIGIT_RUN_REASONS = frozenset({LONG_RUN_REASON, SEPARATED_RUN_REASON})  # an epoch; RT volume numbers
+_EPOCH_VALUE =re.compile(r"[0-9]+")
+_RT_VOLUME_VALUE = re.compile(r"[0-9.;]+|[0-9.;]*;(?:true|false)")
+_IB_ERROR_IN_TEXT =re.compile(r"IB error (\d+):")
 
 
 @dataclass
@@ -139,6 +150,8 @@ class _Run:
     seen: dict[int, str] = field(default_factory=dict)  # distinct IB codes -> first text
     failed: bool = False
     farms: str = "not checked"
+    up: dict[str, bool] | None = None
+    time_error: str = ""
     clock_note: str = "no server time"
     server: datetime | None = None
 
@@ -179,40 +192,75 @@ def _tick_summary(ticks: Counter[int]) -> str:
 # -- steps ---------------------------------------------------------------------------------
 
 
-def farm_names(md: IbMarketData) -> list[str]:
-    """The farms IB reported (codes 2104, 2106, 2158), as `usfarm (market)`, from their texts."""
-    names: dict[int, str] = {}
+def farm_names(md: IbMarketData) -> dict[str, list[str]]:
+    """The farm names IB reported, per kind, in arrival order without duplicates.
+
+    Codes 2104 / 2106 / 2158 end with `:name`; 2107 / 2108 (inactive but available on
+    demand) end with `.name`. A message whose name cannot be parsed adds nothing.
+    """
+    found: dict[str, list[str]] = {}
     for event in md.general_events:
-        if isinstance(event, events.IbError) and event.code in _FARM_CODES:
-            name = event.message.rsplit(":", 1)[-1].strip() if ":" in event.message else event.message
-            names.setdefault(event.code, scrub(name))
-    return [f"{names[code]} ({_FARM_CODES[code]})" for code in _FARM_CODES if code in names]
+        if not (isinstance(event, events.IbError) and event.code in _FARM_CODES):
+            continue
+        message = event.message
+        if ":" in message:
+            name = message.rsplit(":", 1)[-1].strip()
+        elif _DEMAND_MARK in message:
+            name = message.rsplit(_DEMAND_MARK, 1)[-1].strip()
+        else:
+            name = ""
+        name = scrub(name) if name else ""
+        if name and name not in found.setdefault(_FARM_CODES[event.code], []):
+            found[_FARM_CODES[event.code]].append(name)
+    return {kind: names for kind, names in found.items() if names}
 
 
-def _step_farms(run: _Run, conn: IbConnection, md: IbMarketData) -> None:
+def _farm_line(up: dict[str, bool], names: dict[str, list[str]]) -> str:
+    parts = []
+    for kind in _FARM_KINDS_SHOWN:
+        if kind in names:
+            parts.append(f"{', '.join(names[kind])} ({kind})")
+        elif up.get(kind):
+            parts.append(f"name not parsed ({kind})")
+    return ", ".join(parts) if parts else "none"
+
+
+def _step_farms(run: _Run, conn: IbConnection) -> None:
     run.say("2. Data farms")
     up = {kind: conn.wait_for_data_farm(FARM_WAIT, farm=kind) for kind in ("market", "historical")}
-    text = ", ".join(f"{kind} {'up' if value else 'NOT seen'}" for kind, value in up.items())
-    run.farms = text
-    # IB's messages about the farms reach `general_events` only while the market-data object
-    # reads events, so ask for the clock now (step 3 prints the answer) before naming the farms.
-    md.request_server_time()
+    run.up = up
+    run.farms = ", ".join(f"{kind} {'up' if value else 'NOT seen'}" for kind, value in up.items())
+
+
+def _ask_time(run: _Run, md: IbMarketData) -> None:
+    """Ask for the clock now (step 3 prints it): IB's farm messages reach `general_events`
+    only while the market-data object reads events, so this comes before naming the farms."""
     try:
+        md.request_server_time()
         run.server = md.wait_server_time(TIME_WAIT)
     except DataLost:
         run.server = None
-    names = farm_names(md)
-    run.say(f"   farms IB reported: {', '.join(names) if names else 'none'}")
-    if all(up.values()):
-        run.ok(text)
+    except Exception as exc:  # noqa: BLE001 - reported by step 3, not as "no answer"
+        run.time_error = f"{type(exc).__name__}: {exc}"
+
+
+def _report_farms(run: _Run, md: IbMarketData) -> None:
+    if run.up is None:
+        return
+    run.say(f"   farms IB reported: {_farm_line(run.up, farm_names(md))}")
+    if all(run.up.values()):
+        run.ok(run.farms)
     else:
-        run.fail(text)
+        run.fail(run.farms)
 
 
 def _step_time(run: _Run) -> datetime | None:
-    """Step 3: print the clock that step 2 asked for."""
+    """Step 3: print the clock that `_ask_time` asked for."""
     run.say("3. Server time")
     server = run.server
+    if run.time_error:
+        run.fail(f"the server-time request failed: {run.time_error}")
+        return None
     if server is None:
         run.fail(f"no answer from IB within {TIME_WAIT:g} s")
         return None
@@ -228,7 +276,11 @@ def _step_contract(run: _Run, md: IbMarketData, sym: _Symbol) -> None:
     try:
         info = md.resolve_stock(sym.symbol, 10.0)
     except ResolveFailed as exc:
-        run.note(getattr(exc, "code", None), str(exc))
+        code = getattr(exc, "code", None)
+        if code is None:  # "not found" carries its IB code only in the text
+            match = _IB_ERROR_IN_TEXT.search(str(exc))
+            code = int(match.group(1)) if match else None
+        run.note(code, str(exc))
         sym.ok = False
         sym.verdict = "contract not found"
         run.say(f"   {sym.symbol}:")
@@ -433,7 +485,9 @@ def run_steps(
     say("1. Connect")
     run.ok(connected)
     symbols = [_Symbol(s) for s in args.symbols]
-    _guarded(run, "data farms", lambda: _step_farms(run, conn, md))
+    _guarded(run, "data farms", lambda: _step_farms(run, conn))
+    _ask_time(run, md)
+    _guarded(run, "data farms", lambda: _report_farms(run, md))
     if "historical NOT seen" in run.farms:
         advice.append(ADVICE_FARM)
     server = _guarded(run, "server time", lambda: _step_time(run))
@@ -469,10 +523,12 @@ def run_steps(
 
 
 def split_findings(record: Path, findings: list[Finding]) -> tuple[int, list[Finding]]:
-    """(findings on a `tickString` line, all the others). Streamed quotes carry last-trade
-    times and volume stamps in tick types 45 and 48 that the scan cannot tell from a
-    date of the session (a known limitation, issue 156)."""
-    tick_lines: set[int] = set()
+    """(expected findings, all the others). Streamed quotes carry last-trade times (tick type
+    45, an epoch) and RT volume (type 48, `price;size;ms-epoch;total;vwap;flag`) that the scan
+    flags as a digit run (a known limitation, issue 156). A finding is expected only when its
+    line is a `tickString` of type 45 or 48 whose value has no other characters than those
+    formats allow, and its reason is the digit-run one."""
+    allowed: set[int] = set()
     try:
         lines = record.read_text(encoding="utf-8").split("\n")
     except (OSError, UnicodeDecodeError):
@@ -483,10 +539,25 @@ def split_findings(record: Path, findings: list[Finding]) -> tuple[int, list[Fin
         except ValueError:
             continue
         if isinstance(parsed, dict) and parsed.get("name") == EXPECTED_TICK_EVENT:
-            tick_lines.add(number)
-    expected = [f for f in findings if f.line in tick_lines]
-    other = [f for f in findings if f.line not in tick_lines]
+            args = parsed.get("args")
+            if isinstance(args, list) and len(args) == 3 and _expected_tick(args[1], args[2]):
+                allowed.add(number)
+    def is_expected(f: Finding) -> bool:
+        return f.line in allowed and f.reason in _DIGIT_RUN_REASONS
+
+    expected = [f for f in findings if is_expected(f)]
+    other = [f for f in findings if not is_expected(f)]
     return len(expected), other
+
+
+def _expected_tick(tick_type: Any, value: Any) -> bool:
+    if not isinstance(value, str) or isinstance(tick_type, bool):
+        return False
+    if tick_type == 45:
+        return _EPOCH_VALUE.fullmatch(value) is not None
+    if tick_type == 48:
+        return _RT_VOLUME_VALUE.fullmatch(value) is not None
+    return False
 
 
 def report_probe_findings(say: _Say, record: Path, findings: list[Finding]) -> None:

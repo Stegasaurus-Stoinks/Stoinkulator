@@ -32,7 +32,13 @@ from MainStoinker.ib.client import DataOnlyClient
 from MainStoinker.ib.connection import DATA_REQUESTS, ConnState, IbConnection
 from MainStoinker.ib.market_data import IbMarketData
 from MainStoinker.ib.probe import closed_session_day
-from MainStoinker.ib.recorder import Finding, SessionRecorder
+from MainStoinker.ib.recorder import (
+    LONG_RUN_REASON,
+    SEPARATED_RUN_REASON,
+    Finding,
+    SessionRecorder,
+    scan_recording,
+)
 from tests.fake_ib import FARM_MESSAGES, ConnectBehavior, FakeIbClient, make_bar
 
 SERVER = datetime(2024, 11, 22, 22, 0, tzinfo=UTC)  # Friday 17:00 New York, session closed
@@ -616,11 +622,12 @@ def test_the_scan_summary_splits_tick_findings_from_the_others(rig: Rig) -> None
         '{"seq": 2, "kind": "raw", "name": "tickString", "args": [3, 48, "1732290001"]}',
         '{"seq": 3, "kind": "raw", "name": "error", "args": [3, "x"]}',
     ]) + "\n", encoding="utf-8")
-    findings = [Finding(2, "a", ""), Finding(3, "b", ""), Finding(4, "other reason", "")]
+    run_reason = LONG_RUN_REASON
+    findings = [Finding(2, run_reason, ""), Finding(3, run_reason, ""), Finding(4, "other reason", "")]
     probe.report_probe_findings(say, record, findings)
     text = out.getvalue()
     assert "3 finding(s): 2 from last-trade-time and volume ticks (expected), 1 other" in text
-    assert "line 4: other reason" in text and "line 2" not in text and "line 3: b" not in text
+    assert "line 4: other reason" in text and "line 2" not in text and "line 3:" not in text
 
 
 def test_a_real_run_with_tick_strings_counts_them_as_expected(rig: Rig) -> None:
@@ -803,3 +810,187 @@ def test_the_main_module_dispatches_probe_data_in_process_and_stops_before_any_c
     assert info.value.code == code
     shown = capsys.readouterr()
     assert ("--quote-seconds" in shown.out) if code == 0 else ("--port" in shown.err)
+
+
+# -- fix round: the recording check, farm names, the clock step, IB codes ---------------------------
+
+
+def _tick_line(number: int, tick_type: int, value: str) -> str:
+    return json.dumps({"seq": number, "kind": "raw", "name": "tickString", "args": [3, tick_type, value]})
+
+
+def _planted_values() -> dict[str, tuple[int, str]]:
+    account = "".join(["D", "U"]) + str(7654321)  # built at run time: no account-shaped literal
+    path = "C:" + "/" + "Users" + "/" + "someone" + "/" + "x"
+    mail = "a.b" + "@" + "example." + "com"
+    return {
+        "account on a type 45 line": (45, account),
+        "account on a type 48 line": (48, account),
+        "account on a type 84 line": (84, "U" + str(7654321)),
+        "path on a type 45 line": (45, path),
+        "path on a type 32 line": (32, path),
+        "e-mail on a type 32 line": (32, "mail me at " + mail),
+    }
+
+
+@pytest.mark.parametrize("what", sorted(_planted_values()))
+def test_a_planted_token_on_a_tick_string_line_is_other(tmp_path: Path, what: str) -> None:
+    tick_type, value = _planted_values()[what]
+    record = tmp_path / "planted.jsonl"
+    lines = ['{"format": "x"}', _tick_line(2, tick_type, value)]
+    record.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    findings = scan_recording(record, [])
+    mine = [f for f in findings if f.line == 2]
+    assert mine, findings
+    expected, other = probe.split_findings(record, findings)
+    assert expected == 0, (expected, other)
+    assert [f for f in other if f.line == 2] == mine
+    out = io.StringIO()
+    probe.report_probe_findings(cli._Say(out), record, findings)
+    assert "line 2:" in out.getvalue()
+
+
+def test_genuine_epoch_and_rt_volume_lines_are_expected_and_a_wrong_reason_is_not(tmp_path: Path) -> None:
+    record = tmp_path / "genuine.jsonl"
+    record.write_text("\n".join([
+        '{"format": "x"}',
+        _tick_line(2, 45, "1732290000"),
+        _tick_line(3, 48, "190.5;300;1732290000123;12345;190.4;true"),
+        _tick_line(4, 48, "190.5;300;1732290000123;12345;190.4;false"),
+    ]) + "\n", encoding="utf-8")
+    findings = scan_recording(record, [])
+    findings = [f for f in findings if f.line > 1]  # line 1 is the stand-in header of this file
+    assert {f.line for f in findings} == {2, 3, 4}, findings
+    assert {f.reason for f in findings} <= {LONG_RUN_REASON, SEPARATED_RUN_REASON}
+    expected, other = probe.split_findings(record, findings)
+    assert (expected, other) == (len(findings), [])
+    # the same lines with another reason (an address, say) are not the expected kind
+    expected, other = probe.split_findings(record, [Finding(2, "IPv4 address", "")])
+    assert expected == 0 and len(other) == 1
+
+
+def test_farm_names_keep_every_name_per_kind_in_order(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "FARM_MESSAGES", (
+        (2104, "Market data farm connection is OK:usfarm.nj"),
+        (2104, "Market data farm connection is OK:uscrypto"),
+        (2104, "Market data farm connection is OK:usfarm.nj"),
+        (2106, "HMDS data farm connection is OK:euhmds"),
+        (2106, "HMDS data farm connection is OK:ushmds"),
+        (2158, "Sec-def data farm connection is OK:secdefnj"),
+    ))
+    code, text = rig.run("--no-history")
+    assert code == 0, text
+    assert ("farms IB reported: usfarm.nj, uscrypto (market), euhmds, ushmds (historical), "
+            "secdefnj (security definitions)") in text
+
+
+def test_farm_names_are_parsed_from_the_inactive_but_available_form(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "FARM_MESSAGES", (
+        (2108, "Market data farm connection is inactive but should be available upon demand.usfarm"),
+        (2107, "HMDS data farm connection is inactive but should be available upon demand.ushmds"),
+    ))
+    code, text = rig.run("--no-history")
+    assert code == 0, text
+    assert "market up, historical up" in text
+    assert "farms IB reported: usfarm (market), ushmds (historical)" in text
+
+
+def test_a_farm_that_is_up_without_a_parsable_name_says_so_and_not_none(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "FARM_MESSAGES", (
+        (2108, "Market data farm connection is inactive"),
+        (2106, "HMDS data farm connection is OK:ushmds"),
+    ))
+    code, text = rig.run("--no-history")
+    assert code == 0, text
+    assert "farms IB reported: name not parsed (market), ushmds (historical)" in text
+    assert "farms IB reported: none" not in text
+
+
+def test_a_failing_farm_step_does_not_turn_into_no_answer_for_the_clock(rig: Rig) -> None:
+    base = rig.connection_factory
+
+    def factory(args: Any, observers: list[Any]) -> IbConnection:
+        conn = base(args, observers)
+
+        def boom(*a: Any, **k: Any) -> bool:
+            raise RuntimeError("farm wait broke")
+
+        conn.wait_for_data_farm = boom  # type: ignore[method-assign]
+        return conn
+
+    rig.connection_factory = factory  # type: ignore[method-assign]
+    code, text = rig.run("--no-history")
+    assert code == 1, text
+    assert "data farms: unexpected RuntimeError: farm wait broke" in text
+    assert "no answer from IB" not in text
+    assert "IB clock minus this machine's clock = +2.0 s" in text
+    assert [c.name for c in rig.fakes[0].calls].count("reqCurrentTime") == 1
+
+
+def test_a_failing_clock_request_is_reported_as_that_failure(rig: Rig) -> None:
+    def factory(conn: IbConnection) -> IbMarketData:
+        md = IbMarketData(conn, clock=rig.clock, poll_interval=0.01)
+
+        def boom() -> None:
+            raise RuntimeError("clock request broke")
+
+        md.request_server_time = boom  # type: ignore[method-assign]
+        return md
+
+    rig.market_data_factory = factory  # type: ignore[method-assign]
+    code, text = rig.run("--no-history")
+    assert code == 1, text
+    assert "the server-time request failed: RuntimeError: clock request broke" in text
+    assert "no answer from IB" not in text
+
+
+def test_an_unknown_symbol_shows_its_ib_code_in_the_summary(rig: Rig) -> None:
+    base = rig.script.apply
+
+    def apply(fake: Any) -> None:
+        base(fake)
+
+        def lookup(rid: int, c: Any) -> list[tuple[Any, ...]]:
+            if c.symbol == "ZZZZ":
+                return [error_played(rid, 200, "No security definition has been found for the request")]
+            return [("contractDetails", rid, details(c.symbol)), ("contractDetailsEnd", rid)]
+
+        fake.respond("reqContractDetails", lookup)
+
+    rig.script.apply = apply  # type: ignore[method-assign]
+    code, text = rig.run("--symbols", "AAPL,ZZZZ", "--no-history")
+    assert code == 1, text
+    codes_line = next(x for x in text.splitlines() if "IB codes seen:" in x)
+    assert "200: " in codes_line, codes_line
+
+
+def test_the_real_recorder_header_names_probe_data_and_holds_nothing_private(rig: Rig) -> None:
+    private = "zed" + "quux"
+    rig.env["USERNAME"] = private
+    out = io.StringIO()
+    rig.env.setdefault("USERPROFILE", str(rig.home))
+    code = cli.probe_data_main(
+        ["--port", "7497", "--symbols", "aapl,msft", "--no-history", "--quote-seconds", "10"],
+        env=rig.env, stdin=Tty(), input_fn=lambda prompt: "7497", out=out, clock=rig.clock,
+        sleep=rig.clock.sleep, today=date(2024, 11, 22),
+        connection_factory=rig.connection_factory, market_data_factory=rig.market_data_factory)
+    assert code == 0, out.getvalue()
+    first = rig.recording.read_text(encoding="utf-8").splitlines()[0]
+    head = json.loads(first)
+    assert head["command"] == "probe-data AAPL MSFT"
+    assert "fetch-bars" not in first
+    assert private not in first.lower() and str(rig.home) not in first and str(rig.tmp) not in first
+
+
+def test_the_quotes_request_is_not_a_snapshot_and_not_a_regulatory_snapshot(rig: Rig) -> None:
+    code, _ = rig.run("--no-history")
+    assert code == 0
+    requests = [c for c in rig.fakes[0].calls if c.name == "reqMktData"]
+    assert requests
+    for call in requests:
+        assert call.args[3] is False
+        assert call.args[4] is False
