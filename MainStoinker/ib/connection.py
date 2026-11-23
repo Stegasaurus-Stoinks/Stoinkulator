@@ -63,6 +63,9 @@ Every change goes through `_set_phase`, under the lock, which enforces
 NEW -> CONNECTING -> READY -> CLOSED (CLOSED is final; READY only from CONNECTING, for
 the live current attempt whose reader still runs, with no close seen and no `close()`
 started; a refused READY fails the attempt, which is retried like any other failure).
+One brief exception to "CLOSED is final": a `close()` nested on the opener thread inside
+the state-change method (a signal handler) can produce CLOSED, READY, CLOSED; the end state
+is correct because `open()` re-checks the close flag and raises.
 
 =======================  =============================================================
 caller                   change
@@ -478,8 +481,16 @@ class IbConnection:
                 if self._close_evt.is_set():
                     raise self._closed_error()
         except BaseException:
-            # Every attempt has been ended by `_open_attempts`; only the state is left.
-            self._set_phase(ConnState.CLOSED)
+            # `_open_attempts` ends every attempt it fails, but not one it returned as READY: an
+            # exception after that (Ctrl-C, a signal handler, the close check above) finds the
+            # current attempt still connected. End it, unless it is already over.
+            try:
+                with self._lock:
+                    att = self._att
+                if att is not None and not att.dead:
+                    self._end_attempt(att)
+            finally:
+                self._set_phase(ConnState.CLOSED)
             raise
         finally:
             with self._lock:
@@ -590,9 +601,9 @@ class IbConnection:
                 or att is not self._att
                 or att.dead
                 or att.closed_seen
-                or att.reader is None
+                or att.reader is None  # defensive: the reader is always started before `_await_ready`
                 or not att.reader.is_alive()
-                or self._close_started
+                or self._close_started  # defensive: `_close_evt` is set in the same lock block
                 or self._close_evt.is_set()
             ):
                 return False
@@ -623,7 +634,16 @@ class IbConnection:
             stuck = self._join_threads(att)
             att.dead = True
             self._backlog.clear()
+            # After a failed open nothing of this attempt may reach `next_event`. The pops that
+            # carry a 326 or 502 into the failure list happen before this call. (`close()` of
+            # a READY connection does not come here: events queued before it stay readable.)
+            self._drain(att)
         return stuck
+
+    @staticmethod
+    def _drain(att: _Attempt) -> None:
+        while IbConnection._pop(att, 0) is not None:
+            pass
 
     def _join_threads(self, att: _Attempt) -> list[threading.Thread]:
         stuck: list[threading.Thread] = []
