@@ -50,6 +50,9 @@ class _StaticFiles(StaticFiles):
         if pinned is not None and "content-type" in response.headers:
             response.headers["content-type"] = pinned
         response.headers["x-content-type-options"] = "nosniff"
+        # Revalidate on every use (cheap: the ETag / Last-Modified answer is a 304), so an update is
+        # never masked by a heuristically cached older module.
+        response.headers["cache-control"] = "no-cache"
         return response
 
     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:

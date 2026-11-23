@@ -283,3 +283,24 @@ td button.row-select[aria-pressed="true"]:hover:not(:disabled):not([aria-disable
   color: var(--accent-text);
   border-color: var(--accent);
 }
+
+/* Indicator overlays: legend with one toggle per item, notes, day note */
+.overlay-legend { margin: 0 0 8px; font-size: 12px; }
+.overlay-legend[hidden], .day-note[hidden] { display: none; }
+.overlay-toggles { list-style: none; margin: 0 0 4px; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 8px; }
+.overlay-toggle { font-size: 12px; padding: 2px 8px; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* an item that is off keeps full-strength text (text and muted text stay at 4.5:1 or more on the page
+   background); it shows as off by a flat, dashed button, a struck-through name and a striped swatch */
+.overlay-toggle[aria-pressed="false"] { background: var(--bg); border-style: dashed; }
+.overlay-toggle[aria-pressed="false"] .overlay-name { text-decoration: line-through; }
+.overlay-toggle[aria-pressed="false"] .swatch { background-image: repeating-linear-gradient(90deg, transparent 0 2px, var(--bg) 2px 4px); }
+.overlay-toggle[aria-pressed="false"] .swatch-mark { text-decoration: line-through; }
+.overlay-toggle[aria-pressed="true"] { border-color: var(--accent); }
+.overlay-legend .swatch { display: inline-block; width: 14px; height: 4px; flex: none; }
+.overlay-legend .swatch-mark { display: inline-block; min-width: 1.2em; text-align: center; flex: none; }
+.overlay-note { margin: 2px 0 0; }
+.overlay-errors:empty { display: none; }
+.day-note { margin: 0 0 8px; font-size: 13px; }
+.day-note-button { margin-left: 8px; }
+.marker-shape.pos { color: var(--pos); }
+.marker-shape.neg { color: var(--neg); }

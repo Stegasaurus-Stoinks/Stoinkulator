@@ -119,6 +119,21 @@ def test_javascript_is_served_as_javascript(empty_db: Path) -> None:
         assert response.headers["content-type"].startswith("text/javascript"), url
 
 
+def test_static_responses_must_be_revalidated_and_answer_conditional_requests(empty_db: Path) -> None:
+    client = make_client(empty_db)
+    for url in ("/", "/js/main.js", "/app.css", "/" + VENDOR):
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert response.headers["cache-control"] == "no-cache", url
+        validators = {k: v for k, v in response.headers.items() if k in ("etag", "last-modified")}
+        assert validators, url
+        again = client.get(url, headers={"If-None-Match": validators["etag"]} if "etag" in validators
+                           else {"If-Modified-Since": validators["last-modified"]})
+        assert again.status_code == 304, url
+        assert again.headers["cache-control"] == "no-cache", url
+        assert again.content == b"", url
+
+
 @pytest.mark.parametrize("registry_says", ["text/plain", "application/javascript"])
 def test_content_types_are_pinned_whatever_the_registry_says(
         empty_db: Path, monkeypatch: pytest.MonkeyPatch, registry_says: str) -> None:

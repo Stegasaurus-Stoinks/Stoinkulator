@@ -1,15 +1,24 @@
 // The algo detail view: one algo of one run. Status, summary numbers, the algo's equity curve with its
 // drawdown, a candle chart of the algo's symbol (one day at a time, with a day control) carrying the entry
 // and exit of each trade, and the sortable trade table. Selecting a trade marks its row and its markers and
-// scrolls the chart to it, loading that trade's day first when another day is shown. Follows the view
-// contract in main.js.
+// scrolls the chart to it, loading that trade's day first when another day is shown. The algo's indicators
+// (the series route, for the same window as the bars), the stop and target lines of a realistic run (the
+// orders route, once per view) and their legend are drawn by charts/overlays.js. Follows the view contract in
+// main.js.
 //
-// Exports: render, TRADE_COLUMNS, dayOfTime, shiftDay, stepDay, initialDay, dayWindow, barsState,
-// buildTradeRows, selectLabel, summaryItems, trimDecimal. Everything but render is pure (no DOM, no
-// network) so node can test it.
+// Previous/next day jump to the nearest day that has bars: one bars request covers up to 7 calendar days
+// (stepWindow), the nearest day with a bar (nearestBarDay) is then shown. A trade that exits on another day
+// says so (exitNote) with a button to show that day; so does one shown on its exit day (entryNote). The search
+// for the nearest day runs in a scope of its own: it never aborts the day being shown, which is replaced only
+// when a day is found.
+//
+// Exports: render, TRADE_COLUMNS, dayOfTime, shiftDay, stepDay, stepWindow, nearestBarDay, exitNote, entryNote, initialDay,
+// dayWindow, barsState, buildTradeRows, selectLabel, summaryItems, trimDecimal. Everything but render is pure
+// (no DOM, no network) so node can test it.
 import { ApiError, getJson, isAbortError } from "../api.js";
 import { createCandleChart } from "../charts/candles.js";
 import { createEquityChart } from "../charts/equity.js";
+import { createOverlays } from "../charts/overlays.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
 import { chartTimeToDataTime, dataTimeToChartTime, netClass } from "../format.js";
 import { runHash, runsHash } from "../routes.js";
@@ -45,6 +54,47 @@ export function stepDay(day, delta, first, last) {
   if (first && next < first) return null;
   if (last && next > last) return null;
   return next;
+}
+
+export const SEARCH_DAYS = 7; // the longest span of one bars request (the route's limit)
+
+// The bars request that looks for the nearest day with bars `delta` (-1 or +1) from `day`: up to 7 calendar
+// days that way, kept inside the run's bar range [first, last] ("YYYY-MM-DD", either may be null).
+// {start, end} like dayWindow, or null when that side of the range is empty.
+export function stepWindow(day, delta, first, last) {
+  const near = shiftDay(day, delta);
+  const far = shiftDay(day, delta * SEARCH_DAYS);
+  if (near === null || far === null) return null;
+  let low = delta > 0 ? near : far;
+  let high = delta > 0 ? far : near;
+  if (first && low < first) low = first;
+  if (last && high > last) high = last;
+  if (low > high) return null;
+  return { start: low + " 00:00:00", end: high + " 23:59:59" };
+}
+
+// The day of the first (delta > 0) or last (delta < 0) of the bars the bars route sent, or null when none
+// has a readable time.
+export function nearestBarDay(bars, delta) {
+  let best = null;
+  for (const bar of Array.isArray(bars) ? bars : []) {
+    const day = bar ? dayOfTime(bar.time) : null;
+    if (day === null) continue;
+    if (best === null || (delta > 0 ? day < best : day > best)) best = day;
+  }
+  return best;
+}
+
+// The note for a selected trade shown on its entry day when it exits on another: {text, day} or null.
+export function exitNote(row, shownDay) {
+  if (!row || !shownDay || row.entryDay !== shownDay || !row.exitDay || row.exitDay === shownDay) return null;
+  return { text: "Exits on " + row.exitDay + ".", day: row.exitDay };
+}
+
+// The note for a selected trade shown on its exit day when it entered on another: {text, day} or null.
+export function entryNote(row, shownDay) {
+  if (!row || !shownDay || row.exitDay !== shownDay || !row.entryDay || row.entryDay === shownDay) return null;
+  return { text: "Entered on " + row.entryDay + ".", day: row.entryDay };
 }
 
 // The day the chart opens on: the day of the algo's first trade (earliest entry), else the day of the run's
@@ -118,18 +168,20 @@ function numberOrNull(value) {
 
 // The trades route's trades as table rows. `key` and `number` are the 1-based position in the order the
 // server sent (unique, stable across sorting); the raw fields are kept; entryChart, exitChart (chart
-// seconds) and entryDay are derived from the naive data times.
+// seconds), entryDay and exitDay are derived from the naive data times.
 export function buildTradeRows(trades) {
   const list = Array.isArray(trades) ? trades : [];
   return list.map((trade, index) => {
     const entryChart = dataTimeToChartTime(trade.entry_time);
+    const exitChart = dataTimeToChartTime(trade.exit_time);
     return {
       ...trade,
       key: index + 1,
       number: index + 1,
       entryChart,
-      exitChart: dataTimeToChartTime(trade.exit_time),
+      exitChart,
       entryDay: entryChart === null ? null : dayOfTime(trade.entry_time),
+      exitDay: exitChart === null ? null : dayOfTime(trade.exit_time),
     };
   });
 }
@@ -287,16 +339,22 @@ export async function render(container, params, ctx) {
 
   // The candle chart and its day control.
   const dayLabel = h("span", { class: "day-label", role: "status" });
-  const previousButton = h("button", { type: "button", onclick: () => step(-1) }, "Previous day");
-  const nextButton = h("button", { type: "button", onclick: () => step(1) }, "Next day");
+  // Previous and next stay focusable at the ends (aria-disabled, activation ignored): a disabled button
+  // under the keyboard focus would drop it to the page.
+  const previousButton = h("button", { type: "button", "aria-disabled": "false", onclick: () => step(-1) },
+    "Previous day");
+  const nextButton = h("button", { type: "button", "aria-disabled": "false", onclick: () => step(1) },
+    "Next day");
+  const dayNote = h("div", { class: "day-note muted", role: "status", hidden: true });
   const barsError = h("div", { class: "bars-error" });
+  const overlayBox = h("div", { class: "overlay-box" });
   const candleBox = h("div", { class: "chart-box" });
   const candleParts = [h("h3", {}, "Price and trades"),
     symbol
       ? h("div", { class: "toolbar day-control", role: "group", "aria-label": "Day shown" },
         previousButton, dayLabel, nextButton)
       : h("p", { class: "muted" }, "This algo has no symbol recorded, so there are no candles to show."),
-    barsError, candleBox];
+    dayNote, barsError, overlayBox, candleBox];
   if (symbol) {
     candleParts.push(h("p", { class: "muted chart-caption" },
       symbol + ", 1-minute bars, one day at a time; times are data time, as stored."));
@@ -340,18 +398,43 @@ export async function render(container, params, ctx) {
     }
   }
 
+  // The indicator overlays and their legend; a failure to build them leaves the candles and trades working.
+  let overlays = null;
+  if (candles) {
+    try {
+      overlays = createOverlays(candles, { ctx, container: overlayBox }); // registers its own disposal at once
+    } catch (err) {
+      overlayBox.replaceChildren(errorPanel(err));
+    }
+  }
+  // The orders of a realistic run, requested once for the view (not per day): the stop and target lines.
+  const realistic = run.fills === "realistic";
+  let ordersRequest = null;
+  if (candles && overlays && realistic) {
+    ordersRequest = getJson("/api/runs/" + runId + "/orders", { algo: idname }, { signal: ctx.signal });
+    ordersRequest.catch(() => {}); // awaited per day below; this keeps an unawaited failure from being unhandled
+  }
+
   let day = initialDay(rows, run.last_bar);
   let selectedKey = null;
   let request = null;
+  let stepSearch = null; // the scope of a running search for the previous / next day
 
   function paintDay() {
     dayLabel.textContent = day ? day + " (data time)" : "no day";
-    previousButton.disabled = !day || stepDay(day, -1, firstDay, lastDay) === null;
-    nextButton.disabled = !day || stepDay(day, 1, firstDay, lastDay) === null;
+    previousButton.setAttribute("aria-disabled", String(!day || stepDay(day, -1, firstDay, lastDay) === null));
+    nextButton.setAttribute("aria-disabled", String(!day || stepDay(day, 1, firstDay, lastDay) === null));
   }
 
   function showError(err) {
     barsError.replaceChildren(errorPanel(err));
+  }
+
+  // A line of text under the day control, with an optional button; "" hides it.
+  function setDayNote(text, action) {
+    dayNote.textContent = text || "";
+    if (text && action) dayNote.append(h("button", { type: "button", class: "day-note-button", onclick: action.run }, action.label));
+    dayNote.hidden = !text;
   }
 
   function selectedRow() {
@@ -361,20 +444,78 @@ export async function render(container, params, ctx) {
   function drawTrades() {
     candles.setTrades(rows, selectedKey);
     const row = selectedRow();
-    if (row && row.entryDay === day && row.entryChart !== null) candles.focusTime(row.entryChart);
+    const exits = exitNote(row, day);
+    const entered = entryNote(row, day);
+    const other = exits || entered;
+    if (other) setDayNote(other.text, { label: "Show " + other.day, run: () => loadDay(other.day) });
+    else setDayNote("");
+    if (!row) return;
+    if (row.entryDay === day && row.entryChart !== null) {
+      if (row.exitDay === day && row.exitChart !== null) candles.focusSpan(row.entryChart, row.exitChart);
+      else candles.focusTime(row.entryChart);
+    } else if (row.exitDay === day && row.exitChart !== null) {
+      candles.focusTime(row.exitChart);
+    }
   }
 
-  // Latest wins: a newer day aborts the older request, and only the newest may draw.
+  // The orders of the run: {events, fills} or {error}; a failure of the (shared) request is the same each day.
+  async function loadOrders() {
+    if (!ordersRequest) return { events: null, fills: null, error: null };
+    try {
+      const data = await ordersRequest;
+      if (!data || !Array.isArray(data.order_events) || !Array.isArray(data.fills)) throw unexpected();
+      return { events: data.order_events, fills: data.fills, error: null };
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      return { events: null, fills: null, error: err };
+    }
+  }
+
+  // Draws the overlays of the day once the series (and, for a realistic run, the orders) are there. Never
+  // rejects: a failed series request is shown in the legend, anything else beside the chart, and the
+  // candles and trades keep working. Only the scope that requested the bars may draw.
+  async function drawOverlays(mine, seriesRequest, bars) {
+    try {
+      let seriesData = null;
+      let seriesError = null;
+      try {
+        seriesData = await seriesRequest;
+      } catch (err) {
+        if (isAbortError(err) || !mine.isCurrent()) return;
+        seriesError = err;
+      }
+      const orders = await loadOrders();
+      if (!mine.isCurrent()) return;
+      overlays.setData({
+        series: seriesData, seriesError, orderEvents: orders.events, ordersError: orders.error, fills: orders.fills,
+        fillModel: run.fills, runStatus: run.status, bars,
+      });
+    } catch (err) {
+      if (isAbortError(err) || !mine.isCurrent()) return;
+      showError(err);
+    }
+  }
+
+  // Latest wins: a newer day aborts the older request, and only the newest may draw. The series (same window
+  // as the bars) is requested in the same scope: a newer day aborts both.
   async function loadDay(next) {
     if (!candles) return;
     if (request) request.abort();
+    if (stepSearch) stepSearch.abort(); // showing a day (by any route) ends a search for another
+    stepSearch = null;
     const mine = request = ctx.child();
     day = next;
     paintDay();
     barsError.replaceChildren();
+    setDayNote("");
     candles.setNote("Loading bars...");
     try {
       const window = dayWindow(day);
+      const seriesRequest = overlays
+        ? getJson("/api/runs/" + runId + "/series", { algo: idname, start: window.start, end: window.end },
+          { signal: mine.signal })
+        : null;
+      if (seriesRequest) seriesRequest.catch(() => {}); // awaited after the bars; see below
       const data = await getJson("/api/runs/" + runId + "/bars",
         { symbol, start: window.start, end: window.end }, { signal: mine.signal });
       if (!mine.isCurrent()) return;
@@ -382,17 +523,55 @@ export async function render(container, params, ctx) {
       candles.setBars(state.candles ? data.bars : []);
       candles.setNote(state.note);
       drawTrades();
+      if (!overlays) return;
+      if (!state.candles) {
+        overlays.clear();
+        return;
+      }
+      drawOverlays(mine, seriesRequest, data.bars); // not awaited: the candles and trades do not wait for it
     } catch (err) {
       if (isAbortError(err) || !mine.isCurrent()) return;
       candles.setBars([]);
       candles.setNote("");
+      if (overlays) overlays.clear();
       showError(err);
     }
   }
 
-  function step(delta) {
-    const next = day ? stepDay(day, delta, firstDay, lastDay) : null;
-    if (next !== null) loadDay(next);
+  // Previous / next day: the nearest day that has bars. One bars request covers up to 7 calendar days that way.
+  async function step(delta) {
+    if (!candles || !day) return;
+    const direction = delta > 0 ? "next" : "previous";
+    if ((delta > 0 ? nextButton : previousButton).getAttribute("aria-disabled") === "true") return;
+    const search = stepWindow(day, delta, firstDay, lastDay);
+    const none = "No " + direction + " day with bars within 7 days of " + day + " in this run's bar range. "
+      + "Staying on " + day + ".";
+    if (!search) {
+      setDayNote(none);
+      return;
+    }
+    // A scope of its own: the day on show keeps loading (or stays drawn) while the search runs, and is
+    // replaced only when a day is found (loadDay then aborts and replaces it).
+    if (stepSearch) stepSearch.abort();
+    const mine = stepSearch = ctx.child();
+    setDayNote("Looking for the " + direction + " day with bars...");
+    try {
+      const data = await getJson("/api/runs/" + runId + "/bars",
+        { symbol, start: search.start, end: search.end }, { signal: mine.signal });
+      if (!mine.isCurrent()) return;
+      const found = data && data.available === true ? nearestBarDay(data.bars, delta) : null;
+      if (found === null) {
+        if (stepSearch === mine) stepSearch = null;
+        setDayNote(data && data.available !== true ? barsState(data, symbol).note : none);
+        return;
+      }
+      await loadDay(found); // aborts the search scope and the shown day's request; clears the note
+    } catch (err) {
+      if (isAbortError(err) || !mine.isCurrent()) return;
+      if (stepSearch === mine) stepSearch = null;
+      setDayNote("");
+      showError(err);
+    }
   }
 
   function select(key) {
