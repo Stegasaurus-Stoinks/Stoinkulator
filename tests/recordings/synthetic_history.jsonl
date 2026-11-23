@@ -1,0 +1,25 @@
+{"format":"stoinkulator-ib-session","version":1,"redaction":3,"ibapi":"10.37.2","command":"synthetic recording written by hand, not a real session","port":7497,"start_utc":null,"error_time":"zeroed","current_time":"zeroed"}
+{"seq":1,"t":0.0,"kind":"raw","name":"connectAck","args":[]}
+{"seq":2,"t":0.01,"kind":"raw","name":"nextValidId","args":[1]}
+{"seq":3,"t":0.01,"kind":"raw","name":"managedAccounts","args":["ACCOUNT-1"]}
+{"seq":4,"t":0.02,"kind":"raw","name":"error","args":[-1,0,2104,"Market data farm connection is OK:usfarm",""]}
+{"seq":5,"t":0.02,"kind":"raw","name":"error","args":[-1,0,2106,"HMDS data farm connection is OK:ushmds",""]}
+{"seq":6,"t":0.02,"kind":"raw","name":"error","args":[-1,0,2158,"Sec-def data farm connection is OK:secdefil",""]}
+{"seq":7,"t":0.5,"kind":"request","name":"reqContractDetails","args":[1,{"__class__":"Contract","conId":0,"symbol":"AAPL","secType":"STK","exchange":"SMART","currency":"USD"}]}
+{"seq":8,"t":0.6,"kind":"raw","name":"contractDetails","args":[1,{"__class__":"ContractDetails","contract":{"__class__":"Contract","conId":265598,"symbol":"AAPL","secType":"STK","exchange":"SMART","primaryExchange":"NASDAQ","currency":"USD","localSymbol":"AAPL","tradingClass":"NMS"},"marketName":"NMS","minTick":0.01,"longName":"APPLE INC","timeZoneId":"US/Eastern","tradingHours":"20240102:0400-20240102:2000","liquidHours":"20240102:0930-20240102:1600","minSize":"1","sizeIncrement":"1","suggestedSizeIncrement":"100"}]}
+{"seq":9,"t":0.6,"kind":"raw","name":"contractDetailsEnd","args":[1]}
+{"seq":10,"t":1.0,"kind":"request","name":"reqHeadTimeStamp","args":[2,{"__class__":"Contract","conId":265598,"symbol":"AAPL","secType":"STK","exchange":"SMART","currency":"USD"},"TRADES",1,2]}
+{"seq":11,"t":1.1,"kind":"raw","name":"headTimestamp","args":[2,"345479400"]}
+{"seq":12,"t":2.0,"kind":"request","name":"reqHistoricalData","args":[3,{"__class__":"Contract","conId":265598,"symbol":"AAPL","secType":"STK","exchange":"SMART","currency":"USD"},"20240102-21:00:00","1 D","1 min","TRADES",1,2,false,[]]}
+{"seq":13,"t":2.5,"kind":"raw","name":"historicalData","args":[3,{"__class__":"BarData","date":"1704205800","open":187.15,"high":187.4,"low":187.1,"close":187.3,"volume":"12345","wap":"187.2","barCount":50}]}
+{"seq":14,"t":2.5,"kind":"raw","name":"historicalData","args":[3,{"__class__":"BarData","date":"1704205860","open":187.3,"high":187.45,"low":187.25,"close":187.4,"volume":"9876","wap":"187.35","barCount":41}]}
+{"seq":15,"t":2.5,"kind":"raw","name":"historicalData","args":[3,{"__class__":"BarData","date":"1704205920","open":187.4,"high":187.5,"low":187.3,"close":187.35,"volume":"7654","wap":"187.4","barCount":33}]}
+{"seq":16,"t":2.5,"kind":"raw","name":"historicalDataEnd","args":[3,"20240102-14:30:00","20240102-21:00:00"]}
+{"seq":17,"t":3.0,"kind":"request","name":"reqHistoricalData","args":[4,{"__class__":"Contract","conId":0,"symbol":"NOSUCH","secType":"STK","exchange":"SMART","currency":"USD"},"20240102-21:00:00","1 D","1 min","TRADES",1,2,false,[]]}
+{"seq":18,"t":3.1,"kind":"raw","name":"error","args":[4,0,200,"No security definition has been found for the request",""]}
+{"seq":19,"t":4.0,"kind":"request","name":"reqMktData","args":[5,{"__class__":"Contract","conId":265598,"symbol":"AAPL","secType":"STK","exchange":"SMART","currency":"USD"},"",false,false,[]]}
+{"seq":20,"t":4.1,"kind":"raw","name":"marketDataType","args":[5,3]}
+{"seq":21,"t":4.1,"kind":"raw","name":"tickPrice","args":[5,1,187.2,{"__class__":"TickAttrib","canAutoExecute":false,"pastLimit":false,"preOpen":false}]}
+{"seq":22,"t":4.1,"kind":"raw","name":"tickSize","args":[5,0,"300"]}
+{"seq":23,"t":5.0,"kind":"raw","name":"error","args":[-1,0,1100,"Connectivity between IB and Trader Workstation has been lost.",""]}
+{"seq":24,"t":6.0,"kind":"raw","name":"error","args":[-1,0,1102,"Connectivity between IB and TWS has been restored- data maintained.",""]}
