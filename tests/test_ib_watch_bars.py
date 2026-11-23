@@ -685,12 +685,12 @@ def test_the_files_hold_the_closed_bars_only_in_the_month_file_formats(rig: Rig)
     lines = raw.decode("utf-8").splitlines()
     assert lines[0] == HEADER
     assert lines[1] == f"2024-08-16 09:30:00,{ep(9, 30)},99.0,99.5,98.8,99.2,5000"
-    assert lines[4] == f"2024-08-16 09:33:00,{ep(9, 33)},100.0,100.6,99.9,100.3,1800"
+    assert lines[3] == f"2024-08-16 09:33:00,{ep(9, 33)},100.0,100.6,99.9,100.3,1800"
     assert lines[-1] == f"2024-08-16 09:36:00,{ep(9, 36)},101.1,101.3,101.0,101.2,900"
-    assert [row[0][11:16] for row in rig.rows("AAPL")] == ["09:30", "09:31", "09:32", "09:33", "09:34",
+    assert [row[0][11:16] for row in rig.rows("AAPL")] == ["09:30", "09:31", "09:33", "09:34",
                                                            "09:35", "09:36"]  # 09:37 is still forming
     assert "101.2" not in {row[2] for row in rig.rows("AAPL")}  # the forming bar's open is not there
-    assert len(rig.rows("MSFT")) == 7
+    assert len(rig.rows("MSFT")) == 6
     assert "Still forming" not in rig.text and "still forming, not written: 09:37" in rig.text
 
 
@@ -716,8 +716,8 @@ def test_the_summary_has_the_statistics_the_first_run_needs(rig: Rig) -> None:
     text = rig.text
     summary = text[text.index("Summary"):]
     aapl = summary[summary.index("AAPL:"):summary.index("MSFT:")]
-    assert "closed bars emitted live: 4" in aapl and "backfill bars written: 3" in aapl
-    assert "missing minutes inside the span: none" in aapl
+    assert "closed bars emitted live: 4" in aapl and "backfill bars written: 2" in aapl
+    assert "missing minutes inside the span (1): 09:32" in aapl  # 09:32 was seen only in the snapshot
     assert "late revisions: 0; rows that may be stale: 0; bad bars skipped: 0" in aapl
     assert "stream: LIVE" in aapl and "DELAYED" not in aapl
     counts, firsts, closes = [3, 2, 4, 2], [30.0, 1.5, 0.5, 2.0], [1.5, 0.5, 2.0, 1.0]
@@ -772,8 +772,8 @@ def test_a_late_revision_is_counted_and_nothing_emitted_is_rewritten(rig: Rig) -
     assert "nothing already emitted is rewritten" in rig.text
     assert "late revisions: 2" in rig.text
     rows = rig.rows("AAPL")
-    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33", "09:35"]
-    assert rows[3][2:] == ["100.0", "100.6", "99.9", "100.3", "1800"]
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:33", "09:35"]
+    assert rows[2][2:] == ["100.0", "100.6", "99.9", "100.3", "1800"]
     assert "150.0" not in rig.csv("AAPL").read_text(encoding="utf-8")
     assert "9999" not in rig.csv("AAPL").read_text(encoding="utf-8")
     assert len(rig.closed_lines("AAPL")) == 2  # 09:33 and 09:35
@@ -786,7 +786,7 @@ def test_a_missing_minute_is_listed_in_the_summary(rig: Rig) -> None:
     rig.upd("AAPL", 37, (37, 2.0), (101.0, 101.0, 101.0, 101.0, 10))
     rig.end_at(4)
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK
-    assert "missing minutes inside the span (2): 09:34, 09:35" in rig.text
+    assert "missing minutes inside the span (3): 09:32, 09:34, 09:35" in rig.text
     assert "09:34" not in "".join(r[0] for r in rig.rows("AAPL"))
 
 
@@ -799,7 +799,7 @@ def test_a_second_run_the_same_day_appends_only_later_bars(rig: Rig) -> None:
     rig.end_at(3)
     assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK
     first = rig.csv("AAPL").read_text(encoding="utf-8")
-    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:32", "09:33", "09:34"]
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:33", "09:34"]
     # the second run starts at 09:36:25 and its backfill repeats everything up to 09:35
     second = Rig(rig.tmp)
     second.server_epoch = ep(9, 36, 25)
@@ -816,9 +816,9 @@ def test_a_second_run_the_same_day_appends_only_later_bars(rig: Rig) -> None:
             conn.close()
         for fake in second.fakes:
             fake.close()
-    assert "AAPL_live_2024-08-16.csv exists with 5 rows, last 09:34; appending only later bars" in second.text
+    assert "AAPL_live_2024-08-16.csv exists with 4 rows, last 09:34; appending only later bars" in second.text
     rows = rig.rows("AAPL")
-    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33", "09:34", "09:35", "09:36"]
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:33", "09:34", "09:36"]
     assert len({r[1] for r in rows}) == len(rows)
     assert rig.csv("AAPL").read_text(encoding="utf-8").startswith(first)  # appended, nothing rewritten
     assert rig.csv("AAPL").read_text(encoding="utf-8").count(HEADER) == 1
@@ -848,7 +848,7 @@ def test_data_lost_requests_again_once_and_emits_no_duplicate(rig: Rig) -> None:
     backfilled = [ln for ln in rig.text.splitlines() if ln.endswith("(backfilled)")]
     assert [ln[:5] for ln in backfilled] == ["09:34", "09:35"]
     rows = rig.rows("AAPL")
-    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33", "09:34", "09:35", "09:36"]
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:33", "09:34", "09:35", "09:36"]
     assert len({r[1] for r in rows}) == len(rows)  # no minute twice
     emitted = [ln[:5] for ln in rig.text.splitlines() if re.match(r"^\d\d:\d\d  AAPL  O ", ln)]
     assert len(emitted) == len(set(emitted)) == 4  # 09:33, 09:34 and 09:35 once, 09:36 once
@@ -867,9 +867,10 @@ def test_lost_then_restored_continues_and_a_later_bar_still_closes(rig: Rig) -> 
     rig.end_at(3)
     assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
     assert "IB connectivity LOST (code 1100)" in rig.text and "IB connectivity restored." in rig.text
-    assert rig.text.index("LOST") < rig.text.index("restored.") < rig.text.index("09:33  AAPL  O")
+    lost_line = "AAPL 09:33 not written: spanned a connection loss"
+    assert rig.text.index("LOST") < rig.text.index("restored.") < rig.text.index(lost_line)
     assert len(rig.requests) == 1  # data kept: no new request
-    assert [r[0][11:16] for r in rig.rows("AAPL")][-1] == "09:33"
+    assert [r[0][11:16] for r in rig.rows("AAPL")][-1] == "09:31"  # 09:33 spanned the loss: not written
 
 
 def test_still_lost_at_the_end_of_the_watch_exits_4(rig: Rig) -> None:
@@ -891,7 +892,7 @@ def test_a_closed_connection_stops_with_exit_4_and_the_files_stay_intact(rig: Ri
     assert "STOPPED: the connection to TWS closed" in rig.text
     assert rig.connections[0].state is ConnState.CLOSED
     rows = rig.rows("AAPL")
-    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33"]
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:33"]
     assert "Summary" in rig.text and "exit 4" in rig.text
 
 
@@ -1111,6 +1112,47 @@ def test_a_backfill_that_arrives_late_never_writes_the_forming_bar_as_closed(rig
     assert "late revision for" not in rig.text
 
 
+def test_a_minute_known_only_from_a_late_backfill_snapshot_is_not_written(rig: Rig) -> None:
+    """The same late backfill, but IB's next update is already the next minute: 09:33 was seen only in
+    the snapshot taken before it ended, so nothing about it is known to be final."""
+    rig.server_epoch = ep(9, 33, 59)
+    rig.armed_count = 0
+    hold_history(rig, from_request=1)
+    deliver_backfill(rig, "AAPL", AAPL_BACKFILL + [(ep(9, 33), 100.0, 100.5, 99.9, 100.2, 1000)], at=4.0)
+    rig.at(4.5, lambda: None, ready=lambda: ": backfill:" in rig.text)
+    rig.upd("AAPL", 34, (34, 5.0), (100.8, 100.8, 100.8, 100.8, 5))
+    rig.upd("AAPL", 35, (35, 2.0), (100.8, 100.8, 100.8, 100.8, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL 09:33 not written: seen only in the backfill snapshot (no live update)" in rig.text
+    assert rig.text.count("09:33 not written") == 1
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:32", "09:34"]
+    assert "minutes not written: snapshot only 1, connection loss 0" in rig.text
+    assert "first update not seen" not in rig.text
+
+
+def test_a_snapshot_only_minute_closed_by_time_is_not_written_either(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 30)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL + [(ep(9, 33), 100.0, 100.5, 99.9, 100.2, 1000)]]}
+    rig.at(rig.tt(36, 1.0), lambda: None)  # past 09:33 + 60 s + 90 s: closed by time
+    rig.end_at(3, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL 09:33 not written: seen only in the backfill snapshot (no live update)" in rig.text
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:32"]
+    assert "closed by time: no later" not in rig.text
+
+
+def test_a_minute_with_one_live_update_after_the_snapshot_is_written(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 30)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL + [(ep(9, 33), 100.0, 100.5, 99.9, 100.2, 1000)]]}
+    rig.upd("AAPL", 33, (33, 45.0), (100.0, 100.8, 99.9, 100.7, 1400))
+    rig.upd("AAPL", 34, (34, 2.0), (100.7, 100.7, 100.7, 100.7, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert rig.rows("AAPL")[3][2:] == ["100.0", "100.8", "99.9", "100.7", "1400"]
+    assert not re.search(r"\d\d:\d\d not written", rig.text)
+
+
 def test_a_backfill_after_data_loss_is_judged_at_the_time_its_request_was_sent(rig: Rig) -> None:
     rig.backfills = {"AAPL": [AAPL_BACKFILL]}
     rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.6, 99.9, 100.3, 1800))
@@ -1128,8 +1170,28 @@ def test_a_backfill_after_data_loss_is_judged_at_the_time_its_request_was_sent(r
     rig.end_at(4, symbols=1)
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
     rows = rig.rows("AAPL")
-    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33", "09:34", "09:35"]
-    assert rows[5][2:] == ["100.8", "101.2", "100.7", "101.1", "1900"]
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:33", "09:34", "09:35"]
+    assert rows[4][2:] == ["100.8", "101.2", "100.7", "101.1", "1900"]
+    assert "700" not in rig.csv("AAPL").read_text(encoding="utf-8")
+
+
+def test_a_late_backfill_after_data_loss_without_a_final_update_writes_no_partial_row(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 34, (34, 5.0), (100.3, 100.3, 100.3, 100.3, 5))
+    rig.upd("AAPL", 35, (35, 5.0), (100.8, 100.8, 100.8, 100.8, 10))  # live update of 09:35 before the loss
+    rig.drop((35, 58.0), 1101)
+    hold_history(rig, from_request=2)
+    second = AAPL_BACKFILL[1:] + [(ep(9, 33), 100.0, 100.6, 99.9, 100.3, 1800),
+                                  (ep(9, 34), 100.3, 100.9, 100.2, 100.8, 2200),
+                                  (ep(9, 35), 100.8, 101.0, 100.7, 100.9, 700)]
+    deliver_backfill(rig, "AAPL", second, at=rig.tt(36, 3.0), after_request=2)
+    rig.at(rig.tt(36, 3.5), lambda: None, ready=lambda: "re-requested backfill:" in rig.text)
+    rig.upd("AAPL", 36, (36, 5.0), (101.1, 101.1, 101.1, 101.1, 5))  # no final update of 09:35
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL 09:35 not written: seen only in the backfill snapshot (no live update)" in rig.text
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:33", "09:34"]
     assert "700" not in rig.csv("AAPL").read_text(encoding="utf-8")
 
 
@@ -1139,16 +1201,24 @@ def test_a_backfill_after_data_loss_is_judged_at_the_time_its_request_was_sent(r
 ])
 def test_the_grace_period_decides_whether_the_last_backfill_bar_is_closed(
         rig: Rig, seconds_after_the_minute: int, closed: bool) -> None:
-    rig.server_epoch = ep(9, 33, seconds_after_the_minute)  # the 09:32 bar ended at 09:33:00
-    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
-    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
-    rig.end_at(1, symbols=1)
-    assert rig.watch(symbols="AAPL", minutes=1) == watch_bars.EXIT_OK, rig.text
+    """After a data loss, with a lag bound of 0 s measured from live updates, the re-requested backfill's
+    last bar (09:34, no trade in 09:35) is closed at the request only if its minute ended `CLOSE_GRACE`
+    s before it was sent."""
+    rig.backfills = {"AAPL": [AAPL_BACKFILL, AAPL_BACKFILL[1:] + [
+        (ep(9, 33), 100.0, 100.6, 99.9, 100.3, 1800), (ep(9, 34), 100.3, 100.9, 100.2, 100.8, 2200)]]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 34, (34, 0.0), (100.3, 100.4, 100.3, 100.3, 100))  # first seen at 0.0 s: bound 0
+    rig.drop((35, float(seconds_after_the_minute)), 1101)  # the re-request is sent at 09:35:0x
+    rig.at(rig.tt(35, 10.0), lambda: None, ready=lambda: "re-requested backfill:" in rig.text)
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
     if closed:
-        assert "last 09:32; 3 new closed bars written" in rig.text
-        assert "still forming" not in rig.text.split("Summary")[0]
+        assert "last 09:34; 1 new closed bars written" in rig.text
+        assert "09:34  AAPL  O 100.3 H 100.9 L 100.2 C 100.8  volume 2200  (backfilled)" in rig.text
+        assert [r[0][11:16] for r in rig.rows("AAPL")][-1] == "09:34"
     else:
-        assert "last 09:32; 2 new closed bars written; the 09:32 bar is still forming" in rig.text
+        assert "last 09:34; 0 new closed bars written; the 09:34 bar is still forming" in rig.text
+        assert "(backfilled)" not in rig.text
 
 
 def test_data_lost_requests_are_capped_and_spaced_at_least_15_seconds_apart(rig: Rig) -> None:
@@ -1189,16 +1259,24 @@ def test_all_history_requests_of_all_symbols_are_spaced_at_least_a_second(rig: R
         assert own[1] - own[0] >= watch_bars.IDENTICAL_REQUEST_SPACING
 
 
-def test_a_quiet_minute_closed_by_time_then_revised_says_the_file_keeps_the_earlier_values(rig: Rig) -> None:
+def quiet_minute_rig(rig: Rig, revised: tuple[float, float, float, float, int]) -> None:
+    """09:33 has one live update (at 09:33:01, so the lag bound is 1 s), then no trade in 09:34: it is
+    closed by time at 09:35:31; IB then sends a revision of it, and a bar of 09:35 and 09:36."""
+    rig.server_epoch = ep(9, 33, 0)
     rig.backfills = {"AAPL": [AAPL_BACKFILL]}
-    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
-    rig.at(rig.tt(35, 31.0), lambda: None)  # 09:33 is closed by time at 09:35:30
-    rig.upd("AAPL", 33, (35, 40.0), (100.0, 100.7, 99.9, 100.6, 1300))  # IB revises it afterwards
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.at(rig.tt(35, 32.0), lambda: None)  # 09:33 is closed by time at 09:35:31
+    rig.upd("AAPL", 33, (35, 40.0), revised)  # IB revises it afterwards
     rig.upd("AAPL", 35, (35, 45.0), (100.6, 100.6, 100.6, 100.6, 1))
     rig.upd("AAPL", 36, (36, 1.0), (100.6, 100.6, 100.6, 100.6, 1))
     rig.end_at(4, symbols=1)
+
+
+def test_a_quiet_minute_closed_by_time_then_revised_says_the_file_keeps_the_earlier_values(rig: Rig) -> None:
+    quiet_minute_rig(rig, (100.0, 100.7, 99.9, 100.6, 1300))
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
-    assert rig.rows("AAPL")[3][2:] == ["100.0", "100.5", "99.9", "100.2", "1000"]
+    assert "09:33  AAPL" in rig.text and "closed by time" in rig.text
+    assert rig.rows("AAPL")[2][2:] == ["100.0", "100.5", "99.9", "100.2", "1000"]
     late = [ln for ln in rig.text.splitlines() if "late revision for 09:33" in ln]
     assert len(late) == 1
     assert "the file keeps the earlier values" in late[0]
@@ -1209,11 +1287,7 @@ def test_a_quiet_minute_closed_by_time_then_revised_says_the_file_keeps_the_earl
 
 
 def test_a_revision_identical_to_the_written_row_is_not_called_stale(rig: Rig) -> None:
-    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
-    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
-    rig.at(rig.tt(35, 31.0), lambda: None)
-    rig.upd("AAPL", 33, (35, 40.0), (100.0, 100.5, 99.9, 100.2, 1000))
-    rig.end_at(4, symbols=1)
+    quiet_minute_rig(rig, (100.0, 100.5, 99.9, 100.2, 1000))
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
     assert "identical to the bar already emitted" in rig.text and "rows that may be stale: 0" in rig.text
 
@@ -1285,7 +1359,7 @@ def test_a_start_before_the_open_says_market_closed_and_writes_the_previous_sess
     assert "AAPL: market closed: no new bars expected" in rig.text
     assert rig.text.count("market closed") == 1
     assert "AAPL: backfill holds 3 bars of the previous session: not written" in rig.text
-    assert "delayed" not in rig.text
+    assert "looks like delayed" not in rig.text
     assert not list(rig.live.rglob("*.csv"))  # nothing, in particular no file of the previous day
 
 
@@ -1297,7 +1371,7 @@ def test_a_start_just_after_the_open_writes_only_todays_backfill_bars(rig: Rig) 
     rig.end_at(2, symbols=1)
     assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
     assert "AAPL: backfill holds 2 bars of the previous session: not written" in rig.text
-    assert [r[0][:10] for r in rig.rows("AAPL")] == ["2024-08-16"] * 4
+    assert [r[0][:10] for r in rig.rows("AAPL")] == ["2024-08-16"] * 3
     assert not (rig.live / "AAPL" / "AAPL_live_2024-08-15.csv").exists()
     assert "stream: LIVE" in rig.text
 
@@ -1311,17 +1385,32 @@ def test_the_market_closing_during_the_watch_is_said_once_and_the_last_bar_still
     rig.upd("AAPL", 59, (59, 59.0), (100.9, 101.5, 100.5, 101.4, 90000), hh=15)
     rig.at(rig.tt(0, 30.0, hh=16), lambda: None)  # a pass over the symbols after 16:00
     rig.at(rig.tt(1, 0.0, hh=16), lambda: None)  # and a second one: still said once
-    rig.end_at(4, symbols=1)
-    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    rig.at(rig.tt(2, 0.0, hh=16), lambda: None)  # 16:02: past 15:59 + 60 s + 90 s ...
+    seen: list[bool] = []
+    rig.at(rig.tt(19, 59.0, hh=16), lambda: seen.append("15:59  AAPL" in rig.text))  # ... but not 16:20
+    rig.end_at(24, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=24) == watch_bars.EXIT_OK, rig.text
+    assert seen == [False]  # the last bars of a session wait for 16:20 server time
     assert rig.text.count("market closed: no new bars expected") == 1
     assert rig.rows("AAPL")[-1][2:] == ["100.9", "101.5", "100.5", "101.4", "90000"]
-    assert "delayed" not in rig.text
+    assert "closed by time" in [ln for ln in rig.text.splitlines() if ln.startswith("15:59  AAPL")][0]
+    assert "looks like delayed" not in rig.text
+
+
+def test_a_bar_of_the_last_minutes_is_not_closed_by_time_before_16_20(rig: Rig) -> None:
+    rig.server_epoch = ep(15, 58, 30)
+    rig.backfills = {"AAPL": [[(ep(15, 56), 100.0, 101.0, 99.0, 100.5, 10)]]}
+    rig.upd("AAPL", 59, (59, 1.0), (100.9, 100.9, 100.9, 100.9, 5), hh=15)
+    rig.end_at(19, symbols=1)  # the watch ends at 16:17:30 server time
+    assert rig.watch(symbols="AAPL", minutes=19) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL 15:56 not written: seen only in the backfill snapshot" in rig.text
+    assert "15:59  AAPL" not in rig.text and "still forming, not written: 15:59" in rig.text
 
 
 # -- outages ----------------------------------------------------------------------------------
 
 
-def test_nothing_is_closed_by_time_while_the_connection_is_lost(rig: Rig) -> None:
+def test_nothing_is_closed_by_time_while_the_connection_is_lost_and_the_bar_is_not_written(rig: Rig) -> None:
     rig.backfills = {"AAPL": [AAPL_BACKFILL]}
     rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
     rig.drop((33, 40.0), 1100)
@@ -1335,27 +1424,41 @@ def test_nothing_is_closed_by_time_while_the_connection_is_lost(rig: Rig) -> Non
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
     text = rig.text
     assert "closed by time" not in text.split("Summary")[0].replace("no bar is closed by time", "")
-    line = [ln for ln in text.splitlines() if ln.startswith("09:33  AAPL")]
-    assert len(line) == 1 and "(spanned a connection loss)" in line[0]
-    assert text.index("connectivity restored") < text.index(line[0])
-    assert rig.rows("AAPL")[3][2:] == ["100.0", "100.6", "99.9", "100.4", "1700"]  # the final values
-    assert "spanned a connection loss 2" in text  # 09:33 and 09:35, the minutes of the outage
+    assert "AAPL 09:33 not written: spanned a connection loss" in text
+    assert "AAPL 09:35 not written: spanned a connection loss" in text  # 09:35 ran into the restore
+    assert text.index("connectivity restored") < text.index("AAPL 09:33 not written")
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31"]
+    assert "connection loss 2" in text
 
 
-def test_a_bar_that_spanned_an_outage_waits_90_seconds_after_the_restore_before_time_closes_it(
+def test_a_bar_whose_last_update_came_before_an_outage_is_not_written_when_a_later_update_closes_it(
         rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((33, 40.0), 1100)
+    rig.drop((34, 20.0), 1102, ready=lambda: "connectivity LOST" in rig.text)
+    rig.at(rig.tt(34, 21.0), lambda: None, ready=lambda: "connectivity restored" in rig.text)
+    rig.upd("AAPL", 34, (34, 25.0), (100.3, 100.3, 100.3, 100.3, 5))  # 09:33's trades after 33:40 are missing
+    rig.upd("AAPL", 35, (35, 1.0), (100.3, 100.3, 100.3, 100.3, 5))
+    rig.end_at(3, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL 09:33 not written: spanned a connection loss" in rig.text
+    assert "09:33  AAPL  O" not in rig.text
+    assert "09:33" not in "".join(r[0] for r in rig.rows("AAPL"))
+
+
+def test_a_spanned_bar_that_nothing_closes_is_not_written_by_time_either(rig: Rig) -> None:
     rig.backfills = {"AAPL": [AAPL_BACKFILL]}
     rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
     rig.drop((33, 40.0), 1100)
     rig.drop((35, 40.0), 1102, ready=lambda: "connectivity LOST" in rig.text)
     rig.at(rig.tt(35, 42.0), lambda: None, ready=lambda: "connectivity restored" in rig.text)
-    seen: list[bool] = []
-    rig.at(rig.tt(37, 0.0), lambda: seen.append("09:33  AAPL" in rig.text))  # 80 s after the restore
+    rig.at(rig.tt(37, 0.0), lambda: None)
     rig.end_at(4, symbols=1)
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
-    assert seen == [False]
-    line = [ln for ln in rig.text.splitlines() if ln.startswith("09:33  AAPL")]
-    assert len(line) == 1 and "closed by time" in line[0] and "(spanned a connection loss)" in line[0]
+    assert "AAPL 09:33 not written: spanned a connection loss" in rig.text
+    assert "closed by time: no later" not in rig.text
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31"]
 
 
 def test_connection_codes_1100_to_1102_are_printed_as_notices_not_errors(rig: Rig) -> None:
@@ -1394,7 +1497,288 @@ def test_closes_after_a_skipped_minute_are_left_out_of_the_close_delay_statistic
     line = [ln for ln in rig.text.splitlines() if ln.startswith("09:33  AAPL")][0]
     assert "closed by the 09:36 update, after 2 minutes without a bar" in line
     assert "closed after the minute ended, s (min / median / max): 3.0 / 3.0 / 3.0" in rig.text  # 09:36 only
-    assert "skipped minute 1, spanned a connection loss 0" in rig.text
+    assert "connection loss 0; closes left out of the close-delay statistics: skipped minute 1" in rig.text
+
+
+# -- second review: a row is a finished bar with final values, or there is no row ---------------
+
+
+def minutes_in(rig: Rig, symbol: str = "AAPL") -> dict[str, list[str]]:
+    """minute -> [open, high, low, close, volume] of every row of the symbol's live file today."""
+    path = rig.csv(symbol)
+    if not path.exists():
+        return {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == HEADER
+    return {ln.split(",")[0][11:16]: ln.split(",")[2:] for ln in lines[1:]}
+
+
+def delayed_stream(rig: Rig, *, server: int, snapshot_minutes: range, hh: int, lag: int, last_volume: int,
+                   bars: tuple[int, ...], minutes: int) -> int:  # `bars`: epochs of the bars that update
+    """A stream `lag` s behind IB's clock: `snapshot_minutes` of closed bars, then the forming bar
+    `snapshot_minutes.stop` (volume `last_volume`), then three updates per bar of `bars` (volumes
+    10, 300, 900) delivered `lag` s after the data time. Returns the exit code."""
+    rig.server_epoch = server
+    last = snapshot_minutes.stop
+    rig.backfills = {"AAPL": [[(ep(hh, m), 99.0, 99.5, 98.8, 99.2, 100) for m in snapshot_minutes]
+                              + [(ep(hh, last), 99.0, 99.5, 98.8, 99.2, last_volume)]]}
+    for start in bars:
+        for seconds, volume in ((5, 10), (30, 300), (55, 900)):
+            upd_at(rig, "AAPL", start, start + seconds + lag, (99.0, 99.5, 98.8, 99.2, volume))
+    rig.end_at(minutes, symbols=1)
+    return rig.watch(symbols="AAPL", minutes=minutes)
+
+
+def test_a_stream_100_seconds_behind_is_not_closed_by_time_while_its_bar_is_still_forming(rig: Rig) -> None:
+    lag = 100
+    rig.server_epoch = ep(10, 0, 40)  # the data clock reads 09:59:00
+    rig.backfills = {"AAPL": [[(ep(9, m), 99.0, 99.5, 98.8, 99.2, 100) for m in range(50, 59)]
+                              + [(ep(9, 59), 99.0, 99.5, 98.8, 99.2, 1)]]}
+    upd_at(rig, "AAPL", ep(9, 59), ep(9, 59, 30) + lag, (99.0, 99.5, 98.8, 99.2, 300))
+    upd_at(rig, "AAPL", ep(9, 59), ep(9, 59, 55) + lag, (99.0, 99.5, 98.8, 99.2, 900))
+    for minute in (0, 1):
+        start = ep(10, minute)
+        upd_at(rig, "AAPL", start, start + 5 + lag, (99.0, 99.5, 98.8, 99.2, 10))
+        rig.at(start + 151 - rig.server_epoch, lambda: None)  # a pass at server M+151: data M+51, forming
+        upd_at(rig, "AAPL", start, start + 55 + lag, (99.0, 99.5, 98.8, 99.2, 900))
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert all(row[-1] == "900" for minute, row in minutes_in(rig).items() if minute >= "09:59"), rig.text
+
+
+def test_a_delayed_stream_started_after_16_00_never_writes_a_partial_row(rig: Rig) -> None:
+    """Server 16:05:20, data clock 15:50: the snapshot's 15:50 bar (volume 40) is forming at the request."""
+    code = delayed_stream(rig, server=ep(16, 5, 20), snapshot_minutes=range(41, 50), hh=15, lag=920,
+                          last_volume=40, bars=(ep(15, 50), ep(15, 51), ep(15, 52)), minutes=4)
+    assert code == 0, rig.text
+    rows = minutes_in(rig)
+    assert rows.get("15:50", ["", "", "", "", "900"])[-1] == "900", rows
+    assert rows.get("15:51", ["", "", "", "", "900"])[-1] == "900", rows
+    assert "15:52" not in rows  # still forming at the end of the watch
+    assert "late revision for" not in rig.text
+
+
+def test_a_snapshot_only_minute_of_a_delayed_stream_is_not_written(rig: Rig) -> None:
+    """Lag 125 s: the snapshot's 09:59 bar (volume 30) gets no live update, so it is not written."""
+    code = delayed_stream(rig, server=ep(10, 1, 10), snapshot_minutes=range(50, 59), hh=9, lag=125,
+                          last_volume=30, bars=(ep(10, 0), ep(10, 1), ep(10, 2)), minutes=5)
+    assert code == 0, rig.text
+    assert "AAPL 09:59 not written: seen only in the backfill snapshot (no live update)" in rig.text
+    rows = minutes_in(rig)
+    assert "09:59" not in rows
+    assert all(row[-1] == "900" for minute, row in rows.items() if minute.startswith("10:")), rows
+    assert "first update not seen" not in rig.text
+
+
+# -- the DELAYED label ------------------------------------------------------------------------------
+
+
+def label_stream(rig: Rig, *, server: int, snapshot_last: int, updates: list[tuple[int, int, int]]) -> None:
+    """A snapshot of 09:50 to `snapshot_last` (forming) at `server`, then live updates (bar minute at 10:xx
+    or 09:xx as an epoch, seconds after 10:00:00 it arrives, volume)."""
+    rig.server_epoch = server
+    rig.backfills = {"AAPL": [[(ep(9, m), 99.0, 99.5, 98.8, 99.2, 100) for m in range(50, snapshot_last)]
+                              + [(ep(9, snapshot_last), 99.0, 99.5, 98.8, 99.2, 30)]]}
+    for bar_epoch, when, volume in updates:
+        upd_at(rig, "AAPL", bar_epoch, ep(10, 0) + when, (99.0, 99.5, 98.8, 99.2, volume))
+    rig.end_at(3, symbols=1)
+
+
+@pytest.mark.parametrize("live_arrival,declared", [(120, False), (121, True)])
+def test_the_label_threshold_is_a_lag_of_more_than_120_seconds(rig: Rig, live_arrival: int,
+                                                               declared: bool) -> None:
+    # the snapshot at 10:01:10 holds 09:59 as its newest bar (130 s behind: over); the live update of
+    # the 10:00 bar arrives 120 s or 121 s after that bar started
+    label_stream(rig, server=ep(10, 1, 10), snapshot_last=59, updates=[(ep(10, 0), live_arrival, 50)])
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert ("looks like delayed" in rig.text) is declared
+
+
+def test_one_live_update_confirms_a_backfill_that_showed_the_lag(rig: Rig) -> None:
+    label_stream(rig, server=ep(10, 1, 10), snapshot_last=59, updates=[(ep(10, 0), 130, 50)])
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert rig.text.count("looks like delayed") == 1
+
+
+def test_a_backfill_alone_does_not_declare_delayed(rig: Rig) -> None:
+    label_stream(rig, server=ep(10, 1, 10), snapshot_last=59, updates=[])
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert "looks like delayed" not in rig.text
+
+
+@pytest.mark.parametrize("second_when,declared", [(80, True), (75, False)])
+def test_two_live_updates_10_seconds_apart_declare_delayed_without_the_backfill(
+        rig: Rig, second_when: int, declared: bool) -> None:
+    # the snapshot at 10:00:25 shows 85 s (not over); the 09:59 bar's updates arrive at 10:01:10 (130 s
+    # behind the bar) and then 10:01:20 (10 s later: declared) or 10:01:15 (5 s later: not yet)
+    label_stream(rig, server=ep(10, 0, 25), snapshot_last=59, updates=[
+        (ep(9, 59), 70, 40), (ep(9, 59), second_when, 60)])
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert ("looks like delayed" in rig.text) is declared
+
+
+def test_a_quiet_symbol_is_not_called_delayed_and_then_current_again(rig: Rig) -> None:
+    """The newest snapshot bar is 3 minutes old (the symbol did not trade), then its current bar arrives."""
+    rig.server_epoch = ep(10, 5, 30)
+    rig.backfills = {"AAPL": [[(ep(9, m), 99.0, 99.5, 98.8, 99.2, 100) for m in range(56, 60)]
+                              + [(ep(10, 0), 99.0, 99.5, 98.8, 99.2, 100),
+                                 (ep(10, 2), 99.0, 99.5, 98.8, 99.2, 100)]]}
+    upd_at(rig, "AAPL", ep(10, 5), ep(10, 5, 40), (99.1, 99.1, 99.1, 99.1, 5))
+    upd_at(rig, "AAPL", ep(10, 6), ep(10, 6, 2), (99.1, 99.1, 99.1, 99.1, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert "delayed" not in rig.text.split("Summary")[0] and "current again" not in rig.text
+
+
+def test_a_delayed_stream_that_becomes_current_says_so_and_stops_being_labelled(rig: Rig) -> None:
+    rig.server_epoch = ep(10, 0, 25)
+    rig.backfills = {"AAPL": [[(ep(9, m), 99.0, 99.5, 98.8, 99.2, 100) for m in range(36, 46)]]}
+    upd_at(rig, "AAPL", ep(9, 45), ep(10, 0, 30), (99.0, 99.6, 98.8, 99.3, 150))  # 15 min behind: declared
+    upd_at(rig, "AAPL", ep(10, 0), ep(10, 0, 40), (99.0, 99.6, 98.8, 99.3, 1))  # a current bar
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert rig.text.count("looks like delayed") == 1
+    current = "AAPL: bars are current again (at most 40 s behind IB's clock): treating the stream as live"
+    assert current in rig.text
+    assert "AAPL: streaming (delayed" not in rig.text and "stream: LIVE" in rig.text
+
+
+# -- wording ---------------------------------------------------------------------------------------
+
+
+def test_a_delayed_stream_says_the_session_ended_and_bars_continue(rig: Rig) -> None:
+    rig.server_epoch = ep(15, 59, 20)  # the data clock reads 15:44:20
+    rig.backfills = {"AAPL": [[(ep(15, m), 99.0, 99.5, 98.8, 99.2, 100) for m in range(35, 44)]
+                              + [(ep(15, 44), 99.0, 99.5, 98.8, 99.2, 40)]]}
+    upd_at(rig, "AAPL", ep(15, 44), ep(15, 59, 30), (99.0, 99.5, 98.8, 99.2, 150))
+    upd_at(rig, "AAPL", ep(15, 45), ep(16, 0, 1), (99.0, 99.5, 98.8, 99.2, 10))
+    upd_at(rig, "AAPL", ep(15, 45), ep(16, 0, 31), (99.0, 99.5, 98.8, 99.2, 900))
+    upd_at(rig, "AAPL", ep(15, 46), ep(16, 1, 1), (99.0, 99.5, 98.8, 99.2, 10))
+    rig.end_at(3, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL: regular session ended; delayed bars continue for about 15 minutes" in rig.text
+    assert "market closed" not in rig.text
+    rows = minutes_in(rig)
+    assert rows["15:44"][-1] == "150" and rows["15:45"][-1] == "900"
+
+
+def test_a_start_in_the_session_with_no_bar_of_today_yet_says_why(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 31, 0)
+    yesterday = [int(datetime(2024, 8, 15, 15, m, tzinfo=NY).timestamp()) for m in range(50, 60)]
+    rig.backfills = {"AAPL": [[(e, 99.0, 99.5, 98.8, 99.2, 100) for e in yesterday]]}
+    upd_at(rig, "AAPL", yesterday[-1], ep(9, 31, 5), (99.0, 99.5, 98.8, 99.2, 100))  # an update of yesterday
+    upd_at(rig, "AAPL", ep(9, 30), ep(9, 45, 3), (99.0, 99.5, 98.8, 99.2, 10))
+    upd_at(rig, "AAPL", ep(9, 30), ep(9, 45, 50), (99.0, 99.5, 98.8, 99.2, 900))
+    upd_at(rig, "AAPL", ep(9, 31), ep(9, 46, 3), (99.0, 99.5, 98.8, 99.2, 10))
+    rig.end_at(16, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=16) == watch_bars.EXIT_OK, rig.text
+    note = ("AAPL: no bars of today's session yet; with delayed data the first bars appear about "
+            "15 minutes after the open")
+    assert rig.text.count(note) == 1
+    assert not rig.csv("AAPL", "2024-08-15").exists(), "an update of the previous session was written"
+    assert "AAPL: update for 15:59 of the previous session ignored: not written" in rig.text
+    assert minutes_in(rig)["09:30"][-1] == "900"
+    assert "looks like delayed" in rig.text
+
+
+def test_a_start_before_the_open_does_not_say_no_bars_yet(rig: Rig) -> None:
+    rig.server_epoch = ep(8, 0, 0)
+    rig.end_at(1, symbols=1)
+    rig.watch(symbols="AAPL", minutes=1)
+    assert "no bars of today's session yet" not in rig.text and "market closed" in rig.text
+
+
+# -- a live file that cannot be used stops only that symbol --------------------------------------------
+
+
+def msft_only(rig: Rig) -> None:
+    """The standard stream of MSFT only (nothing is scripted for the symbol that is stopped)."""
+    for k in range(33, 38):
+        o = 400.0 + (k - 33)
+        rig.upd("MSFT", k, (k, 35.0) if k == 33 else (k, 3.0), (o, o + 0.5, o - 0.5, o + 0.2, 100 * k))
+        if k < 37:
+            rig.upd("MSFT", k, (k, 50.0 if k == 33 else 30.0), (o, o + 0.5, o - 0.5, o + 0.4, 200 * k))
+    rig.end_at(5)
+
+
+def stopped_symbol_checks(rig: Rig, code: int) -> None:
+    assert code == watch_bars.EXIT_FAILED, rig.text
+    assert "Unexpected" not in rig.text and "Traceback" not in rig.text
+    lines = [ln for ln in rig.text.splitlines() if "close it in other programs (for example Excel)" in ln]
+    assert len(lines) == 1 and lines[0].startswith("AAPL: ") and "AAPL_live_2024-08-16.csv" in lines[0]
+    assert "run again" in lines[0]
+    assert "AAPL: stopped: file not writable" in rig.text
+    cancels = [c.args[0] for c in rig.fakes[-1].calls_named("cancelHistoricalData")]
+    assert cancels.count(rig.req_ids["AAPL"]) == 1  # cancelled once, never polled again
+    assert len(minutes_in(rig, "MSFT")) >= 6  # the other symbol kept streaming
+
+
+def test_a_live_file_that_cannot_be_opened_stops_only_that_symbol(rig: Rig) -> None:
+    (rig.live / "AAPL" / "AAPL_live_2024-08-16.csv").mkdir(parents=True)  # as if open in another program
+    msft_only(rig)
+    stopped_symbol_checks(rig, rig.watch())
+
+
+@pytest.mark.parametrize("tail", ["2024-08-16 09:3", "2024-08-16 09:32:00," + str(ep(9, 32)) + ",99.8,100"])
+def test_a_damaged_last_row_stops_only_that_symbol_and_leaves_the_file_alone(rig: Rig, tail: str) -> None:
+    path = rig.csv("AAPL")
+    path.parent.mkdir(parents=True)
+    row = "2024-08-16 09:31:00," + str(ep(9, 31)) + ",99.2,99.9,99.1,99.8,4000"
+    text = HEADER + "\n" + row + "\n" + tail
+    path.write_text(text, encoding="utf-8", newline="\n")
+    msft_only(rig)
+    stopped_symbol_checks(rig, rig.watch())
+    assert path.read_text(encoding="utf-8") == text  # untouched
+
+
+# -- a re-requested backfill that is still on its way ---------------------------------------------------
+
+
+def pending_rerequest(rig: Rig, *, closes_first: bool) -> None:
+    """09:33 has a live update (volume 1000) at 09:33:01; 1101 at 09:34:30 (no 1100), and the re-requested
+    backfill, which holds 09:33's final values (volume 2500), takes 80 s (inside the 90 s timeout)."""
+    rig.server_epoch = ep(9, 33, 0)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    if closes_first:
+        rig.upd("AAPL", 34, (34, 1.0), (100.3, 100.3, 100.3, 100.3, 5))  # 09:33 is written with 1000
+    rig.drop((34, 30.0), 1101)
+    hold_history(rig, from_request=2)
+    second = AAPL_BACKFILL + [(ep(9, 33), 100.0, 100.9, 99.9, 100.8, 2500),
+                              (ep(9, 34), 100.3, 100.9, 100.2, 100.8, 300)]
+    deliver_backfill(rig, "AAPL", second, at=rig.tt(35, 50.0), after_request=2)  # 09:33 was due at 09:35:31
+    rig.at(rig.tt(35, 51.0), lambda: None, ready=lambda: "re-requested backfill:" in rig.text)
+    rig.upd("AAPL", 34, (35, 55.0), (100.3, 100.9, 100.2, 100.8, 600))
+    rig.upd("AAPL", 35, (36, 2.0), (100.8, 100.8, 100.8, 100.8, 5))
+    rig.end_at(4, symbols=1)
+
+
+def test_nothing_is_closed_by_time_while_a_rerequested_backfill_is_on_its_way(rig: Rig) -> None:
+    pending_rerequest(rig, closes_first=False)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert minutes_in(rig)["09:33"] == ["100.0", "100.9", "99.9", "100.8", "2500"]  # the backfill's values
+    assert "closed by time: no later update" not in rig.text
+
+
+def test_a_rerequested_backfill_that_differs_from_a_written_row_says_so(rig: Rig) -> None:
+    pending_rerequest(rig, closes_first=True)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert minutes_in(rig)["09:33"] == ["100.0", "100.5", "99.9", "100.2", "1000"]  # not rewritten
+    line = [ln for ln in rig.text.splitlines() if "re-requested backfill differs for 09:33" in ln]
+    assert len(line) == 1 and "the file keeps the earlier values" in line[0]
+    assert "volume 1000" in line[0] and "volume 2500" in line[0]
+    assert "rows that may be stale: 1" in rig.text
+
+
+# -- the snapshot, the outage and the date rules ---------------------------------------------------------
+
+
+def test_a_minute_closed_by_a_later_snapshot_bar_is_written_without_the_forming_label(rig: Rig) -> None:
+    code = delayed_stream(rig, server=ep(10, 0, 25), snapshot_minutes=range(36, 45), hh=9, lag=900,
+                          last_volume=40, bars=(ep(9, 45), ep(9, 46)), minutes=3)
+    assert code == 0, rig.text
+    assert minutes_in(rig)["09:44"][-1] == "100"  # a later bar exists in the snapshot: final
+    assert "09:44  AAPL  O" not in rig.text and "(updates 0" not in rig.text  # closed at the request: silent
 
 
 # -- the recording of a run that never connected -----------------------------------------------
