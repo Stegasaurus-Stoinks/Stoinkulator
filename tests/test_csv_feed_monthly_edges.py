@@ -5,6 +5,7 @@ Companion to `test_csv_feed_monthly.py`; every file lives under `tmp_path`.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
+from MainStoinker.engine import feed
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.feed import (
     COLUMNS,
@@ -183,11 +185,6 @@ def test_both_layouts_present_even_when_the_month_folder_has_one_file(tmp_path: 
         read_symbol_bars(tmp_path, "AAPL")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T7 defect: the month-name pattern matches non-ASCII digits; the reader accepts "
-    "such a file and symbol_fingerprint then raises UnicodeEncodeError",
-)
 def test_unicode_digit_file_name_is_not_a_month_file(tmp_path: Path) -> None:
     """A non-ASCII-digit year in a file name must not count as a month file."""
     put(tmp_path / "AAPL" / "AAPL_٢٠٢٤-08.csv", [row("2024-08-02 09:30:00")])
@@ -301,6 +298,87 @@ def test_write_month_file_failure_while_writing_leaves_old_file_and_no_temp(
         write_month_file(path, frame_of("2024-08-02 09:30:00", "2024-08-02 09:31:00"))
     assert path.read_bytes() == old
     assert [p.name for p in path.parent.iterdir()] == [path.name]
+
+
+class FakeClock:
+    """A clock that only advances when the fake sleep is called (no real waiting)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.pauses: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now += seconds
+
+
+def test_write_month_file_retries_replace_while_the_target_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = month_file_path(tmp_path, "AAPL", 2024, 8)
+    write_month_file(path, frame_of("2024-08-02 09:30:00"))
+    real_replace = os.replace
+    calls: list[int] = []
+
+    def flaky(src: object, dst: object) -> None:
+        calls.append(1)
+        if len(calls) <= 3:
+            raise PermissionError(13, "in use")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", flaky)
+    clock = FakeClock()
+    new = frame_of("2024-08-03 09:30:00", "2024-08-03 09:31:00")
+    write_month_file(path, new, sleep=clock.sleep, clock=clock)
+    assert len(calls) == 4
+    assert len(clock.pauses) == 3
+    assert len(read_offline_bars(path)) == 2
+    assert [p.name for p in path.parent.iterdir()] == [path.name]
+
+
+def test_write_month_file_gives_up_after_the_budget_and_keeps_the_old_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = month_file_path(tmp_path, "AAPL", 2024, 8)
+    write_month_file(path, frame_of("2024-08-02 09:30:00"))
+    old = path.read_bytes()
+    calls: list[int] = []
+
+    def locked(src: object, dst: object) -> None:
+        calls.append(1)
+        raise PermissionError(13, "in use")
+
+    monkeypatch.setattr(os, "replace", locked)
+    clock = FakeClock()
+    with pytest.raises(PermissionError, match="in use"):
+        write_month_file(path, frame_of("2024-08-03 09:30:00"), sleep=clock.sleep, clock=clock)
+    assert clock.now >= feed.REPLACE_RETRY_SECONDS
+    assert clock.now < feed.REPLACE_RETRY_SECONDS + feed.REPLACE_RETRY_PAUSE + 1e-9
+    assert len(calls) > 1
+    assert path.read_bytes() == old
+    assert [p.name for p in path.parent.iterdir()] == [path.name]
+
+
+def test_write_month_file_does_not_retry_other_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = month_file_path(tmp_path, "AAPL", 2024, 8)
+    calls: list[int] = []
+
+    def broken(src: object, dst: object) -> None:
+        calls.append(1)
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", broken)
+    clock = FakeClock()
+    with pytest.raises(OSError, match="disk gone"):
+        write_month_file(path, frame_of("2024-08-02 09:30:00"), sleep=clock.sleep, clock=clock)
+    assert len(calls) == 1
+    assert clock.pauses == []
+    assert list(path.parent.iterdir()) == []
 
 
 def test_write_month_file_overwrites_an_existing_month_and_creates_the_folder(tmp_path: Path) -> None:

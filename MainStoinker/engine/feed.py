@@ -17,6 +17,7 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -98,7 +99,7 @@ def month_file_path(data_dir: Path, symbol: str, year: int, month: int) -> Path:
 
 
 def _month_name(symbol: str) -> re.Pattern[str]:
-    return re.compile(re.escape(symbol) + r"_(\d{4})-(0[1-9]|1[0-2])\.csv")
+    return re.compile(re.escape(symbol) + r"_([0-9]{4})-(0[1-9]|1[0-2])\.csv")
 
 
 def symbol_bar_files(data_dir: Path, symbol: str) -> list[Path]:
@@ -139,9 +140,10 @@ def read_symbol_bars(
     """All bars of `symbol` as one frame (columns `COLUMNS`, RangeIndex).
 
     A legacy file is read exactly as `read_offline_bars` does. Month files are
-    concatenated; every row must lie in its file's month and the dates must be
-    strictly increasing across the whole result, else `ValueError` naming the
-    file. Errors are those of `symbol_bar_files` and `read_offline_bars`.
+    concatenated; every row must lie in its file's month and the dates of a
+    file must be strictly increasing, else `ValueError` naming the file (files
+    are sorted by month, so the whole result is then strictly increasing).
+    Errors are those of `symbol_bar_files` and `read_offline_bars`.
     `reader` reads one file (default `read_offline_bars`; a seam for callers).
     """
     files = symbol_bar_files(data_dir, symbol)
@@ -149,7 +151,6 @@ def read_symbol_bars(
         return reader(files[0])
     pattern = _month_name(symbol)
     frames = []
-    previous: tuple[Path, pd.Timestamp] | None = None
     for path in files:
         frame = reader(path)
         match = pattern.fullmatch(path.name)
@@ -166,12 +167,6 @@ def read_symbol_bars(
             )
         if not dates.is_monotonic_increasing or dates.duplicated().any():
             raise ValueError(f"month file {path} has dates that are not strictly increasing")
-        if previous is not None and dates.iloc[0] <= previous[1]:
-            raise ValueError(
-                f"month file {path} overlaps {previous[0].name}: starts at {dates.iloc[0]}, "
-                f"which is not after {previous[1]}"
-            )
-        previous = (path, dates.iloc[-1])
         frames.append(frame)
     return pd.concat(frames, ignore_index=True)[list(COLUMNS)]
 
@@ -201,7 +196,19 @@ def symbol_fingerprint(
     return digest.hexdigest(), total
 
 
-def write_month_file(path: Path, frame: pd.DataFrame) -> None:
+# On Windows `os.replace` raises PermissionError while a reader has the target
+# open; the writer retries for at most this long, pausing this long between tries.
+REPLACE_RETRY_SECONDS = 2.0
+REPLACE_RETRY_PAUSE = 0.05
+
+
+def write_month_file(
+    path: Path,
+    frame: pd.DataFrame,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
     """Write `frame` (columns `COLUMNS`) as a month file, atomically.
 
     Format: header `date,time,open,high,low,close,volume`, no index column,
@@ -209,7 +216,11 @@ def write_month_file(path: Path, frame: pd.DataFrame) -> None:
     file in the same folder and is then moved over `path` with `os.replace`, so
     a reader never sees a half-written file. The folder is created if needed.
     A frame with other columns or no rows is a `ValueError`; so is a row outside
-    the month named by `path` when `path` is a month file name.
+    the month named by `path` when `path` is a month file name. If the move fails
+    with `PermissionError` (a reader holds the target open, Windows) it is retried
+    for up to `REPLACE_RETRY_SECONDS`, pausing with `sleep`, timed by `clock`; then
+    the original error is raised. On any failure `path` is unchanged and no temp
+    file is left.
     """
     path = Path(path)
     if list(frame.columns) != list(COLUMNS):
@@ -217,7 +228,7 @@ def write_month_file(path: Path, frame: pd.DataFrame) -> None:
     if frame.empty:
         raise ValueError("refusing to write an empty month file")
     dates = pd.to_datetime(frame["date"])
-    match = re.fullmatch(r".+_(\d{4})-(0[1-9]|1[0-2])\.csv", path.name)
+    match = re.fullmatch(r".+_([0-9]{4})-(0[1-9]|1[0-2])\.csv", path.name)
     if match and ((dates.dt.year != int(match.group(1))) | (dates.dt.month != int(match.group(2)))).any():
         raise ValueError(f"frame has rows outside the month of {path.name}")
     out = frame.copy()
@@ -227,7 +238,15 @@ def write_month_file(path: Path, frame: pd.DataFrame) -> None:
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="") as temp:
             out.to_csv(temp, index=False, lineterminator="\n")
-        os.replace(temp_name, path)
+        deadline = clock() + REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if clock() >= deadline:
+                    raise
+                sleep(REPLACE_RETRY_PAUSE)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(temp_name)

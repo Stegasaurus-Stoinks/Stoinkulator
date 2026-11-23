@@ -102,11 +102,13 @@ def test_row_outside_its_month_refused(tmp_path: Path, frame: pd.DataFrame) -> N
         read_symbol_bars(tmp_path, "AAPL")
 
 
-def test_overlap_between_month_files_refused(tmp_path: Path, frame: pd.DataFrame) -> None:
-    """Dates must be strictly increasing: a repeated or backwards stamp is refused.
+def test_dates_inside_a_month_file_must_be_strictly_increasing(
+    tmp_path: Path, frame: pd.DataFrame
+) -> None:
+    """A repeated or backwards stamp inside one file is refused.
 
-    Every row must lie in its file's month, so two month files cannot interleave;
-    what remains reachable is a repeat or step back inside one file, checked here.
+    Rows outside the file's month are refused too (test above), so month files
+    cannot overlap one another; this is the only ordering left to check.
     """
     write_months(tmp_path, frame)
     assert len(read_symbol_bars(tmp_path, "AAPL")) == len(frame)  # adjacent months are fine
