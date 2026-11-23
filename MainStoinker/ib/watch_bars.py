@@ -40,8 +40,8 @@ Checks, in this sequence, before any client or connection is built: arguments; d
 machine's idea of "home"); output and recording paths (not in the repository or a OneDrive
 folder, not a file or under one); the port guard (`check_broker_port`: paper ports always, a
 live port only if the OWNER set the opt-in variable named in the refusal text, in their own
-terminal; this module never sets it); the folders are created; the console gate (an interactive terminal; the owner
-types the port number). The environment is read in `main` only. Every printed line passes
+terminal; this module never sets it); the folders are created; the console gate (an interactive
+terminal; the owner types the port number). The environment is read in `main` only. Every printed line passes
 `scrub` and `ManagedAccounts` is never printed.
 
 The session recording (on by default, `watch-bars-<date>-<n>.jsonl`) is written by
