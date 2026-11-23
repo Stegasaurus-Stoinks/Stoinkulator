@@ -154,7 +154,16 @@ class Rig:
 
     @property
     def fake(self) -> Any:
-        return self.fakes[0]
+        """The fake of the latest attempt: there is one fake (one client) per attempt."""
+        return self.fakes[-1]
+
+    @property
+    def connects(self) -> int:
+        return sum(f.connects for f in self.fakes)
+
+    def names(self, *wanted: str) -> list[str]:
+        """The wanted call names of every fake, attempt by attempt."""
+        return [n for f in self.fakes for n in f.call_names if n in wanted]
 
 
 @pytest.fixture
@@ -171,10 +180,13 @@ def build(request: pytest.FixtureRequest) -> Callable[..., Rig]:
     ) -> Rig:
         clock = Clock()
         fakes: list[Any] = []
+        script = list(behavior) if isinstance(behavior, list) else [behavior]
 
         def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
+            # one fake per attempt, each scripted with the next behaviour (the last repeats)
             wrapper = DataOnlyClient(env, on_event, on_raw, logger)
-            fake = fake_cls(wrapper, connect_behavior=behavior, **(fake_kw or {}))
+            one = script[min(len(fakes), len(script) - 1)]
+            fake = fake_cls(wrapper, connect_behavior=one, **(fake_kw or {}))
             fakes.append(fake)
             return fake
 
@@ -229,10 +241,6 @@ def wait_until(predicate: Callable[[], bool]) -> None:
     raise AssertionError("condition not reached")
 
 
-def names(fake: Any, *wanted: str) -> list[str]:
-    return [n for n in fake.call_names if n in wanted]
-
-
 def assert_no_events_of_attempt_one(conn: IbConnection) -> None:
     """The disconnect() that ended attempt 1 reported connectionClosed; the consumer must
     not see it (nor read it as the close of attempt 2)."""
@@ -241,13 +249,17 @@ def assert_no_events_of_attempt_one(conn: IbConnection) -> None:
     assert not any(isinstance(e, events.ConnectionClosed) for e in seen), seen
 
 
-def assert_disconnect_between_connects(fake: Any) -> None:
-    """Every connect after the first is preceded by a disconnect of the previous one."""
-    seq = names(fake, "connect", "disconnect")
+def assert_disconnect_between_connects(rig: Rig) -> None:
+    """Every client but the last is disconnected before the next one is built, and is dropped."""
+    seq = rig.names("connect", "disconnect")
     assert seq.count("connect") >= 2
+    assert len(rig.fakes) == seq.count("connect")  # one client per attempt
     for i, name in enumerate(seq):
         if name == "connect" and i > 0:
             assert seq[i - 1] == "disconnect", seq
+    for fake in rig.fakes[:-1]:
+        assert not fake.isConnected()
+        assert fake.connects == 1  # never connected a second time
 
 
 # -- open: guards before anything is built ----------------------------------------
@@ -336,17 +348,17 @@ def test_bounded_attempts_then_gives_up(build: Callable[..., Rig]) -> None:
     rig = build(ConnectBehavior.REFUSE)
     with pytest.raises(ConnectFailed) as info:
         rig.conn.open()
-    assert rig.fake.connects == 3
+    assert rig.connects == 3
     assert rig.clock.sleeps == [5, 10]  # two retry sleeps, backing off
     assert len(info.value.failures) == 3
     # disconnect() before every retry, and after the last attempt
-    assert names(rig.fake, "connect", "disconnect") == ["connect", "disconnect"] * 3
+    assert rig.names("connect", "disconnect") == ["connect", "disconnect"] * 3
 
 
 def test_late_close_of_a_refused_attempt_is_not_read_as_the_next_one(build: Callable[..., Rig]) -> None:
     rig = build([ConnectBehavior.REFUSE, ConnectBehavior.ACCEPT])
     rig.conn.open()
-    assert rig.fake.connects == 2
+    assert rig.connects == 2
     seen = drain(rig.conn)
     assert not any(isinstance(e, events.ConnectionClosed) for e in seen)
     assert not any(isinstance(e, events.IbError) and e.code == 502 for e in seen)
@@ -362,9 +374,9 @@ def test_hung_handshake_abandoned_after_timeout(
     rig.clock.jump = 100.0
     with caplog.at_level(logging.WARNING):
         rig.conn.open()
-    assert rig.fake.connects == 2
+    assert rig.connects == 2
     assert rig.conn.attempts_made == 2
-    assert_disconnect_between_connects(rig.fake)
+    assert_disconnect_between_connects(rig)
     assert any("abandoned" in r.getMessage() for r in caplog.records)
     assert_no_events_of_attempt_one(rig.conn)
     assert rig.conn.state is ConnState.READY
@@ -373,7 +385,7 @@ def test_hung_handshake_abandoned_after_timeout(
 def test_socket_closed_in_handshake_is_detected_without_a_callback(build: Callable[..., Rig]) -> None:
     rig = build([ConnectBehavior.CLOSED_IN_HANDSHAKE, ConnectBehavior.ACCEPT])
     rig.conn.open()
-    assert rig.fake.connects == 2
+    assert rig.connects == 2
     assert rig.clock.sleeps == [5]  # one retry delay, and no timeout was needed to notice
     assert rig.clock.now == 5
 
@@ -388,11 +400,11 @@ def test_missing_next_valid_id_counts_as_failed_attempt(
     rig.clock.jump = 100.0
     with caplog.at_level(logging.WARNING):
         rig.conn.open()
-    assert rig.fake.connects == 2
+    assert rig.connects == 2
     assert any("no nextValidId" in r.getMessage() for r in caplog.records)
     assert_no_events_of_attempt_one(rig.conn)
     # the connected client is disconnected before the second connect
-    assert_disconnect_between_connects(rig.fake)
+    assert_disconnect_between_connects(rig)
 
 
 def test_client_id_in_use_is_fatal_without_retry(build: Callable[..., Rig]) -> None:

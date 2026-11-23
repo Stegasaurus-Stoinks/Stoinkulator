@@ -18,12 +18,11 @@ Facts about ibapi 10.37.2 the design rests on
   connection not having closed), within `ready_timeout`. A refused socket is
   error 502 followed by `connectionClosed`, both delivered before `connect`
   returns; TWS closing the socket during the handshake delivers nothing at all.
-  Every queued event carries the number of the attempt that produced it, and
-  the queue is drained between attempts, so a close from attempt N is never
-  read as the close of attempt N+1.
-* `disconnect()` is called before every retry (after a failed attempt of any
-  kind, including a `nextValidId` timeout): a second `connect` on a connected
-  client would silently open a second socket.
+* An `EClient` keeps one message queue for its whole life and `reset()` does not
+  clear it, so a message left over from a failed attempt would be decoded by the
+  next attempt on the same client. Hence **one fresh client per attempt**: the
+  factory is called once per attempt, the previous client is disconnected, its
+  threads joined (bounded) and it is dropped, never used again.
 * `run()` after a caller `disconnect()` with messages still queued raises
   `TypeError` on the run thread. The reader thread wraps `run()` and turns any
   exception into a `ReaderStopped` event.
@@ -33,16 +32,35 @@ Facts about ibapi 10.37.2 the design rests on
   subscriptions are kept. 326 (client id in use) is detected by its code and is
   never retried.
 * `connectionClosed` arrives on the caller thread after a `disconnect()` and on
-  the run thread after a peer close; the handlers here are thread-safe.
+  the run thread after a peer close, and with the real client the two can race.
+  At most one `ConnectionClosed` per attempt reaches the consumer.
 
 The retry loop catches narrowly: `OSError` (sockets, timeouts) and the
 documented outcomes of a hung handshake. `MessageRefused`, `BrokerPortRefused`
 and anything else propagate from the first attempt (after a `disconnect()`),
 including a refusal by the client's frame guard, which leaves the socket open.
 
+Per-attempt state
+-----------------
+Everything that belongs to one attempt (client, threads, event queue, lost flag,
+data-farm codes) lives in one small `_Attempt` object, created by `_begin_attempt`.
+The callbacks given to the factory are bound to that object, so a late callback of
+an old client (from any thread) lands in the old object and can reach neither the
+current attempt's queue nor its state. When an attempt ends its object is marked
+dead and ignores further callbacks.
+
+If a thread of an old client (the connect helper or the reader) is still alive
+`join_timeout` after its `disconnect()`, that is logged at warning level and recorded
+in the failure list, and the next attempt goes on with a new client. More than
+`MAX_STUCK_THREADS` such threads alive at once makes `open()` fail (`ConnectFailed`),
+so that threads cannot pile up.
+
 Threads: callbacks only put events on a queue; the caller thread consumes them
-(`next_event`). Observers see every request and every raw callback, on the
-thread where it happens, so they must be thread-safe.
+(`next_event`). Observers see every request and every raw callback, on the thread
+where it happens, so they must be thread-safe and fast. **An observer must not call
+back into the connection**: `request()` from an observer on the thread that is
+inside `request()` raises `RuntimeError` (it would deadlock), and `close()` from an
+observer is not supported either.
 
 Waiting and backoff use the injected `clock` and `sleep`. The clock bounds every
 timeout; waits for something to happen block for at most `poll_interval` real
@@ -54,17 +72,13 @@ close() during open()
 has started, `open()` makes no further connect attempt, wakes from every wait within
 `poll_interval` (the connect wait and the ready wait) or at once (the default
 backoff sleep waits on an event that `close()` sets), disconnects whatever is open,
-ends in state CLOSED and raises `ConnectionClosedDuringOpen`. A connect that
-succeeds at the same moment is disconnected, never left READY. An injected `sleep`
-is called as it is: it must be interruptible or short, or the abort waits for it.
-
-Per-attempt state (the lost flag, the data-farm codes, `next_valid_id`, the queues)
-is reset in `_begin_attempt`. Events carry the number of the attempt whose thread
-produced them: the helper and reader threads capture it when they are started, so a
-late callback of an old thread can never be read as the new attempt's. If the reader
-or the connect helper of an attempt is still alive `join_timeout` after its
-`disconnect()`, no further attempt is made on that client: `open()` fails with
-`ConnectFailed` naming the thread.
+ends in state CLOSED and raises `ConnectionClosedDuringOpen`. `close()` itself waits,
+bounded by `join_timeout`, until `open()` has finished that cleanup (when it is called
+on another thread than `open()`, the reader or the connect helper); if that bound is
+exceeded it logs an error naming what is still running. Whichever of `open()`, the
+connect helper and `close()` sees a connected client after the close flag is set
+disconnects it, so no connect that finishes late stays open. An injected `sleep` is
+called as it is: it must be interruptible or short, or the abort waits for it.
 """
 
 from __future__ import annotations
@@ -108,6 +122,8 @@ FARM_KINDS: dict[str, frozenset[int]] = {
 
 DATA_FARM_CODES: frozenset[int] = frozenset().union(*FARM_KINDS.values())
 MAX_ATTEMPTS = 100
+MAX_STUCK_THREADS = 3
+"""More abandoned threads than this still alive makes `open()` fail."""
 MAX_REQUESTS_PER_SECOND = 50  # IB documents 50 messages per second
 MAX_CLIENT_ID = 2**31 - 1
 CLIENT_ID_IN_USE = 326
@@ -116,6 +132,15 @@ RESTORED_DATA_LOST = 1101
 RESTORED_DATA_KEPT = 1102
 REFUSED_CLIENT_IDS: frozenset[int] = frozenset({0, 123})
 """0 would take over orders placed by hand in TWS; 123 is the legacy code's id."""
+MAX_SECONDS: dict[str, float] = {
+    "connect_timeout": 300,
+    "ready_timeout": 300,
+    "retry_delay": 600,
+    "max_retry_delay": 600,
+    "poll_interval": 10,
+    "join_timeout": 60,
+}
+"""Upper bounds (seconds) of the constructor's timeouts and delays."""
 
 
 class ConnState(enum.Enum):
@@ -127,7 +152,7 @@ class ConnState(enum.Enum):
 
 
 class ConnectFailed(RuntimeError):
-    """`open()` gave up. `failures` lists every attempt with IB's code and message."""
+    """`open()` gave up. `failures` lists every attempt so far with IB's code and message."""
 
     def __init__(self, message: str, failures: tuple[AttemptFailure, ...] = ()) -> None:
         super().__init__(message)
@@ -194,7 +219,7 @@ ConnectionEvent = events.Event | ConnectionLost | ConnectionRestored | ReaderSto
 
 
 class Observer(Protocol):
-    """Optional hooks; an object may define either or both."""
+    """Optional hooks; an object may define either or both. Must not call back into the connection."""
 
     def on_request(self, name: str, args: tuple[Any, ...]) -> None: ...
 
@@ -207,18 +232,33 @@ class _ConnectBox:
         self.error: BaseException | None = None
 
 
-def _positive_number(name: str, value: Any) -> None:
+class _Attempt:
+    """Everything that belongs to one connect attempt; never reused."""
+
+    def __init__(self, number: int) -> None:
+        self.number = number
+        self.client: Any = None
+        self.helper: threading.Thread | None = None
+        self.reader: threading.Thread | None = None
+        self.queue: queue.Queue[ConnectionEvent] = queue.Queue()
+        self.lost = False
+        self.farm_codes: set[int] = set()
+        self.closed_seen = False  # at most one ConnectionClosed per attempt is delivered
+        self.dead = False  # set when the attempt is over: later callbacks are ignored
+
+
+def _positive_number(name: str, value: Any, maximum: float) -> None:
     if (
         isinstance(value, bool)
         or not isinstance(value, int | float)
         or not math.isfinite(value)
-        or value <= 0
+        or not 0 < value <= maximum
     ):
-        raise ValueError(f"{name} must be a finite number above 0, not {value!r}")
+        raise ValueError(f"{name} must be a finite number above 0 and at most {maximum}, not {value!r}")
 
 
 class IbConnection:
-    """Owns one IB client, its reader thread and its event queue. See the module docstring.
+    """Owns the IB client of the current attempt, its reader thread and its event queue.
 
     Public API: `open()`, `close()` (also `with`), `state`, `next_event(timeout)`,
     `wait_for_data_farm(timeout, farm=None)`, `request(name, *args)`,
@@ -229,8 +269,10 @@ class IbConnection:
     Constructor numbers are validated: `attempts` is an int from 1 to `MAX_ATTEMPTS`
     (there is no way to retry forever), `max_requests_per_second` an int from 1 to
     `MAX_REQUESTS_PER_SECOND` (IB allows 50 messages per second), `backoff` at least
-    1, and every timeout and delay finite and above 0. The client id is checked by
-    `open()` (an int from 1 to 2147483647, not 123; `bool` is refused).
+    1, and every timeout and delay finite, above 0 and at most its bound in
+    `MAX_SECONDS` (`connect_timeout` and `ready_timeout` 300 s, `retry_delay` and
+    `max_retry_delay` 600 s, `join_timeout` 60 s, `poll_interval` 10 s). The client id
+    is checked by `open()` (an int from 1 to 2147483647, not 123; `bool` is refused).
 
     Timeouts. `connect_timeout` (default 10 s) bounds one `connect` call and
     `ready_timeout` (default 10 s) the wait for `nextValidId` after it. On the first
@@ -298,7 +340,7 @@ class IbConnection:
             ("poll_interval", poll_interval),
             ("join_timeout", join_timeout),
         ):
-            _positive_number(label, number)
+            _positive_number(label, number, MAX_SECONDS[label])
         if (
             isinstance(backoff, bool)
             or not isinstance(backoff, int | float)
@@ -327,19 +369,16 @@ class IbConnection:
         self._log = logger if logger is not None else logging.getLogger(__name__)
 
         self._lock = threading.RLock()
-        self._queue: queue.Queue[tuple[int, ConnectionEvent]] = queue.Queue()
         self._backlog: deque[ConnectionEvent] = deque()  # consumer thread only
-        self._tls = threading.local()  # the attempt a helper or reader thread belongs to
-        self._attempt = 0
+        self._tls = threading.local()  # .internal: a thread this class started; .in_request
+        self._att: _Attempt | None = None  # the current attempt
+        self._stuck: list[threading.Thread] = []  # abandoned threads of old attempts
         self.attempts_made = 0
         self._phase = ConnState.NEW  # NEW, CONNECTING, READY or CLOSED
-        self._lost = False
         self._close_started = False
         self._close_evt = threading.Event()  # set by close(); read by open()
-        self._client: Any = None
-        self._reader: threading.Thread | None = None
-        self._helper: threading.Thread | None = None
-        self._farm_codes: set[int] = set()
+        self._opener: threading.Thread | None = None  # the thread inside open()
+        self._open_done = threading.Event()
         self._farm_cond = threading.Condition(self._lock)
         self._request_ids = 0
         self._request_times: deque[float] = deque()
@@ -353,7 +392,8 @@ class IbConnection:
     @property
     def state(self) -> ConnState:
         with self._lock:
-            if self._phase is ConnState.READY and self._lost:
+            att = self._att
+            if self._phase is ConnState.READY and att is not None and att.lost:
                 return ConnState.LOST
             return self._phase
 
@@ -388,60 +428,74 @@ class IbConnection:
             if self._phase is not ConnState.NEW or self._close_started:
                 raise RuntimeError(f"open() on a connection that is {self._phase.value}")
             self._phase = ConnState.CONNECTING
+            self._opener = threading.current_thread()
+            self._open_done.clear()
         try:
-            self._client = self._factory(
-                env=self._env, on_event=self._on_event, on_raw=self._on_raw, logger=self._log
-            )
-            failures: list[AttemptFailure] = []
-            for n in range(1, self._attempts + 1):
-                self._check_open()
-                self._begin_attempt(n)
-                try:
-                    failure, fatal = self._attempt_once(n)
-                except BaseException:
-                    self._end_attempt()
-                    raise
-                if failure is None:
-                    return
-                failures.append(failure)
-                self._log.warning(
-                    "IB connect attempt %d of %d to %s:%d failed: %s",
-                    n, self._attempts, self.host, self.port, failure.describe(),
-                )
-                stuck = self._end_attempt()
-                self._check_open()
-                if fatal:
-                    raise ClientIdInUse(
-                        f"IB client id {self.client_id} is already in use by another API "
-                        f"connection to this TWS ({failure.describe()}); not retrying. "
-                        "Close the other client or use another id.",
-                        tuple(failures),
-                    )
-                if stuck:
-                    raise ConnectFailed(
-                        f"IB thread {', '.join(t.name for t in stuck)} did not end within "
-                        f"{self._join_timeout}s after disconnect(); not connecting again on the "
-                        f"same client (attempt {n} of {self._attempts}): "
-                        + "; ".join(f.describe() for f in failures),
-                        tuple(failures),
-                    )
-                if n < self._attempts:
-                    self._pause(min(self._retry_delay * self._backoff ** (n - 1), self._max_retry_delay))
-            raise ConnectFailed(
-                f"Could not connect to IB at {self.host}:{self.port} with client id "
-                f"{self.client_id} after {self._attempts} attempt(s): "
-                + "; ".join(f.describe() for f in failures),
-                tuple(failures),
-            )
+            self._open_attempts()
         except BaseException:
             try:
                 if self._close_evt.is_set():
                     # close() is (or was) running: make sure nothing of ours stays open.
-                    self._end_attempt()
+                    self._end_attempt(self._att)
             finally:
                 with self._lock:
                     self._phase = ConnState.CLOSED
             raise
+        finally:
+            with self._lock:
+                self._opener = None
+            self._open_done.set()
+
+    def _open_attempts(self) -> None:
+        failures: list[AttemptFailure] = []
+        for n in range(1, self._attempts + 1):
+            self._check_open()
+            att = self._begin_attempt(n)
+            try:
+                failure, fatal = self._attempt_once(att)
+            except BaseException:
+                self._end_attempt(att)
+                raise
+            if failure is None:
+                return
+            failures.append(failure)
+            self._log.warning(
+                "IB connect attempt %d of %d to %s:%d failed: %s",
+                n, self._attempts, self.host, self.port, failure.describe(),
+            )
+            for thread in self._end_attempt(att):
+                self._stuck.append(thread)
+                failures.append(
+                    AttemptFailure(
+                        n, None,
+                        f"IB thread {thread.name} did not end within {self._join_timeout}s after "
+                        "disconnect(); abandoned (the next attempt uses a new client)",
+                    )
+                )
+            self._check_open()
+            if fatal:
+                raise ClientIdInUse(
+                    f"IB client id {self.client_id} is already in use by another API "
+                    f"connection to this TWS ({failure.describe()}); not retrying. "
+                    "Close the other client or use another id.",
+                    tuple(failures),
+                )
+            alive = [t for t in self._stuck if t.is_alive()]
+            if len(alive) > MAX_STUCK_THREADS:
+                raise ConnectFailed(
+                    f"{len(alive)} abandoned IB threads ({', '.join(t.name for t in alive)}) are "
+                    f"still alive (more than {MAX_STUCK_THREADS}); giving up after attempt {n} of "
+                    f"{self._attempts}: " + "; ".join(f.describe() for f in failures),
+                    tuple(failures),
+                )
+            if n < self._attempts:
+                self._pause(min(self._retry_delay * self._backoff ** (n - 1), self._max_retry_delay))
+        raise ConnectFailed(
+            f"Could not connect to IB at {self.host}:{self.port} with client id "
+            f"{self.client_id} after {self._attempts} attempt(s): "
+            + "; ".join(f.describe() for f in failures),
+            tuple(failures),
+        )
 
     def _check_open(self) -> None:
         if self._close_evt.is_set():
@@ -458,44 +512,51 @@ class IbConnection:
         else:
             self._sleep(seconds)
 
-    def _begin_attempt(self, n: int) -> None:
-        """Start attempt `n`: all per-attempt state is reset here, and only here."""
+    def _begin_attempt(self, n: int) -> _Attempt:
+        """Start attempt `n` with a fresh client and a fresh `_Attempt`."""
+        att = _Attempt(n)
         with self._lock:
-            self._attempt = n
+            self._att = att
             self.attempts_made = n
-            self._lost = False
-            self._farm_codes.clear()
             self.next_valid_id = None
-            self._helper = None
-            self._reader = None
         self._backlog.clear()
-        self._drain()
+        att.client = self._factory(
+            env=self._env,
+            on_event=lambda event: self._on_event(att, event),
+            on_raw=lambda name, args: self._on_raw(att, name, args),
+            logger=self._log,
+        )
+        return att
 
-    def _drain(self) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                return
+    def _disconnect(self, att: _Attempt) -> None:
+        """`disconnect()` the attempt's client. A client that is already closed may raise."""
+        try:
+            att.client.disconnect()
+        except (AttributeError, OSError, TypeError) as exc:
+            self._log.debug(
+                "IB client of attempt %d: disconnect() raised %r; treated as already closed",
+                att.number, exc,
+            )
 
-    def _end_attempt(self) -> list[threading.Thread]:
-        """Disconnect (always, before any retry), join the threads, drop what is queued.
+    def _end_attempt(self, att: _Attempt | None) -> list[threading.Thread]:
+        """Disconnect (always, before any retry), join the threads, retire the attempt.
 
         Returns the threads that are still alive after `join_timeout`.
         """
-        stuck: list[threading.Thread] = []
+        if att is None:
+            return []
         try:
-            if self._client is not None:
-                self._client.disconnect()
+            if att.client is not None:
+                self._disconnect(att)
         finally:
-            stuck = self._join_threads()
+            stuck = self._join_threads(att)
+            att.dead = True
             self._backlog.clear()
-            self._drain()
         return stuck
 
-    def _join_threads(self) -> list[threading.Thread]:
+    def _join_threads(self, att: _Attempt) -> list[threading.Thread]:
         stuck: list[threading.Thread] = []
-        for role, thread in (("connect helper", self._helper), ("reader", self._reader)):
+        for role, thread in (("connect helper", att.helper), ("reader", att.reader)):
             if thread is None or thread is threading.current_thread():
                 continue
             try:
@@ -509,42 +570,43 @@ class IbConnection:
                 stuck.append(thread)
         return stuck
 
-    def _connect_target(self, client: Any, box: _ConnectBox, attempt: int) -> None:
-        self._tls.attempt = attempt
+    def _connect_target(self, att: _Attempt, box: _ConnectBox) -> None:
+        self._tls.internal = True
         try:
-            client.connect(self.host, self.port, self.client_id)
+            att.client.connect(self.host, self.port, self.client_id)
         except BaseException as exc:  # handed to the caller thread, which decides
             box.error = exc
         finally:
+            if self._close_evt.is_set():
+                self._disconnect(att)  # a connect that finished after close() must not stay open
             box.done.set()
 
-    def _attempt_once(self, n: int) -> tuple[AttemptFailure | None, bool]:
-        client = self._client
+    def _attempt_once(self, att: _Attempt) -> tuple[AttemptFailure | None, bool]:
+        n = att.number
+        self._check_open()
         box = _ConnectBox()
         helper = threading.Thread(
-            target=self._connect_target, args=(client, box, n), name=f"ib-connect-{n}", daemon=True
+            target=self._connect_target, args=(att, box), name=f"ib-connect-{n}", daemon=True
         )
+        att.helper = helper
         helper.start()
-        self._helper = helper
         deadline = self._clock() + self._connect_timeout
         released = False
         while not box.done.wait(self._poll):
             if self._close_evt.is_set():
-                client.disconnect()  # releases a hung connect; the check below aborts
+                self._disconnect(att)  # releases a hung connect; the check below aborts
                 break
             if self._clock() >= deadline:
                 released = True
-                client.disconnect()
+                self._disconnect(att)
                 break
         helper.join(self._join_timeout)
         if helper.is_alive():
-            detail = (
-                f"The IB connect helper thread {helper.name} of attempt {n} did not end after "
-                "disconnect()."
-            )
             if self._close_evt.is_set():
-                raise self._closed_error(f" ({detail})")
-            raise ConnectFailed(detail)
+                raise self._closed_error(f" (connect helper {helper.name} still running)")
+            return AttemptFailure(
+                n, None, f"connect helper {helper.name} did not end after disconnect(); abandoned"
+            ), False
         self._check_open()  # a connect that succeeded concurrently is disconnected by the caller
         error = box.error
         if released:
@@ -561,33 +623,31 @@ class IbConnection:
             raise error
         # connect() returned. That proves nothing: wait for nextValidId.
         reader = threading.Thread(
-            target=self._read, args=(client, n), name=f"ib-reader-{n}", daemon=True
+            target=self._read, args=(att,), name=f"ib-reader-{n}", daemon=True
         )
+        att.reader = reader
         reader.start()
-        self._reader = reader
-        return self._await_ready(n, reader)
+        return self._await_ready(att, reader)
 
-    def _await_ready(self, n: int, reader: threading.Thread) -> tuple[AttemptFailure | None, bool]:
+    def _await_ready(self, att: _Attempt, reader: threading.Thread) -> tuple[AttemptFailure | None, bool]:
+        n = att.number
         deadline = self._clock() + self._ready_timeout
         last_error: events.IbError | None = None
         closed = False
         while True:
             self._check_open()
-            item = self._pop(self._poll)
-            if item is None:
+            ev = self._pop(att, self._poll)
+            if ev is None:
                 if self._clock() >= deadline:
                     why = f"no nextValidId within {self._ready_timeout}s"
                     return self._no_ready(n, last_error, why), False
                 if reader.is_alive():
                     continue
-                item = self._pop(0)  # the reader ended: everything it queued is there
-                if item is None:
+                ev = self._pop(att, 0)  # the reader ended: everything it queued is there
+                if ev is None:
                     why = "connection closed before nextValidId" if closed else (
                         "connection closed during the handshake")
                     return self._no_ready(n, last_error, why), False
-            attempt, ev = item
-            if attempt != n:
-                continue  # a late event of an earlier attempt
             self._backlog.append(ev)
             if isinstance(ev, events.NextValidId):
                 with self._lock:
@@ -614,16 +674,18 @@ class IbConnection:
 
     # -- reader and callbacks ----------------------------------------------------
 
-    def _read(self, client: Any, attempt: int) -> None:
-        self._tls.attempt = attempt  # captured when the thread was started, not read later
+    def _read(self, att: _Attempt) -> None:
+        self._tls.internal = True
         try:
-            client.run()
+            att.client.run()
         except BaseException as exc:  # becomes an event; the thread never dies loudly
             self.reader_errors.append(exc)
-            self._queue.put((attempt, ReaderStopped(exc)))
+            if not att.dead:
+                att.queue.put(ReaderStopped(exc))
 
-    def _on_raw(self, name: str, args: tuple[Any, ...]) -> None:
-        self._notify("on_raw", name, args)
+    def _on_raw(self, att: _Attempt, name: str, args: tuple[Any, ...]) -> None:
+        if not att.dead:
+            self._notify("on_raw", name, args)
 
     def _notify(self, hook: str, name: str, args: tuple[Any, ...]) -> None:
         for obs in self._observers:
@@ -636,47 +698,51 @@ class IbConnection:
                 self.observer_failures.append(exc)
                 self._log.error("IB observer %r.%s raised %r", obs, hook, exc)
 
-    def _on_event(self, event: events.Event) -> None:
-        tag = getattr(self._tls, "attempt", None)  # set on helper and reader threads only
+    def _on_event(self, att: _Attempt, event: events.Event) -> None:
         derived: ConnectionEvent | None = None
         farm_code: int | None = None
         with self._lock:
-            attempt = self._attempt if tag is None else tag
-            if attempt == self._attempt:  # a late event of an old attempt changes no state
-                if isinstance(event, events.IbError):
-                    code = event.code
-                    if code in DATA_FARM_CODES:
-                        farm_code = code
-                    elif code == CONNECTION_LOST:
-                        self._lost = True
-                        derived = ConnectionLost(code, event.message)
-                    elif code in (RESTORED_DATA_LOST, RESTORED_DATA_KEPT):
-                        self._lost = False
-                        derived = ConnectionRestored(
-                            code, event.message, data_lost=code == RESTORED_DATA_LOST
-                        )
-                elif isinstance(event, events.ConnectionClosed) and self._phase is ConnState.READY:
+            if att.dead:
+                return
+            if isinstance(event, events.IbError):
+                code = event.code
+                if code in DATA_FARM_CODES:
+                    farm_code = code
+                elif code == CONNECTION_LOST:
+                    att.lost = True
+                    derived = ConnectionLost(code, event.message)
+                elif code in (RESTORED_DATA_LOST, RESTORED_DATA_KEPT):
+                    att.lost = False
+                    derived = ConnectionRestored(
+                        code, event.message, data_lost=code == RESTORED_DATA_LOST
+                    )
+            elif isinstance(event, events.ConnectionClosed):
+                if att.closed_seen:  # the real client can report the close twice
+                    return
+                att.closed_seen = True
+                if att is self._att and self._phase is ConnState.READY:
                     self._phase = ConnState.CLOSED
-        self._queue.put((attempt, event))
+        att.queue.put(event)
         if derived is not None:
             if isinstance(derived, ConnectionRestored) and derived.data_lost:
                 self._log.warning("IB code 1101: data lost; subscriptions must be requested again")
             elif isinstance(derived, ConnectionLost):
                 self._log.warning("IB code 1100: connection to IB lost; not reconnecting")
-            self._queue.put((attempt, derived))
+            att.queue.put(derived)
         if farm_code is not None:
             # After the queue put: a waiter that wakes can read the event with next_event.
             with self._farm_cond:
-                self._farm_codes.add(farm_code)
+                att.farm_codes.add(farm_code)
                 self._farm_cond.notify_all()
 
     # -- consumer side -------------------------------------------------------------
 
-    def _pop(self, wait: float) -> tuple[int, ConnectionEvent] | None:
+    @staticmethod
+    def _pop(att: _Attempt, wait: float) -> ConnectionEvent | None:
         try:
             if wait <= 0:
-                return self._queue.get_nowait()
-            return self._queue.get(timeout=wait)
+                return att.queue.get_nowait()
+            return att.queue.get(timeout=wait)
         except queue.Empty:
             return None
 
@@ -686,11 +752,15 @@ class IbConnection:
             return self._backlog.popleft()
         deadline = self._clock() + timeout
         while True:
-            item = self._pop(min(self._poll, timeout) if timeout > 0 else 0)
-            if item is not None:
-                if item[0] == self._attempt:
-                    return item[1]
-                continue
+            att = self._att
+            wait = min(self._poll, timeout) if timeout > 0 else 0
+            if att is None:
+                if wait > 0:
+                    self._close_evt.wait(wait)
+            else:
+                ev = self._pop(att, wait)
+                if ev is not None:
+                    return ev
             if timeout <= 0 or self._clock() >= deadline:
                 return None
 
@@ -701,6 +771,7 @@ class IbConnection:
         2158), which does not mean the historical farm is up. `farm` is `"market"`,
         `"historical"` or `"secdef"` to wait for that kind (see `FARM_KINDS`); anything
         else raises `ValueError`. Does not consume events: they stay for `next_event`.
+        Only the messages of the current attempt count.
         """
         if farm is None:
             wanted = DATA_FARM_CODES
@@ -710,14 +781,16 @@ class IbConnection:
             raise ValueError(f"farm must be None or one of {sorted(FARM_KINDS)}, not {farm!r}")
         deadline = self._clock() + timeout
         with self._farm_cond:
-            while not self._farm_codes & wanted:
+            while True:
+                att = self._att
+                if att is not None and att.farm_codes & wanted:
+                    return True
                 if self._clock() >= deadline:
                     self._log.warning(
                         "No IB data-farm message (%s) within %ss", sorted(wanted), timeout
                     )
                     return False
                 self._farm_cond.wait(self._poll)
-            return True
 
     # -- requests ----------------------------------------------------------------------
 
@@ -729,36 +802,50 @@ class IbConnection:
     def request(self, name: str, *args: Any) -> Any:
         """Send one data request (see `DATA_REQUESTS`), rate limited.
 
-        Allowed in states READY and LOST (see the class docstring).
+        Allowed in states READY and LOST (see the class docstring). Raises
+        `RuntimeError` when called from an observer of a request on the same thread.
         """
         if name not in DATA_REQUESTS:
             raise MessageRefused(
                 f"IbConnection refuses request {name!r}: only {sorted(DATA_REQUESTS)} may be sent."
             )
-        self._require_requestable(name)
+        if getattr(self._tls, "in_request", False):
+            raise RuntimeError(
+                "request() was called from inside request() (an observer?); observers must not "
+                "call back into the connection"
+            )
+        att = self._require_requestable(name)
         with self._request_lock:
-            self._throttle()
-            self._require_requestable(name)  # close() may have run while the throttle waited
-            self._notify("on_request", name, args)
-            return getattr(self._client, name)(*args)
+            self._tls.in_request = True
+            try:
+                self._throttle()
+                att = self._require_requestable(name)  # close() may have run while it waited
+                self._notify("on_request", name, args)
+                return getattr(att.client, name)(*args)
+            finally:
+                self._tls.in_request = False
 
-    def _require_requestable(self, name: str) -> None:
+    def _require_requestable(self, name: str) -> _Attempt:
         state = self.state
-        if state not in (ConnState.READY, ConnState.LOST):
+        att = self._att
+        if state not in (ConnState.READY, ConnState.LOST) or att is None:
             raise NotConnected(f"Cannot send {name}: the connection is {state.value}")
+        return att
 
     def _throttle(self) -> None:
         """At most `max_requests_per_second` in any one second of the injected clock.
 
         When full it sleeps through the injected `sleep` and then trusts that the wait
         happened: `now` is at least the moment it waited for, even if the clock was not
-        advanced by that sleep, so a frozen fake clock cannot make this loop spin.
+        advanced by that sleep. The test for an expired request is `times[0] + window
+        <= now`, the same sum as `until`, so a frozen clock cannot make this loop spin
+        (`now - window` is not exact in floats).
         """
         window = 1.0
         times = self._request_times
         now = max(self._clock(), times[-1] if times else -math.inf)
         while True:
-            while times and times[0] <= now - window:
+            while times and times[0] + window <= now:
                 times.popleft()
             if len(times) < self._rate:
                 times.append(now)
@@ -772,18 +859,42 @@ class IbConnection:
     def close(self) -> None:
         """Disconnect and join the threads. Idempotent; safe after a failed open.
 
-        From another thread it also aborts a running `open()` (see the module docstring).
-        Joins are bounded by `join_timeout`.
+        From another thread it also aborts a running `open()` and waits (at most
+        `join_timeout`) for it to finish its cleanup; see the module docstring.
         """
         with self._lock:
             if self._close_started:
                 return
             self._close_started = True
             self._close_evt.set()
+            opener = self._opener
+            first = self._att
+        own = getattr(self._tls, "internal", False) or opener is threading.current_thread()
         try:
-            if self._client is not None:
-                self._client.disconnect()
+            if first is not None and first.client is not None:
+                self._disconnect(first)
         finally:
-            self._join_threads()
+            if opener is not None and not own and not self._open_done.wait(self._join_timeout):
+                self._log.error(
+                    "close(): open() on thread %s did not finish within %ss; still running: %s",
+                    opener.name, self._join_timeout, self._running_threads() or "nothing else",
+                )
+            with self._lock:
+                att = self._att  # open() may have begun a newer attempt before it saw the flag
+            if att is not None:
+                if att.client is not None and (att is not first or att.client.isConnected()):
+                    self._disconnect(att)
+                self._join_threads(att)
+                att.dead = True
             with self._lock:
                 self._phase = ConnState.CLOSED
+
+    def _running_threads(self) -> str:
+        names = [
+            t.name
+            for att in (self._att,)
+            if att is not None
+            for t in (att.helper, att.reader)
+            if t is not None and t.is_alive()
+        ]
+        return ", ".join(names)

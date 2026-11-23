@@ -6,6 +6,7 @@ and every thread a test starts ends before the test returns.
 """
 
 import ast
+import logging
 import os
 import threading
 import time
@@ -20,6 +21,8 @@ from MainStoinker.ib import events
 from MainStoinker.ib.client import ALLOWED_MESSAGE_IDS, DataOnlyClient, MessageRefused
 from MainStoinker.ib.connection import (
     DATA_REQUESTS,
+    MAX_SECONDS,
+    MAX_STUCK_THREADS,
     ClientIdInUse,
     ClientIdRefused,
     ConnectFailed,
@@ -75,12 +78,39 @@ class SeqClock:
             self.now += seconds
 
 
+class SignalClock(SeqClock):
+    """Sets `seen` when the thread named `watch` reads the clock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.watch = ""
+        self.seen = threading.Event()
+
+    def __call__(self) -> float:
+        if threading.current_thread().name == self.watch:
+            self.seen.set()
+        return super().__call__()
+
+
+class PausingConnection(IbConnection):
+    """Signals when open() is about to wait in the backoff pause."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.paused = threading.Event()
+
+    def _pause(self, seconds: float) -> None:
+        self.paused.set()
+        super()._pause(seconds)
+
+
 class ProbeFake(FakeIbClient):
     """The fake plus a gate for `run` and a hook for the first moments of a connect."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.on_connect: Callable[[Any, int], None] | None = None
+        self.attempt_no = 1  # the attempt this fake (one per attempt) was built for
         self.run_slow = threading.Event()  # set: `run` ignores a disconnect until released
         self.run_slow.set()
         self.run_started = threading.Event()
@@ -103,7 +133,7 @@ class ProbeFake(FakeIbClient):
             return super().connect(host, port, clientId)
         finally:
             if self.on_connect is not None:
-                self.on_connect(self, self.connects)
+                self.on_connect(self, self.attempt_no)
 
     def run(self) -> None:
         self.run_started.set()
@@ -145,10 +175,23 @@ class Rig:
 
     @property
     def fake(self) -> Any:
-        return self.fakes[0]
+        """The fake of the latest attempt: there is one fake (one client) per attempt."""
+        return self.fakes[-1]
+
+    @property
+    def connects(self) -> int:
+        return sum(f.connects for f in self.fakes)
+
+    @property
+    def hangs(self) -> int:
+        return sum(f.hangs_entered for f in self.fakes)
+
+    def any_connected(self) -> bool:
+        return any(f.isConnected() for f in self.fakes)
 
     def raw_sequence(self) -> list[str]:
-        return [n for n in self.fake.call_names if n in ("connect", "disconnect")]
+        """connect/disconnect calls of every fake, attempt by attempt."""
+        return [n for f in self.fakes for n in f.call_names if n in ("connect", "disconnect")]
 
     def sequence(self) -> list[str]:
         """connect/disconnect calls, a run of disconnects counted once (a hung attempt is
@@ -173,26 +216,32 @@ def rig_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Rig]]:
         behavior: Any = B.ACCEPT,
         *,
         fake_cls: type[FakeIbClient] = ProbeFake,
-        fake_kw: dict[str, Any] | None = None,
+        fake_kw: dict[str, Any] | list[dict[str, Any]] | None = None,
         port: int = 7497,
         client_id: int = 21,
         env: Any = None,
         on_connect: Callable[[Any, int], None] | None = None,
         sleep: Callable[[float], None] | None = None,
         clock: SeqClock | None = None,
+        conn_cls: type[IbConnection] = IbConnection,
         **conn_kw: Any,
     ) -> Rig:
         clock = clock if clock is not None else SeqClock()
         fakes: list[Any] = []
+        script = list(behavior) if isinstance(behavior, list) else [behavior]
+        kws = fake_kw if isinstance(fake_kw, list) else [fake_kw or {}]
 
         def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
+            # one fake per attempt, each scripted with the next behaviour (the last repeats)
             wrapper = DataOnlyClient(env, on_event, on_raw, logger)
-            fake = fake_cls(wrapper, connect_behavior=behavior, **(fake_kw or {}))
+            one = script[min(len(fakes), len(script) - 1)]
+            fake = fake_cls(wrapper, connect_behavior=one, **kws[min(len(fakes), len(kws) - 1)])
             fake.on_connect = on_connect
             fakes.append(fake)
+            fake.attempt_no = len(fakes)
             return fake
 
-        conn = IbConnection(
+        conn = conn_cls(
             "127.0.0.1", port, client_id, env={} if env is None else env,
             client_factory=factory, clock=clock, sleep=sleep or clock.sleep, poll_interval=0.002,
             **conn_kw,
@@ -263,7 +312,9 @@ def settle(rig: Rig) -> None:
 NO_FARM = {"farm_messages": ()}
 
 
-def run_in_thread(fn: Callable[[], Any]) -> tuple[threading.Thread, list[Any]]:
+def run_in_thread(
+    fn: Callable[[], Any], name: str = "probe-caller"
+) -> tuple[threading.Thread, list[Any]]:
     out: list[Any] = []
 
     def target() -> None:
@@ -272,7 +323,7 @@ def run_in_thread(fn: Callable[[], Any]) -> tuple[threading.Thread, list[Any]]:
         except BaseException as exc:  # handed to the test thread
             out.append(("exc", exc))
 
-    t = threading.Thread(target=target, name="probe-caller", daemon=True)
+    t = threading.Thread(target=target, name=name, daemon=True)
     t.start()
     return t, out
 
@@ -307,7 +358,7 @@ def test_retry_forever_is_not_possible_by_default_and_max_wait_is_bounded(
     rig = rig_factory(B.REFUSE)
     with pytest.raises(ConnectFailed):
         rig.conn.open()
-    assert rig.fake.connects == 3
+    assert rig.connects == 3
     assert sum(rig.clock.sleeps) == 15
 
 
@@ -321,8 +372,8 @@ def test_backoff_is_capped_by_max_retry_delay(rig_factory: Callable[..., Rig]) -
 def test_hang_hang_accept(rig_factory: Callable[..., Rig]) -> None:
     rig = rig_factory([B.HANG, B.HANG, B.ACCEPT], attempts=3)
     rig.clock.triggers = [
-        lambda: bool(rig.fakes) and rig.fake.hangs_entered >= 1,
-        lambda: bool(rig.fakes) and rig.fake.hangs_entered >= 2,
+        lambda: rig.hangs >= 1,
+        lambda: rig.hangs >= 2,
     ]
     rig.conn.open()
     assert rig.conn.state is ConnState.READY
@@ -336,8 +387,8 @@ def test_hang_hang_accept(rig_factory: Callable[..., Rig]) -> None:
 def test_hang_forever_gives_up_after_the_attempts(rig_factory: Callable[..., Rig]) -> None:
     rig = rig_factory(B.HANG, attempts=2)
     rig.clock.triggers = [
-        lambda: rig.fake.hangs_entered >= 1 if rig.fakes else False,
-        lambda: rig.fake.hangs_entered >= 2 if rig.fakes else False,
+        lambda: rig.hangs >= 1,
+        lambda: rig.hangs >= 2,
     ]
     with pytest.raises(ConnectFailed) as info:
         rig.conn.open()
@@ -370,7 +421,7 @@ def test_client_id_in_use_first_is_fatal_and_leaves_no_socket(rig_factory: Calla
         rig.conn.open()
     assert rig.sequence() == ["connect", "disconnect"]
     assert rig.clock.sleeps == []
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
     assert rig.conn.state is ConnState.CLOSED
 
 
@@ -523,11 +574,11 @@ def assert_aborted_by_close(rig: Rig, out: list[Any], connects_at_close: int) ->
     assert out, "open() did not return after close()"
     assert out[0][0] == "exc", "open() returned normally after close()"
     assert type(out[0][1]) is ConnectionClosedDuringOpen, out[0][1]  # not a bare AttributeError
-    assert rig.fake.connects == connects_at_close, (
+    assert rig.connects == connects_at_close, (
         f"connect() after close(): {rig.raw_sequence()}"
     )
     assert rig.conn.state is ConnState.CLOSED
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
 
 
 @pytest.mark.parametrize("fake_cls", [ProbeFake, QuietProbeFake])
@@ -563,9 +614,9 @@ def test_close_between_attempts_makes_no_further_connect(rig_factory: Callable[.
     holder.append(rig.conn)
     with pytest.raises(ConnectionClosedDuringOpen):
         rig.conn.open()
-    assert rig.fake.connects == 1
+    assert rig.connects == 1
     assert rig.conn.state is ConnState.CLOSED
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
 
 
 def test_a_connect_that_succeeds_while_close_runs_is_disconnected(rig_factory: Callable[..., Rig]) -> None:
@@ -578,9 +629,9 @@ def test_a_connect_that_succeeds_while_close_runs_is_disconnected(rig_factory: C
     holder.append(rig.conn)
     with pytest.raises(ConnectionClosedDuringOpen):
         rig.conn.open()
-    assert rig.fake.connects == 1
+    assert rig.connects == 1
     assert rig.conn.state is ConnState.CLOSED
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
 
 
 def test_close_from_another_thread_while_the_default_backoff_sleeps_wakes_it(
@@ -596,13 +647,12 @@ def test_close_from_another_thread_while_the_default_backoff_sleeps_wakes_it(
         made.append(fake)
         return fake
 
-    conn = IbConnection(
+    conn = PausingConnection(
         "127.0.0.1", 7497, 21, env={}, client_factory=factory, clock=clock, poll_interval=0.002,
         retry_delay=60, max_retry_delay=60,
     )
     t, out = run_in_thread(conn.open)
-    wait_until(lambda: bool(made) and made[0].connects >= 1 and len(made[0].calls_named("disconnect")) >= 1)
-    time.sleep(0.02)  # let it reach the backoff wait
+    assert conn.paused.wait(WAIT)  # open() is at the backoff wait (or about to be: both end the same)
     conn.close()
     t.join(WAIT)
     assert not t.is_alive(), "close() did not wake the default backoff sleep"
@@ -644,15 +694,17 @@ def test_close_during_open_leaves_no_live_connection_behind(rig_factory: Callabl
     t.join(WAIT)
     assert not t.is_alive()
     assert rig.conn.state is ConnState.CLOSED
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
 
 
 def test_close_while_ready_and_a_consumer_is_blocked_in_next_event(rig_factory: Callable[..., Rig]) -> None:
-    rig = rig_factory(fake_kw=NO_FARM)
+    clock = SignalClock()
+    rig = rig_factory(fake_kw=NO_FARM, clock=clock)
     rig.conn.open()
     settle(rig)
+    clock.watch = "probe-caller"
     t, out = run_in_thread(lambda: rig.conn.next_event(60.0))  # the clock never moves
-    time.sleep(0.02)
+    assert clock.seen.wait(WAIT)  # the consumer is inside next_event
     rig.conn.close()
     t.join(WAIT)
     assert not t.is_alive(), "a consumer blocked in next_event is not woken by close()"
@@ -665,7 +717,7 @@ def test_close_twice_open_twice_and_open_after_close(rig_factory: Callable[..., 
     rig.conn.open()
     with pytest.raises(RuntimeError):
         rig.conn.open()
-    assert rig.fake.connects == 1
+    assert rig.connects == 1
     rig.conn.close()
     rig.conn.close()
     assert rig.raw_sequence().count("disconnect") == 1
@@ -689,7 +741,7 @@ def test_context_manager_closes_when_the_body_raises(rig_factory: Callable[..., 
         assert rig.conn.state is ConnState.READY
         raise KeyError("body")
     assert rig.conn.state is ConnState.CLOSED
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
     assert rig.raw_sequence() == ["connect", "disconnect"]
 
 
@@ -739,7 +791,7 @@ def test_keyboard_interrupt_in_backoff_sleep_leaves_nothing_open(rig_factory: Ca
     with pytest.raises(KeyboardInterrupt):
         rig.conn.open()
     assert rig.raw_sequence() == ["connect", "disconnect"]
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
     assert rig.conn.state is ConnState.CLOSED
 
 
@@ -759,7 +811,7 @@ def test_keyboard_interrupt_while_waiting_for_next_valid_id_closes_and_joins(
     clock.triggers = [lambda: setattr(clock, "armed", len(rig.fake.delivered) >= 5) or False]
     with pytest.raises(KeyboardInterrupt):
         rig.conn.open()
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
     assert rig.conn.state is ConnState.CLOSED
     assert not [t for t in threading.enumerate() if t.name.startswith("ib-reader") and t.is_alive()]
 
@@ -778,7 +830,7 @@ def test_keyboard_interrupt_while_connect_hangs_releases_the_helper(rig_factory:
     clock.triggers = [lambda: setattr(clock, "armed", rig.fake.hangs_entered >= 1) or False]
     with pytest.raises(KeyboardInterrupt):
         rig.conn.open()
-    assert not rig.fake.isConnected()
+    assert not rig.any_connected()
     wait_until(lambda: not [t for t in threading.enumerate() if t.name.startswith("ib-connect")])
     assert rig.conn.state is ConnState.CLOSED
 
@@ -809,81 +861,400 @@ def test_reader_dying_after_ready_does_not_leave_the_state_ready(rig_factory: Ca
         rig.conn.request("reqCurrentTime")
 
 
-# -- the attempt tag, and a connect that will not end -----------------------------------------------
+# -- one client per attempt: nothing of an old client reaches the next attempt --------------------
 
 
-def test_a_reader_slower_than_join_timeout_stops_the_open_instead_of_sharing_the_client(
+def test_each_attempt_gets_a_fresh_client_and_requests_go_to_the_last_one(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory([B.REFUSE, B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=3)
+    rig.clock.triggers = [lambda: len(rig.fakes) > 1 and len(rig.fakes[1].delivered) >= 5]
+    rig.conn.open()
+    assert len(rig.fakes) == 3 and len({id(f) for f in rig.fakes}) == 3
+    assert [f.connects for f in rig.fakes] == [1, 1, 1]  # no client is connected twice
+    assert not rig.fakes[0].isConnected() and not rig.fakes[1].isConnected()
+    rig.conn.request("reqCurrentTime")
+    assert [len(f.calls_named("reqCurrentTime")) for f in rig.fakes] == [0, 0, 1]
+    # the old clients are never used again: no run() and no call after their disconnect()
+    for old in rig.fakes[:2]:
+        assert "disconnect" in old.call_names
+        assert len(old.calls_named("run")) <= 1
+
+
+def test_a_stuck_reader_of_an_old_client_is_logged_and_the_next_attempt_uses_a_new_client(
+    rig_factory: Callable[..., Rig], caplog: pytest.LogCaptureFixture
+) -> None:
+    def hook(fake: Any, n: int) -> None:
+        if n == 1:
+            fake.gate_on = "currentTime"
+            fake.push("currentTime", 1)  # attempt 1's reader blocks in this callback
+
+    rig = rig_factory([B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=3, join_timeout=0.01, on_connect=hook)
+    rig.clock.triggers = [lambda: rig.fakes[0].entered.is_set()]
+    with caplog.at_level(logging.WARNING):
+        rig.conn.open()
+    assert rig.conn.state is ConnState.READY
+    assert len(rig.fakes) == 2 and rig.connects == 2
+    assert any("ib-reader-1" in r.getMessage() and "did not end" in r.getMessage() for r in caplog.records)
+    assert len(rig.fakes[0].calls_named("run")) == 1  # the old client never ran a second time
+    assert len(rig.fakes[1].calls_named("run")) == 1
+
+
+def test_open_gives_up_when_too_many_old_threads_are_stuck_and_reports_every_failure(
     rig_factory: Callable[..., Rig],
 ) -> None:
     def hook(fake: Any, n: int) -> None:
         fake.gate_on = "currentTime"
-        fake.push("currentTime", 1)  # attempt 1's reader blocks in this callback
+        fake.push("currentTime", 1)
 
-    rig = rig_factory(
-        [B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=3, join_timeout=0.01, on_connect=hook
-    )
-    rig.clock.triggers = [lambda: bool(rig.fakes) and rig.fake.entered.is_set()]
+    rig = rig_factory(B.NO_NEXT_VALID_ID, attempts=10, join_timeout=0.01, on_connect=hook)
+    rig.clock.triggers = [
+        (lambda i=i: len(rig.fakes) > i and rig.fakes[i].entered.is_set())
+        for i in range(MAX_STUCK_THREADS + 1)
+    ]
     with pytest.raises(ConnectFailed) as info:
         rig.conn.open()
     assert not isinstance(info.value, ConnectionClosedDuringOpen)
-    assert "ib-reader-1" in str(info.value)
-    assert "did not end" in str(info.value)
-    assert rig.fake.connects == 1  # no second connect, so no second run() loop on this client
-    assert rig.clock.sleeps == []
+    assert len(rig.fakes) == MAX_STUCK_THREADS + 1  # attempts stop at the first one over the bound
+    failures = info.value.failures
+    assert [f.attempt for f in failures if "did not end" in f.message] == list(
+        range(1, MAX_STUCK_THREADS + 2)
+    )
+    assert len(failures) == 2 * (MAX_STUCK_THREADS + 1)  # each attempt: its own failure + the stuck thread
+    assert f"ib-reader-{MAX_STUCK_THREADS + 1}" in str(info.value)
     assert rig.conn.state is ConnState.CLOSED
-    assert len([c for c in rig.fake.calls if c.name == "run"]) == 1
 
 
-class _TagStub:
-    """A client whose run() blocks, then reports through the callback it was built with."""
-
-    def __init__(self, on_event: Callable[[Any], None]) -> None:
-        self.on_event = on_event
-        self.started = threading.Event()
-        self.release = threading.Event()
-
-    def run(self) -> None:
-        self.started.set()
-        self.release.wait(WAIT)
-        self.on_event(events.IbError(-1, 1100, "late"))
-        self.on_event(events.NextValidId(99))
-
-
-def test_late_callbacks_of_an_old_reader_keep_the_attempt_they_were_started_with() -> None:
-    stubs: list[_TagStub] = []
-
-    def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
-        stubs.append(_TagStub(on_event))
-        return stubs[0]
-
-    conn = IbConnection("127.0.0.1", 7497, 21, env={}, client_factory=factory, poll_interval=0.002)
-    conn._client = factory(env={}, on_event=conn._on_event, on_raw=conn._on_raw, logger=None)
-    conn._begin_attempt(1)
-    reader = threading.Thread(target=conn._read, args=(conn._client, 1), name="ib-reader-1", daemon=True)
-    reader.start()
-    assert stubs[0].started.wait(WAIT)
-    conn._begin_attempt(2)  # the next attempt begins while attempt 1's reader is still running
-    stubs[0].release.set()
-    reader.join(WAIT)
-    assert not reader.is_alive()
-    # Read at callback time, the tag would be 2: attempt 1's 1100 and nextValidId would be
-    # attempt 2's events, and the 1100 would mark attempt 2 lost.
-    assert conn.next_event(0) is None
-    assert conn.next_event(0) is None
-    assert conn._lost is False
-
-
-def test_connect_that_never_returns_is_reported_not_retried(rig_factory: Callable[..., Rig]) -> None:
-    rig = rig_factory(B.ACCEPT, fake_cls=StuckConnectFake, join_timeout=0.01)
-    rig.clock.triggers = [lambda: bool(rig.fakes) and rig.fake.stuck_entered.is_set()]
+def test_a_connect_that_never_returns_does_not_stop_the_next_attempt_but_is_bounded(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(B.ACCEPT, fake_cls=StuckConnectFake, attempts=10, join_timeout=0.01)
+    rig.clock.auto = 50.0  # every clock read is past the connect timeout
     with pytest.raises(ConnectFailed) as info:
         rig.conn.open()
-    assert "did not end" in str(info.value)
-    assert info.value.failures == ()
-    helpers = [t for t in threading.enumerate() if t.name == "ib-connect-1"]
+    assert len(rig.fakes) == MAX_STUCK_THREADS + 1
+    # item 10: the failures of all attempts so far, also when raised for stuck threads
+    expected = [n for n in range(1, MAX_STUCK_THREADS + 2) for _ in (0, 1)]
+    assert [f.attempt for f in info.value.failures] == expected
+    assert all("did not end" in f.message for f in info.value.failures)
+    helpers = [t for t in threading.enumerate() if t.name.startswith("ib-connect-")]
     assert helpers and all(t.daemon for t in helpers)
     assert rig.conn.state is ConnState.CLOSED
+
+
+STALE = ["nextValidId", "1100", "farm", "326"]
+
+
+def inject_late(old: Any, what: str) -> None:
+    """A late callback of an old client, as its reader or the disconnect() on it could make."""
+    wrapper = old.wrapper
+    if what == "nextValidId":
+        wrapper.nextValidId(999)
+    elif what == "1100":
+        wrapper.error(-1, 0, 1100, "late 1100", "")
+    elif what == "farm":
+        wrapper.error(-1, 0, 2106, "late farm", "")
+    elif what == "326":
+        wrapper.error(-1, 0, 326, "late 326", "")
+    else:
+        raise AssertionError(what)
+
+
+def test_a_late_next_valid_id_of_attempt_one_never_makes_attempt_two_ready(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+
+    class Rec:
+        def on_raw(self, name: str, args: tuple[Any, ...]) -> None:
+            seen.append((name, args))
+
+    def hook(fake: Any, n: int) -> None:
+        if n == 2:  # on the connect helper of attempt 2, as the old thread tag would have read it
+            inject_late(rig.fakes[0], "nextValidId")
+
+    rig = rig_factory(
+        B.NO_NEXT_VALID_ID, attempts=2, fake_kw=NO_FARM, on_connect=hook, observers=(Rec(),)
+    )
+    rig.clock.triggers = [
+        lambda: len(rig.fakes[0].delivered) >= 2,
+        lambda: len(rig.fakes) > 1 and len(rig.fakes[1].delivered) >= 2,
+    ]
+    with pytest.raises(ConnectFailed):
+        rig.conn.open()
+    assert rig.conn.next_valid_id is None
+    assert rig.conn.state is ConnState.CLOSED
+    assert ("nextValidId", (999,)) not in seen
+
+
+def test_the_reviewer_probe_a_held_back_next_valid_id_999_is_never_reported(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    # Attempt 1: no nextValidId, but a late nextValidId(999) queued; its reader is held on
+    # managedAccounts past the ready deadline. Attempt 2: no nextValidId at all.
+    def hook(fake: Any, n: int) -> None:
+        if n == 1:
+            fake.gate_on = "managedAccounts"
+            fake.push("nextValidId", 999)
+        else:
+            rig.fakes[0].gate.set()  # the old reader wakes up while attempt 2 waits
+
+    rig = rig_factory(
+        B.NO_NEXT_VALID_ID, attempts=2, join_timeout=0.01, fake_kw=NO_FARM, on_connect=hook
+    )
+    rig.clock.triggers = [
+        lambda: rig.fakes[0].entered.is_set(),
+        lambda: len(rig.fakes) > 1 and len(rig.fakes[1].delivered) >= 2,
+    ]
+    with pytest.raises(ConnectFailed):
+        rig.conn.open()
+    assert rig.conn.next_valid_id is None
+    assert rig.conn.state is ConnState.CLOSED
+
+
+@pytest.mark.parametrize("what", ["1100", "farm", "326"])
+def test_stale_state_changing_callbacks_of_attempt_one_do_not_touch_attempt_two(
+    rig_factory: Callable[..., Rig], what: str
+) -> None:
+    def hook(fake: Any, n: int) -> None:
+        if n == 2:
+            inject_late(rig.fakes[0], what)
+
+    rig = rig_factory([B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=2, fake_kw=NO_FARM, on_connect=hook)
+    rig.clock.triggers = [lambda: len(rig.fakes[0].delivered) >= 2]
+    rig.conn.open()  # not ClientIdInUse for a stale 326
+    assert rig.conn.state is ConnState.READY  # not LOST for a stale 1100
+    got = drain(rig.conn)
+    assert not [e for e in got if isinstance(e, ConnectionLost)]
+    assert not [e for e in got if isinstance(e, events.IbError) and e.code in (1100, 326, 2106)]
+    rig.clock.triggers = [lambda: True]
+    assert rig.conn.wait_for_data_farm(10.0) is False  # a stale farm code is not this attempt's
+
+
+def test_farm_codes_of_a_failed_attempt_do_not_satisfy_the_wait_of_the_next(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    # Attempt 1 sees the three farm messages and then fails; attempt 2 sees none.
+    rig = rig_factory([B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=2, fake_kw=[{}, NO_FARM])
+    rig.clock.triggers = [lambda: len(rig.fakes[0].delivered) >= 5]
+    rig.conn.open()
+    assert rig.conn.state is ConnState.READY
+    assert {d.name for d in rig.fakes[0].delivered} >= {"error"}
+    rig.clock.triggers = [lambda: True]
+    assert rig.conn.wait_for_data_farm(10.0) is False
+    for kind in ("market", "historical", "secdef"):
+        rig.clock.triggers = [lambda: True]
+        assert rig.conn.wait_for_data_farm(10.0, farm=kind) is False
+
+
+# -- the READY guard, and close() racing open() ---------------------------------------------------
+
+
+class CloseAtReady(IbConnection):
+    """Runs close() to completion right after nextValidId is taken, before READY is set."""
+
+    def _pop(self, att: Any, wait: float) -> Any:
+        ev = IbConnection._pop(att, wait)
+        if isinstance(ev, events.NextValidId):
+            self.close()
+        return ev
+
+
+def test_close_that_completes_just_before_ready_is_not_overwritten_by_ready(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(conn_cls=CloseAtReady)
+    with pytest.raises(ConnectionClosedDuringOpen):
+        rig.conn.open()
+    assert rig.conn.state is ConnState.CLOSED
+    assert rig.conn.next_valid_id is None
+    assert not rig.any_connected()
+    with pytest.raises(NotConnected):
+        rig.conn.request("reqCurrentTime")
+
+
+class CleanupGateFake(ProbeFake):
+    """disconnect() on the thread named probe-caller (the one inside open()) blocks."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cleanup_entered = threading.Event()
+        self.cleanup_release = threading.Event()
+
+    def disconnect(self) -> None:
+        if threading.current_thread().name == "probe-caller":
+            self.cleanup_entered.set()
+            self.cleanup_release.wait(WAIT)
+        super().disconnect()
+
+
+def test_close_waits_for_open_to_finish_its_cleanup(rig_factory: Callable[..., Rig]) -> None:
+    rig = rig_factory(B.HANG, fake_cls=CleanupGateFake)
+    opener, out = run_in_thread(rig.conn.open)
+    wait_until(lambda: bool(rig.fakes) and rig.hangs >= 1)
+    closer, _ = run_in_thread(rig.conn.close, name="probe-closer")
+    assert rig.fake.cleanup_entered.wait(WAIT)  # open() is in the middle of its cleanup
+    closer.join(0.05)
+    assert closer.is_alive(), "close() returned while open() was still cleaning up"
+    rig.fake.cleanup_release.set()
+    closer.join(WAIT)
+    opener.join(WAIT)
+    assert not closer.is_alive() and not opener.is_alive()
+    assert type(out[0][1]) is ConnectionClosedDuringOpen
+    assert rig.conn.state is ConnState.CLOSED
+    assert not rig.any_connected()
+
+
+def test_close_stops_waiting_for_open_after_join_timeout_and_says_so(
+    rig_factory: Callable[..., Rig], caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = rig_factory(B.HANG, fake_cls=CleanupGateFake, join_timeout=0.01)
+    opener, out = run_in_thread(rig.conn.open)
+    wait_until(lambda: bool(rig.fakes) and rig.hangs >= 1)
+    with caplog.at_level(logging.ERROR):
+        rig.conn.close()  # open() is blocked in its cleanup: close() gives up after join_timeout
+    assert rig.fake.cleanup_entered.is_set()
+    assert any(
+        r.levelno == logging.ERROR and "did not finish" in r.getMessage() and "probe-caller" in r.getMessage()
+        for r in caplog.records
+    )
+    assert rig.conn.state is ConnState.CLOSED
+    rig.fake.cleanup_release.set()
+    opener.join(WAIT)
+    assert not opener.is_alive()
+    assert type(out[0][1]) is ConnectionClosedDuringOpen
+
+
+def test_a_connect_that_finishes_after_close_returned_is_disconnected_by_the_helper(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(B.ACCEPT, fake_cls=StuckConnectFake, join_timeout=0.01)
+    opener, out = run_in_thread(rig.conn.open)
+    wait_until(lambda: bool(rig.fakes) and rig.fake.stuck_entered.is_set())
+    rig.conn.close()  # the connect has not assigned its connection yet: nothing to disconnect
+    assert rig.conn.state is ConnState.CLOSED
+    opener.join(WAIT)
+    assert not opener.is_alive() and type(out[0][1]) is ConnectionClosedDuringOpen
+    rig.fake.stuck_release.set()  # now the connect completes
+    wait_until(lambda: not [t for t in threading.enumerate() if t.name.startswith("ib-connect")])
+    assert not rig.any_connected()
+    assert rig.conn.state is ConnState.CLOSED
+
+
+# -- disconnect() of the real client can race and raise; ConnectionClosed is delivered once -------
+
+
+class RaisingDisconnectFake(ProbeFake):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.disconnect_raises: BaseException | None = None  # raised by the next disconnect() only
+
+    def disconnect(self) -> None:
+        super().disconnect()
+        error, self.disconnect_raises = self.disconnect_raises, None
+        if error is not None:
+            raise error
+
+
+RACE_ERRORS = [AttributeError("conn is None"), OSError("closed"), TypeError("x")]
+
+
+@pytest.mark.parametrize("error", RACE_ERRORS, ids=lambda e: type(e).__name__)
+def test_close_treats_a_disconnect_race_as_already_closed(
+    rig_factory: Callable[..., Rig], error: BaseException
+) -> None:
+    rig = rig_factory(fake_cls=RaisingDisconnectFake)
+    rig.conn.open()
+    rig.fake.disconnect_raises = error
+    rig.conn.close()
+    assert rig.conn.state is ConnState.CLOSED
+    assert not [t for t in threading.enumerate() if t.name.startswith("ib-reader")]
+
+
+def test_close_does_not_hide_other_errors_from_disconnect(rig_factory: Callable[..., Rig]) -> None:
+    rig = rig_factory(fake_cls=RaisingDisconnectFake)
+    rig.conn.open()
+    rig.fake.disconnect_raises = ValueError("not a race")
+    with pytest.raises(ValueError):
+        rig.conn.close()
+    assert rig.conn.state is ConnState.CLOSED
+    rig.fake.disconnect_raises = None
+    rig.conn.close()  # idempotent
+
+
+def test_a_failed_attempt_whose_disconnect_raises_a_race_error_still_retries(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    def hook(fake: Any, n: int) -> None:
+        if n == 1:
+            fake.disconnect_raises = AttributeError("conn is None")
+
+    rig = rig_factory([B.REFUSE, B.ACCEPT], fake_cls=RaisingDisconnectFake, attempts=2, on_connect=hook)
+    rig.conn.open()
+    assert rig.conn.state is ConnState.READY
+
+
+def test_at_most_one_connection_closed_per_attempt_reaches_the_consumer(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(fake_kw=NO_FARM)
+    rig.conn.open()
+    settle(rig)
+    rig.fake.wrapper.connectionClosed()  # run()'s finally ...
+    rig.fake.wrapper.connectionClosed()  # ... and the caller's disconnect(), as with real ibapi
+    rig.conn.close()
+    got = drain(rig.conn)
+    assert len([e for e in got if isinstance(e, events.ConnectionClosed)]) == 1
+
+
+# -- a released hang that then raises something else is not retried ---------------------------------
+
+
+class HangThenOther(ProbeFake):
+    def connect(self, host: Any, port: Any, clientId: Any) -> None:
+        try:
+            return super().connect(host, port, clientId)
+        except AttributeError as exc:
+            raise ValueError("the released connect failed in another way") from exc
+
+
+def test_a_released_hang_that_raises_something_else_propagates_without_retry(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory([B.HANG, B.ACCEPT], fake_cls=HangThenOther)
+    rig.clock.triggers = [lambda: rig.hangs >= 1]
+    with pytest.raises(ValueError, match="another way"):
+        rig.conn.open()
+    assert rig.connects == 1 and len(rig.fakes) == 1
     assert rig.clock.sleeps == []
+    assert rig.conn.state is ConnState.CLOSED
+
+
+# -- observers must not call back into the connection ------------------------------------------------
+
+
+def test_an_observer_that_calls_request_gets_an_error_instead_of_a_deadlock(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    class Reentrant:
+        conn: IbConnection
+
+        def on_request(self, name: str, args: tuple[Any, ...]) -> None:
+            self.conn.request("reqCurrentTime")
+
+    obs = Reentrant()
+    rig = rig_factory(observers=(obs,))
+    obs.conn = rig.conn
+    rig.conn.open()
+    t, out = run_in_thread(lambda: rig.conn.request("reqMarketDataType", 3))
+    t.join(WAIT)
+    assert not t.is_alive(), "request() deadlocked on an observer that called request()"
+    assert out[0][0] == "ok"
+    assert [type(e) for e in rig.conn.observer_failures] == [RuntimeError]
+    assert len(rig.fake.calls_named("reqMarketDataType")) == 1
+    assert rig.fake.calls_named("reqCurrentTime") == []
+    rig.conn.request("reqCurrentTime")  # the guard is released afterwards
+    assert len(rig.fake.calls_named("reqCurrentTime")) == 1
 
 
 # -- the data farm mapping --------------------------------------------------------------------------
@@ -1114,8 +1485,46 @@ def test_throttle_terminates_when_the_clock_does_not_advance() -> None:
     assert all(s > 0 for s in sleeps)
 
 
-def _ready_connection(**kw: Any) -> tuple[IbConnection, Any]:
-    """A READY connection over the fake whose clock never moves (`now` stays 0)."""
+@pytest.mark.parametrize(
+    "frozen", [0.2, 0.1, 0.7, 1 / 3, 2 / 3, 1e9 + 0.3, 123456.789, 5.55, 1e-9, 0.0]
+)
+def test_throttle_terminates_on_a_clock_frozen_at_an_awkward_float(frozen: float) -> None:
+    # (0.2 + 1.0) - 1.0 < 0.2 in floats: comparing against `now - window` never expires.
+    sleeps: list[float] = []
+
+    def frozen_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        assert len(sleeps) < 50, f"the throttle is spinning on a clock frozen at {frozen!r}"
+
+    conn, fake = _ready_connection(frozen, sleep=frozen_sleep, max_requests_per_second=1)
+    for _ in range(4):
+        conn.request("reqCurrentTime")
+    assert len(fake.calls_named("reqCurrentTime")) == 4
+    assert 1 <= len(sleeps) <= 4
+    assert all(s > 0 for s in sleeps)
+
+
+def test_the_bounds_of_timeouts_and_delays_are_the_documented_ones() -> None:
+    assert MAX_SECONDS == {
+        "connect_timeout": 300,
+        "ready_timeout": 300,
+        "retry_delay": 600,
+        "max_retry_delay": 600,
+        "poll_interval": 10,
+        "join_timeout": 60,
+    }
+
+
+@pytest.mark.parametrize("name", sorted(MAX_SECONDS))
+def test_a_timeout_or_delay_above_its_bound_is_rejected_and_the_bound_itself_accepted(name: str) -> None:
+    IbConnection("127.0.0.1", 7497, 21, env={}, **{name: MAX_SECONDS[name]})
+    for too_much in (MAX_SECONDS[name] + 0.001, MAX_SECONDS[name] * 2, 1e9):
+        with pytest.raises(ValueError):
+            IbConnection("127.0.0.1", 7497, 21, env={}, **{name: too_much})
+
+
+def _ready_connection(frozen: float = 0.0, **kw: Any) -> tuple[IbConnection, Any]:
+    """A READY connection over the fake whose clock never moves (it stays at `frozen`)."""
     fakes: list[Any] = []
 
     def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
@@ -1123,7 +1532,7 @@ def _ready_connection(**kw: Any) -> tuple[IbConnection, Any]:
         return fakes[0]
 
     conn = IbConnection(
-        "127.0.0.1", 7497, 21, env={}, client_factory=factory, clock=lambda: 0.0,
+        "127.0.0.1", 7497, 21, env={}, client_factory=factory, clock=lambda: frozen,
         poll_interval=0.002, **kw,
     )
     conn.open()
