@@ -56,9 +56,6 @@ LEGACY_IBAPI_ALLOWLIST = (
     "MainStoinker/DataCollection/apiApi.py",
     "MainStoinker/Util/IBKRHelper.py",
     "MainStoinker/MainStuff/this is how we do it dum dum.py",
-    "MainStoinker/DataCollection/Dumb dumb/IBAPI_TESTING.py",
-    "MainStoinker/testy/testy.py",
-    "MainStoinker/testy/testy_advanced.py",
 )
 
 # Where MainStoinker/ib may import from within MainStoinker. broker_guard is
@@ -214,6 +211,7 @@ def test_only_ib_and_frozen_legacy_import_ibapi() -> None:
 def test_legacy_ibapi_allowlist_is_frozen_and_files_exist() -> None:
     assert not allowlist_problems(LEGACY_IBAPI_ALLOWLIST)
     assert len(ORIGINAL_LEGACY_IBAPI_FILES) == 6
+    assert len(LEGACY_IBAPI_ALLOWLIST) == 3  # the three broker test scripts were deleted (#158)
     missing = [p for p in LEGACY_IBAPI_ALLOWLIST if not (ROOT / p).is_file()]
     assert not missing, f"remove deleted files from the allowlist: {missing}"
 
