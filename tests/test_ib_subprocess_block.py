@@ -11,6 +11,7 @@ import ast
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -300,61 +301,69 @@ def test_sentinel_does_not_replace_the_in_process_block(monkeypatch: pytest.Monk
 
 THE_FUNCTION = "_broker_blocked_here"
 FORBIDDEN_NAMES = {"socket", "subprocess", "__import__", "eval", "exec", "open", "EClient", "Connection"}
+ENV_WORDS = {"environ", "getenv", "putenv", "environb"}
+IMPORT_ROOTS = {"os", "ibapi", "socket", "subprocess", "importlib"}
 
 
 def environment_problems(source: str) -> list[str]:
     """Everything in `source` that reads the environment, except the one allowed read.
 
-    Allowed: `"STOINK_BROKER_BLOCKED" in os.environ`, once, inside `_broker_blocked_here`; and
-    the import of `os` that it needs. Every other use of `os`, `environ`, `getenv`, `putenv`,
-    `environb` is a problem, as are raw sockets, `ibapi` and dynamic code.
+    Allowed, and nothing else: one plain `import os` (no alias, no `from os import`), and the
+    name `os` used exactly once, in `"STOINK_BROKER_BLOCKED" in os.environ` inside
+    `_broker_blocked_here`. Any other use of the name `os`, an alias, `environ`, `getenv`,
+    `putenv` or `environb` (as a name, an attribute or a string, so also as the argument of
+    `getattr`, `vars`, `__import__`, `importlib.import_module` or `sys.modules[...]`), raw
+    sockets, `ibapi` and dynamic code are problems.
     """
     tree = ast.parse(source)
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     problems: list[str] = []
+    plain_os_imports = 0
     allowed_reads = 0
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in {"ibapi", "socket", "subprocess"} or (root == "os" and alias.name != "os"):
-                    problems.append(f"import {alias.name}")
+                if alias.name == "os" and alias.asname is None:
+                    plain_os_imports += 1
+                elif alias.name.split(".")[0] in IMPORT_ROOTS:
+                    problems.append(f"line {node.lineno}: import {alias.name} as {alias.asname}")
         elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".")[0] in {"os", "ibapi", "socket", "subprocess"}:
-                problems.append(f"from {node.module} import ...")
-        elif isinstance(node, ast.Attribute) and node.attr in {"environ", "getenv", "putenv", "environb"}:
-            parent = parents.get(node)
-            scope = node
-            while scope in parents and not isinstance(scope, ast.FunctionDef):
-                scope = parents[scope]
-            exact = (
-                node.attr == "environ"
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "os"
-                and isinstance(parent, ast.Compare)
-                and parent.comparators[0] is node
-                and len(parent.ops) == 1
-                and isinstance(parent.ops[0], ast.In)
-                and isinstance(parent.left, ast.Constant)
-                and parent.left.value == VARIABLE
-                and isinstance(scope, ast.FunctionDef)
-                and scope.name == THE_FUNCTION
-            )
-            if exact:
-                allowed_reads += 1
-            else:
-                problems.append(f"line {node.lineno}: {node.attr}")
+            if (node.module or "").split(".")[0] in IMPORT_ROOTS:
+                problems.append(f"line {node.lineno}: from {node.module} import ...")
+        elif isinstance(node, ast.Attribute):
+            if node.attr == "environ" and isinstance(node.value, ast.Name) and node.value.id == "os":
+                continue  # `os.environ`: the Name branch below decides whether this use is the allowed one
+            if node.attr in ENV_WORDS | {"_inner", "socket", "_conn", "conn", "import_module", "modules"}:
+                problems.append(f"line {node.lineno}: attribute {node.attr}")
         elif isinstance(node, ast.Name):
-            if node.id in FORBIDDEN_NAMES:
+            if node.id in FORBIDDEN_NAMES or node.id in ENV_WORDS:
                 problems.append(f"line {node.lineno}: name {node.id}")
-            if node.id == "os" and not (
-                isinstance(parents.get(node), ast.Attribute) and parents[node].attr == "environ"
-            ):
-                problems.append(f"line {node.lineno}: os used other than as os.environ")
-        elif isinstance(node, ast.Attribute) and node.attr in {"_inner", "socket", "_conn", "conn"}:
-            problems.append(f"line {node.lineno}: attribute {node.attr}")
-        elif isinstance(node, ast.Constant) and node.value == "STOINK_ALLOW_LIVE_PORT":
-            problems.append(f"line {node.lineno}: the live-port variable")
+            elif node.id == "os":
+                parent = parents.get(node)
+                compare = parents.get(parent) if isinstance(parent, ast.Attribute) else None
+                scope: ast.AST = node
+                while scope in parents and not isinstance(scope, ast.FunctionDef):
+                    scope = parents[scope]
+                if (
+                    isinstance(parent, ast.Attribute)
+                    and parent.attr == "environ"
+                    and isinstance(compare, ast.Compare)
+                    and compare.comparators[0] is parent
+                    and len(compare.ops) == 1
+                    and isinstance(compare.ops[0], ast.In)
+                    and isinstance(compare.left, ast.Constant)
+                    and compare.left.value == VARIABLE
+                    and isinstance(scope, ast.FunctionDef)
+                    and scope.name == THE_FUNCTION
+                ):
+                    allowed_reads += 1
+                else:
+                    problems.append(f"line {node.lineno}: os used other than in the one allowed read")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in ENV_WORDS | {"os", "STOINK_ALLOW_LIVE_PORT"}:
+                problems.append(f"line {node.lineno}: string {node.value!r}")
+    if plain_os_imports != 1:
+        problems.append(f"expected exactly one plain `import os`, found {plain_os_imports}")
     if allowed_reads != 1:
         problems.append(f"expected exactly one allowed read, found {allowed_reads}")
     return problems
@@ -380,3 +389,71 @@ def test_the_source_check_catches_every_other_read() -> None:
     mutated["a read elsewhere"] = source + "\n\ndef _other() -> object:\n    return os.environ\n"
     for label, text in mutated.items():
         assert environment_problems(text), label
+
+
+ALIAS_CASES = {
+    "alias then getattr": ("import os as o\n", "def _x() -> object:\n    return getattr(o, 'environ')\n"),
+    "alias then vars": ("import os as o\n", "def _x() -> object:\n    return vars(o)['environ']\n"),
+    "alias then system": ("import os as o\n", "def _x() -> object:\n    return o.system('x')\n"),
+    "alias then environ": ("import os as o\n", "def _x() -> object:\n    return o.environ\n"),
+    "from os import environ": ("from os import environ\n", "def _x() -> object:\n    return environ\n"),
+    "second plain import": ("import os\n", "def _x() -> object:\n    return 1\n"),
+    "getattr on sys.modules": (
+        "import sys\n", "def _x() -> object:\n    return getattr(sys.modules['os'], 'environ')\n"),
+    "getattr on import_module": (
+        "import importlib\n",
+        "def _x() -> object:\n    return getattr(importlib.import_module('os'), 'environ')\n"),
+    "getattr on __import__": ("", "def _x() -> object:\n    return getattr(__import__('os'), 'environ')\n"),
+    "getattr on the real os name": ("", "def _x() -> object:\n    return getattr(os, 'getenv')\n"),
+    "os passed on": ("", "def _x() -> object:\n    return dict(vars(os))\n"),
+    "os.putenv": ("", "def _x() -> None:\n    os.putenv('A', 'b')\n"),
+}
+
+
+@pytest.mark.parametrize("label", list(ALIAS_CASES))
+def test_the_source_check_catches_aliases_and_dynamic_access(label: str) -> None:
+    source = CONNECTION_SOURCE.read_text(encoding="utf-8")
+    assert environment_problems(source) == []
+    header, body = ALIAS_CASES[label]
+    marker = "import os\n"
+    assert source.count(marker) == 1
+    mutated = source.replace(marker, marker + header) + "\n\n" + body
+    assert environment_problems(mutated), label
+
+
+# -- the instance check runs on every attempt ---------------------------------------------------
+
+
+def test_the_instance_check_runs_on_every_attempt() -> None:
+    class Failing:
+        """Attempt 1: a scripted fake (not an EClient) whose connect fails, so the open retries."""
+
+        def connect(self, *args: Any) -> None:
+            raise OSError("attempt 1 fails")
+
+        def disconnect(self) -> None:
+            pass
+
+    class Stub(EClient):
+        connects: list[Any] = []
+
+        def __init__(self, **kwargs: Any) -> None:  # EClient is never initialised: no socket exists
+            pass
+
+        def connect(self, *args: Any) -> None:
+            Stub.connects.append(args)
+
+        def disconnect(self) -> None:
+            pass
+
+    calls: list[int] = []
+
+    def factory(**kwargs: Any) -> Any:
+        calls.append(1)
+        return Failing() if len(calls) == 1 else Stub(**kwargs)
+
+    before = set(threading.enumerate())
+    refused(open_connection(factory, attempts=3), attempts_made=2)
+    assert len(calls) == 2
+    assert Stub.connects == []
+    assert set(threading.enumerate()) <= before
