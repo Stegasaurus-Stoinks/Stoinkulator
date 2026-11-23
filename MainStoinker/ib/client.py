@@ -28,10 +28,18 @@ Two layers enforce it, both before anything reaches the socket:
 does. The guard reads the environment mapping given to the constructor at call
 time. `startApi` always sends an empty optional-capabilities string.
 
+The handshake frame is accepted only as the first frame passed on by a given
+guarded connection object (one bit of state per connection).
+
 Out of scope, because Python cannot prevent it: code that replaces the guard
-by writing the private attributes (`client._conn`, `client.__dict__`), or that
-talks to a socket of its own. Callers must be reviewed for that; the import
-boundary test (no `socket`) is what stops this package doing it.
+by writing the private attributes (`client._conn`, `client.__dict__`), that
+reaches past it through `client.conn._inner` (the wrapped `Connection`) or
+`client.conn.socket` (its raw socket), or that talks to a socket of its own.
+Callers must be reviewed for that; the import boundary test (no `socket`) is
+what stops this package doing it. Building a raw `EClient` or `Connection`
+anywhere else in `MainStoinker/ib` is forbidden by convention (issue 115:
+this module is the only one that imports ibapi's client, wrapper and
+connection) and is not yet enforced by a test.
 
 Callbacks only turn their arguments into events (`MainStoinker.ib.events`) and
 hand them to `on_event`; they never call the client and never raise into
@@ -55,8 +63,8 @@ from decimal import Decimal
 from typing import Any
 
 from ibapi.client import EClient
-from ibapi.common import BarData, TickAttrib, TickerId
-from ibapi.contract import ContractDetails
+from ibapi.common import BarData, TagValueList, TickAttrib, TickerId
+from ibapi.contract import Contract, ContractDetails
 from ibapi.message import OUT
 from ibapi.ticktype import TickType
 from ibapi.wrapper import EWrapper
@@ -132,7 +140,12 @@ def _check_id(msg_id: object) -> None:
 # -- connection-level guard ---------------------------------------------------
 
 _TEXT_ID = re.compile(rb"(0|[1-9][0-9]{0,5})\0")  # ibapi.comm.make_msg, server < 201
-_HANDSHAKE_BODY = re.compile(rb"v[0-9]+\.\.[0-9]+(?: [\x20-\x7e]*)?")  # EClient.connect
+# EClient.connect sends `v<min>..<max>` and, only when `connectOptions` is a
+# non-empty string, one space and the options. ibapi's own check
+# (`isAsciiPrintable`) also lets tab, LF and CR through; the guard does not:
+# options may contain only the printable ASCII bytes 0x20-0x7e, so a client
+# that sets options with a control character fails closed in `connect`.
+_HANDSHAKE_BODY = re.compile(rb"v[0-9]+\.\.[0-9]+(?: [\x20-\x7e]+)?")
 _HANDSHAKE_PREFIX = b"API\0"
 
 
@@ -146,8 +159,11 @@ def _unframe(data: bytes) -> bytes | None:
     return data[4:]
 
 
-def _check_frame(raw: object) -> None:
+def _check_frame(raw: object, first_write: bool) -> None:
     """Raise `MessageRefused` unless `raw` is the handshake or an allowed message.
+
+    The handshake is accepted only when `first_write` is true (the connection
+    object has passed no frame on yet).
 
     Framing (ibapi 10.37.2): `comm.make_msg` writes a 4-byte big-endian length,
     then either `<decimal id>\\0<fields>` (server version below 201) or a raw
@@ -160,6 +176,8 @@ def _check_frame(raw: object) -> None:
     if type(raw) is not bytes:
         raise _refuse_frame(f"frame is {type(raw).__name__}, not bytes")
     if raw.startswith(_HANDSHAKE_PREFIX):
+        if not first_write:
+            raise _refuse_frame("handshake frame after the first write")
         body = _unframe(raw[len(_HANDSHAKE_PREFIX):])
         if body is not None and _HANDSHAKE_BODY.fullmatch(body):
             return
@@ -188,9 +206,11 @@ class _GuardedConnection:
 
     def __init__(self, inner: Any) -> None:
         object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_wrote", False)  # the one bit of state
 
     def sendMsg(self, msg: bytes):  # noqa: N802 (ibapi's name)
-        _check_frame(msg)
+        _check_frame(msg, first_write=not self._wrote)
+        object.__setattr__(self, "_wrote", True)
         return self._inner.sendMsg(msg)
 
     def __getattr__(self, name: str) -> Any:
@@ -270,6 +290,29 @@ class DataOnlyClient(EWrapper, EClient):
         # the data-only client sends none at all.
         self.optCapab = ""
         return super().startApi()
+
+    def reqMktData(
+        self,
+        reqId: TickerId,
+        contract: Contract,
+        genericTickList: str,
+        snapshot: bool,
+        regulatorySnapshot: bool,
+        mktDataOptions: TagValueList,
+    ):
+        # IB bills a regulatory snapshot per request (0.01 USD each in 10.37.2),
+        # so only exactly False is accepted. Refused before anything is built or
+        # written. (`snapshot`, `genericTickList` and `mktDataOptions` are not
+        # billed or state-changing: see the review notes on issue 115.)
+        if regulatorySnapshot is not False:
+            raise MessageRefused(
+                "The data-only IB client refuses reqMktData with "
+                f"regulatorySnapshot={regulatorySnapshot!r}: regulatory snapshots "
+                "are billed and are refused."
+            )
+        return super().reqMktData(
+            reqId, contract, genericTickList, snapshot, regulatorySnapshot, mktDataOptions
+        )
 
     def sendMsg(self, msgId: int, msg: str):
         _check_id(msgId)

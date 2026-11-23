@@ -594,6 +594,140 @@ def test_malformed_handshakes_are_refused(frame):
     assert stub.sent == []
 
 
+def test_handshake_length_prefix_must_equal_body_length():
+    body = b"v100..203"
+    for prefix_len in (len(body) - 1, len(body) + 1, 0, 2**32 - 1):
+        frame = b"API\0" + struct.pack("!I", prefix_len) + body
+        client, _ = make_client()
+        stub = with_stub(client, 100)
+        with pytest.raises(MessageRefused):
+            client.conn.sendMsg(frame)
+        assert stub.sent == []
+    client, _ = make_client()
+    stub = with_stub(client, 100)
+    client.conn.sendMsg(b"API\0" + struct.pack("!I", len(body)) + body)
+    assert len(stub.sent) == 1
+
+
+@pytest.mark.parametrize("bad", ["\0", "\t", "\n", "\r", "\x1f", "\x7f", "\x80", "\xff"])
+def test_handshake_options_must_be_printable_ascii(bad):
+    # Allowed: one space then bytes 0x20-0x7e. (ibapi's own check would also let
+    # tab, LF and CR through; the guard is stricter and fails closed.)
+    for options in (bad, "ok" + bad, bad + "ok"):
+        client, _ = make_client()
+        stub = with_stub(client, 100)
+        frame = b"API\0" + _framed(b"v100..203 " + options.encode("latin-1"))
+        with pytest.raises(MessageRefused):
+            client.conn.sendMsg(frame)
+        assert stub.sent == []
+
+
+def test_handshake_options_accept_every_printable_ascii_byte():
+    options = "".join(chr(c) for c in range(0x20, 0x7F))
+    client, _ = make_client()
+    stub = with_stub(client, 100)
+    client.conn.sendMsg(_handshake(options))
+    assert len(stub.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"01\0", b"00\0", b"02\0", b"09\0", b"020\0", b"0001\0", b"0049\0", b"0087\0", b"090\0"],
+)
+def test_text_ids_with_a_leading_zero_are_refused(body):
+    # `01` would read as REQ_MKT_DATA (1) if leading zeros were accepted.
+    client, _ = make_client()
+    stub = with_stub(client, 100)
+    with pytest.raises(MessageRefused):
+        client.conn.sendMsg(_framed(body))
+    assert stub.sent == []
+
+
+def test_text_id_without_leading_zero_is_still_accepted():
+    client, _ = make_client()
+    stub = with_stub(client, 100)
+    client.conn.sendMsg(_framed(b"1\0"))
+    client.conn.sendMsg(_framed(b"20\0"))
+    assert len(stub.sent) == 2
+
+
+def test_handshake_is_accepted_only_as_the_first_write():
+    client, _ = make_client()
+    stub = with_stub(client, 100)
+    client.conn.sendMsg(_handshake())
+    with pytest.raises(MessageRefused):
+        client.conn.sendMsg(_handshake())
+    assert stub.sent == [_handshake()]
+    # after an ordinary frame, a handshake is refused too
+    client2, _ = make_client()
+    stub2 = with_stub(client2, 100)
+    client2.conn.sendMsg(_frame(100, OUT.REQ_CURRENT_TIME))
+    with pytest.raises(MessageRefused):
+        client2.conn.sendMsg(_handshake())
+    assert stub2.sent == [_frame(100, OUT.REQ_CURRENT_TIME)]
+
+
+def test_the_first_write_state_is_per_wrapped_connection():
+    client, _ = make_client()
+    with_stub(client, 100)
+    client.conn.sendMsg(_handshake())
+    stub2 = StubConn()
+    client.conn = stub2  # a new connection object: its own first write
+    client.conn.sendMsg(_handshake())
+    assert stub2.sent == [_handshake()]
+
+
+def test_a_refused_frame_does_not_use_up_the_first_write():
+    client, _ = make_client()
+    stub = with_stub(client, 100)
+    with pytest.raises(MessageRefused):
+        client.conn.sendMsg(_frame(100, OUT.PLACE_ORDER))
+    client.conn.sendMsg(_handshake())
+    assert stub.sent == [_handshake()]
+
+
+# -- regulatory snapshots are billed per request and stay off -----------------
+
+
+@pytest.mark.parametrize("value", [True, 1, "false", "False", None, 0, "", [], 1.0])
+def test_regulatory_snapshot_other_than_false_is_refused(value):
+    client, _ = make_client()
+    stub = with_stub(client, 203)
+    with pytest.raises(MessageRefused, match="regulatory snapshots are billed"):
+        client.reqMktData(4, contract(), "", False, value, [])
+    assert stub.sent == []
+
+
+@pytest.mark.parametrize("server_version", SERVER_VERSIONS)
+def test_regulatory_snapshot_false_is_byte_identical_to_plain_eclient(server_version):
+    client, _ = make_client()
+    stub = with_stub(client, server_version)
+    plain = EClient(EWrapper())
+    plain_stub = StubConn()
+    plain.conn = plain_stub
+    plain.serverVersion_ = server_version
+    plain.connState = EClient.CONNECTED
+    client.reqMktData(4, contract(), "233", True, False, [])
+    plain.reqMktData(4, contract(), "233", True, False, [])
+    assert len(stub.sent) == 1
+    assert stub.sent == plain_stub.sent
+
+
+def test_req_mkt_data_signature_equals_eclients():
+    import inspect
+
+    assert inspect.signature(DataOnlyClient.reqMktData) == inspect.signature(EClient.reqMktData)
+
+
+def test_the_wire_field_that_carries_regulatory_snapshot_is_zero():
+    # The refusal matters because True would put "1" in that field.
+    client, _ = make_client()
+    stub = with_stub(client, 203)
+    client.reqMktData(4, contract(), "", False, False, [])
+    fields = stub.sent[0][4:].split(b"\0")
+    assert fields[-3:] == [b"0", b"", b""]  # regulatorySnapshot, options, end
+
+
 def test_every_assignment_to_conn_is_wrapped_and_forwarded():
     client, _ = make_client()
     stub = with_stub(client, 203)
@@ -617,6 +751,11 @@ def test_every_assignment_to_conn_is_wrapped_and_forwarded():
     assert client.conn._inner is raw
 
 
+# NOTE: this replaces `ibapi.client.Connection`, the class that the pytest
+# broker-connection block in tests/conftest.py patches. It is safe only because
+# the fake neither subclasses `Connection` nor touches `socket`. This pattern is
+# allowed in this file and in tests/test_fake_ib_extra.py only and must not be
+# copied elsewhere.
 class FakeConnection:
     """Stands in for ibapi.connection.Connection: no socket, scripted replies."""
 
@@ -652,14 +791,24 @@ class FakeConnection:
 
 def test_connect_disconnect_and_reader_work_through_the_wrapper(monkeypatch):
     # The real EClient.connect, handshake, reader thread, startApi and disconnect,
-    # against a fake Connection (no socket is created).
+    # against a fake Connection (no socket is created). This sidesteps the
+    # pytest broker-connection block in tests/conftest.py by replacing the class
+    # it patches; it is safe only because the fake neither subclasses
+    # `Connection` nor touches `socket`. Allowed in this file and
+    # tests/test_fake_ib_extra.py only; do not copy it.
+    # The endpoint is TEST-NET-1 (192.0.2.1, not routable) on a port that is not
+    # a TWS port. The port guard refuses every non-paper port without the
+    # opt-in, so the opt-in is supplied through this client's own env mapping
+    # only, never through os.environ. Even if the swap failed, nothing would
+    # point at a TWS port.
     FakeConnection.instances = []
     monkeypatch.setattr(ibapi_client, "Connection", FakeConnection)
-    client, got = make_client()
-    client.connect("127.0.0.1", 7497, 21)
+    client, got = make_client({OPT_IN: "1"})
+    client.connect("192.0.2.1", 49152, 21)
+    reader = client.reader
     try:
         fake = FakeConnection.instances[0]
-        assert fake.host == "127.0.0.1" and fake.port == 7497
+        assert fake.host == "192.0.2.1" and fake.port == 49152
         assert fake.sent[0] == _handshake_for_connect()
         assert fake.sent[1] == _frame(203, OUT.START_API, "2\x0021\0\0")
         assert len(fake.sent) == 2
@@ -673,10 +822,11 @@ def test_connect_disconnect_and_reader_work_through_the_wrapper(monkeypatch):
         with pytest.raises(MessageRefused):
             EClient.sendMsg(client, OUT.PLACE_ORDER, "x")
         assert len(fake.sent) == 2
-        reader = client.reader
     finally:
-        client.disconnect()
-    reader.join(5)
+        try:
+            client.disconnect()
+        finally:
+            reader.join(5)
     assert not reader.is_alive()
     assert client.conn is None
     assert not client.isConnected()
