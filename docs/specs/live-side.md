@@ -119,9 +119,9 @@ reach the algos. Updates to the bar in progress go to the event sink, for a
 future live chart, and to the paper broker for nothing: simulated fills use
 closed bars only, exactly as in a backtest.
 
-Bar times stay in the machine's local time without a zone, as in the offline
-files, so stored runs and offline data stay comparable. The run records the
-machine's time zone name so the dashboard can label it.
+Bar times are naive `America/New_York` wall-clock times (fixed in code, not the
+machine's zone), as in the offline files, so stored runs and offline data stay
+comparable. The regular session reads 09:30 to 16:00 all year.
 
 A missing minute (no trades in that minute, or a gap after a reconnect) is
 recorded as a gap. Algos are not fed invented bars.
@@ -297,10 +297,10 @@ T17, GitHub issues 114 to 130.
   read from the error callback and the missing `nextValidId`; attempts are
   bounded. The data-farm wait accepts codes 2104, 2106, 2107, 2108 and 2158
   and is bounded.
-- **Data time.** Bar times are naive `America/Los_Angeles` wall-clock times,
-  fixed in code and pinned by a test over every committed row. "Machine local
-  time" above is wrong: the committed data and three algos' cut-off times are
-  Pacific, and the machine's zone must not change the bars.
+- **Data time.** Bar times are naive `America/New_York` wall-clock times,
+  fixed in code and pinned by a test over every committed row. The regular
+  session is 09:30 to 16:00 (last bar 15:59); the three algos' cut-off times
+  are in the same zone, and the machine's zone must not change the bars.
 - **Fetched data.** Regular trading hours only, one request per trading day,
   bars filtered to the requested day (IB returns the previous session for a
   holiday), one file per symbol per month under

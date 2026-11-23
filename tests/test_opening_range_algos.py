@@ -39,7 +39,7 @@ class Bar(NamedTuple):
     close: float
 
 
-def day(date: str, ohlc: list[OHLC], start: str = "06:30") -> list[Bar]:
+def day(date: str, ohlc: list[OHLC], start: str = "09:30") -> list[Bar]:
     """Consecutive 1-minute bars from `start` on `date`."""
     t0 = pd.Timestamp(f"{date} {start}")
     return [Bar(t0 + pd.Timedelta(minutes=i), *x) for i, x in enumerate(ohlc)]
@@ -121,7 +121,7 @@ class Rig:
         self.algo.broker = self.broker  # type: ignore[attr-defined]
         # two warm-up bars from an earlier day: the algos read AlgoData.iloc[-2]
         self.rows: list[tuple] = []
-        for ts in ("2024-08-16 12:58", "2024-08-16 12:59"):
+        for ts in ("2024-08-16 15:58", "2024-08-16 15:59"):
             self._add(Bar(pd.Timestamp(ts), 90, 91, 89, 90))
 
     def _add(self, bar: Bar) -> None:
@@ -166,18 +166,18 @@ def test_first_candle_of_each_day_sets_the_range(algo_id):
     rig.feed(day(D1, [first_candle(100)]))
     assert rig.state == "initState"
     assert (rig.algo.upperbound, rig.algo.lowerbound) == (102, 98)
-    rig.feed(day(D1, [quiet(100)], "06:31"))
+    rig.feed(day(D1, [quiet(100)], "09:31"))
     assert rig.state == "waitingState"
-    rig.feed(day(D1, [quiet(100)], "06:32"))
+    rig.feed(day(D1, [quiet(100)], "09:32"))
     assert (rig.algo.upperbound, rig.algo.lowerbound) == (102, 98)
 
     # day 2: the first bar is the new range, not a continuation of day 1
     rig.feed(day(D2, [first_candle(200)]))
     assert rig.state == "initState"
     assert (rig.algo.upperbound, rig.algo.lowerbound) == (202, 198)
-    rig.feed(day(D2, [quiet(200)], "06:31"))
+    rig.feed(day(D2, [quiet(200)], "09:31"))
     assert rig.state == "waitingState"
-    rig.feed(day(D2, [quiet(200)], "06:32"))
+    rig.feed(day(D2, [quiet(200)], "09:32"))
     assert (rig.algo.upperbound, rig.algo.lowerbound) == (202, 198)
     assert rig.trades == []
 
@@ -191,17 +191,17 @@ def test_one_trade_per_day_and_reset_next_day(algo_id):
     assert rig.state == "doneTradingState"
     first, second = rig.trades
     assert (first["id"], second["id"]) == ("T0", "T1")
-    assert trade_tuple(first) == (1, f"{D1} 06:33:00", 102.5, f"{D1} 06:34:00", 114.0)
-    assert trade_tuple(second) == (1, f"{D2} 06:33:00", 202.5, f"{D2} 06:34:00", 214.0)
+    assert trade_tuple(first) == (1, f"{D1} 09:33:00", 102.5, f"{D1} 09:34:00", 114.0)
+    assert trade_tuple(second) == (1, f"{D2} 09:33:00", 202.5, f"{D2} 09:34:00", 214.0)
     assert len(rig.calls("open_position")) == 2
 
 
 def test_no_second_trade_same_day_after_close(algo_id):
     rig = Rig(algo_id)
-    rig.feed(day(D1, setup(100, "long")))  # closes at the target on the 06:34 bar
+    rig.feed(day(D1, setup(100, "long")))  # closes at the target on the 09:34 bar
     assert rig.state == "doneTradingState"
     # a second complete, valid setup later the same day
-    rig.feed(day(D1, [breakout_up(100), retest_up(100), target_bar(100, "long", 3)], "07:00"))
+    rig.feed(day(D1, [breakout_up(100), retest_up(100), target_bar(100, "long", 3)], "10:00"))
     assert rig.state == "doneTradingState"
     assert len(rig.trades) == 1
     assert len(rig.calls("open_position")) == 1
@@ -210,22 +210,22 @@ def test_no_second_trade_same_day_after_close(algo_id):
 def test_retest_timeout_ends_the_day_but_next_day_trades(algo_id):
     rig = Rig(algo_id)
     timeout = rig.algo.retestTimeout
-    # breakout at 06:32; first bar strictly more than `timeout` minutes later gives up
+    # breakout at 09:32; first bar strictly more than `timeout` minutes later gives up
     rig.feed(day(D1, [first_candle(100), quiet(100), breakout_up(100), drift_up(100)]))
     assert rig.state == "breakoutState"
     # exactly `timeout` minutes after the breakout is still within the limit
-    rig.feed(at(D1, plus(D1, "06:32", timeout), drift_up(100)))
+    rig.feed(at(D1, plus(D1, "09:32", timeout), drift_up(100)))
     assert rig.state == "breakoutState"
-    rig.feed(at(D1, plus(D1, "06:32", timeout + 1), drift_up(100)))
+    rig.feed(at(D1, plus(D1, "09:32", timeout + 1), drift_up(100)))
     assert rig.state == "doneTradingState"
     # a perfect retest afterwards is ignored for the rest of the day
-    rig.feed(at(D1, plus(D1, "06:32", timeout + 2), retest_up(100)))
+    rig.feed(at(D1, plus(D1, "09:32", timeout + 2), retest_up(100)))
     assert rig.state == "doneTradingState"
     assert rig.trades == []
 
     rig.feed(day(D2, setup(200, "long")))
     assert [trade_tuple(t) for t in rig.trades] == [
-        (1, f"{D2} 06:33:00", 202.5, f"{D2} 06:34:00", 214.0)
+        (1, f"{D2} 09:33:00", 202.5, f"{D2} 09:34:00", 214.0)
     ]
 
 
@@ -242,7 +242,7 @@ def test_retest_timeout_bar_cannot_enter_or_fail(algo_id, late_bar):
     timeout = rig.algo.retestTimeout
     rig.feed(day(D1, [first_candle(100), quiet(100), breakout_up(100)]))
     assert rig.state == "breakoutState"
-    rig.feed(at(D1, plus(D1, "06:32", timeout + 1), late_bar(100)))
+    rig.feed(at(D1, plus(D1, "09:32", timeout + 1), late_bar(100)))
     assert rig.state == "doneTradingState"
     assert rig.trades == []
     assert rig.broker.calls == ()
@@ -261,15 +261,15 @@ def test_stop_and_take_profit_on_same_bar_close_once(algo_id, direction):
     else:  # stop 102, target 86: low below target, close above stop
         both = (97.5, 110, 85, 105)
         stop = 102.0
-    rig.feed(at(D1, "06:34", both))
+    rig.feed(at(D1, "09:34", both))
     assert rig.state == "doneTradingState"
     assert rig.algo.inTrade is False
     closes = rig.calls("close_position")
     assert len(closes) == 1
     assert closes[0].args["price"] == stop  # the stop is checked first, and fills at the stop
-    assert closes[0].args["time"] == pd.Timestamp(f"{D1} 06:34")
+    assert closes[0].args["time"] == pd.Timestamp(f"{D1} 09:34")
     (rec,) = rig.trades
-    assert (rec["closeTime"], rec["closePrice"]) == (f"{D1} 06:34:00", stop)
+    assert (rec["closeTime"], rec["closePrice"]) == (f"{D1} 09:34:00", stop)
 
 
 def test_breakout_candle_that_gapped_outside_the_range_is_ignored(algo_id):
@@ -277,55 +277,55 @@ def test_breakout_candle_that_gapped_outside_the_range_is_ignored(algo_id):
     rig.feed(day(D1, [first_candle(100), quiet(100)]))
     assert rig.state == "waitingState"
     # opens above the range and closes above it: gapped across the bound
-    rig.feed(at(D1, "06:32", (103, 105, 102.5, 104)))
+    rig.feed(at(D1, "09:32", (103, 105, 102.5, 104)))
     assert rig.state == "waitingState"
     # opens exactly on the bound: not strictly inside, also ignored
-    rig.feed(at(D1, "06:33", (102, 105, 101.5, 104)))
+    rig.feed(at(D1, "09:33", (102, 105, 101.5, 104)))
     assert rig.state == "waitingState"
     # gapped below and closed below
-    rig.feed(at(D1, "06:34", (97, 97.5, 95, 96)))
+    rig.feed(at(D1, "09:34", (97, 97.5, 95, 96)))
     assert rig.state == "waitingState"
     # a later candle that opens inside and closes beyond the bound is a breakout
-    rig.feed(at(D1, "06:35", breakout_up(100)))
+    rig.feed(at(D1, "09:35", breakout_up(100)))
     assert rig.state == "breakoutState"
     assert rig.algo.direction == "up"
-    assert rig.algo.breakout_time == pd.Timestamp(f"{D1} 06:35")
+    assert rig.algo.breakout_time == pd.Timestamp(f"{D1} 09:35")
 
 
 def test_end_of_day_close_at_cutoff(algo_id):
     rig = Rig(algo_id)
     rig.feed(day(D1, setup(100, "long", with_target=False)))
     assert rig.state == "inTradeState"
-    rig.feed(day(D1, [hold_bar(100, "long")] * 5, "12:50"))  # 12:50 .. 12:54
+    rig.feed(day(D1, [hold_bar(100, "long")] * 5, "15:50"))  # 15:50 .. 15:54
     assert rig.state == "inTradeState"
-    rig.feed(at(D1, "12:55", hold_bar(100, "long")))  # the cut-off minute itself: still open
+    rig.feed(at(D1, "15:55", hold_bar(100, "long")))  # the cut-off minute itself: still open
     assert rig.state == "inTradeState"
     assert rig.calls("close_position") == []
-    rig.feed(at(D1, "12:56", (102.5, 103.2, 102.4, 103.1)))  # first bar after the cut-off
+    rig.feed(at(D1, "15:56", (102.5, 103.2, 102.4, 103.1)))  # first bar after the cut-off
     assert rig.state == "doneTradingState"
     assert rig.algo.inTrade is False
     closes = rig.calls("close_position")
     assert len(closes) == 1
     assert closes[0].args["price"] == 103.1
-    assert closes[0].args["time"] == pd.Timestamp(f"{D1} 12:56")
-    rig.feed(day(D1, [hold_bar(100, "long")] * 3, "12:57"))
+    assert closes[0].args["time"] == pd.Timestamp(f"{D1} 15:56")
+    rig.feed(day(D1, [hold_bar(100, "long")] * 3, "15:57"))
     assert len(rig.calls("close_position")) == 1
     assert [trade_tuple(t) for t in rig.trades] == [
-        (1, f"{D1} 06:33:00", 102.5, f"{D1} 12:56:00", 103.1)
+        (1, f"{D1} 09:33:00", 102.5, f"{D1} 15:56:00", 103.1)
     ]
 
 
 @pytest.mark.parametrize(
     "retest_at, enters",
-    [("12:54", True), ("12:55", False), ("12:57", False)],
+    [("15:54", True), ("15:55", False), ("15:57", False)],
 )
 def test_no_entry_at_or_after_cutoff(algo_id, retest_at, enters):
     rig = Rig(algo_id)
     rig.feed(day(D1, [first_candle(100), quiet(100)]))
-    rig.feed(at(D1, "12:50", breakout_up(100)))
+    rig.feed(at(D1, "15:50", breakout_up(100)))
     assert rig.state == "breakoutState"
     n_drift = int(retest_at[-2:]) - 51
-    rig.feed(day(D1, [drift_up(100)] * n_drift, "12:51"))
+    rig.feed(day(D1, [drift_up(100)] * n_drift, "15:51"))
     rig.feed(at(D1, retest_at, retest_up(100)))
     if enters:
         assert rig.state == "inTradeState"
@@ -339,10 +339,10 @@ def test_no_entry_at_or_after_cutoff(algo_id, retest_at, enters):
 def test_breakout_state_reaching_cutoff_is_done_for_the_day(algo_id):
     rig = Rig(algo_id)
     rig.feed(day(D1, [first_candle(100), quiet(100)]))
-    rig.feed(at(D1, "12:50", breakout_up(100)))
-    rig.feed(at(D1, "12:54", drift_up(100)))
+    rig.feed(at(D1, "15:50", breakout_up(100)))
+    rig.feed(at(D1, "15:54", drift_up(100)))
     assert rig.state == "breakoutState"
-    rig.feed(at(D1, "12:55", drift_up(100)))
+    rig.feed(at(D1, "15:55", drift_up(100)))
     assert rig.state == "doneTradingState"
     assert rig.trades == []
 
@@ -350,7 +350,7 @@ def test_breakout_state_reaching_cutoff_is_done_for_the_day(algo_id):
 def test_trade_still_open_at_day_change_is_closed_before_reset(algo_id, caplog):
     rig = Rig(algo_id)
     rig.feed(day(D1, setup(100, "long", with_target=False)))
-    rig.feed(day(D1, [hold_bar(100, "long")] * 2, "12:29"))  # half-day session ends 12:30
+    rig.feed(day(D1, [hold_bar(100, "long")] * 2, "15:29"))  # half-day session ends 15:30
     assert rig.state == "inTradeState"
     assert rig.algo.inTrade is True
 
@@ -360,9 +360,9 @@ def test_trade_still_open_at_day_change_is_closed_before_reset(algo_id, caplog):
     closes = rig.calls("close_position")
     assert len(closes) == 1
     assert closes[0].args["price"] == 201
-    assert closes[0].args["time"] == pd.Timestamp(f"{D2} 06:30")
+    assert closes[0].args["time"] == pd.Timestamp(f"{D2} 09:30")
     assert [trade_tuple(t) for t in rig.trades] == [
-        (1, f"{D1} 06:33:00", 102.5, f"{D2} 06:30:00", 201.0)
+        (1, f"{D1} 09:33:00", 102.5, f"{D2} 09:30:00", 201.0)
     ]
     assert any(
         r.levelno == logging.WARNING and r.name.startswith("algo:") for r in caplog.records
@@ -371,7 +371,7 @@ def test_trade_still_open_at_day_change_is_closed_before_reset(algo_id, caplog):
     assert rig.state == "initState"
     assert rig.algo.inTrade is False
     assert (rig.algo.upperbound, rig.algo.lowerbound) == (202, 198)
-    rig.feed(day(D2, [quiet(200)], "06:31"))
+    rig.feed(day(D2, [quiet(200)], "09:31"))
     assert rig.state == "waitingState"
 
 
@@ -398,7 +398,7 @@ def test_long_and_short_setups(algo_id, direction):
     assert trade.volume == 10
     assert rig.algo.tp == tp_call.args["price"]
 
-    rig.feed(at(D1, "06:34", target_bar(100, direction, rr)))
+    rig.feed(at(D1, "09:34", target_bar(100, direction, rr)))
     assert rig.state == "doneTradingState"
     (rec,) = rig.trades
     assert rec["closePrice"] == tp_call.args["price"]
@@ -416,9 +416,9 @@ FIRST_DAY = [
             "symbol": "AAPL",
             "volume": 10,
             "direction": 0,
-            "openTime": "2024-08-19 06:33:00",
+            "openTime": "2024-08-19 09:33:00",
             "openPrice": 225.08,
-            "closeTime": "2024-08-19 07:17:00",
+            "closeTime": "2024-08-19 10:17:00",
             "closePrice": 223.34,
             "status": "Closed",
         },
@@ -431,9 +431,9 @@ FIRST_DAY = [
             "symbol": "TSLA",
             "volume": 10,
             "direction": 0,
-            "openTime": "2024-08-19 06:43:00",
+            "openTime": "2024-08-19 09:43:00",
             "openPrice": 216.47,
-            "closeTime": "2024-08-19 06:48:00",
+            "closeTime": "2024-08-19 09:48:00",
             "closePrice": 219.47,
             "status": "Closed",
         },

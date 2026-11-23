@@ -1,0 +1,178 @@
+[
+ {
+  "id": "elliot-tsla0",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 07:04:00",
+  "openPrice": 217.28,
+  "closeTime": "2024-08-19 07:16:00",
+  "closePrice": 221.32,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla1",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 07:47:00",
+  "openPrice": 220.58,
+  "closeTime": "2024-08-19 11:51:00",
+  "closePrice": 222.76,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla2",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 11:59:00",
+  "openPrice": 222.29,
+  "closeTime": "2024-08-19 12:34:00",
+  "closePrice": 222.79,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla3",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 06:54:00",
+  "openPrice": 226.28,
+  "closeTime": "2024-08-20 07:01:00",
+  "closePrice": 224.02,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla4",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 07:04:00",
+  "openPrice": 223.88,
+  "closeTime": "2024-08-20 07:28:00",
+  "closePrice": 221.64,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla5",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 07:31:00",
+  "openPrice": 221.52,
+  "closeTime": "2024-08-21 07:15:00",
+  "closePrice": 220.0496,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla6",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 07:58:00",
+  "openPrice": 221.4,
+  "closeTime": "2024-08-21 11:02:00",
+  "closePrice": 222.97,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla7",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 11:33:00",
+  "openPrice": 223.86,
+  "closeTime": "2024-08-21 11:38:00",
+  "closePrice": 223.4,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla8",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 11:48:00",
+  "openPrice": 222.84,
+  "closeTime": "2024-08-22 06:32:00",
+  "closePrice": 221.7,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla9",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 07:05:00",
+  "openPrice": 222.0,
+  "closeTime": "2024-08-22 07:31:00",
+  "closePrice": 219.78,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla10",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 10:01:00",
+  "openPrice": 216.57,
+  "closeTime": "2024-08-22 10:44:00",
+  "closePrice": 214.4,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla11",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 11:28:00",
+  "openPrice": 213.83,
+  "closeTime": "2024-08-22 12:40:00",
+  "closePrice": 211.69,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla12",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:57:00",
+  "openPrice": 217.65,
+  "closeTime": "2024-08-26 06:55:00",
+  "closePrice": 216.427,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla13",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 08:50:00",
+  "openPrice": 212.62,
+  "closeTime": "2024-08-26 09:32:00",
+  "closePrice": 214.03,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla14",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 09:57:00",
+  "openPrice": 213.58,
+  "closeTime": "2024-08-26 10:48:00",
+  "closePrice": 211.44,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-tsla15",
+  "symbol": "TSLA",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 12:47:00",
+  "openPrice": 212.4,
+  "closeTime": "2024-08-26 12:57:00",
+  "closePrice": 213.05,
+  "status": "Closed"
+ }
+]

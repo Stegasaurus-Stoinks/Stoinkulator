@@ -1,0 +1,178 @@
+[
+ {
+  "id": "elliot-aapl0",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 07:43:00",
+  "openPrice": 223.57,
+  "closeTime": "2024-08-19 08:12:00",
+  "closePrice": 224.62,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl1",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 08:20:00",
+  "openPrice": 224.34,
+  "closeTime": "2024-08-19 11:56:00",
+  "closePrice": 224.82,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl2",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 12:03:00",
+  "openPrice": 224.72,
+  "closeTime": "2024-08-19 12:37:00",
+  "closePrice": 225.02,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl3",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 06:48:00",
+  "openPrice": 226.65,
+  "closeTime": "2024-08-21 07:06:00",
+  "closePrice": 227.53,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl4",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 07:35:00",
+  "openPrice": 227.14,
+  "closeTime": "2024-08-21 07:44:00",
+  "closePrice": 227.79,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl5",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 08:29:00",
+  "openPrice": 226.49,
+  "closeTime": "2024-08-22 06:37:00",
+  "closePrice": 227.27,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl6",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 07:15:00",
+  "openPrice": 227.06,
+  "closeTime": "2024-08-22 10:35:00",
+  "closePrice": 224.79,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl7",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 12:02:00",
+  "openPrice": 224.88,
+  "closeTime": "2024-08-23 06:33:00",
+  "closePrice": 225.9,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl8",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:00:00",
+  "openPrice": 227.32,
+  "closeTime": "2024-08-23 07:05:00",
+  "closePrice": 227.38,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl9",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:20:00",
+  "openPrice": 227.37,
+  "closeTime": "2024-08-23 09:27:00",
+  "closePrice": 225.1,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl10",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 11:22:00",
+  "openPrice": 226.27,
+  "closeTime": "2024-08-23 11:56:00",
+  "closePrice": 226.57,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl11",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 12:48:00",
+  "openPrice": 226.6,
+  "closeTime": "2024-08-26 07:33:00",
+  "closePrice": 224.33,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl12",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 08:19:00",
+  "openPrice": 224.73,
+  "closeTime": "2024-08-26 08:44:00",
+  "closePrice": 225.28,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl13",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 08:50:00",
+  "openPrice": 225.18,
+  "closeTime": "2024-08-26 09:32:00",
+  "closePrice": 225.85,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl14",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 10:22:00",
+  "openPrice": 226.24,
+  "closeTime": "2024-08-26 12:28:00",
+  "closePrice": 226.56,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-aapl15",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-26 12:28:00",
+  "openPrice": 226.51,
+  "closeTime": "2024-08-26 12:49:00",
+  "closePrice": 226.55,
+  "status": "Closed"
+ }
+]

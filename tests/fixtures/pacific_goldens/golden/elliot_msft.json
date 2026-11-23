@@ -1,0 +1,112 @@
+[
+ {
+  "id": "elliot-msft0",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 07:09:00",
+  "openPrice": 419.0,
+  "closeTime": "2024-08-19 11:48:00",
+  "closePrice": 420.38,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft1",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-19 12:10:00",
+  "openPrice": 419.92,
+  "closeTime": "2024-08-19 12:58:00",
+  "closePrice": 421.31,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft2",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 07:05:00",
+  "openPrice": 423.31,
+  "closeTime": "2024-08-20 09:55:00",
+  "closePrice": 423.83,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft3",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 10:03:00",
+  "openPrice": 423.46,
+  "closeTime": "2024-08-20 10:50:00",
+  "closePrice": 424.12,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft4",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 11:51:00",
+  "openPrice": 424.97,
+  "closeTime": "2024-08-21 07:47:00",
+  "closePrice": 426.15,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft5",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 08:37:00",
+  "openPrice": 423.56,
+  "closeTime": "2024-08-22 06:36:00",
+  "closePrice": 426.44,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft6",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-22 06:49:00",
+  "openPrice": 424.93,
+  "closeTime": "2024-08-22 08:19:00",
+  "closePrice": 420.68,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft7",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 06:47:00",
+  "openPrice": 416.64,
+  "closeTime": "2024-08-23 07:03:00",
+  "closePrice": 418.11,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft8",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:24:00",
+  "openPrice": 418.64,
+  "closeTime": "2024-08-23 07:48:00",
+  "closePrice": 414.45,
+  "status": "Closed"
+ },
+ {
+  "id": "elliot-msft9",
+  "symbol": "MSFT",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-23 07:48:00",
+  "openPrice": 413.47,
+  "closeTime": "None",
+  "closePrice": null,
+  "status": "Open"
+ }
+]
