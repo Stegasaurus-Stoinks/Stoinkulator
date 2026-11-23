@@ -39,7 +39,18 @@ arguments on ``, ( ) @ [ ] { }`` too (PowerShell argument arrays), sees through
 piped into a shell, decodes ``-EncodedCommand``, follows a ``cd`` into the
 package directory, and blocks a command over 50,000 characters that mentions
 the package. Blocked by design, even though they only print help:
-``fetch-bars --help``, ``probe-data -h``, ``python -c "import MainStoinker.ib..."``.
+``fetch-bars --help``, ``probe-data -h``, ``python -c "import MainStoinker.ib; main()"``.
+Two exceptions (issue 155). A path to ``MainStoinker/__main__.py`` counts as
+running the package only when the segment has an interpreter token (a launch
+word or a ``py*`` program counts as one) or the path is the command word. When
+the command word is a variable or expression (``"$R"``, ``%PY%``) it counts
+unless the next word is an option or none, so a lint through ``"$R"`` passes.
+``python -c`` code is "import-only" if it is at most 2,000 ASCII characters with
+no ``$``, backtick, backslash or ``%`` and parses into only imports and ``print`` of names, attribute
+chains, str/number constants and f-strings of those (no ``*``, no ``print``
+alias, none of ``MainStoinker.__main__``/``.ib.cli``/``.ib.quick_probe``/``runpy``);
+for it only the "MainStoinker next to ib" rule is off (importing cannot connect:
+every connection goes through ``IbConnection.open()``), and any error blocks.
 Not seen: a script or file that itself imports and runs the package (written
 in one call, run in another), ``bash script.sh``, aliases/functions, a module
 name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
@@ -80,6 +91,7 @@ Standard library only; must not import anything from the repo.
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import re
@@ -695,6 +707,21 @@ def _first_harmless(toks: list[str]) -> int | None:
     return None
 
 
+def _path_is_argument(segment: str, toks: list[str], i: int) -> bool:
+    """The package path ``toks[i]`` is no run: see the opening comment (issue 155)."""
+    words = segment.split()
+    j = _command_index(words)
+    cw = _cmd_base(words[j].strip("\"'")) if j < len(words) else ""
+    if re.fullmatch(r"[a-z0-9_.:+-]+", cw):
+        return cw not in _LAUNCH_WORDS | _SHELL_WRAPPERS | _FEEDERS and not (
+            "python" in cw or cw.startswith("py")
+        )
+    k = i + 1
+    while k < len(toks) and "/" in toks[k]:
+        k += 1
+    return k >= len(toks) or toks[k].startswith("-")
+
+
 def _ib_from_import(text: str) -> bool:
     """``from mainstoinker import ... ib`` up to the next ``;``, in linear time."""
     key = "from mainstoinker import "
@@ -710,8 +737,12 @@ def _ib_from_import(text: str) -> bool:
         pos = end  # later occurrences before `end` scan a part of the same span
 
 
-def _scan_code(text: str) -> str | None:
-    """Judge text that is code (a ``-c`` argument or heredoc body)."""
+def _scan_code(text: str, import_only: bool = False) -> str | None:
+    """Judge text that is code (a ``-c`` argument or heredoc body).
+
+    """
+    if import_only:  # the word ``ib`` no longer counts
+        text = _IB_WORD.sub("x", text)
     if _CODE_WORD.search(text):
         return "running MainStoinker from code (runpy, import, exec, subprocess)"
     if _IB_DOTTED.search(text) or _ib_from_import(text) or _IB_PATH.search(text):
@@ -740,6 +771,84 @@ def _python_code_args(text: str) -> list[str]:
         if _has_interpreter(_normalise(window[cut + 1 :])):
             out.append(text[m.end() : len(text) if end == -1 else end])
     return out
+
+
+# --- import-only ``python -c`` code (issue 155) -----------------------------------
+_IO_CHARS = re.compile(r"[A-Za-z0-9_ .,;:(){}'\"-]*")  # shell-inert: no $ ` \\ % ! newline
+_IO_C_FLAG = re.compile(r"(?<![\w-])-[BEIPRSOdbqsuv]*c[ \t]+(?=[\"'])")
+_IO_PY = r"(?i:python[\d.]*|pythonw|py|ipython)(?i:\.exe)?"
+_IO_LEAD = re.compile(  # [VAR=x] python [-P ...]; the path may be quoted
+    rf"\s*(?:\w+=\S*\s+)*(?:\"(?:[^\"]*[\\/])?{_IO_PY}\"|'(?:[^']*[\\/])?{_IO_PY}'"
+    rf"|(?:[^\s\"']*[\\/])?{_IO_PY})(?:\s+-[BEIPRSOdbqsuv]+)*\s*"
+)
+_IO_DENIED = re.compile(  # entry points and ``runpy``, also as a prefix
+    r"(?:mainstoinker\.(?:__main__|ib\.(?:cli|quick_probe))|runpy)(?![\w])", re.I
+)
+
+
+def _io_value(n: ast.expr) -> bool:
+    """A str/number constant, a name or attribute chain on a name, or an f-string of those."""
+    if isinstance(n, ast.Constant):
+        return type(n.value) in (str, int, float)
+    if isinstance(n, ast.JoinedStr):
+        return all(
+            isinstance(v, ast.Constant)
+            or (v.conversion == -1 and v.format_spec is None and _io_value(v.value)
+                and isinstance(v.value, (ast.Name, ast.Attribute)))
+            for v in n.values
+        )
+    while isinstance(n, ast.Attribute):
+        n = n.value
+    return isinstance(n, ast.Name)
+
+
+def _import_only(code: str) -> bool:
+    """Explicit allowlist: imports and ``print`` of plain values, nothing else."""
+    if not code.strip() or len(code) > 2000 or not _IO_CHARS.fullmatch(code):
+        return False
+    try:
+        body = ast.parse(code).body
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    bound: set[str] = set()
+    for st in body:
+        if isinstance(st, ast.Import):
+            mods = [a.name for a in st.names]
+            bound.update(a.asname or a.name.split(".")[0] for a in st.names)
+        elif isinstance(st, ast.ImportFrom) and st.module and not st.level:
+            mods = [st.module] + [f"{st.module}.{a.name}" for a in st.names]
+            bound.update(a.asname or a.name for a in st.names)
+        elif (
+            isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+            and isinstance(st.value.func, ast.Name) and st.value.func.id == "print"
+            and not st.value.keywords and all(_io_value(a) for a in st.value.args)
+        ):
+            continue
+        else:
+            return False
+        if any(_IO_DENIED.match(m) for m in mods):
+            return False
+    return not bound & {"print", "*"}
+
+
+def _import_only_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of import-only code in ``python -c "..."`` arguments; [] on any error."""
+    spans: list[tuple[int, int]] = []
+    try:
+        for m, _ in zip(_IO_C_FLAG.finditer(text), range(50)):
+            end = _quoted_at(text, m.end()) or 0  # 0 or -1: none or unterminated
+            lead = max(text.rfind(c, 0, m.start()) for c in ";|&\n\r(") + 1
+            if (
+                end > 0
+                and text[end : end + 1] in " \t\r\n;|&)"  # one whole word
+                and _IO_LEAD.fullmatch(text, lead, m.start())
+                and (not spans or m.end() >= spans[-1][1])
+                and _import_only(text[m.end() + 1 : end - 1])
+            ):
+                spans.append((m.end() + 1, end - 1))
+    except Exception:  # noqa: BLE001 - no allowance on error: the old rule applies
+        return []
+    return spans
 
 
 _QUOTE = re.compile(r"[\"']")
@@ -834,7 +943,10 @@ def _scan_connecting(segment: str) -> str | None:
         if stop is not None and i > stop:
             break
         if tok.endswith("mainstoinker/__main__.py"):
-            # The entry file of the package: judged whatever runs it.
+            # The entry file of the package: judged whatever runs it, unless
+            # the command is no run of it (a lint tool behind a variable).
+            if not (has_py or i == cmd0) and _path_is_argument(segment, toks, i):
+                continue
             why = fed(i, i + 1) or _check_subcommand(
                 toks, table, i + 1, "MainStoinker/__main__.py"
             )
@@ -1084,17 +1196,23 @@ def _heredoc_bodies(text: str) -> list[str]:
 
 def _judge_connecting(text: str, resolve: bool = True) -> str | None:
     """The T10 rule over a command whose continuation lines are joined."""
-    segs = _connect_segments(text, resolve)
+    mentions = "mainstoinker" in _normalise_connect(text, resolve)
     # An unbalanced quote means message removal may not have covered the text:
     # then nothing counts as "just text" any more.
     text_ok = text.count('"') % 2 == 0 and text.count("'") % 2 == 0
+    # Import-only ``python -c`` code is judged apart (below), the rest without it.
+    spans = _import_only_spans(text) if mentions else []
+    codes = [text[a:b] for a, b in spans]
+    for a, b in reversed(spans):
+        text = text[:a] + "x" + text[b:]
+    segs = _connect_segments(text, resolve)
     # A pipeline that ends in a shell or interpreter runs the text it is fed.
     feeds = [False] * len(segs)
     for i in range(len(segs) - 2, -1, -1):
         if segs[i][1] == "|" and (_is_pipe_consumer(segs[i + 1][0]) or feeds[i + 1]):
             feeds[i] = True
     ctx = _Ctx()
-    ctx.mentions = "mainstoinker" in _normalise_connect(text, resolve)
+    ctx.mentions = mentions
     for i, (segment, _sep) in enumerate(segs):
         try:
             why = _connecting_reason(segment, text_ok, ctx, feeds[i])
@@ -1118,6 +1236,10 @@ def _judge_connecting(text: str, resolve: bool = True) -> str | None:
             why = _scan_code(norm)
             if why:
                 return why
+    for code in codes:
+        why = _scan_code(_normalise_connect(code, resolve), import_only=True)
+        if why:
+            return why
     return None
 
 

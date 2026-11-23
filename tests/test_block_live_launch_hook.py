@@ -8,6 +8,7 @@ import hashlib
 import io
 import itertools
 import json
+import random
 import subprocess
 import sys
 import time
@@ -747,15 +748,8 @@ IB_BLOCKED = [
     'cmd /c "python -m MainStoinker.ib.cli"',
     'powershell -Command "python -m MainStoinker.ib.cli"',
     'pwsh -c "python -m MainStoinker.ib.cli"',
-    'python -c "import MainStoinker.ib.connection"',
-    "python -c 'import MainStoinker.ib.connection'",
-    'python -c "from MainStoinker.ib import connection"',
     'python -c "from MainStoinker.ib.connection import Conn; Conn().connect()"',
-    'python -c "from MainStoinker import ib"',
-    'python -c "import MainStoinker.ib"',
-    'python -c "import MainStoinker . ib"',
     'python -c "import os; import MainStoinker.ib.cli as c"',
-    'python -c "import os; from MainStoinker.ib import connection"',
     "python -c \"import importlib; importlib.import_module('MainStoinker.ib.connection')\"",
     "python -c \"__import__('MainStoinker.ib.connection')\"",
     "python -c \"import runpy; runpy.run_module('MainStoinker.ib.cli', run_name='__main__')\"",
@@ -768,7 +762,6 @@ IB_BLOCKED = [
     "python <<EOF\nfrom MainStoinker.ib import connection\nEOF",
     'python -i -c "import MainStoinker.ib.connection"',
     f"bash -c \"{VENV_PY} -c 'import MainStoinker.ib.connection'\"",
-    'git status; python -c "import MainStoinker.ib.connection"',
 ]
 
 
@@ -1034,10 +1027,6 @@ B python -c "import @P@.__main__" @F@
 B python -c "from @P@ import __main__" @F@
 B python -c "from @P@ import __main__ as m"
 B python -c "import @P@.ib.cli as c; c.main([])"
-B python -c "from @P@ import ib"
-B python -c "from @P@ import (ib)"
-B python -c "from @P@ import engine, ib"
-B python -c "import @P@ .ib"
 B python -m @P@.ib.cli
 B python -m pdb @P@/__main__.py @F@
 B python -m cProfile @P@/__main__.py @F@
@@ -1183,7 +1172,6 @@ FP_STILL_BLOCKED = {
     "python -m @P@ @F@ --help",
     "python -m @P@ @R@ -h",
     "python -m @P@.ib.cli --help",
-    'python -c "import @P@.ib.connection"',
 }
 
 CONT_TABLE = r"""
@@ -2258,3 +2246,343 @@ def test_fix3_new_rules_are_linear_in_time() -> None:
     for name, command in shapes.items():
         _, took = _timed(command)
         assert took < _TIMING_BOUND, (name, took)
+
+
+# --- issue 155: two false positives ---------------------------------------------
+# Every row is a command string used as data; nothing here is ever executed.
+
+_R_EXE = "C:/x/.venv/Scripts/ruff.exe"
+_LINT_ARGS = "tests conftest.py MainStoinker/engine MainStoinker/api MainStoinker/ib"
+_REPORTED_LINT = (
+    f'R="{_R_EXE}"; "$R" check . 2>&1 | tail -5; '
+    f'"$R" check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B 2>&1 | tail -40'
+)
+
+PATH_ARG_ALLOWED = [
+    _REPORTED_LINT,
+    f'cd /x/work && R="{_R_EXE}"; "$R" check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B',
+    f"R={_R_EXE}; $R check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B",
+    f"& $ruff check {_LINT_ARGS} MainStoinker/__main__.py --select E,F,W,I,B",
+    '"$R" format --check MainStoinker/__main__.py',
+    "$tool MainStoinker/__main__.py",
+    "$tool MainStoinker\\__main__.py --check",
+    "$d MainStoinker/__main__.py old/__main__.py",
+    # an offline subcommand: what the hook does today for python .../__main__.py backtest
+    "$x MainStoinker/__main__.py backtest",
+    "python MainStoinker/__main__.py backtest",
+    # a literal tool that is no interpreter: the path is an argument
+    "diff MainStoinker/__main__.py other.py",
+    "wc -l MainStoinker/__main__.py",
+]
+
+PATH_ARG_BLOCKED = [
+    '$py MainStoinker/__main__.py fetch-bars',
+    '"$PY" MainStoinker/__main__.py probe-data --port 7497',
+    "$py -m MainStoinker fetch-bars",
+    "& $py MainStoinker/__main__.py fetch-bars",
+    "%PY% MainStoinker\\__main__.py fetch-bars",
+    "$py MainStoinker fetch-bars",
+    "MainStoinker/__main__.py fetch-bars",
+    "python MainStoinker/__main__.py fetch-bars",
+    "$x MainStoinker/__main__.py fetch-bars",
+    "$(which python) MainStoinker/__main__.py fetch-bars",
+    "`which python` MainStoinker/__main__.py fetch-bars",
+    '$t MainStoinker/__main__.py ./x fetch-bars',
+    # a literal command that can run it stays judged
+    "pypy3 MainStoinker/__main__.py fetch-bars",
+    "python3.14t MainStoinker/__main__.py fetch-bars",
+    "start MainStoinker/__main__.py fetch-bars",
+    "ii MainStoinker/__main__.py fetch-bars",
+    "bash MainStoinker/__main__.py fetch-bars",
+    "cmd /c MainStoinker/__main__.py fetch-bars",
+    "R=x; $R MainStoinker/__main__.py fetch-bars; $R check .",
+]
+
+
+@pytest.mark.parametrize("command", PATH_ARG_ALLOWED)
+def test_issue155_path_argument_of_a_non_interpreter_is_allowed(command: str) -> None:
+    assert hook.decide(command) == (False, ""), command
+
+
+@pytest.mark.parametrize("command", PATH_ARG_BLOCKED)
+def test_issue155_package_runs_stay_blocked(command: str) -> None:
+    assert hook.decide(command)[0] is True, command
+
+
+_PYS = [
+    "python",
+    VENV_PY,
+    f'"{VENV_PY}"',
+    '"C:\\Program Files\\Python 3.14\\python.exe"',
+    "C:/x/.venv/Scripts/python.exe",
+    "VAR=1 python",
+    "py",
+]
+
+IO_ALLOWED_CODE = [
+    "import MainStoinker.ib.fetch as f; print(f.__file__)",
+    "import MainStoinker.ib.fetch as f;print(f.__file__)",
+    "from MainStoinker.ib import fetch; print(fetch.__file__)",
+    "import MainStoinker.ib.fetch as f; import MainStoinker.ib.bars as b; print(f.__file__, b.__file__)",
+    "import MainStoinker.ib.fetch as f; print('ok')",
+    'import MainStoinker.ib.fetch as f; print("ok")',
+    "import MainStoinker.ib.fetch as f; print(1, 2.5, f.a.b.c)",
+    "import MainStoinker as m; print(m.ib.__name__)",
+    'import MainStoinker.ib.fetch as f; print(f"{f.__file__} ok")',
+    "import MainStoinker.ib",
+    "from MainStoinker import ib; print(ib.__file__)",
+    "from MainStoinker.ib import (fetch)",
+    "import os; import MainStoinker.ib.fetch as f; print(os.sep, f.__file__)",
+]
+
+
+def _c_forms(code: str, py: str) -> list[str]:
+    forms = []
+    if '"' not in code:
+        forms += [f'{py} -c "{code}"', f'{py} -P -c "{code}"', f'& {py} -P -c "{code}"']
+    if "'" not in code:
+        forms += [f"{py} -c '{code}'", f"{py} -P -c '{code}'", f"& {py} -Ic '{code}'"]
+    return forms
+
+
+def _io_commands(codes: list[str]) -> list[str]:
+    return [c for code in codes for py in _PYS for c in _c_forms(code, py)]
+
+
+def test_issue155_import_only_code_is_allowed() -> None:
+    commands = _io_commands(IO_ALLOWED_CODE)
+    assert len(commands) > 300
+    wrong = [c for c in commands if hook.decide(c) != (False, "")]
+    assert wrong == []
+    reported = 'python -P -c "import MainStoinker.ib.fetch as f; print(f.__file__)"'
+    assert hook.main(_payload(reported)) == 0
+    assert hook.main(_payload(reported, "PowerShell")) == 0
+    assert hook.decide(f'"{VENV_PY}" -P -c "import MainStoinker.ib.fetch as f; print(f.__file__)"') == (
+        False,
+        "",
+    )
+
+
+IO_BLOCKED_CODE = [
+    "import MainStoinker.ib.fetch as f; print(f.fetch())",
+    "import MainStoinker.ib.fetch as f; f.fetch(1)",
+    "import MainStoinker.ib.fetch as f; f.main()",
+    "import MainStoinker.ib.fetch as f; print(f.a.b())",
+    "import MainStoinker.ib.fetch as f; print(f.a().b)",
+    "from MainStoinker.ib.connection import IbConnection; IbConnection(1)",
+    "from MainStoinker.ib.connection import IbConnection; print(IbConnection().open())",
+    "import MainStoinker.ib.fetch as f; getattr(f, 1)()",
+    "import MainStoinker.ib.fetch as f; print(getattr(f, 1))",
+    "import MainStoinker.ib.fetch as f; print(vars(f))",
+    "import MainStoinker.ib.fetch as f; print(dir(f))",
+    "import MainStoinker.ib.fetch as f; print(repr(f))",
+    "import MainStoinker.ib.fetch as f; open(1)",
+    "import MainStoinker.ib.fetch as f; exec(1)",
+    "import MainStoinker.ib.fetch as f; eval(1)",
+    "import MainStoinker.ib.cli",
+    "import MainStoinker.ib.cli as c",
+    "import MainStoinker.__main__",
+    "import MainStoinker.ib.quick_probe",
+    "import MainStoinker.IB.CLI",
+    "from MainStoinker.ib.cli import main; main()",
+    "from MainStoinker.ib import cli",
+    "from MainStoinker.ib import quick_probe as q",
+    "from MainStoinker import __main__",
+    "from MainStoinker.__main__ import x",
+    "import runpy; import MainStoinker.ib.fetch",
+    "import MainStoinker.ib.fetch; import runpy as r; print(r)",
+    "import importlib; import MainStoinker.ib.fetch",
+    "import subprocess; import MainStoinker.ib.fetch",
+    "__import__(1); import MainStoinker.ib.fetch",
+    "import MainStoinker.ib.fetch; __import__(1)",
+    "import os; os.system(1); import MainStoinker.ib.fetch",
+    "import MainStoinker.ib.fetch; import os; os.system(1)",
+    "from MainStoinker.ib import *",
+    "import MainStoinker.ib.fetch as print; print()",
+    "from MainStoinker.ib import fetch as print; print(1)",
+    "import print; import MainStoinker.ib.fetch",
+    "import MainStoinker.ib.fetch as f; x = f.a",
+    "import MainStoinker.ib.fetch as f; print(f.a[0])",
+    "import MainStoinker.ib.fetch as f; print(f.a + 1)",
+    "import MainStoinker.ib.fetch as f; print(-1)",
+    "import MainStoinker.ib.fetch as f; print(1, end=2)",
+    "import MainStoinker.ib.fetch as f; print(*f.a)",
+    "import MainStoinker.ib.fetch as f; print(lambda: 1)",
+    "import MainStoinker.ib.fetch as f; print([f for f in 1])",
+    "import MainStoinker.ib.fetch as f; print(f.a if f else 1)",
+    "import MainStoinker.ib.fetch as f; print(f'{f.a()}')",
+    "import MainStoinker.ib.fetch as f; print(f'{f.a!r}')",
+    "import MainStoinker.ib.fetch as f; print(f'{f.a:>10}')",
+    "import MainStoinker.ib.fetch as f; print(b'x')",
+    "import MainStoinker.ib.fetch as f; print(None)",
+    "import MainStoinker.ib.fetch as f; if f: print(1)",
+    "import MainStoinker.ib.fetch as f; class A: pass",
+    "import MainStoinker.ib.fetch as f; def g(): pass",
+    "import MainStoinker.ib.fetch as f; with f: pass",
+    "import MainStoinker.ib.fetch as f; for i in f: pass",
+    "import MainStoinker.ib.fetch as f; print(f.__file__",
+    "import MainStoinker.ib.fetch as f; print(f.__file__));",
+    "import MainStoinker.ib.fetch as f; (f.main)()",
+    "import MainStoinker.ib.fetch as f; print(f.__file__) if 1 else f.main()",
+    "import MainStoinker.ib.fetch as f; assert f",
+    "import MainStoinker.ib.fetch as f; del f",
+    "import MainStoinker.ib.fetch as f; f.a = 1",
+    "import MainStoinker.ib.fetch as f; print(f.__file__) or f.main()",
+    "import MainStoinker.ib.fetch as f; print(f.a, f.main())",
+    "import MainStoinker.ib.fetch as f; print(f.a)  # x",
+    "import MainStoinker.ib.fetch as f; print(1)\n" + "x",
+    "import MainStoinker.ib.fetch as f; print(f.__file__) ; " * 100,
+    "import MainStoinker.ib.fetch as f; print('" + "a" * 2000 + "')",
+    "import MainStoinker.ib.fetch as f; print(f.__file__) ; print($HOME)",
+    "import MainStoinker.ib.fetch as f; print('$HOME')",
+    "import MainStoinker.ib.fetch as f; print('%PATH%')",
+    "import MainStoinker.ib.fetch as f; print('\\x41')",
+    "import MainStoinker.ib.fetch as f; print('`x`')",
+    "import MainStoinker.ib.fetch as f; print('a!')",
+    "import MainStoinker.ib.fetch as f; print('é')",
+    "import MainStoinker.ib.fetch as f; print('a\\nb')",
+]
+
+
+def test_issue155_other_code_stays_blocked() -> None:
+    commands = _io_commands(IO_BLOCKED_CODE)
+    assert len(commands) > 700
+    wrong = [c for c in commands if not hook.decide(c)[0]]
+    assert wrong == []
+
+
+def test_issue155_import_only_allowance_is_narrow() -> None:
+    ok = "import MainStoinker.ib.fetch as f; print(f.__file__)"
+    for command in (
+        # not python's own -c, or not one whole word
+        f'python -i -c "{ok}"',
+        f'python -m foo -c "{ok}"',
+        f'python script.py -c "{ok}"',
+        f'python -X dev -c "{ok}"',
+        f'python -W ignore -c "{ok}"',
+        f'sudo python -c "{ok}"',
+        f'bash -c "python -c \'{ok}\'"',
+        f"bash -c \"{VENV_PY} -c '{ok}'\"",
+        f'$PYTHON -c "{ok}"',
+        f"python -c '{ok}'\"; f.main()\"",
+        f"python -c '{ok}'\"; print(1)\"",
+        f"python -c \"{ok}\"'; f.main()'",
+        f'python -c "{ok}" ; python -c "import MainStoinker.ib.fetch as f; f.main()"',
+        f'python -c "{ok}" && python -c "import MainStoinker.ib.fetch as f; f.main()"',
+        f'python -c "{ok}" | python -c "import MainStoinker.ib.fetch as f; f.main()"',
+        # piped, heredoc, file, module: unchanged
+        f'echo "{ok}" | python -',
+        f'echo "{ok}" | python',
+        f'echo "{ok}" | bash',
+        f"python - <<'EOF'\n{ok}\nEOF",
+        f"python <<EOF\n{ok}\nEOF",
+        f"python - <<EOF\n{ok}\nEOF",
+        f"cat <<EOF | python\n{ok}\nEOF",
+        "python MainStoinker/ib/fetch.py",
+        "python -m MainStoinker.ib.fetch",
+        # every other rule still runs on the whole command
+        f'python -c "{ok}"; python -m MainStoinker fetch-bars',
+        f'python -c "{ok}"; python MainStoinker/__main__.py probe-data',
+        f'python -c "{ok}"; python -m MainStoinker.ib.cli',
+        f'python -c "{ok}"; python "{ENTRY}"',
+        f'python -c "{ok}"; cmd /c "{BAT}"',
+        f'python -c "{ok}; print(\'{ENTRY}\')"',
+        f'python -c "{ok}"; python -m $M',
+        f'python -c "{ok}" && python -c "import runpy; runpy.run_module(\'MainStoinker\')"',
+        f'python -c "{ok}"; python -c "import MainStoinker.ib.cli"',
+        f'python -c "{ok}"; echo "import MainStoinker.ib.cli" | python',
+        f"python -c \"{ok}\"; xargs python MainStoinker/__main__.py",
+        f'cd MainStoinker && python -c "{ok}"; python __main__.py fetch-bars',
+    ):
+        assert hook.decide(command)[0] is True, command
+
+
+_IO_BAD_SNIPPETS = [
+    "f.main()", "f.fetch(1)", "getattr(f, 0)()", "os.system(0)", "print(f.fetch())",
+    "exec(0)", "eval(0)", "open(0)", "vars(f)", "dir(f)", "repr(f)", "__import__(0)",
+    "importlib.import_module(0)", "IbConnection()", "f.IbConnection().open()",
+    "print(f.a())", "print(f.a[0])", "x = f.a", "del f", "f.a = 1", "[f for f in 1]",
+    "import MainStoinker.ib.cli", "import MainStoinker.__main__",
+    "import MainStoinker.ib.quick_probe", "from MainStoinker.ib import cli",
+    "from MainStoinker.ib.cli import main", "from MainStoinker import __main__",
+    "import runpy", "import MainStoinker.ib.fetch as print", "from MainStoinker.ib import *",
+    "if f: pass", "lambda: 1",
+]  # fmt: skip
+
+
+def test_issue155_seeded_mutations_of_allowed_code_are_never_allowed() -> None:
+    rng = random.Random(155)
+    pys = [p for p in _PYS if "Program" not in p]
+    done = 0
+    allowed_back = []
+    while done < 2000:
+        parts = rng.choice(IO_ALLOWED_CODE).split("; ")
+        for _ in range(rng.choice((1, 1, 2, 3))):
+            parts.insert(rng.randint(0, len(parts)), rng.choice(_IO_BAD_SNIPPETS))
+        code = "; ".join(parts)
+        forms = _c_forms(code, rng.choice(pys))
+        if not forms:
+            continue
+        command = rng.choice(forms)
+        done += 1
+        if not hook.decide(command)[0]:
+            allowed_back.append(command)
+    assert allowed_back == []
+
+
+def test_issue155_big_or_odd_code_is_refused_fast() -> None:
+    head = "import MainStoinker.ib.fetch as f; "
+    assert hook._import_only("import MainStoinker.ib.fetch as f; print(f.__file__)") is True
+    assert hook._import_only(head + "print(1); " * 400) is False  # over 2,000 characters
+    shapes = {
+        "many_prints": head + "print(1); " * 5_000,
+        "parens": head + "print(" + "(" * 20_000 + "1" + ")" * 20_000 + ")",
+        "attrs": head + "print(f" + ".a" * 20_000 + ")",
+        "many_c": ('python -c "' + head + 'print(1)" ') * 500,  # only 50 are looked at
+    }
+    for name, code in shapes.items():
+        command = code if name == "many_c" else f'python -c "{code}"'
+        blocked, took = _timed(command)
+        assert took < _TIMING_BOUND, (name, took)
+        assert blocked is True, name
+
+
+def test_issue155_errors_in_the_new_code_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    command = 'python -c "import MainStoinker.ib.fetch as f; print(f.__file__)"'
+    assert hook.decide(command) == (False, "")
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hook, "_import_only", boom)
+    assert hook.decide(command)[0] is True  # no allowance: the ib rule applies
+    monkeypatch.undo()
+    monkeypatch.setattr(hook, "_io_value", boom)
+    assert hook.decide(command)[0] is True
+    monkeypatch.undo()
+    monkeypatch.setattr(hook, "_scan_code", boom)
+    assert hook.decide(command)[0] is True
+    monkeypatch.undo()
+    assert hook.decide(command) == (False, "")
+    # an unbalanced quote or an unterminated string is never import-only
+    for bad in (
+        'python -c "import MainStoinker.ib.fetch as f; print(f.__file__)',
+        "python -c 'import MainStoinker.ib.fetch as f; print(f.__file__)",
+        'python "C:\\a (x86)\\python.exe" -c "import MainStoinker.ib.fetch"',
+    ):
+        assert hook.decide(bad)[0] is True, bad
+
+
+def test_issue155_allowed_code_still_checks_the_scan_without_ib() -> None:
+    # the helper that skips only the ib rules keeps every other code rule
+    assert hook._scan_code("import mainstoinker.ib.fetch", import_only=True) is None
+    assert hook._scan_code("import mainstoinker.ib.fetch") is not None
+    for code in (
+        "import mainstoinker.ib.fetch; import runpy",
+        "import mainstoinker.ib.fetch; print(mainstoinker.__main__)",
+        "import mainstoinker.ib.fetch; import mainstoinker.__main__",
+        "import mainstoinker.ib.fetch; print(sys.argv)",
+        "import mainstoinker.ib.fetch; print(exec)",
+        "import mainstoinker.ib.fetch; import subprocess",
+    ):
+        assert hook._scan_code(code, import_only=True) is not None, code
