@@ -4,7 +4,7 @@ The rules below are enforced by `tests/test_ib_import_boundary.py` (and, from
 the other side, by `tests/test_engine_import_boundary.py` and
 `tests/test_api_boundary.py`). Changing a rule is a reviewed edit of those tests.
 
-1. `ibapi` may be imported only here, plus a frozen allowlist of the six
+1. `ibapi` may be imported only here, plus a frozen allowlist of the three
    legacy files that import it today. The allowlist can only shrink.
 2. From the rest of `MainStoinker`, this package may import only
    `MainStoinker.ib.*`, `MainStoinker.engine.*` and
