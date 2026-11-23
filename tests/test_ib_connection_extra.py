@@ -39,6 +39,7 @@ from MainStoinker.ib.connection import (
 )
 from MainStoinker.Util.broker_guard import BrokerPortRefused
 from tests.fake_ib import REQUEST_ARGS, ConnectBehavior, FakeIbClient
+from tests.test_ib_subprocess_block import environment_problems
 
 WAIT = 5.0
 B = ConnectBehavior
@@ -1783,8 +1784,11 @@ def test_module_source_has_no_environment_or_raw_socket_access() -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    assert not {"environ", "getenv", "putenv", "environb"} & (attrs | names)
-    assert not {"os", "socket", "subprocess", "__import__", "eval", "exec", "open"} & names
+    # The one allowed read of os.environ (in `_broker_blocked_here`) is checked exactly by
+    # `environment_problems`; anything else, including a second read, fails there.
+    assert environment_problems(path.read_text(encoding="utf-8")) == []
+    assert not {"getenv", "putenv", "environb"} & (attrs | names)
+    assert not {"socket", "subprocess", "__import__", "eval", "exec", "open"} & names
     strings = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
     assert "STOINK_ALLOW_LIVE_PORT" not in strings
 

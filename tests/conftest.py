@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,40 @@ def pytest_unconfigure(config):
     if mp is not None:
         mp.undo()
         del config.stash[_BLOCK_PATCH]
+
+
+# Second guard: a session-wide variable that child processes inherit (see
+# MainStoinker/ib/connection.py, `_broker_blocked_here`). Separate from the block above.
+BROKER_BLOCKED_VARIABLE = "STOINK_BROKER_BLOCKED"
+_BLOCKED_VARIABLE_BEFORE = pytest.StashKey[str | None]()
+
+
+def _set_broker_blocked_variable(config):
+    config.stash[_BLOCKED_VARIABLE_BEFORE] = os.environ.get(BROKER_BLOCKED_VARIABLE)
+    os.environ[BROKER_BLOCKED_VARIABLE] = "1"
+
+
+def _restore_broker_blocked_variable(config):
+    if _BLOCKED_VARIABLE_BEFORE not in config.stash:
+        return
+    before = config.stash[_BLOCKED_VARIABLE_BEFORE]
+    del config.stash[_BLOCKED_VARIABLE_BEFORE]
+    if before is None:
+        os.environ.pop(BROKER_BLOCKED_VARIABLE, None)
+    else:
+        os.environ[BROKER_BLOCKED_VARIABLE] = before
+
+
+# A module cannot define `pytest_configure` twice, and the existing one must stay as it is,
+# so the hooks below implement the same hooks under other names (pluggy `specname`).
+@pytest.hookimpl(specname="pytest_configure")
+def pytest_configure_broker_blocked_variable(config):
+    _set_broker_blocked_variable(config)
+
+
+@pytest.hookimpl(specname="pytest_unconfigure")
+def pytest_unconfigure_broker_blocked_variable(config):
+    _restore_broker_blocked_variable(config)
 
 
 def pytest_addoption(parser):
