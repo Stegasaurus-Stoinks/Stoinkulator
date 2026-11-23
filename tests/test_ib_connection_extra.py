@@ -24,6 +24,7 @@ from MainStoinker.ib.connection import (
     DATA_REQUESTS,
     MAX_SECONDS,
     MAX_STUCK_THREADS,
+    AttemptFailure,
     ClientIdInUse,
     ClientIdRefused,
     ConnectFailed,
@@ -870,6 +871,98 @@ def test_keyboard_interrupt_while_connect_hangs_releases_the_helper(rig_factory:
     assert rig.conn.state is ConnState.CLOSED
 
 
+class InterruptAfterReady(IbConnection):
+    """Ctrl-C lands after the attempts loop returned READY, before open() returns."""
+
+    def _open_attempts(self) -> None:
+        super()._open_attempts()
+        assert self.state is ConnState.READY
+        raise KeyboardInterrupt
+
+
+class InterruptInSetPhase(IbConnection):
+    """Ctrl-C lands inside the state-change method, right after READY was assigned."""
+
+    def _set_phase(self, new: ConnState, att: Any = None) -> bool:
+        ok = super()._set_phase(new, att)
+        if new is ConnState.READY and ok:
+            raise KeyboardInterrupt
+        return ok
+
+
+def _assert_fully_closed(rig: Rig) -> None:
+    assert not rig.any_connected()
+    assert rig.conn.state is ConnState.CLOSED
+    assert not [t for t in threading.enumerate() if t.name.startswith("ib-") and t.is_alive()]
+    with pytest.raises(NotConnected):
+        rig.conn.request("reqCurrentTime")
+
+
+@pytest.mark.parametrize("conn_cls", [InterruptAfterReady, InterruptInSetPhase])
+def test_keyboard_interrupt_after_ready_ends_the_attempt_and_propagates(
+    rig_factory: Callable[..., Rig], conn_cls: type[IbConnection]
+) -> None:
+    rig = rig_factory(conn_cls=conn_cls)
+    with pytest.raises(KeyboardInterrupt):
+        rig.conn.open()
+    _assert_fully_closed(rig)
+
+
+@pytest.mark.parametrize("conn_cls", [InterruptAfterReady, InterruptInSetPhase])
+def test_keyboard_interrupt_after_ready_in_a_with_block_leaves_nothing_connected(
+    rig_factory: Callable[..., Rig], conn_cls: type[IbConnection]
+) -> None:
+    rig = rig_factory(conn_cls=conn_cls)
+    with pytest.raises(KeyboardInterrupt), rig.conn:  # __exit__ never runs: __enter__ raised
+        pytest.fail("the body of the with block must not run")
+    _assert_fully_closed(rig)
+
+
+# -- what next_event returns once open() has failed or the connection was closed -----------------------
+
+
+class FailAfterReady(IbConnection):
+    """The attempt reaches READY and the reader has queued more; then the attempt is reported failed."""
+
+    def _attempt_once(self, att: _Attempt) -> tuple[AttemptFailure | None, bool]:
+        result = super()._attempt_once(att)
+        assert result == (None, False)
+        wait_until(lambda: not att.queue.empty())  # managedAccounts and farm messages are queued
+        return AttemptFailure(att.number, None, "forced"), False
+
+
+def test_next_event_returns_nothing_after_a_failed_open(rig_factory: Callable[..., Rig]) -> None:
+    rig = rig_factory(conn_cls=FailAfterReady, attempts=1)
+    with pytest.raises(ConnectFailed):
+        rig.conn.open()
+    assert rig.conn.state is ConnState.CLOSED
+    assert rig.conn.next_event(0) is None
+
+
+def test_a_failed_open_still_reports_the_codes_that_were_popped_before_the_drain(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(B.REFUSE, attempts=1)
+    with pytest.raises(ConnectFailed) as info:
+        rig.conn.open()
+    assert [f.code for f in info.value.failures] == [502]
+    assert rig.conn.next_event(0) is None
+
+
+def test_events_queued_before_close_stay_readable_and_nothing_new_is_delivered(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(fake_kw=NO_FARM)
+    rig.conn.open()
+    old = rig.fake
+    rig.conn.close()
+    got = drain(rig.conn)
+    assert any(isinstance(e, events.NextValidId) for e in got)  # queued before the close
+    inject_late(old, "farm")
+    inject_late(old, "1100")
+    assert rig.conn.next_event(0) is None
+
+
 # -- reader trouble ---------------------------------------------------------------------------------
 
 
@@ -1320,6 +1413,24 @@ def test_farm_messages_that_came_during_open_satisfy_the_wait(rig_factory: Calla
     rig = rig_factory()
     rig.conn.open()
     assert rig.conn.wait_for_data_farm(5.0) is True
+
+
+def test_the_farm_wait_is_false_while_connecting_even_when_farm_codes_arrived(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    # The attempt is held before nextValidId (it never comes) but the farm codes are in.
+    rig = rig_factory(B.NO_NEXT_VALID_ID, ready_timeout=300)  # the clock never moves
+    t, out = run_in_thread(rig.conn.open, name="probe-opener")
+    try:
+        wait_until(lambda: rig.conn._att is not None and bool(rig.conn._att.farm_codes))
+        assert rig.conn.state is ConnState.CONNECTING
+        assert rig.conn.wait_for_data_farm(0.0) is False
+        for kind in ("market", "historical", "secdef"):
+            assert rig.conn.wait_for_data_farm(0.0, farm=kind) is False
+    finally:
+        rig.conn.close()
+        t.join(WAIT)
+    assert isinstance(out[0][1], ConnectionClosedDuringOpen)
 
 
 FARM_CASES = [
