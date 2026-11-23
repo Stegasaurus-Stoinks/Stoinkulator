@@ -32,6 +32,7 @@ from MainStoinker.ib.client import DataOnlyClient
 from MainStoinker.ib.connection import ConnState, IbConnection
 from MainStoinker.ib.market_data import IbMarketData, Outcome
 from MainStoinker.ib.recorder import SessionRecorder, scan_recording
+from MainStoinker.Util.broker_guard import BrokerPortRefused
 from tests.fake_ib import FARM_MESSAGES, ConnectBehavior, FakeIbClient, make_bar
 
 REPO = Path(__file__).resolve().parent.parent
@@ -717,7 +718,8 @@ def test_the_summary_has_the_statistics_the_first_run_needs(rig: Rig) -> None:
     aapl = summary[summary.index("AAPL:"):summary.index("MSFT:")]
     assert "closed bars emitted live: 4" in aapl and "backfill bars written: 3" in aapl
     assert "missing minutes inside the span: none" in aapl
-    assert "late revisions: 0; bad bars skipped: 0" in aapl
+    assert "late revisions: 0; rows that may be stale: 0; bad bars skipped: 0" in aapl
+    assert "stream: LIVE" in aapl and "DELAYED" not in aapl
     counts, firsts, closes = [3, 2, 4, 2], [30.0, 1.5, 0.5, 2.0], [1.5, 0.5, 2.0, 1.0]
 
     def mmm(values: list[float], spec: str) -> str:
@@ -833,7 +835,8 @@ def test_data_lost_requests_again_once_and_emits_no_duplicate(rig: Rig) -> None:
                              (ep(9, 36), 101.1, 101.1, 101.0, 101.05, 30)]]}
     rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.6, 99.9, 100.3, 1800))
     rig.upd("AAPL", 34, (34, 5.0), (100.3, 100.3, 100.3, 100.3, 5))  # 09:33 closes
-    rig.drop((34, 10.0), 1101)
+    # the re-request goes out at 09:36:10: IB's snapshot cannot hold a closed 09:35 bar before then
+    rig.drop((36, 10.0), 1101)
     rig.upd("AAPL", 36, (36, 20.0), (101.1, 101.3, 101.0, 101.2, 900))  # on the new request id
     rig.upd("AAPL", 37, (37, 1.0), (101.2, 101.2, 101.2, 101.2, 10))
     rig.end_at(4)
@@ -1042,6 +1045,420 @@ def test_an_account_shaped_string_never_reaches_the_output_the_files_or_the_reco
     assert "DU1234567" not in body and "DU0000000" not in body and "U7654321" not in body
     assert scan_recording(recording, []) == []
     assert "Recording check: 0 finding(s)" in rig.text
+
+
+# -- review round: finished bars only -------------------------------------------------------
+
+
+def upd_at(rig: Rig, symbol: str, bar_epoch: int, when: int, ohlcv: Bar6) -> None:
+    """An update of the bar starting at `bar_epoch`, delivered at server time `when` (epoch seconds)."""
+    o, h, lo, c, v = ohlcv
+
+    def push() -> None:
+        rig.expected += 1
+        rig.fakes[-1].push("historicalDataUpdate", rig.req_ids[symbol], make_bar(bar_epoch, o, h, lo, c, v))
+
+    rig.at(when - rig.server_epoch, push)
+
+
+def hold_history(rig: Rig, *, from_request: int) -> list[tuple[str, float]]:
+    """Make requests number `from_request` on (per run, 1 based) answer nothing: the test delivers the
+    backfill itself, later. Returns the list that gets (symbol, script time) of every request sent."""
+    sent: list[tuple[str, float]] = []
+    original = rig._history  # noqa: SLF001
+
+    def hist(req_id: int, contract: Contract, *rest: Any) -> list[tuple[Any, ...]]:
+        sent.append((contract.symbol, rig.t))
+        if len(sent) >= from_request:
+            rig.req_ids[contract.symbol] = req_id
+            rig.requests.append((contract.symbol, req_id, rest[1], rest[6]))
+            return []
+        return original(req_id, contract, *rest)
+
+    rig._history = hist  # type: ignore[method-assign]  # noqa: SLF001
+    return sent
+
+
+def deliver_backfill(rig: Rig, symbol: str, bars: list[tuple[Any, ...]], at: float,
+                     after_request: int = 1) -> None:
+    """At script time `at`, once `after_request` requests of `symbol` are out, IB sends `bars` and the end."""
+
+    def deliver() -> None:
+        req_id = rig.req_ids[symbol]
+        for b in bars:
+            rig.fakes[-1].push("historicalData", req_id, make_bar(*b))
+        rig.fakes[-1].push("historicalDataEnd", req_id, "start", "end")
+
+    rig.at(at, deliver, ready=lambda: len([r for r in rig.requests if r[0] == symbol]) >= after_request)
+
+
+def test_a_backfill_that_arrives_late_never_writes_the_forming_bar_as_closed(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 59)  # the request goes out 1 s before 09:33 ends ...
+    rig.armed_count = 0
+    hold_history(rig, from_request=1)
+    partial = (ep(9, 33), 100.0, 100.5, 99.9, 100.2, 1000)
+    deliver_backfill(rig, "AAPL", AAPL_BACKFILL + [partial], at=4.0)  # ... and the answer arrives after it
+    rig.at(4.5, lambda: None, ready=lambda: ": backfill:" in rig.text)
+    rig.upd("AAPL", 33, (34, 4.0), (100.0, 100.9, 99.9, 100.8, 2500))
+    rig.upd("AAPL", 34, (34, 5.0), (100.8, 100.8, 100.8, 100.8, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert "the 09:33 bar is still forming" in rig.text
+    rows = rig.rows("AAPL")
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33"]
+    assert rows[3][2:] == ["100.0", "100.9", "99.9", "100.8", "2500"]
+    assert ",1000\n" not in rig.csv("AAPL").read_text(encoding="utf-8").split(f",{ep(9, 33)},")[1]
+    assert "late revision for" not in rig.text
+
+
+def test_a_backfill_after_data_loss_is_judged_at_the_time_its_request_was_sent(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 34, (34, 5.0), (100.3, 100.3, 100.3, 100.3, 5))
+    rig.upd("AAPL", 35, (35, 5.0), (100.8, 100.8, 100.8, 100.8, 10))
+    rig.drop((35, 58.0), 1101)  # the re-request goes out at 09:35:58, 2 s before 09:35 ends
+    hold_history(rig, from_request=2)
+    second = AAPL_BACKFILL[1:] + [(ep(9, 33), 100.0, 100.6, 99.9, 100.3, 1800),
+                                  (ep(9, 34), 100.3, 100.9, 100.2, 100.8, 2200),
+                                  (ep(9, 35), 100.8, 101.0, 100.7, 100.9, 700)]
+    deliver_backfill(rig, "AAPL", second, at=rig.tt(36, 3.0), after_request=2)  # arrives after 09:36:00
+    rig.at(rig.tt(36, 3.5), lambda: None, ready=lambda: "re-requested backfill:" in rig.text)
+    rig.upd("AAPL", 35, (36, 4.0), (100.8, 101.2, 100.7, 101.1, 1900))
+    rig.upd("AAPL", 36, (36, 5.0), (101.1, 101.1, 101.1, 101.1, 5))
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    rows = rig.rows("AAPL")
+    assert [r[0][11:16] for r in rows] == ["09:30", "09:31", "09:32", "09:33", "09:34", "09:35"]
+    assert rows[5][2:] == ["100.8", "101.2", "100.7", "101.1", "1900"]
+    assert "700" not in rig.csv("AAPL").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("seconds_after_the_minute,closed", [
+    (watch_bars.CLOSE_GRACE, True),  # the minute ended exactly the grace period before the request
+    (watch_bars.CLOSE_GRACE - 1, False),  # one second less: the bar may still be forming
+])
+def test_the_grace_period_decides_whether_the_last_backfill_bar_is_closed(
+        rig: Rig, seconds_after_the_minute: int, closed: bool) -> None:
+    rig.server_epoch = ep(9, 33, seconds_after_the_minute)  # the 09:32 bar ended at 09:33:00
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.end_at(1, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=1) == watch_bars.EXIT_OK, rig.text
+    if closed:
+        assert "last 09:32; 3 new closed bars written" in rig.text
+        assert "still forming" not in rig.text.split("Summary")[0]
+    else:
+        assert "last 09:32; 2 new closed bars written; the 09:32 bar is still forming" in rig.text
+
+
+def test_data_lost_requests_are_capped_and_spaced_at_least_15_seconds_apart(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    sent = []
+    original = rig._history  # noqa: SLF001
+
+    def hist(*a: Any) -> list[tuple[Any, ...]]:
+        sent.append(rig.t)
+        return original(*a)
+
+    rig._history = hist  # type: ignore[method-assign]  # noqa: SLF001
+    for k in range(watch_bars.MAX_REREQUESTS + 1):  # one more loss than the cap allows
+        rig.drop((34, float(k)), 1101,
+                 ready=(lambda k=k: rig.text.count("re-requested backfill") == k))
+    rig.end_at(10, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=10) == watch_bars.EXIT_FAILED, rig.text
+    assert len(sent) == watch_bars.MAX_REREQUESTS + 1  # the first request and ten more, no eleventh
+    assert all(b - a >= watch_bars.IDENTICAL_REQUEST_SPACING for a, b in zip(sent, sent[1:], strict=False))
+    assert f"data lost {watch_bars.MAX_REREQUESTS + 1} times" in rig.text
+    assert f"re-requests after data loss: {watch_bars.MAX_REREQUESTS}" in rig.text
+
+
+def test_all_history_requests_of_all_symbols_are_spaced_at_least_a_second(rig: Rig) -> None:
+    sent = hold_history(rig, from_request=10_000)  # only records the requests
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("MSFT", 33, (33, 35.0), (400.0, 400.5, 399.9, 400.2, 1000))
+    rig.drop((35, 0.0), 1101)  # both streams lose their data at once
+    rig.upd("AAPL", 36, (36, 5.0), (100.6, 100.6, 100.6, 100.6, 1))
+    rig.upd("MSFT", 36, (36, 10.0), (400.6, 400.6, 400.6, 400.6, 1))
+    rig.end_at(4)
+    assert rig.watch(minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert [s for s, _ in sent].count("AAPL") == 2 and [s for s, _ in sent].count("MSFT") == 2
+    times = sorted(t for _, t in sent)
+    assert all(b - a >= watch_bars.REQUEST_SPACING for a, b in zip(times, times[1:], strict=False)), sent
+    for name in ("AAPL", "MSFT"):
+        own = [t for s, t in sent if s == name]
+        assert own[1] - own[0] >= watch_bars.IDENTICAL_REQUEST_SPACING
+
+
+def test_a_quiet_minute_closed_by_time_then_revised_says_the_file_keeps_the_earlier_values(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.at(rig.tt(35, 31.0), lambda: None)  # 09:33 is closed by time at 09:35:30
+    rig.upd("AAPL", 33, (35, 40.0), (100.0, 100.7, 99.9, 100.6, 1300))  # IB revises it afterwards
+    rig.upd("AAPL", 35, (35, 45.0), (100.6, 100.6, 100.6, 100.6, 1))
+    rig.upd("AAPL", 36, (36, 1.0), (100.6, 100.6, 100.6, 100.6, 1))
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert rig.rows("AAPL")[3][2:] == ["100.0", "100.5", "99.9", "100.2", "1000"]
+    late = [ln for ln in rig.text.splitlines() if "late revision for 09:33" in ln]
+    assert len(late) == 1
+    assert "the file keeps the earlier values" in late[0]
+    assert "written O 100.0 H 100.5 L 99.9 C 100.2 volume 1000" in late[0]
+    assert "newer O 100.0 H 100.7 L 99.9 C 100.6 volume 1300" in late[0]
+    assert len([ln for ln in rig.closed_lines("AAPL") if ln.startswith("09:33")]) == 1  # emitted once
+    assert "rows that may be stale: 1" in rig.text and "late revisions: 1" in rig.text
+
+
+def test_a_revision_identical_to_the_written_row_is_not_called_stale(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.at(rig.tt(35, 31.0), lambda: None)
+    rig.upd("AAPL", 33, (35, 40.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert "identical to the bar already emitted" in rig.text and "rows that may be stale: 0" in rig.text
+
+
+# -- delayed data -----------------------------------------------------------------------------
+
+
+def delayed_rig(rig: Rig, minutes: int) -> int:
+    """The reviewer's scenario: IB's clock says 10:00:25 and the newest bar is 09:45 (15 min behind)."""
+    rig.server_epoch = ep(10, 0, 25)
+    rig.backfills = {"AAPL": [[(ep(9, m), 99.0, 99.5, 98.8, 99.2, 100) for m in range(36, 46)]]}
+    upd_at(rig, "AAPL", ep(9, 45), ep(10, 0, 30), (99.0, 99.6, 98.8, 99.3, 150))
+    upd_at(rig, "AAPL", ep(9, 46), ep(10, 1, 1), (99.3, 99.3, 99.3, 99.3, 5))
+    upd_at(rig, "AAPL", ep(9, 46), ep(10, 1, 30), (99.3, 99.9, 99.2, 99.8, 800))
+    upd_at(rig, "AAPL", ep(9, 47), ep(10, 2, 1), (99.8, 99.8, 99.8, 99.8, 5))
+    upd_at(rig, "AAPL", ep(9, 47), ep(10, 2, 30), (99.8, 99.9, 99.7, 99.85, 600))
+    rig.end_at(minutes, symbols=1)
+    return rig.watch(symbols="AAPL", minutes=minutes)
+
+
+def test_delayed_data_is_declared_once_and_no_partial_row_is_written(rig: Rig) -> None:
+    assert delayed_rig(rig, 3) == watch_bars.EXIT_OK, rig.text
+    text = rig.text
+    declared = [ln for ln in text.splitlines() if "behind IB's clock: this looks like delayed" in ln]
+    assert declared == ["AAPL: bars are about 15 minutes behind IB's clock: this looks like delayed "
+                        "market data (the paper account may not share the live account's real-time data)"]
+    assert "late revision for" not in text
+    rows = rig.rows("AAPL")
+    assert [r[0][11:16] for r in rows] == [f"09:{m}" for m in range(36, 47)]  # 09:47 is still forming
+    assert rows[-2][2:] == ["99.0", "99.6", "98.8", "99.3", "150"]  # 09:45 as its last update left it
+    assert rows[-1][2:] == ["99.3", "99.9", "99.2", "99.8", "800"]
+    assert "still forming, not written: 09:47" in text
+    printed = rig.closed_lines("AAPL")
+    assert printed and all("(delayed about 15 min)" in ln for ln in printed), printed
+    summary = text[text.index("Summary"):]
+    assert "AAPL: streaming (delayed about 15 min)" in summary and "stream: DELAYED" in summary
+    assert "LIVE" not in summary
+
+
+def test_a_delayed_bar_with_no_later_update_is_closed_by_the_delayed_clock(rig: Rig) -> None:
+    # 5 minutes: IB's clock reaches 10:05:25, the delayed clock about 09:50:24; 09:47 ended at 09:48:00
+    assert delayed_rig(rig, 5) == watch_bars.EXIT_OK, rig.text
+    line = [ln for ln in rig.text.splitlines() if ln.startswith("09:47  AAPL")]
+    assert len(line) == 1 and "closed by time" in line[0] and "(delayed about 15 min)" in line[0]
+    assert rig.rows("AAPL")[-1][2:] == ["99.8", "99.9", "99.7", "99.85", "600"]
+
+
+def test_a_delayed_bar_is_not_closed_by_time_while_the_delayed_clock_has_not_reached_it(rig: Rig) -> None:
+    # IB's clock is past 09:47 + 90 s by 15 minutes, but the delayed clock is not: 3 minutes, no row
+    assert delayed_rig(rig, 3) == watch_bars.EXIT_OK, rig.text
+    assert not [ln for ln in rig.closed_lines("AAPL") if ln.startswith("09:47")]
+    assert "closed by time: no later update" not in rig.text and "closed by time 0" in rig.text
+    assert rig.rows("AAPL")[-1][0][11:16] == "09:46"
+
+
+def test_a_live_stream_is_not_called_delayed(rig: Rig) -> None:
+    rig.standard()
+    assert rig.watch() == watch_bars.EXIT_OK, rig.text
+    assert "delayed" not in rig.text and "market closed" not in rig.text
+    assert "stream: LIVE, bars at most" in rig.text
+
+
+def test_a_start_before_the_open_says_market_closed_and_writes_the_previous_session_nowhere(rig: Rig) -> None:
+    rig.server_epoch = ep(8, 0, 0)
+    friday = [int(datetime(2024, 8, 15, 15, m, tzinfo=NY).timestamp()) for m in (57, 58, 59)]
+    rig.backfills = {"AAPL": [[(e, 99.0, 99.5, 98.8, 99.2, 100) for e in friday]]}
+    rig.end_at(1, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=1) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL: market closed: no new bars expected" in rig.text
+    assert rig.text.count("market closed") == 1
+    assert "AAPL: backfill holds 3 bars of the previous session: not written" in rig.text
+    assert "delayed" not in rig.text
+    assert not list(rig.live.rglob("*.csv"))  # nothing, in particular no file of the previous day
+
+
+def test_a_start_just_after_the_open_writes_only_todays_backfill_bars(rig: Rig) -> None:
+    yesterday = [int(datetime(2024, 8, 15, 15, m, tzinfo=NY).timestamp()) for m in (58, 59)]
+    rig.backfills = {"AAPL": [[(e, 99.0, 99.5, 98.8, 99.2, 100) for e in yesterday] + AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL: backfill holds 2 bars of the previous session: not written" in rig.text
+    assert [r[0][:10] for r in rig.rows("AAPL")] == ["2024-08-16"] * 4
+    assert not (rig.live / "AAPL" / "AAPL_live_2024-08-15.csv").exists()
+    assert "stream: LIVE" in rig.text
+
+
+def test_the_market_closing_during_the_watch_is_said_once_and_the_last_bar_still_closes(rig: Rig) -> None:
+    rig.server_epoch = ep(15, 58, 30)
+    rig.backfills = {"AAPL": [[(ep(15, 56), 100.0, 101.0, 99.0, 100.5, 10),
+                               (ep(15, 57), 100.5, 101.0, 100.0, 100.8, 10)]]}
+    rig.upd("AAPL", 58, (58, 40.0), (100.8, 101.0, 100.7, 100.9, 50), hh=15)
+    rig.upd("AAPL", 59, (59, 1.0), (100.9, 100.9, 100.9, 100.9, 5), hh=15)
+    rig.upd("AAPL", 59, (59, 59.0), (100.9, 101.5, 100.5, 101.4, 90000), hh=15)
+    rig.at(rig.tt(0, 30.0, hh=16), lambda: None)  # a pass over the symbols after 16:00
+    rig.at(rig.tt(1, 0.0, hh=16), lambda: None)  # and a second one: still said once
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert rig.text.count("market closed: no new bars expected") == 1
+    assert rig.rows("AAPL")[-1][2:] == ["100.9", "101.5", "100.5", "101.4", "90000"]
+    assert "delayed" not in rig.text
+
+
+# -- outages ----------------------------------------------------------------------------------
+
+
+def test_nothing_is_closed_by_time_while_the_connection_is_lost(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((33, 40.0), 1100)
+    rig.at(rig.tt(35, 35.0), lambda: None, ready=lambda: "connectivity LOST" in rig.text)  # 09:33 is overdue
+    rig.drop((35, 40.0), 1102)
+    rig.at(rig.tt(35, 42.0), lambda: None, ready=lambda: "connectivity restored" in rig.text)
+    rig.upd("AAPL", 33, (35, 45.0), (100.0, 100.6, 99.9, 100.4, 1700))  # what IB held back, after the restore
+    rig.upd("AAPL", 35, (35, 50.0), (100.6, 100.6, 100.6, 100.6, 1))
+    rig.upd("AAPL", 36, (36, 1.0), (100.6, 100.6, 100.6, 100.6, 1))
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    text = rig.text
+    assert "closed by time" not in text.split("Summary")[0].replace("no bar is closed by time", "")
+    line = [ln for ln in text.splitlines() if ln.startswith("09:33  AAPL")]
+    assert len(line) == 1 and "(spanned a connection loss)" in line[0]
+    assert text.index("connectivity restored") < text.index(line[0])
+    assert rig.rows("AAPL")[3][2:] == ["100.0", "100.6", "99.9", "100.4", "1700"]  # the final values
+    assert "spanned a connection loss 2" in text  # 09:33 and 09:35, the minutes of the outage
+
+
+def test_a_bar_that_spanned_an_outage_waits_90_seconds_after_the_restore_before_time_closes_it(
+        rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((33, 40.0), 1100)
+    rig.drop((35, 40.0), 1102, ready=lambda: "connectivity LOST" in rig.text)
+    rig.at(rig.tt(35, 42.0), lambda: None, ready=lambda: "connectivity restored" in rig.text)
+    seen: list[bool] = []
+    rig.at(rig.tt(37, 0.0), lambda: seen.append("09:33  AAPL" in rig.text))  # 80 s after the restore
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert seen == [False]
+    line = [ln for ln in rig.text.splitlines() if ln.startswith("09:33  AAPL")]
+    assert len(line) == 1 and "closed by time" in line[0] and "(spanned a connection loss)" in line[0]
+
+
+def test_connection_codes_1100_to_1102_are_printed_as_notices_not_errors(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((33, 40.0), 1100)
+    rig.drop((33, 50.0), 1102, ready=lambda: "connectivity LOST" in rig.text)
+    rig.at(rig.tt(33, 55.0), lambda: None, ready=lambda: "connectivity restored" in rig.text)
+    rig.end_at(2, symbols=1)
+    rig.watch(symbols="AAPL", minutes=2)
+    assert re.search(r"IB notice 1100: ", rig.text) and re.search(r"IB notice 1102: ", rig.text)
+    assert not re.search(r"IB error 110[012]", rig.text)
+
+
+# -- statistics -------------------------------------------------------------------------------
+
+
+def test_a_negative_offset_is_printed_with_a_single_sign(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (33, 59.7), (100.2, 100.2, 100.2, 100.2, 5))  # IB's clock, 1 s resolution, is behind
+    rig.upd("AAPL", 35, (34, 59.5), (100.3, 100.3, 100.3, 100.3, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert "first seen -0.3 s after the minute started" in rig.text
+    assert "+-" not in rig.text and "-+" not in rig.text
+
+
+def test_closes_after_a_skipped_minute_are_left_out_of_the_close_delay_statistics(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 36, (36, 2.0), (101.0, 101.0, 101.0, 101.0, 10))  # 09:34 and 09:35 have no bar
+    rig.upd("AAPL", 37, (37, 3.0), (101.0, 101.0, 101.0, 101.0, 10))
+    rig.end_at(4, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    line = [ln for ln in rig.text.splitlines() if ln.startswith("09:33  AAPL")][0]
+    assert "closed by the 09:36 update, after 2 minutes without a bar" in line
+    assert "closed after the minute ended, s (min / median / max): 3.0 / 3.0 / 3.0" in rig.text  # 09:36 only
+    assert "skipped minute 1, spanned a connection loss 0" in rig.text
+
+
+# -- the recording of a run that never connected -----------------------------------------------
+
+
+def test_a_refused_run_leaves_no_header_only_recording_behind(rig: Rig) -> None:
+    base = rig.connection_factory
+
+    def refusing(args: Any, observers: list[Any]) -> IbConnection:
+        conn = base(args, observers)
+
+        def open_refused() -> None:
+            raise BrokerPortRefused("refused by the test: nothing was sent")
+
+        conn.open = open_refused  # type: ignore[method-assign]
+        return conn
+
+    rig.connection_factory = refusing  # type: ignore[method-assign]
+    assert rig.watch(record=True) == watch_bars.EXIT_REFUSED
+    assert rig.recorders  # a recording was started ...
+    assert not list(rig.tmp.rglob("*.jsonl"))  # ... and, holding only its header, deleted again
+    assert "Recording:" not in rig.text and "REFUSED" in rig.text
+
+
+@pytest.mark.parametrize("behavior", [ConnectBehavior.REFUSE, ConnectBehavior.CLIENT_ID_IN_USE,
+                                      ConnectBehavior.NO_NEXT_VALID_ID,
+                                      ConnectBehavior.CLOSED_IN_HANDSHAKE])
+def test_a_failed_connect_never_leaves_a_header_only_recording_behind(
+        rig: Rig, behavior: ConnectBehavior) -> None:
+    rig.behavior = behavior
+    assert rig.watch(record=True) == watch_bars.EXIT_NO_CONNECTION
+    for path in rig.tmp.rglob("*.jsonl"):  # what stays holds events: it is checked and reported
+        assert watch_bars._header_only(path) is False  # noqa: SLF001
+        assert "Recording check:" in rig.text
+    assert "Recording:" in rig.text or not list(rig.tmp.rglob("*.jsonl"))
+
+
+def test_header_only_means_the_session_header_and_no_event(tmp_path: Path) -> None:
+    one, two = tmp_path / "one.jsonl", tmp_path / "two.jsonl"
+    one.write_text('{"header": 1}\n', encoding="utf-8")
+    two.write_text('{"header": 1}\n{"event": 2}\n', encoding="utf-8")
+    assert watch_bars._header_only(one) is True and watch_bars._header_only(two) is False  # noqa: SLF001
+    assert watch_bars._header_only(tmp_path / "missing.jsonl") is False  # noqa: SLF001
+
+
+def test_a_recording_with_events_is_kept_and_checked_after_a_run(rig: Rig) -> None:
+    rig.standard()
+    assert rig.watch(record=True) == watch_bars.EXIT_OK
+    kept = list((rig.tmp / "home" / "Stoinkulator" / "recordings").glob("*.jsonl"))
+    assert len(kept) == 1 and "Recording check: 0 finding(s)" in rig.text
+
+
+# -- the documentation names the paper port ---------------------------------------------------
+
+
+def test_the_docstring_and_the_help_show_the_paper_port_and_no_live_example(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    doc = watch_bars.__doc__ or ""
+    assert "--port 7497 --symbols AAPL,MSFT,TSLA" in doc and "7496" not in doc
+    with pytest.raises(SystemExit):
+        watch_bars.parse_args(["--help"])
+    shown = capsys.readouterr().out
+    assert "--port 7497 --symbols AAPL,MSFT,TSLA" in shown and "7496" not in shown
+    assert "own opt-in" in shown and "STOINK_ALLOW_LIVE_PORT" not in shown
 
 
 # -- source checks --------------------------------------------------------------------------

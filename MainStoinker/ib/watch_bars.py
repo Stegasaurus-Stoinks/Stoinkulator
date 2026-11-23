@@ -1,6 +1,9 @@
 """Owner-run live bar watcher: subscribe to IB's live-updating 1-minute bars and save the closed ones.
 
-    python -m MainStoinker.ib.watch_bars --port 7496 --symbols AAPL,MSFT,TSLA --minutes 30
+    python -m MainStoinker.ib.watch_bars --port 7497 --symbols AAPL,MSFT,TSLA --minutes 30
+
+7497 is the paper port of TWS (data only, no opt-in variable). A live port is refused unless the
+owner has made their own opt-in in their own terminal; this module never sets it.
 
 Only the owner runs it, in a real terminal, with TWS or IB Gateway open. It runs no algo and
 places no trade: it is built on `IbConnection` and `IbMarketData` (a data-only client that
@@ -16,8 +19,30 @@ A bar is therefore known to be closed only when an update with a LATER timestamp
 the previous update is then final and is emitted once. The forming bar is never emitted as
 closed and never written. An update with an EARLIER timestamp than the forming bar (or one
 already emitted) is a late revision: counted, reported, and nothing already emitted is
-rewritten. A bar that no later update has closed 90 s after its minute ended is closed by
+rewritten (a revision of a minute already written says that the file keeps the earlier values
+and shows both). A bar that no later update has closed 90 s after its minute ended is closed by
 time (the end of the session has no later update) and marked so.
+
+A row in a file is a FINISHED bar with final values; when that cannot be known no row is
+written and the output says so. Hence:
+
+- The backfill is IB's snapshot at the time the request was SENT: its last bar is judged against
+  IB's server time at that moment (re-requests after data loss too), closed only if its minute
+  ended at least `CLOSE_GRACE` s before; otherwise it is the forming bar and is not written.
+- Delayed data (a paper account may not share the live account's real-time data): while the
+  regular session is open (09:30 to 16:00 New York, weekday, by server time) a symbol whose
+  newest bar is more than 2 minutes behind server time is declared DELAYED, once, loudly. From
+  then on "closed by time" and the backfill's last bar are judged against the delayed clock
+  (server time minus the measured lag, the smallest `server time - newest bar start` seen), and
+  every bar line and the summary say "(delayed about N min)". Files stay correct, just late.
+  Outside the session no stream is called delayed: the output says "market closed: no new bars
+  expected", and a clock outside the session closes a bar by time only after that bar's session
+  has ended.
+- While the connection is reported lost (code 1100) nothing is closed by time. A bar whose minute
+  overlapped an outage is marked "(spanned a connection loss)", is closed by time only 90 s after
+  the restore, and is excluded from the close-delay statistics.
+- Bars of an earlier New York date than the server's (a start before 09:30 backfills the previous
+  session) are not written.
 
 Offsets (`first seen +S s after the minute started`, `closed +S s after the minute ended`)
 are IB's server time at start (1 s resolution) plus the elapsed monotonic clock, against the
@@ -139,6 +164,10 @@ MIN_POLL_SLICE = 0.02
 FORMING_EVERY = 10.0  # seconds between two forming-bar lines of one symbol
 CLOSE_GRACE = 2  # a backfill bar this soon after its minute ended may still be forming
 SETTLE_SECONDS = 90  # a bar with no later update this long after its minute is closed by time
+CONNECTION_NOTICES = frozenset({1100, 1101, 1102})  # connectivity lost, restored with data lost, restored
+DELAY_THRESHOLD = 120.0 # newest bar more than this behind server time in session: delayed data
+SESSION_OPEN_MINUTE = 9 * 60 + 30
+SESSION_CLOSE_MINUTE = 16 * 60
 BACKFILL_TIMEOUT = 90.0
 SERVER_TIME_TIMEOUT = 10.0
 RESOLVE_TIMEOUT = 10.0
@@ -192,7 +221,10 @@ def build_parser() -> argparse.ArgumentParser:
             "port number to confirm.\n\n"
             "A bar is closed when an update with a later minute arrives. The session recording "
             "(on by default) grows with every update and may slow a long watch: use --no-record "
-            "to avoid that."
+            "to avoid that.\n\n"
+            "Example, a paper account (port 7497, data only, no opt-in variable needed):\n"
+            "  python -m MainStoinker.ib.watch_bars --port 7497 --symbols AAPL,MSFT,TSLA --minutes 30\n"
+            "A live port is refused unless the owner has made their own opt-in."
         ),
         epilog=EXIT_CODES_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -422,8 +454,18 @@ class _Sym:
     cancelled: bool = False
     phase: str = "new"  # new, backfill, live, stopped
     stop_reason: str = ""
-    requested_at: float = 0.0
+    requested_at: float = 0.0  # monotonic clock when the last request was sent
+    requested_server: float = 0.0  # IB server time when the last request was sent
     rerequests: int = 0
+    newest: int | None = None  # start of the newest bar of the server's New York date seen
+    lag_bound: float | None = None  # smallest `server time - newest bar start` seen, s
+    delayed: bool = False
+    closed_noted: bool = False
+    previous_session: int = 0  # backfill bars of an earlier date, not written
+    spanned: int = 0  # bars closed whose minute overlapped a connection loss
+    skipped_closes: int = 0  # bars closed by an update that skipped empty minutes
+    stale: int = 0  # late revisions that differ from the row already emitted
+    emitted_bars: dict[int, tuple[Bar, bool]] = field(default_factory=dict)
     first_backfill: bool = True
     last_emitted: int | None = None
     forming: _Forming | None = None
@@ -442,7 +484,15 @@ class _Sym:
 
     @property
     def had_bars(self) -> bool:
-        return bool(self.emitted) or self.forming is not None
+        return bool(self.emitted) or self.forming is not None or self.previous_session > 0
+
+    @property
+    def lag(self) -> float:
+        return (self.lag_bound or 0.0) if self.delayed else 0.0
+
+    @property
+    def tag(self) -> str:
+        return f" (delayed about {max(1, round(self.lag / 60))} min)" if self.delayed else ""
 
 
 def _num(value: float) -> str:
@@ -458,6 +508,30 @@ def _mmm(values: Sequence[float], spec: str = ".1f") -> str:
 
 def _hm(epoch: int) -> str:
     return f"{data_time(epoch):%H:%M}"
+
+
+def _ny(epoch: float) -> datetime:
+    return datetime.fromtimestamp(epoch, tz=UTC).astimezone(NY)
+
+
+def _in_session(epoch: float) -> bool:
+    """The regular session by IB's clock: a weekday, 09:30 up to 16:00 New York (holidays unknown)."""
+    moment = _ny(epoch)
+    minute = moment.hour * 60 + moment.minute
+    return moment.weekday() < 5 and SESSION_OPEN_MINUTE <= minute < SESSION_CLOSE_MINUTE
+
+
+def _session_end(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, 16, tzinfo=NY).timestamp())
+
+
+def _header_only(path: Path) -> bool:
+    """True when the recording holds the session header and no event (as `cli.py` decides it)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return len([line for line in text.split("\n") if line.strip()]) <= 1
 
 
 class _Watcher:
@@ -480,6 +554,8 @@ class _Watcher:
         self.lost_noted = False
         self.lost_at_end = False
         self.closed = False
+        self.outages: list[list[float]] = []  # [start, end] in server time; end is inf while lost
+        self.last_request: float | None = None  # monotonic clock of the last history request
         self._general_seen: dict[int, events.IbError] = {}
 
     # -- time -----------------------------------------------------------------------------
@@ -487,6 +563,17 @@ class _Watcher:
     def server_now(self) -> float:
         assert self.server0 is not None
         return self.server0 + (self.clock() - self.clock0)
+
+    def _clock(self, sym: _Sym) -> float:
+        """The time the bars of `sym` have reached: IB's server time, less the lag of a delayed stream."""
+        return self.server_now() - sym.lag
+
+    def _lost(self) -> bool:
+        return self.conn.state is ConnState.LOST
+
+    def _outage_ends(self, bar_time: int) -> list[float]:
+        """The ends of the outages that overlapped the minute starting at `bar_time`."""
+        return [end for start, end in self.outages if start < bar_time + 60 and end > bar_time]
 
     # -- the session ----------------------------------------------------------------------
 
@@ -549,21 +636,25 @@ class _Watcher:
                  f"time zone {info.time_zone_id}")
 
     def _request(self, sym: _Sym) -> None:
+        """Send one history request, at least `REQUEST_SPACING` after the previous one (any symbol)."""
         duration = f"{self.args.backfill_minutes * 60} S"
+        if self.last_request is not None:
+            wait = REQUEST_SPACING - (self.clock() - self.last_request)
+            if wait > 0:
+                self.sleep(wait)
+        # IB's backfill is its snapshot at the time the request was sent: note that time now
+        sym.requested_server = self.server_now()
+        sent = self.clock()
         sym.req_id = self.md.request_history(sym.info.contract(), None, duration, use_rth=True,
                                              keep_up_to_date=True)
         sym.cancelled = False
-        sym.requested_at = self.clock()
+        sym.requested_at = self.last_request = sent
         sym.phase = "backfill"
 
     def _request_all(self) -> None:
-        first = True
         for sym in self.syms:
             if sym.info is None:
                 continue
-            if not first:
-                self.sleep(REQUEST_SPACING)
-            first = False
             try:
                 self._request(sym)
             except NotConnected as exc:
@@ -585,6 +676,7 @@ class _Watcher:
                 if sym.phase in ("backfill", "live"):
                     progressed |= self._service(sym, slice_)
                 if sym.phase in ("backfill", "live"):
+                    self._assess(sym)
                     self._settle(sym)
             if not progressed:
                 self.sleep(IDLE_SLEEP)
@@ -606,17 +698,21 @@ class _Watcher:
             raise _Closed
         if state is ConnState.LOST and not self.lost_noted:
             self.lost_noted = True
+            self.outages.append([self.server_now(), math.inf])
             self.say("IB connectivity LOST (code 1100): waiting for it to be restored; "
-                     "the watch time keeps running.")
+                     "the watch time keeps running; no bar is closed by time until it is restored.")
         elif state is ConnState.READY and self.lost_noted:
             self.lost_noted = False
+            if self.outages and self.outages[-1][1] == math.inf:
+                self.outages[-1][1] = self.server_now()
             self.say("IB connectivity restored.")
 
     def _show_general(self) -> None:
         for event in self.md.general_events:
             if isinstance(event, events.IbError) and id(event) not in self._general_seen:
                 self._general_seen[id(event)] = event  # keeps the object, so its id is not reused
-                kind = "notice" if 2100 <= event.code < 2200 else "error"
+                notice = 2100 <= event.code < 2200 or event.code in CONNECTION_NOTICES
+                kind = "notice" if notice else "error"
                 self.say(f"IB {kind} {event.code}: {event.message}")
 
     def _service(self, sym: _Sym, slice_: float) -> bool:
@@ -711,14 +807,55 @@ class _Watcher:
             self.say(f"{sym.name}: bad bar skipped: {exc}")
             return None
 
+    def _observe(self, sym: _Sym, bar: Bar, at: float) -> None:
+        """Note that `bar` existed at server time `at`: the data clock is then at least its start, so
+        `at - newest` bounds the lag of the stream from above (the smallest bound seen is kept)."""
+        if _ny(bar.time).date() != _ny(at).date():
+            return
+        if sym.newest is None or bar.time > sym.newest:
+            sym.newest = bar.time
+        bound = at - sym.newest
+        if sym.lag_bound is None or bound < sym.lag_bound:
+            sym.lag_bound = bound
+
+    def _assess(self, sym: _Sym) -> None:
+        """Say once that the market is closed, and declare a stream DELAYED (or live again)."""
+        now = self.server_now()
+        if not _in_session(now):
+            if not sym.closed_noted:
+                sym.closed_noted = True
+                self.say(f"{sym.name}: market closed: no new bars expected")
+            return
+        sym.closed_noted = False
+        bound = sym.lag_bound
+        if bound is None:
+            return
+        if not sym.delayed and bound > DELAY_THRESHOLD:
+            sym.delayed = True
+            self.say(f"{sym.name}: bars are about {max(1, round(bound / 60))} minutes behind IB's "
+                     "clock: this looks like delayed market data (the paper account may not share "
+                     "the live account's real-time data)")
+        elif sym.delayed and bound <= DELAY_THRESHOLD:
+            sym.delayed = False
+            self.say(f"{sym.name}: bars are current again (at most {bound:.0f} s behind IB's clock): "
+                     "treating the stream as live")
+
     def _backfill(self, sym: _Sym, raw: Sequence[events.HistoricalBar]) -> None:
+        sent = sym.requested_server  # IB's snapshot is at least this old, not as old as `now`
         now = self.server_now()
         by_time: dict[int, Bar] = {}
         for item in raw:
             bar = self._convert(sym, item)
             if bar is not None:
                 by_time[bar.time] = bar
-        bars = [by_time[t] for t in sorted(by_time)]
+        everything = [by_time[t] for t in sorted(by_time)]
+        today = _ny(sent).date()
+        bars = [b for b in everything if _ny(b.time).date() >= today]
+        older = len(everything) - len(bars)
+        for bar in bars:
+            self._observe(sym, bar, sent)
+        self._assess(sym)
+        judged = sent - sym.lag  # the data clock when the request was sent
         initial = sym.first_backfill
         sym.first_backfill = False
         added = 0
@@ -726,9 +863,9 @@ class _Watcher:
             if sym.last_emitted is not None and bar.time <= sym.last_emitted:
                 continue
             forming = sym.forming
-            if bar.time + 60 + CLOSE_GRACE <= now:
+            if bar.time + 60 + CLOSE_GRACE <= judged:
                 if forming is not None and forming.bar.time < bar.time:
-                    self._close_forming(sym, now, "later")
+                    self._close_forming(sym, now, "later", bar.time)
                 elif forming is not None and forming.bar.time == bar.time:
                     sym.forming = None  # the backfill carries the final version
                 if self._emit(sym, bar, now, updates=None, first_seen=None,
@@ -739,8 +876,11 @@ class _Watcher:
             elif forming.bar.time == bar.time:
                 forming.bar = bar
             elif forming.bar.time < bar.time:
-                self._close_forming(sym, now, "later")
+                self._close_forming(sym, now, "later", bar.time)
                 sym.forming = _Forming(bar, 0, None)
+        if older:
+            sym.previous_session += older
+            self.say(f"{sym.name}: backfill holds {older} bars of the previous session: not written")
         if bars:
             text = f"{sym.name}: {'backfill' if initial else 're-requested backfill'}: {len(bars)} bars, "
             text += f"first {_hm(bars[0].time)}, last {_hm(bars[-1].time)}"
@@ -756,6 +896,8 @@ class _Watcher:
         bar = self._convert(sym, raw)
         if bar is None:
             return
+        self._observe(sym, bar, now)
+        self._assess(sym)
         forming = sym.forming
         if sym.last_emitted is not None and bar.time <= sym.last_emitted:
             self._late(sym, bar, f"already emitted up to {_hm(sym.last_emitted)}")
@@ -767,14 +909,29 @@ class _Watcher:
         elif bar.time < forming.bar.time:
             self._late(sym, bar, f"the forming minute is {_hm(forming.bar.time)}")
         else:
-            self._close_forming(sym, now, "later")
+            self._close_forming(sym, now, "later", bar.time)
             sym.forming = _Forming(bar, 1, now)
         self._show_forming(sym)
 
     def _late(self, sym: _Sym, bar: Bar, why: str) -> None:
         sym.late += 1
-        self.say(f"{sym.name}: late revision for {_hm(bar.time)} ({why}); counted, "
-                 "nothing already emitted is rewritten")
+        earlier = sym.emitted_bars.get(bar.time)
+        if earlier is None:
+            self.say(f"{sym.name}: late revision for {_hm(bar.time)} ({why}); counted, "
+                     "nothing already emitted is rewritten")
+            return
+        was, wrote = earlier
+        if (was.open, was.high, was.low, was.close, was.volume) == (
+                bar.open, bar.high, bar.low, bar.close, bar.volume):
+            self.say(f"{sym.name}: late revision for {_hm(bar.time)} ({why}); identical to the bar "
+                     "already emitted; counted")
+            return
+        sym.stale += 1
+        label = "written" if wrote else "emitted, the file already had that minute from an earlier run"
+        self.say(f"{sym.name}: late revision for {_hm(bar.time)} ({why}): the file keeps the earlier "
+                 f"values; {label} {_ohlc(was)} volume {was.volume}; newer {_ohlc(bar)} "
+                 f"volume {bar.volume}; this row may be stale; counted, nothing already emitted "
+                 "is rewritten")
 
     def _show_forming(self, sym: _Sym) -> None:
         forming = sym.forming
@@ -787,22 +944,37 @@ class _Watcher:
         bar = forming.bar
         server = datetime.fromtimestamp(self.server_now(), tz=UTC).astimezone(NY)
         self.say(f"{server:%H:%M:%S}  {sym.name}  forming {_hm(bar.time)}  {_ohlc(bar)}  "
-                 f"volume {bar.volume}  (update {forming.updates})")
+                 f"volume {bar.volume}  (update {forming.updates}){sym.tag}")
 
-    def _close_forming(self, sym: _Sym, now: float, how: str) -> None:
+    def _close_forming(self, sym: _Sym, now: float, how: str, closer: int | None = None) -> None:
+        """Close the forming bar; `closer` is the minute of the update that closed it, if any."""
         forming = sym.forming
         assert forming is not None
         sym.forming = None
         self._emit(sym, forming.bar, now, updates=forming.updates, first_seen=forming.first_seen,
-                   how=how)
+                   how=how, closer=closer)
 
     def _settle(self, sym: _Sym) -> None:
+        """Close the forming bar by time: never while the connection is lost, 90 s after the later of
+        the bar's end and a restore (if its minute overlapped an outage), on the stream's own clock,
+        and a clock outside the session only for a bar of a session that has ended."""
         forming = sym.forming
-        if forming is not None and self.server_now() >= forming.bar.time + 60 + SETTLE_SECONDS:
-            self._close_forming(sym, self.server_now(), "time")
+        if forming is None or self._lost():
+            return
+        bar = forming.bar
+        due = float(bar.time + 60)
+        ends = self._outage_ends(bar.time)
+        if ends:
+            due = max(due, max(ends) - sym.lag)
+        clock = self._clock(sym)
+        if clock < due + SETTLE_SECONDS:
+            return
+        if not (_in_session(clock) or clock >= _session_end(_ny(bar.time).date())):
+            return
+        self._close_forming(sym, self.server_now(), "time")
 
     def _emit(self, sym: _Sym, bar: Bar, now: float, *, updates: int | None, first_seen: float | None,
-              how: str) -> bool:
+              how: str, closer: int | None = None) -> bool:
         """Write and print one closed bar. True if a row was appended to its file."""
         try:
             written = self.files.write(sym.name, bar)
@@ -811,34 +983,51 @@ class _Watcher:
             self._stop(sym, "cannot write the live file")
             return False
         sym.emitted.append(bar.time)
+        sym.emitted_bars[bar.time] = (bar, written)
         sym.last_emitted = bar.time
         sym.last_bar = bar
         head = f"{_hm(bar.time)}  {sym.name}  {_ohlc(bar)}  volume {bar.volume}"
+        tag = sym.tag
         if how == "backfill":
             sym.backfill_written += int(written)
             return written
         if how == "backfilled":
             sym.backfilled_late += 1
-            self.say(f"{head}  (backfilled{'' if written else ', already in the file'})")
+            self.say(f"{head}  (backfilled{'' if written else ', already in the file'}){tag}")
             return written
+        spanned = bool(self._outage_ends(bar.time))
+        loss = " (spanned a connection loss)" if spanned else ""
+        sym.spanned += int(spanned)
+        kept = "" if written else " (already in the file)"
         if how == "time":
             sym.closed_by_time += 1
             self.say(f"{head}  (closed by time: no later update arrived within {SETTLE_SECONDS} s "
-                     f"of the minute's end; updates {updates})")
+                     f"of the minute's end; updates {updates}){loss}{tag}{kept}")
             return written
         sym.live_closed += 1
         if first_seen is None or updates is None:
             self.say(f"{head}  (updates {updates}, first update not seen: the bar was forming "
-                     "at the backfill)")
+                     f"at the backfill){loss}{tag}{kept}")
+            return written
+        if sym.delayed:  # offsets against IB's clock mean nothing for delayed bars
+            sym.update_counts.append(updates)
+            self.say(f"{head}  (updates {updates}, closed by a later update){loss}{tag}{kept}")
             return written
         first_delay = first_seen - bar.time
-        close_delay = now - (bar.time + 60)
         sym.update_counts.append(updates)
         sym.first_delays.append(first_delay)
-        sym.close_delays.append(close_delay)
-        self.say(f"{head}  (updates {updates}, first seen +{first_delay:.1f} s after the minute "
-                 f"started, closed +{close_delay:.1f} s after the minute ended)"
-                 f"{'' if written else ' (already in the file)'}")
+        skipped = 0 if closer is None else max(0, (closer - bar.time) // 60 - 1)
+        if skipped:
+            sym.skipped_closes += 1
+            ended = (f"closed by the {_hm(closer)} update, after {skipped} minute"
+                     f"{'' if skipped == 1 else 's'} without a bar")
+        else:
+            close_delay = now - (bar.time + 60)
+            ended = f"closed {close_delay:+.1f} s after the minute ended"
+            if not spanned:
+                sym.close_delays.append(close_delay)
+        self.say(f"{head}  (updates {updates}, first seen {first_delay:+.1f} s after the minute "
+                 f"started, {ended}){loss}{kept}")
         return written
 
     # -- the end ----------------------------------------------------------------------------
@@ -865,10 +1054,22 @@ class _Watcher:
         for sym in self.syms:
             state = "streaming" if sym.phase in ("backfill", "live") else (
                 f"stopped: {sym.stop_reason}" if sym.phase == "stopped" else "never requested")
-            say(f"  {sym.name}: {state}")
+            say(f"  {sym.name}: {state}{sym.tag}")
+            if sym.delayed:
+                say(f"    stream: DELAYED, bars about {max(1, round(sym.lag / 60))} min "
+                    f"({sym.lag:.0f} s at most) behind IB's clock; files are correct but late")
+            elif sym.lag_bound is not None:
+                say(f"    stream: LIVE, bars at most {sym.lag_bound:.0f} s behind IB's clock")
+            else:
+                say("    stream: lag not measured (no bar of today seen)")
             say(f"    closed bars emitted live: {sym.live_closed} (closed by time {sym.closed_by_time}); "
                 f"backfill bars written: {sym.backfill_written}; backfilled after an outage: "
                 f"{sym.backfilled_late}")
+            say(f"    closes left out of the close-delay statistics: skipped minute "
+                f"{sym.skipped_closes}, spanned a connection loss {sym.spanned}"
+                f"{', delayed stream' if sym.delayed else ''}")
+            if sym.previous_session:
+                say(f"    backfill bars of the previous session, not written: {sym.previous_session}")
             missing = _missing_minutes(sym.emitted)
             if missing:
                 shown = ", ".join(missing[:MAX_MISSING_SHOWN])
@@ -877,8 +1078,8 @@ class _Watcher:
                 say(f"    missing minutes inside the span ({len(missing)}): {shown}{more}")
             else:
                 say("    missing minutes inside the span: none")
-            say(f"    late revisions: {sym.late}; bad bars skipped: {sym.bad}; "
-                f"re-requests after data loss: {sym.rerequests}")
+            say(f"    late revisions: {sym.late}; rows that may be stale: {sym.stale}; "
+                f"bad bars skipped: {sym.bad}; re-requests after data loss: {sym.rerequests}")
             say(f"    updates per bar (min / median / max): {_mmm(sym.update_counts, 'g')}")
             say(f"    first update after the minute started, s (min / median / max): "
                 f"{_mmm(sym.first_delays)}")
@@ -981,11 +1182,13 @@ def run_watch(
     conn: IbConnection | None = None
     code = EXIT_STOPPED
     advice: list[str] = []
+    not_connected = False
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
         refused = _connect(say, conn, args, advice)
         if refused is not None:
             code = refused
+            not_connected = True
         else:
             md = market_data_factory(conn)
             code = _Watcher(args, conn, md, say, files, clock, sleep, wall).run()
@@ -1008,17 +1211,23 @@ def run_watch(
     for line in advice:
         say(f"What to do: {line}")
     if args.record is not None and recorder is not None:
-        words = [w for w in args.private if len(w) >= 3]
-        findings = scan_recording(args.record, words)
-        say(f"Recording: {args.record}")
-        say(f"Recording check: {len(findings)} finding(s). "
-            "Read the file yourself before it is ever committed.")
-        if findings:
-            say("  Where to look (line number and reason only):")
-        for finding in findings[:SHOWN_FINDINGS]:
-            say(f"  line {finding.line}: {finding.reason}")
-        if len(findings) > SHOWN_FINDINGS:
-            say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
+        if not_connected and _header_only(args.record):
+            try:
+                args.record.unlink(missing_ok=True)  # made by this run; nothing was recorded but the header
+            except OSError as exc:
+                say(f"Could not delete the empty recording {args.record}: {type(exc).__name__}")
+        else:
+            words = [w for w in args.private if len(w) >= 3]
+            findings = scan_recording(args.record, words)
+            say(f"Recording: {args.record}")
+            say(f"Recording check: {len(findings)} finding(s). "
+                "Read the file yourself before it is ever committed.")
+            if findings:
+                say("  Where to look (line number and reason only):")
+            for finding in findings[:SHOWN_FINDINGS]:
+                say(f"  line {finding.line}: {finding.reason}")
+            if len(findings) > SHOWN_FINDINGS:
+                say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
     say(f"Result: {_LABELS[code]} (exit {code})")
     say(PATHS_NOTE)
     return code
