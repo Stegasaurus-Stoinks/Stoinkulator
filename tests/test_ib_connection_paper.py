@@ -158,6 +158,9 @@ def not_paper_ids() -> dict[str, str]:
         "lower case": "du" + DIGITS,
         "digits only": DIGITS,
         "D alone": "D",
+        "D and digits only": "D" + DIGITS,
+        "DA": "DA" + DIGITS,
+        "DX": "DX" + DIGITS,
         "DU without digits": "DU",
         "suffix": paper() + "x",
         "two letters after D": "DUU" + DIGITS,
@@ -172,7 +175,8 @@ def test_pattern_rejects(label: str) -> None:
 
 def test_pattern_accepts_and_counts() -> None:
     assert _all_paper_accounts(paper()) == (True, 1, 0)
-    assert _all_paper_accounts("D" + DIGITS) == (True, 1, 0)
+    assert _all_paper_accounts(paper(letters="I")) == (True, 1, 0)
+    assert _all_paper_accounts(paper(letters="F")) == (True, 1, 0)
     assert _all_paper_accounts(f" {paper()} , {paper(OTHER_DIGITS, 'F')} ,") == (True, 2, 0)
     assert _all_paper_accounts(f"{paper()},U{DIGITS}") == (False, 2, 1)
     assert _all_paper_accounts("") == (False, 0, 0)
@@ -187,10 +191,14 @@ def test_default_is_unchanged_with_a_live_looking_account(build: Callable[..., R
     rig.conn.open()
     assert rig.conn.state is ConnState.READY
     assert rig.conn.paper_verified is False
-    seen = []
-    while (ev := rig.conn.next_event(0)) is not None:
-        seen.append(ev)
-    assert any(isinstance(e, events.ManagedAccounts) for e in seen)  # still forwarded
+    seen: list[Any] = []
+
+    def forwarded() -> bool:  # the list may be queued just after nextValidId: wait for it
+        while (ev := rig.conn.next_event(0)) is not None:
+            seen.append(ev)
+        return any(isinstance(e, events.ManagedAccounts) for e in seen)
+
+    assert wait_until(forwarded)  # still forwarded
 
 
 def test_require_paper_must_be_a_bool() -> None:
@@ -208,7 +216,7 @@ def test_require_paper_must_be_a_bool() -> None:
         paper(),
         f"{paper()},{paper(OTHER_DIGITS, 'F')}",
         f" {paper()} , {paper(OTHER_DIGITS)} ,",
-        "D" + DIGITS,
+        paper(letters="I"),
     ],
 )
 def test_paper_accounts_become_ready(build: Callable[..., Rig], accounts: str, order: str) -> None:
@@ -437,3 +445,250 @@ def test_phase_is_assigned_only_in_init_and_set_phase() -> None:
                 if isinstance(target, ast.Attribute) and target.attr == "_phase":
                     owners.add(func.name)
     assert owners == {"__init__", "_set_phase"}
+
+
+# -- scripted handshakes: a failing list is sticky and wins over every other failure --------------
+
+
+def good_list() -> str:
+    return paper()
+
+
+def bad_list() -> str:
+    return "U" + OTHER_DIGITS
+
+
+class ScriptFake(FakeIbClient):
+    """The fake with its handshake replaced: `script` is a list of (callback, args) that the
+    run thread delivers, in that order, after the fake's own connectAck."""
+
+    def __init__(self, *args: Any, script: list[tuple[str, tuple[Any, ...]]], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.script = script
+
+    def connect(self, host: Any, port: Any, clientId: Any) -> None:  # noqa: N803
+        super().connect(host, port, clientId)
+        items: list[Any] = []
+        while True:
+            try:
+                items.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        for item in items:
+            if item[0] not in ("nextValidId", "managedAccounts"):
+                self._q.put(item)
+        for item in self.script:
+            self._q.put(item)
+
+
+NEXT_ID: tuple[str, tuple[Any, ...]] = ("nextValidId", (1,))
+
+
+def accounts_item(text: str) -> tuple[str, tuple[Any, ...]]:
+    return ("managedAccounts", (text,))
+
+
+@pytest.fixture
+def scripted(
+    request: pytest.FixtureRequest,
+) -> Callable[..., tuple[IbConnection, list[ScriptFake], StepClock]]:
+    def make(
+        script: list[tuple[str, tuple[Any, ...]]],
+        cls: type[IbConnection] = IbConnection,
+        **conn_kw: Any,
+    ) -> tuple[IbConnection, list[ScriptFake], StepClock]:
+        clock = StepClock()
+        fakes: list[ScriptFake] = []
+
+        def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
+            fake = ScriptFake(DataOnlyClient(env, on_event, on_raw, logger), script=script)
+            fakes.append(fake)
+            return fake
+
+        conn = cls(
+            "127.0.0.1", 7497, 21, env={}, client_factory=factory, clock=clock,
+            sleep=clock.sleep, poll_interval=0.002, require_paper=True, **conn_kw,
+        )
+        request.addfinalizer(conn.close)
+        return conn, fakes, clock
+
+    return make
+
+
+def sent(fakes: list[ScriptFake]) -> list[str]:
+    return [n for f in fakes for n in f.call_names if n in REQUEST_ARGS]
+
+
+@pytest.mark.parametrize("repeat", range(8))
+@pytest.mark.parametrize(
+    "order",
+    [
+        "bad good id",
+        "bad id good",
+        "id bad good",
+        "good bad id",
+        "good id bad",
+        "id good bad",
+    ],
+)
+def test_a_failing_list_is_sticky_in_every_order(
+    scripted: Callable[..., Any], order: str, repeat: int
+) -> None:
+    parts = {
+        "bad": accounts_item(bad_list()),
+        "good": accounts_item(good_list()),
+        "id": NEXT_ID,
+    }
+    conn, fakes, _clock = scripted([parts[p] for p in order.split()], attempts=3)
+    try:
+        conn.open()
+        outcome = "ready"
+    except NotPaperSession:
+        outcome = "not paper"
+    if outcome == "ready":
+        # Only possible when the failing list was the last message: it then closes the session.
+        assert order.split()[-1] == "bad"
+        assert wait_until(lambda: conn.state is ConnState.CLOSED)
+        assert conn.paper_verified is False
+        with pytest.raises(NotConnected):
+            conn.request("reqCurrentTime")
+    else:
+        assert len(fakes) == 1
+        assert conn.state is ConnState.CLOSED
+    assert conn.paper_verified is False
+    assert sent(fakes) == []
+
+
+class InjectingConnection(IbConnection):
+    """Delivers a failing list on the first empty wait of the ready loop, then ends the wait
+    in the way `mode` names, so the opener sees the failure only after the list was recorded."""
+
+    mode = "deadline"
+    clock: StepClock
+
+    def _pop(self, att: _Attempt, wait: float) -> Any:  # type: ignore[override]
+        injected = getattr(att, "injected", False)
+        if injected and self.mode == "reader_ended" and wait <= 0:
+            return None
+        event = IbConnection._pop(att, wait)
+        if injected or event is not None or wait <= 0:
+            return event
+        att.injected = True  # type: ignore[attr-defined]
+        self._on_event(att, events.ManagedAccounts(bad_list()))
+        if self.mode == "deadline":
+            self.clock.now += 1000.0
+            return None
+        if self.mode == "reader_ended":
+            att.client.disconnect()
+            assert att.reader is not None
+            att.reader.join(WAIT)
+            return None
+        if self.mode == "reader_stopped":
+            return connection_module.ReaderStopped(RuntimeError("boom"))
+        return events.IbError(-1, 326, "client id in use")
+
+
+@pytest.mark.parametrize("mode", ["deadline", "reader_ended", "reader_stopped", "client_id_in_use"])
+def test_failing_list_beats_every_other_failure_of_the_attempt(
+    scripted: Callable[..., Any], mode: str
+) -> None:
+    conn, fakes, clock = scripted([], cls=InjectingConnection, attempts=3, ready_timeout=1.0)
+    conn.mode = mode
+    conn.clock = clock
+    with pytest.raises(NotPaperSession) as info:
+        conn.open()
+    assert not isinstance(info.value, ConnectFailed)
+    assert len(fakes) == 1  # no second attempt, no reconnect to the same TWS
+    assert conn.attempts_made == 1
+    assert fakes[0].calls_named("disconnect")
+    assert conn.state is ConnState.CLOSED
+    assert conn.paper_verified is False
+    assert sent(fakes) == []
+    assert bad_list() not in str(info.value) and OTHER_DIGITS not in str(info.value)
+
+
+def test_a_close_during_open_still_wins_over_a_failing_list(scripted: Callable[..., Any]) -> None:
+    from MainStoinker.ib.connection import ConnectionClosedDuringOpen
+
+    class Closing(InjectingConnection):
+        def _pop(self, att: _Attempt, wait: float) -> Any:  # type: ignore[override]
+            event = super()._pop(att, wait)
+            if getattr(att, "injected", False):
+                self._close_evt.set()
+            return event
+
+    conn, fakes, clock = scripted([], cls=Closing, attempts=3, ready_timeout=1.0)
+    conn.mode = "deadline"
+    conn.clock = clock
+    with pytest.raises(ConnectionClosedDuringOpen):
+        conn.open()
+    assert len(fakes) == 1
+
+
+# -- no request reaches the client once a failing list is recorded ---------------------------------
+
+
+class Hook:
+    def __init__(self) -> None:
+        self.before_request: Callable[[], None] = lambda: None
+
+    def on_request(self, name: str, args: tuple[Any, ...]) -> None:
+        self.before_request()
+
+    def on_raw(self, name: str, args: tuple[Any, ...]) -> None:
+        pass
+
+
+def test_failing_list_between_the_last_check_and_the_call_stops_the_request(
+    scripted: Callable[..., Any],
+) -> None:
+    hook = Hook()
+    conn, fakes, _clock = scripted([NEXT_ID, accounts_item(good_list())], observers=[hook])
+    conn.open()
+    assert conn.paper_verified is True
+
+    def deliver_failing_list_from_another_thread() -> None:
+        t = threading.Thread(target=fakes[0].wrapper.managedAccounts, args=(bad_list(),))
+        t.start()
+        t.join(WAIT)
+        assert not t.is_alive()
+        assert conn.state is ConnState.CLOSED
+
+    hook.before_request = deliver_failing_list_from_another_thread
+    with pytest.raises(NotConnected):
+        conn.request("reqCurrentTime")
+    assert fakes[0].calls_named("reqCurrentTime") == []
+    with pytest.raises(NotConnected):
+        conn.request("reqCurrentTime")
+    assert fakes[0].calls_named("reqCurrentTime") == []
+
+
+def test_failing_list_delivered_inside_the_client_call_does_not_deadlock(
+    scripted: Callable[..., Any],
+) -> None:
+    conn, fakes, _clock = scripted([NEXT_ID, accounts_item(good_list())])
+    conn.open()
+    fake = fakes[0]
+    done = threading.Event()
+    results: list[object] = []
+
+    def call_that_delivers_on_the_calling_thread() -> None:
+        fake.wrapper.managedAccounts(bad_list())  # same thread, inside the request
+
+    fake.reqCurrentTime = call_that_delivers_on_the_calling_thread  # type: ignore[method-assign]
+
+    def worker() -> None:
+        try:
+            results.append(conn.request("reqCurrentTime"))
+        except BaseException as exc:  # noqa: BLE001
+            results.append(exc)
+        done.set()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    assert done.wait(WAIT), "request() deadlocked"
+    assert results == [None]  # it had already passed the last check when the list arrived
+    assert conn.state is ConnState.CLOSED
+    assert conn.paper_verified is False
+    with pytest.raises(NotConnected):
+        conn.request("reqCurrentTime")

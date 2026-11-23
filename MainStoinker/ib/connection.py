@@ -81,9 +81,9 @@ caller                   change
 Per-attempt lifecycle, in order: (1) the factory builds a fresh client; (2) the port
 guard (inside `DataOnlyClient.connect`, and once for `open()` before any client);
 (3) the connect helper thread runs `connect`, bounded by `connect_timeout`; (4) the
-reader thread runs `run()`; (5) the ready wait for `nextValidId`, bounded by
-`ready_timeout`; (6) `_end_attempt` disconnects, joins the threads and retires the
-attempt (on failure, before any retry).
+reader thread runs `run()`; (5) the ready wait for `nextValidId` (and, under `require_paper`,
+a passing account list), bounded by `ready_timeout`; (6) `_end_attempt` disconnects, joins
+the threads and retires the attempt (on failure, before any retry).
 
 Known `ibapi` caveat: a Ctrl-C that lands inside `Connection.sendMsg` between taking
 its lock and its `try` leaves that lock held and can deadlock `close()` in
@@ -324,7 +324,7 @@ def _broker_blocked_here(env: Mapping[str, str]) -> bool:
     return "STOINK_BROKER_BLOCKED" in os.environ or "STOINK_BROKER_BLOCKED" in env
 
 
-_PAPER_ID = re.compile(r"D[A-Z]?[0-9]+")
+_PAPER_ID = re.compile(r"D[UFI][0-9]+")
 PAPER_PORTS: frozenset[int] = frozenset({7497, 4002})
 """TWS paper and IB Gateway paper: the only ports `require_paper=True` accepts."""
 
@@ -333,7 +333,7 @@ def _all_paper_accounts(text: str) -> tuple[bool, int, int]:
     """(ok, listed, failed) for a comma-separated `managedAccounts` list.
 
     Items are stripped and empty items ignored. `ok` needs at least one id and every id
-    to match `D[A-Z]?[0-9]+` (case-sensitive, whole item). The rule and its source are in
+    to match `D[UFI][0-9]+` (case-sensitive, whole item). The rule and its source are in
     the `IbConnection` docstring.
     """
     ids = [item.strip() for item in text.split(",") if item.strip()]
@@ -402,15 +402,28 @@ class IbConnection:
     else `open()` raises `NotPaperSession` before any client is built; the ordinary port guard
     still runs as well. (2) READY needs both `nextValidId` and `managedAccounts` of the
     attempt, in either order, and a list that is non-empty with EVERY id matching
-    `^D[A-Z]?[0-9]+$` (case-sensitive; items stripped, empty items ignored). Source of the
-    rule: IB paper account ids start with `D` (the `DU` prefix), live ids with `U`, `F` or
-    `I`. THIS IS AN ASSUMPTION, TO BE CONFIRMED IN THE OWNER'S FIRST PAPER SESSION. (3) A
+    `^D[UFI][0-9]+$` (case-sensitive; items stripped, empty items ignored). The rule rests on
+    "no live Interactive Brokers account id begins with D, and paper ids begin with DU, DF or
+    DI"; to be confirmed in the owner's first paper session. (Live ids begin with `U`, `F` or
+    `I`.) (3) A
     failing or empty list disconnects at once and `open()` raises `NotPaperSession` (fatal,
-    never retried, state CLOSED, no request possible). (4) `nextValidId` without a
+    never retried, state CLOSED, no request possible). A failing list is sticky (a later
+    passing list does not clear it) and wins over every other failure of the same attempt
+    (timeout, reader ended, 326): after an attempt ends, `open()` raises `NotPaperSession`
+    and makes no further attempt; only a `close()` of the caller is reported instead.
+    (4) `nextValidId` without a
     `managedAccounts` by the ready deadline fails the attempt like a missing `nextValidId`
     (retried; `ConnectFailed` at the end). (5) A later failing `managedAccounts` while READY
     closes the connection (CLOSED, a `ConnectionClosed` event, `request()` raises
     `NotConnected`). `paper_verified` tells whether READY was granted with a passing list.
+    A failing list can arrive just after `open()` returns, which closes the connection, so a
+    caller should check `paper_verified` immediately before its first request. Under
+    `require_paper`, `request()` holds the connection lock (the one `_on_event` takes to
+    record a failing list) across its last state check and the client call, so once a failing
+    list is recorded no request reaches the client; the lock is re-entrant (a callback
+    delivered on the calling thread inside the client call is fine) and `on_request` observers
+    still run before it is taken. Observers of raw callbacks delivered synchronously inside the
+    client call do run under it. With `require_paper=False` locking is unchanged.
     Under `require_paper` the `ManagedAccounts` event is not passed to the consumer, no
     account id is logged, and `NotPaperSession` states only how many ids were listed and
     how many failed.
@@ -636,6 +649,10 @@ class IbConnection:
                     )
                 )
             self._check_open()  # adds: a close() during the cleanup above is reported as a close
+            if att.accounts_bad is not None:
+                # Every way an attempt can end passes here: a failing list beats a timeout, a
+                # reader that ended, a 326 and the rest, and is never retried.
+                raise self._not_paper(att)
             if fatal:
                 raise ClientIdInUse(
                     f"IB client id {self.client_id} is already in use by another API "
@@ -1080,6 +1097,15 @@ class IbConnection:
                 self._throttle()
                 att = self._require_requestable(name)  # close() may have run while it waited
                 self._notify("on_request", name, args)
+                if self._require_paper:
+                    # The lock `_on_event` takes to record a failing list (re-entrant, so a
+                    # callback delivered on this thread inside the call cannot deadlock): once
+                    # a failing list is recorded, no request reaches the client.
+                    with self._lock:
+                        att = self._require_requestable(name)
+                        if att.accounts_bad is not None or not att.accounts_ok:
+                            raise NotConnected(f"Cannot send {name}: the session is not verified as paper")
+                        return getattr(att.client, name)(*args)
                 return getattr(att.client, name)(*args)
             finally:
                 self._tls.in_request = False
