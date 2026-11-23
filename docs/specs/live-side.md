@@ -1,7 +1,7 @@
 # Live-side spec: market data, paper trading and broker orders
 
-Status: approved by the owner on 2026-11-22. See "Decisions" at the end. A
-few facts about the owner's setup are still needed before stage 1.
+Status: approved by the owner on 2026-11-22. See "Decisions" at the end. One
+risk is open: the account has delayed market data only (see "Open risk").
 
 This covers what earlier specs called milestone 1 Phase B and milestone 2
 Phase B. It replaces the Phase B section of `m1-core-seams.md`, which was
@@ -265,7 +265,7 @@ session.
 
 | Stage | Delivers | Owner session |
 |---|---|---|
-| 1. Data only | `IbConnection`, `IbMarketData`, `fetch-bars`, connection errors (issue 19), the fake client and the recorder | TWS on the paper port with "Read-Only API" on. Run `fetch-bars` for a few symbols and a few months; any time, market closed is fine. About 15 minutes. |
+| 1. Data only | `IbConnection`, `IbMarketData`, `fetch-bars`, the market data probe, connection errors (issue 19), the fake client and the recorder | TWS on the paper port with "Read-Only API" on. Run `fetch-bars` for a few symbols and a few months, any time; run the probe once during market hours. About 15 minutes each. |
 | 2. Paper on live bars | `IbBarFeed`, `Engine.run_live`, the `run` command, incremental store, dashboard additions | "Read-Only API" still on. During market hours: start a `paper` run of FunctionTest and EMACrossing, watch it trade in the dashboard for 30 minutes, stop it. |
 | 3. Orders on the IB paper account | `IbOrders`, `IbBroker`, limits, start and stop rules, issue 6 and issue 15 | "Read-Only API" off. During market hours: one FunctionTest trade with stop and target in `live` mode on the paper port, a stop change, a manual stop of the program, a restart with a position open. |
 | 4. Clean-up | Legacy runtime deleted, guards updated | None beyond review. |
@@ -300,11 +300,36 @@ Made by the owner on 2026-11-22:
 7. **Stay on IB's documented path for the TWS API.** The owner uses TWS. See
    "Following IB's documented scheme".
 
-## Still needed from the owner, before stage 1
+## The owner's setup (2026-11-22)
 
-- Whether the trading machine is this machine.
-- Whether the paper account shows market data for US stocks in TWS.
-- Whether sessions should go into the same database as the backtests
-  (`STOINK_DB` set on the trading machine).
-- Confirmation of the TWS settings in the table above for the first two
-  stages: socket clients enabled, port 7497, "Read-Only API" on.
+- TWS, on this machine for now.
+- Sessions go into the same database as the backtests.
+- TWS settings for the first two stages: socket clients enabled, port 7497,
+  "Read-Only API" on.
+- The paper account shows market data delayed by 15 minutes, not live data.
+
+## Open risk: delayed market data
+
+IB's documentation says that historical data through the API needs a live
+market data subscription for the instrument, that requests reaching into the
+last 15 minutes need one in any case, and that the "delayed data" switch
+(`reqMarketDataType(3)`) applies to streaming quotes, not to historical bars.
+A paper account can share the live account's subscriptions, on the same
+computer, after a setting is changed in account management.
+
+What this account can actually get through the API is not known. It decides
+whether stage 2 can use the documented live-bar method as written. So stage 1
+ends with a probe, run in the owner's session, that records which of these
+work: one-minute history older than a day; history ending 20 minutes ago;
+history ending now; the streaming bar request (`keepUpToDate`); and delayed
+streaming quotes. The probe only reads market data.
+
+Depending on the result, before stage 2 is split into tasks:
+
+- If streaming bars work: stage 2 as written.
+- If only delayed data is available: either the owner adds a subscription for
+  US stocks and shares it with the paper account (the owner's decision, with
+  IB's current prices), or stage 2 is built on 15-minute-delayed bars. Delayed
+  bars are enough to prove the pipeline with simulated fills. They are not
+  suitable for stage 3: real orders would fill at current prices while the
+  algos decide on prices from 15 minutes earlier.
