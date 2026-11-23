@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import io
 import itertools
 import json
@@ -704,8 +705,6 @@ def test_allows_offline_subcommands() -> None:
         f"{VENV_PY} -m MainStoinker",
         "py -3.14 -m MainStoinker --help",
         'bash -c "python -m MainStoinker"',
-        "python -m MainStoinker.api.serve",
-        "python -m MainStoinker.engine.sim_broker",
         "python -m pytest tests/test_engine_cli.py",
         "python -m pytest -m slow",
         "python -m ruff check MainStoinker/__main__.py",
@@ -1809,11 +1808,8 @@ def test_only_known_offline_modules_may_run_with_m() -> None:
             "mainstoinker.engine.__main__",
         }
     )
-    # `python -m MainStoinker.api.serve` and `.engine.sim_broker` are asserted
-    # allowed by the T10 tests above; nothing else is.
-    assert hook._OTHER_OFFLINE_MODULES == frozenset(
-        {"mainstoinker.api.serve", "mainstoinker.engine.sim_broker"}
-    )
+    # No other module is allowed: `serve` runs as `python -m MainStoinker serve`.
+    assert not hasattr(hook, "_OTHER_OFFLINE_MODULES")
     for module in (
         "MainStoinker.engine.live",
         "MainStoinker.engine.paper",
@@ -1821,6 +1817,8 @@ def test_only_known_offline_modules_may_run_with_m() -> None:
         "MainStoinker.api",
         "MainStoinker.api.live",
         "MainStoinker.api.serve.extra",
+        "MainStoinker.api.serve",
+        "MainStoinker.engine.sim_broker",
         "MainStoinker.live",
         "MainStoinker.MainStuff.main_utils",
         "MainStoinker.DataCollection.apiApi",
@@ -1844,8 +1842,7 @@ def test_only_known_offline_modules_may_run_with_m() -> None:
         "python -m MainStoinker",
         "python -m MainStoinker.__main__ backtest",
         "python -m MainStoinker.engine.cli report 3",
-        "python -m MainStoinker.api.serve",
-        "python -m MainStoinker.engine.sim_broker",
+        "python -m MainStoinker serve --db runs.db --port 8750",
     ):
         assert hook.decide(command) == (False, ""), command
 
@@ -1853,22 +1850,21 @@ def test_only_known_offline_modules_may_run_with_m() -> None:
 # --- nothing blocked by revival is allowed now -------------------------------------
 
 
+BASELINE = REPO_ROOT / "tests" / "fixtures" / "hook_baseline" / "block_live_launch_revival.py.txt"
+# sha256 of the frozen copy of revival's hook (line endings as LF). Changing the
+# fixture means changing this value in review, so it cannot be edited quietly.
+BASELINE_SHA256 = "76dcde8ff9e8b74cb69879f8d82c12c9443d4cc3202df78729aec253ecdd86aa"
+
+
 def _load_revival_hook() -> types.ModuleType:
-    try:
-        source = subprocess.run(
-            ["git", "show", "origin/revival:.claude/hooks/block_live_launch.py"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=60,
-            check=True,
-        ).stdout
-    except (OSError, subprocess.SubprocessError) as exc:
-        pytest.skip(f"origin/revival is not available here: {exc}")
+    """The frozen copy of revival's hook; never skips (no git, no network)."""
+    data = BASELINE.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(data).hexdigest() == BASELINE_SHA256, (
+        "the frozen baseline hook was edited"
+    )
     module = types.ModuleType("revival_block_live_launch")
-    module.__file__ = "origin/revival:.claude/hooks/block_live_launch.py"
-    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    module.__file__ = str(BASELINE)
+    exec(compile(data.decode("utf-8"), module.__file__, "exec"), module.__dict__)
     return module
 
 
@@ -1947,3 +1943,318 @@ def test_nothing_blocked_by_revival_is_allowed_by_this_hook() -> None:
     # the new rule only adds blocks
     newly_blocked = [c for c in sorted(corpus) if hook.decide(c)[0] and not revival.decide(c)[0]]
     assert len(newly_blocked) > 100
+
+
+# --- T10 fix round 3: closures from the second review ---------------------------------
+# Every row is a command string used as data. The rows in FIX3_BLOCKED were all
+# allowed by the previous head of this PR; the other tables pin verdicts that
+# must not change.
+
+
+def _fw(text: str) -> str:
+    """ASCII letters as full-width look-alikes (NFKC turns them back)."""
+    return "".join(chr(ord(c) + 0xFEE0) if c.isascii() and c.isalpha() else c for c in text)
+
+
+FIX3_BLOCKED = {
+    # 1. redirect operators and comments the tokenizer did not follow
+    "redirects": [
+        "python -m MainStoinker >| backtest fetch-bars",
+        "python -m MainStoinker 2>| backtest fetch-bars",
+        "python -m MainStoinker >|out.txt backtest fetch-bars",
+        "python -m MainStoinker <> backtest fetch-bars",
+        "python -m MainStoinker 3<> backtest fetch-bars",
+        "python -m MainStoinker >& backtest fetch-bars",
+        "python -m MainStoinker 2>& backtest fetch-bars",
+        "python -m MainStoinker <<< backtest fetch-bars",
+        "python -m MainStoinker << backtest fetch-bars",
+        "python -m MainStoinker <<- backtest fetch-bars",
+        "python -m MainStoinker <# backtest #> fetch-bars",
+        "python -m MainStoinker <# runs #> probe-data",
+        "python MainStoinker/__main__.py >| backtest fetch-bars",
+        "python MainStoinker/__main__.py <# backtest #> fetch-bars",
+        "bash -c 'python -m MainStoinker >| backtest fetch-bars'",
+        'powershell -Command "python -m MainStoinker <# backtest #> fetch-bars"',
+        "git status && python -m MainStoinker >& backtest probe-data",
+    ],
+    # 2. an expression in the subcommand position
+    "expressions": [
+        'python -m MainStoinker ("backtest","fetch-bars")[1]',
+        'python -m MainStoinker ("backtest" -replace "backtest","fetch-bars")',
+        'python -m MainStoinker @("backtest","fetch-bars")[1]',
+        'python -m MainStoinker --json ("runs","probe-data")[1]',
+        "python -m MainStoinker {backtest}",
+        'iex ("python -m MainStoinker backtest" -replace "backtest","fetch-bars")',
+        'iex ("python -m MainStoinker backtest" + (" fetch-bars" -join ""))',
+        'python -m MainStoinker report ("x" -join "y") -join "fetch-bars"',
+        'python MainStoinker/__main__.py ("backtest","fetch-bars")[1]',
+    ],
+    # 3. import of the package __main__ or ib without the dotted name
+    "code": [
+        "python -c \"import sys; sys.argv=['x','fetch-bars']; from MainStoinker import __main__\"",
+        "python -c \"import pkgutil; pkgutil.resolve_name('MainStoinker.__main__')\"",
+        "python -c \"import sys, pkgutil; sys.argv=['x','fetch-bars']; "
+        "pkgutil.resolve_name('MainStoinker.__main__')\"",
+        "python -c \"import sys; sys.argv=['x','probe-data']; import MainStoinker\"",
+        "python -c \"m=__import__; m('MainStoinker.__main__')\"",
+        'echo "from MainStoinker import __main__" | python - fetch-bars',
+        "echo \"import sys; sys.argv=['x','fetch-bars']; import MainStoinker\" | python -",
+        "python - fetch-bars <<EOF\nfrom MainStoinker import __main__\nEOF",
+        "python - <<'EOF'\nimport sys\nsys.argv = ['x', 'fetch-bars']\nimport MainStoinker\nEOF",
+        "python <<EOF\nfrom MainStoinker import __main__\nEOF",
+        "bash -c 'echo \"from MainStoinker import __main__\" | python -'",
+    ],
+    # 4. the package name built at run time in the module position
+    "module": [
+        '$M="MainStoinker"; python -m $M fetch-bars',
+        "M=MainStoinker; python -m $M fetch-bars",
+        '$m = "MainStoinker"\npython -m $m fetch-bars',
+        "export M=MainStoinker && python -m ${M} fetch-bars",
+        'cmd /c "set M=MainStoinker&& python -m %M% fetch-bars"',
+        'cmd /c "set M=MainStoinker&& setlocal enabledelayedexpansion&& python -m !M! fetch-bars"',
+        '$env:M = "MainStoinker"; python -m $env:M fetch-bars',
+        "python -m ($M) fetch-bars; echo MainStoinker",
+        "python -m$M fetch-bars; echo MainStoinker",
+        "python -m MainSto* fetch-bars",
+        "python -m Main*er fetch-bars",
+        "python -m MainStoinke? fetch-bars",
+        "python -m [M]ainStoinker fetch-bars",
+        "python -m Main$()Stoinker fetch-bars",
+        'python -m "Main$()Stoinker" fetch-bars',
+        "python -m Main$()Stoinker.ib.cli",
+        "python -X dev -m $M fetch-bars; echo MainStoinker",
+        'bash -c "M=MainStoinker; python -m \\$M fetch-bars"',
+    ],
+    # 5. `..` in a script path
+    "dotdot": [
+        "python MainStoinker/engine/.. fetch-bars",
+        "python MainStoinker/engine/../__main__.py fetch-bars",
+        'python "MainStoinker\\engine\\.." fetch-bars',
+        "python ./MainStoinker/api/../ fetch-bars",
+        "python MainStoinker/engine/../engine/.. fetch-bars",
+        "python C:/repo/MainStoinker/engine/.. fetch-bars",
+        "MainStoinker/engine/../__main__.py fetch-bars",
+    ],
+    # 6. Unicode look-alikes
+    "unicode": [
+        f'python -c "import MainStoinker.{_fw("ib")}.cli"',
+        f'python -c "import {_fw("MainStoinker")}.ib.cli"',
+        f"python -m {_fw('MainStoinker')} fetch-bars",
+        f"python -m {_fw('MainStoinker')}.ib.cli",
+        f"python {_fw('MainStoinker')}/__main__.py fetch-bars",
+        f'python -c "from {_fw("MainStoinker")} import __main__"',
+    ],
+}
+
+# Blocked before and still blocked (not counted as new blocks). The loop rows
+# pin the one item that allows more: a ForEach-Object loop needs the subcommand
+# written out, everything else about loops and xargs stays blocked.
+FIX3_STILL_BLOCKED = [
+    "$s | ForEach-Object { python -m MainStoinker $_ }",
+    "$s | ForEach-Object { python -m MainStoinker $_ --db x.db }",
+    "$s | % { python -m MainStoinker fetch-bars }",
+    "$s | ForEach-Object { python -m MainStoinker.ib.cli backtest }",
+    "$s | ForEach-Object { python -m MainStoinker }",
+    "$s | ForEach-Object { python -m MainStoinker backtest $_ }",
+    "foreach ($s in 'backtest','fetch-bars') { python -m MainStoinker $s }",
+    "$s | ForEach-Object {\n  python -m MainStoinker $_\n}",
+    "echo fetch-bars | xargs python -m MainStoinker",
+    "echo backtest | xargs python -m MainStoinker backtest",
+    "ls | xargs echo; python -m MainStoinker backtest",
+    "python -m $(echo MainStoinker) fetch-bars",
+    "python -m `echo MainStoinker` fetch-bars",
+    "python MainStoinker/ib/.. probe-data",
+    'python -c "from MainStoinker import __main__" fetch-bars',
+    "python -c \"from MainStoinker import *; sys.argv=['x']\"",
+    "python -c \"import MainStoinker, sys; sys.argv=['x','fetch-bars']\"",
+    "python -c \"from MainStoinker import engine; x = 1; compile('x','y','exec')\"",
+    "python <<EOF\nimport pkgutil\npkgutil.resolve_name('MainStoinker.__main__')\nEOF",
+    "python -m MainStoinker &> backtest fetch-bars",
+    "python -m MainStoinker 2>&1 fetch-bars",
+    "python -m MainStoinker @('fetch-bars')",
+    "python -m MainStoinker $(echo fetch-bars)",
+    "python -m MainStoinker ${env:SUB}",
+    "python -m MainStoinker $sub",
+    "python -m MainStoinker %SUB%",
+    "python -m MainStoinker !SUB!",
+    "python -m MainStoinker `fetch-bars`",
+    "python -m MainStoinker (Get-Content sub.txt)",
+    "python -c \"import importlib; importlib.import_module('MainStoinker.__main__')\"",
+    'python -c "import MainStoinker.ib.cli"',
+    "python -c \"import runpy; runpy.run_module('MainStoinker')\"",
+    "python - <<EOF\nimport MainStoinker.__main__\nEOF",
+]
+
+FIX3_ALLOWED = [
+    # redirects after the subcommand, and understood forms before it
+    "python -m MainStoinker backtest --algos a.json --data OfflineData --out out >| log.txt",
+    "python -m MainStoinker backtest --out out 2>&1",
+    "python -m MainStoinker backtest --out out >& log.txt",
+    "python -m MainStoinker backtest --out out &> log.txt",
+    "python -m MainStoinker backtest <<< ''",
+    "python -m MainStoinker 2>&1 backtest",
+    "python -m MainStoinker > log.txt backtest",
+    "python -m MainStoinker backtest <# fetch-bars #>",
+    "python -m MainStoinker runs --db x.db <# note #>",
+    # parentheses and expressions that are not in the subcommand position
+    "(python -m MainStoinker backtest --out out)",
+    "$r = (python -m MainStoinker report 3 --db x.db --json)",
+    "& python -m MainStoinker backtest --algos (Get-Item a.json).FullName --out out",
+    "python -m MainStoinker report 3 --db x.db | ConvertFrom-Json",
+    "python -m MainStoinker serve --db x.db --port 8750",
+    'iex "python -m MainStoinker backtest --algos a.json --data OfflineData --out out"',
+    # Python code naming the package, without the marker words
+    'python -c "import MainStoinker; print(MainStoinker.__file__)"',
+    'python -c "from MainStoinker.engine import SimBroker; print(SimBroker)"',
+    "python -c \"import json; print(json.dumps({'pkg': 'MainStoinker'}))\"",
+    'python -c "print(1)"',
+    'echo "from MainStoinker.engine import SimBroker" | python -',
+    "python - <<EOF\nfrom MainStoinker.engine import SimBroker\nprint(SimBroker)\nEOF",
+    "python -c \"import sys; sys.argv=['x']; print(sys.argv)\"",
+    # the module position
+    'python -m pytest -m "not slow" MainStoinker/engine',
+    "python -m pytest -m slow MainStoinker",
+    "M=other; python -m $M",
+    "$m = 'pytest'; python -m $m tests",
+    "python -m pytest tests/ -k 'a or b' --cov=MainStoinker",
+    "python -m Main$()Stoinker backtest",
+    "git commit -m 'fix hook' -- MainStoinker/engine/foo.py",
+    'git commit -m "hook: block globs" MainStoinker/engine/foo.py',
+    "python -m mypy MainSto*/engine",
+    "python tools/count.py -m x MainStoinker/engine",
+    # `..` that stays offline
+    "python MainStoinker/engine/.. backtest --out out",
+    "python MainStoinker/engine/../__main__.py runs --db x.db",
+    "python MainStoinker/engine/.. --help",
+    'python "MainStoinker\\engine\\.." report 3 --db x.db',
+    "python tools/x.py MainStoinker/engine/..",
+    "python -m pytest MainStoinker/engine/../testy",
+    # Unicode
+    f"python -m {_fw('MainStoinker')} backtest",
+    f"python -m {_fw('pytest')} tests",
+    "echo \uff46\uff45\uff54\uff43\uff48-\uff42\uff41\uff52\uff53",
+    # loops with the subcommand written out
+    "$algos | ForEach-Object { python -m MainStoinker backtest --algos $_ --data OfflineData --out out }",
+    "Get-ChildItem cfg/*.json | ForEach-Object "
+    "{ python -m MainStoinker backtest --algos $_.FullName --data OfflineData --out out }",
+    "foreach ($a in Get-ChildItem cfg) { python -m MainStoinker backtest --algos $a.FullName --out out }",
+    "1..3 | % { python -m MainStoinker report 1 --db x.db }",
+    "$algos | ForEach-Object {\n  python -m MainStoinker backtest --algos $_ --out out\n}",
+    'rg -n "foreach" MainStoinker/api/static; python -m MainStoinker runs --db x.db',
+    "$s | ForEach-Object { Write-Output $_ }",
+    "$s | ForEach-Object { python -m MainStoinker backtest --out o >| log.txt }",
+    "echo x | xargs echo done",
+]
+
+_FIX3_BLOCKED_ROWS = [(g, c) for g, rows in FIX3_BLOCKED.items() for c in rows]
+
+
+@pytest.mark.parametrize(("group", "command"), _FIX3_BLOCKED_ROWS)
+def test_fix3_blocked(group: str, command: str) -> None:
+    assert hook.decide(command)[0] is True, (group, command)
+    assert hook.main(_payload(command)) == 2
+
+
+@pytest.mark.parametrize("command", FIX3_STILL_BLOCKED)
+def test_fix3_still_blocked(command: str) -> None:
+    assert hook.decide(command)[0] is True, command
+
+
+@pytest.mark.parametrize("command", FIX3_ALLOWED)
+def test_fix3_allowed(command: str) -> None:
+    assert hook.decide(command) == (False, ""), command
+    assert hook.main(_payload(command)) == 0
+
+
+def test_fix3_claude_md_commands_stay_allowed() -> None:
+    text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    block = text.split("```", 2)[1]
+    commands = [ln.split("   #")[0].strip() for ln in block.splitlines() if ln.strip()]
+    assert any("MainStoinker backtest" in c for c in commands)
+    for command in commands:
+        command = command.replace("[--allow-remote]", "").replace("[--json]", "")
+        assert hook.decide(command) == (False, ""), command
+    assert hook.decide("python -m MainStoinker serve --db DB --port 8750 --allow-remote") == (False, "")
+
+
+def test_fix3_serve_module_forms_are_blocked_but_the_subcommand_is_allowed() -> None:
+    assert not hasattr(hook, "_OTHER_OFFLINE_MODULES")
+    assert hook.decide("python -m MainStoinker.api.serve")[0] is True
+    assert hook.decide("python -m MainStoinker.engine.sim_broker")[0] is True
+    assert hook.decide("python -m MainStoinker serve --db x.db") == (False, "")
+    assert hook.decide(f"{VENV_PY} -m MainStoinker serve --db DB --port 8750") == (False, "")
+
+
+def test_fix3_dotdot_is_resolved_for_script_paths() -> None:
+    assert hook._normalise_connect("python MainStoinker/engine/.. x") == "python mainstoinker x"
+    assert hook._normalise_connect("python MainStoinker/ib/../__main__.py") == (
+        "python mainstoinker/__main__.py"
+    )
+    assert hook._normalise_connect("python MainStoinker/engine/..", resolve=False) == (
+        "python mainstoinker/engine/.."
+    )
+
+
+def test_fix3_loop_feeders_allow_only_a_written_out_offline_subcommand() -> None:
+    ok = "$a | ForEach-Object { python -m MainStoinker backtest --algos $_ --out o }"
+    assert hook.decide(ok) == (False, "")
+    # the loop value as the subcommand, or right after it, is not accepted
+    assert hook.decide(ok.replace("backtest --algos $_", "$_ --algos x"))[0] is True
+    assert hook.decide(ok.replace("backtest --algos $_", "backtest $_"))[0] is True
+    # xargs and parallel are blocked whatever is written
+    for feeder in ("xargs", "parallel"):
+        assert hook.decide(f"ls | {feeder} python -m MainStoinker backtest")[0] is True
+    assert hook._LOOP_FEEDERS == frozenset({"foreach-object", "foreach", "%"})
+    assert hook._STREAM_FEEDERS == frozenset({"xargs", "parallel"})
+
+
+def test_fix3_expression_in_the_subcommand_slot_is_not_a_subcommand() -> None:
+    toks, marks = hook._tokenise("python -m mainstoinker (backtest,fetch-bars)[1]")
+    assert toks[3] == "backtest"
+    assert marks[3] is True and marks[2] is False
+    assert hook._ODD_OP.match(">|") and hook._ODD_OP.match("2>|") and hook._ODD_OP.match("<#")
+    assert not hook._ODD_OP.match("2>&1") and not hook._ODD_OP.match(">&2")
+    assert not hook._ODD_OP.match(">") and not hook._ODD_OP.match("2>")
+
+
+def test_fix3_code_runners_need_the_package_name() -> None:
+    for code in (
+        "from mainstoinker import __main__",
+        "import sys; sys.argv = ['x']; import mainstoinker",
+        "import pkgutil; mainstoinker",
+        "mainstoinker; importlib",
+        "mainstoinker; __import__('x')",
+        "mainstoinker; exec('x')",
+        "mainstoinker; eval('x')",
+        "mainstoinker; compile('x', 'y', 'exec')",
+        "from mainstoinker import x; x.ib.y",
+        "mainstoinker; runpy",
+    ):
+        assert hook._scan_code(code) is not None, code
+    for code in (
+        "sys.argv = ['x']",
+        "import pkgutil",
+        "import mainstoinker",
+        "print(mainstoinker.engine)",
+    ):
+        assert hook._scan_code(code) is None, code
+
+
+def test_fix3_new_rules_are_linear_in_time() -> None:
+    p = "MainStoinker"
+    shapes = {
+        "odd_ops": "python -m " + p + " " + ">| " * 20_000,
+        "exprs": "python -m " + p + " " + "(" * 20_000 + "backtest",
+        "dotdot": "python " + "a/../" * 8_000 + p + " backtest",
+        "dotdot_many_tokens": "python " + "x/.. " * 8_000 + p,
+        "c_args": ("python -c 'a' " * 3_000) + p,
+        "c_args_py": 'python -c "' + "; ".join(["x"] * 5_000) + '" ' + p,
+        "modules": "python " + "-m $M " * 6_000 + p,
+        "text_ops": "python -m " + p + " backtest " + "-replace " * 8_000,
+        "globs": "python -m " + "*?[" * 15_000 + " " + p,
+        "fullwidth": 'python -c "' + _fw(p) * 3_000 + '"',
+        "loops": ("foreach { python -m " + p + " backtest }; ") * 3_000,
+    }
+    for name, command in shapes.items():
+        _, took = _timed(command)
+        assert took < _TIMING_BOUND, (name, took)

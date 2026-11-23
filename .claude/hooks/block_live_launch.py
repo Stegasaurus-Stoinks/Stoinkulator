@@ -22,7 +22,17 @@ the package (``-m MainStoinker``, ``MainStoinker/__main__.py``, the directory,
 ``MainStoinker.ib`` run or imported from code is blocked; runpy/import/exec/
 subprocess text that names MainStoinker is blocked, because the subcommand is
 not visible there. Only the owner runs connecting commands. Any other
-``-m MainStoinker.<x>`` is blocked (a module allowlist). The rule joins
+``-m MainStoinker.<x>`` is blocked (a module allowlist). Also blocked: a
+redirect or comment the tokenizer does not follow (``>|``, ``<>``, ``>&``,
+``&>``, ``<<``, ``<<<``, ``<# #>``) or an expression (``(``, ``[``, ``{``, ``@``,
+``-replace``, ``-join``) before the subcommand; Python code that names
+MainStoinker next to ``__main__``, ``sys.argv``, ``runpy``, ``pkgutil``,
+``importlib``, ``__import__``, ``exec``, ``eval``, ``compile`` or ``ib``; ``-m``
+followed by a name that is not a literal identifier when the command names the
+package (or a glob that matches it); ``..`` in script paths is resolved; the
+command is also judged after Unicode NFKC folding; a ForEach-Object loop may run
+``backtest``/``runs``/``report``/``serve`` when the word is written out (xargs
+may not). The rule joins
 continuation lines (backslash, backtick or caret before a line break), splits
 arguments on ``, ( ) @ [ ] { }`` too (PowerShell argument arrays), sees through
 ``xargs``/``env``/``timeout``/``start``/``conda run`` and the like, judges text
@@ -30,9 +40,11 @@ piped into a shell, decodes ``-EncodedCommand``, follows a ``cd`` into the
 package directory, and blocks a command over 50,000 characters that mentions
 the package. Blocked by design, even though they only print help:
 ``fetch-bars --help``, ``probe-data -h``, ``python -c "import MainStoinker.ib..."``.
-Not seen: a script or file that itself imports and runs the package,
-``bash script.sh``, aliases/functions, building the module name dynamically,
-tools that run a command themselves (``rg --pre``), copying the package.
+Not seen: a script or file that itself imports and runs the package (written
+in one call, run in another), ``bash script.sh``, aliases/functions, a module
+name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
+a non-empty ``$(...)``), tools that run a command themselves (``rg --pre``),
+copying the package.
 When the hook itself fails (bad JSON, an exception), a request that mentions
 the package is blocked, like one that mentions the entry script or launcher.
 
@@ -72,6 +84,8 @@ import base64
 import json
 import re
 import sys
+import unicodedata
+from fnmatch import fnmatchcase
 from typing import BinaryIO
 
 ENTRY_NAME = "dum dum.py"
@@ -405,11 +419,7 @@ _PACKAGE_MODULES = frozenset(
     }
 )
 # Any other ``-m mainstoinker.<x>`` is blocked, so a future connecting module is
-# blocked by default. These two are the only others accepted: the read-only web
-# API behind ``serve`` and the simulated broker (importing it connects nothing).
-_OTHER_OFFLINE_MODULES = frozenset(
-    {"mainstoinker.api.serve", "mainstoinker.engine.sim_broker"}
-)
+# blocked by default (``serve`` runs as ``python -m MainStoinker serve``).
 _SHELL_WRAPPERS = frozenset(
     {"bash", "sh", "zsh", "dash", "cmd", "powershell", "pwsh", "eval"}
 )
@@ -427,6 +437,31 @@ _CODE_FLAG = re.compile(r"^-[a-z]*c$")
 _C_FLAG_IN_TEXT = re.compile(r"(?:^|\s)-[a-z]*c(?=\s|$)")
 _REDIRECT = re.compile(r"^(?:\d*[<>]|&>)")
 _REDIRECT_BARE = re.compile(r"^(?:\d*>>?|\d*<|&>>?)$")
+# Redirect and comment operators the tokenizer does not follow (``>|``, ``<>``,
+# ``>&``, ``&>``, ``<<``, ``<<<``, ``<# #>``): the word after one may be a file,
+# a delimiter or a comment, so a word before the subcommand slot is not trusted.
+_ODD_OP = re.compile(r"^(?:\d*>\||\d*<>|\d*>&(?![\d-])|&>|\d*<<|<#|#>)")
+_TOKEN_RE = re.compile(r"[^\s,()@\[\]{}]+")
+_EXPR_CHARS = re.compile(r"[(@\[{]")
+# ``-m`` followed by this is a module written out literally.
+_LITERAL_MODULE = re.compile(r"^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*$")
+_ATTACHED_DYNAMIC = re.compile(r"^-[a-z]*m(\S*[$%!*?\[`]\S*)$")
+_GLOB_CHARS = re.compile(r"[*?\[]")
+# PowerShell operators that rewrite text: ``"backtest" -replace ...``.
+_PS_TEXT_OPS = frozenset(
+    {"-replace", "-ireplace", "-creplace", "-join", "-split", "-isplit", "-csplit"}
+)
+# Words in Python code that, next to the package name, may run its CLI or
+# import ``__main__`` / ``ib`` without the dotted name written out.
+_CODE_RUNNERS = re.compile(
+    r"__main__|sys\s*\.\s*argv|runpy|pkgutil|importlib|__import__|\.ib|(?<![a-z0-9_])ib\."
+    r"|(?<![a-z0-9_])(?:exec|eval|compile)"
+)
+_CONNECT_SPLIT = re.compile(
+    r";|&&|\|\||(?<!>)\||\r\n|\n|\r|(?<![>&<])&(?![>&])"
+)
+_DOTDOT_TOKEN = re.compile(r"[^\s;|&()]+")
+_PY_C_ARG = re.compile(r"(?<![\w-])-[a-z]*c[ \t]+(?=[\"'])", re.I)
 _IB_DOTTED = re.compile(r"mainstoinker\s*\.\s*ib(?![\w])")
 _IB_WORD = re.compile(r"(?<![\w])ib(?![\w])")
 _IB_PATH = re.compile(r"mainstoinker/ib(?:/|(?![\w]))")
@@ -450,7 +485,6 @@ _TEXT_COMMANDS = _READERS - {"sed", "awk", "vim"}
 _EXECUTING_TEXT = re.compile(
     r"\$\(|`|\(\s*(?:&\s*)?[^\s(]*(?:python|py\b|uv |pipx )"
 )
-_TOKEN_SPLIT = re.compile(r"[\s,()@\[\]{}]+")
 _SCRIPT_REDIRECT = re.compile(r">>?\s*[^\s|&;<>]*\.(?:sh|ps1|bat|cmd|py)(?=\s|$)")
 _ECHO_WRITERS = frozenset({"echo", "printf", "write-output"})
 # Lint and test runners, which may name package paths. ``coverage`` counts only
@@ -463,7 +497,9 @@ _HARMLESS_TOOLS = frozenset(
 )  # fmt: skip
 _COVERAGE_READ = frozenset({"report", "html", "xml", "combine", "erase"})
 # Words that feed arguments to the next command, so the arguments are not visible.
-_FEEDERS = frozenset({"xargs", "foreach-object", "foreach", "%", "parallel"})
+_LOOP_FEEDERS = frozenset({"foreach-object", "foreach", "%"})
+_STREAM_FEEDERS = frozenset({"xargs", "parallel"})
+_FEEDERS = _LOOP_FEEDERS | _STREAM_FEEDERS
 # Transparent prefixes: the command behind them is the one judged.
 _CONNECT_PREFIXES = frozenset(
     {
@@ -495,7 +531,9 @@ class _Ctx:
     def __init__(self) -> None:
         self.in_pkg = False  # an earlier cd/pushd went into a MainStoinker directory
         self.in_ib = False  # ... into MainStoinker/ib
-        self.fed = False  # a ForEach-Object / xargs came before
+        self.fed_loop = False  # a ForEach-Object / foreach / % came before
+        self.fed_stream = False  # an xargs / parallel came before
+        self.mentions = False  # the command names MainStoinker somewhere
 
 
 def _join_continuations(text: str) -> str:
@@ -503,19 +541,33 @@ def _join_continuations(text: str) -> str:
     return _CONTINUATION.sub(" ", text)
 
 
-def _normalise_connect(command: str) -> str:
-    text = _normalise(command)
+def _resolve_dotdot(m: re.Match[str]) -> str:
+    parts: list[str] = []
+    for part in m.group().split("/"):
+        if part == ".." and parts and parts[-1] not in ("", ".."):
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts)
+
+
+def _normalise_connect(command: str, resolve: bool = True) -> str:
+    # ``$()`` is an empty command substitution: ``Main$()Stoinker`` is the name.
+    text = _normalise(command).replace("$()", "")
     text = re.sub(r"/(?:\./)+", "/", text)
     text = re.sub(r"/\.(?=\s|$)", "/", text)
-    return re.sub(r"/{2,}", "/", text)
+    text = re.sub(r"/{2,}", "/", text)
+    if resolve and "/.." in text:
+        text = _DOTDOT_TOKEN.sub(_resolve_dotdot, text)  # a/b/.. is a
+    return text
 
 
-def _connect_segments(command: str) -> list[tuple[str, str]]:
+def _connect_segments(command: str, resolve: bool = True) -> list[tuple[str, str]]:
     """(segment, separator after it) for the normalised command."""
-    norm = _normalise_connect(command)
+    norm = _normalise_connect(command, resolve)
     out: list[tuple[str, str]] = []
     pos = 0
-    for m in _SEGMENT_SPLIT.finditer(norm):
+    for m in _CONNECT_SPLIT.finditer(norm):
         seg = norm[pos : m.start()].strip()
         if seg:
             out.append((seg, m.group()))
@@ -554,37 +606,76 @@ def _git_runs_args_connect(words: list[str]) -> bool:
     return any(w.startswith("alias.") for w in words) and any("!" in w for w in words)
 
 
-def _positional_table(toks: list[str]) -> list[int | None]:
-    """table[i]: index of the first positional argument at or after i, else None.
+def _tokenise(segment: str) -> tuple[list[str], list[bool]]:
+    """Tokens of a segment, and per token whether ``, ( ) @ [ ] { }`` came right before it."""
+    toks: list[str] = []
+    marks: list[bool] = []
+    pos = 0
+    for m in _TOKEN_RE.finditer(segment):
+        marks.append(_EXPR_CHARS.search(segment, pos, m.start()) is not None)
+        toks.append(m.group())
+        pos = m.end()
+    return toks, marks
+
+
+class _Positionals:
+    """first[i]: index of the first positional argument at or after i, else None.
 
     An option or a redirect is skipped, a bare redirect also skips its target.
-    Built backwards once per segment so that every lookup is O(1).
+    An operator the tokenizer does not follow, or a word that follows an
+    expression character (``("backtest","x")[1]``), counts as the positional
+    itself, so the subcommand check sees it and blocks. Built backwards once per
+    segment so that every lookup is O(1).
     """
-    n = len(toks)
-    table: list[int | None] = [None] * (n + 2)
-    for i in range(n - 1, -1, -1):
-        t = toks[i]
-        if _REDIRECT_BARE.match(t):
-            table[i] = table[i + 2]
-        elif _REDIRECT.match(t) or t.startswith("-"):
-            table[i] = table[i + 1]
-        elif t.rstrip(")}`;"):
-            table[i] = i
-        else:
-            table[i] = table[i + 1]
-    return table
+
+    def __init__(self, toks: list[str], marks: list[bool]) -> None:
+        n = len(toks)
+        first: list[int | None] = [None] * (n + 2)
+        for i in range(n - 1, -1, -1):
+            t = toks[i]
+            if _ODD_OP.match(t) or marks[i]:
+                first[i] = i
+            elif _REDIRECT_BARE.match(t):
+                first[i] = first[i + 2]
+            elif _REDIRECT.match(t) or t.startswith("-"):
+                first[i] = first[i + 1]
+            elif t.rstrip(")}`;"):
+                first[i] = i
+            else:
+                first[i] = first[i + 1]
+        self.first = first
+        self.marks = marks
+
+    def __len__(self) -> int:
+        return len(self.first)
+
+    def __getitem__(self, i: int) -> int | None:
+        return self.first[i]
 
 
 def _check_subcommand(
-    toks: list[str], table: list[int | None], start: int, what: str
+    toks: list[str], table: _Positionals, start: int, what: str
 ) -> str | None:
     idx = table[start] if start < len(table) else None
     if idx is None:
         return None
     sub = toks[idx].rstrip(")}`;")
+    if _ODD_OP.match(sub):
+        return f"`{what}` followed by a redirect or comment the hook cannot follow (`{sub}`)"
+    if table.marks[idx]:
+        return f"`{what}` with an expression in the subcommand position (`{sub}`)"
     if sub in _OFFLINE_SUBCOMMANDS:
         return None
     return f"`{what}` with subcommand `{sub}`"
+
+
+def _literal_offline_sub(toks: list[str], table: _Positionals, start: int) -> bool:
+    """A ForEach-Object loop may run the package only with the subcommand written out."""
+    idx = table[start] if start < len(table) else None
+    if idx is None or _check_subcommand(toks, table, start, "") is not None:
+        return False
+    # ``backtest $_``: a variable right after the subcommand is the loop's value.
+    return not (idx + 1 < len(toks) and toks[idx + 1].startswith("$"))
 
 
 def _first_harmless(toks: list[str]) -> int | None:
@@ -627,17 +718,74 @@ def _scan_code(text: str) -> str | None:
         return "importing MainStoinker.ib (broker code)"
     if "mainstoinker.__main__" in text or "mainstoinker/__main__" in text:
         return "importing MainStoinker.__main__"
+    if "mainstoinker" in text and _CODE_RUNNERS.search(text):
+        return (
+            "code that names MainStoinker and uses __main__, sys.argv, runpy, "
+            "pkgutil, importlib, __import__, exec, eval, compile or ib"
+        )
     return None
 
 
-def _scan_connecting(segment: str) -> str | None:
-    toks = [t for t in _TOKEN_SPLIT.split(segment) if t]
-    n = len(toks)
-    table = _positional_table(toks)
-    feeder = next((k for k, t in enumerate(toks) if t in _FEEDERS), None)
+def _python_code_args(text: str) -> list[str]:
+    """Quoted ``-c`` arguments of python commands, whole (they may contain ``;``)."""
+    out: list[str] = []
+    for count, m in enumerate(_PY_C_ARG.finditer(text)):
+        if count >= 50:
+            break
+        end = _quoted_at(text, m.end())
+        if end is None:
+            continue
+        window = text[max(0, m.start() - 400) : m.start()]
+        cut = max(window.rfind(ch) for ch in ";|&\n\r(")
+        if _has_interpreter(_normalise(window[cut + 1 :])):
+            out.append(text[m.end() : len(text) if end == -1 else end])
+    return out
 
-    def fed(i: int) -> str | None:
-        if feeder is not None and feeder < i:
+
+_QUOTE = re.compile(r"[\"']")
+_PIPE_TO_RUNNER = re.compile(
+    r"[ \t]*\|(?!\|)[ \t]*(?:\S*[\\/])?"
+    r"(?:python[\d.]*|pythonw|py|ipython|bash|sh|zsh|dash|cmd|pwsh|powershell|iex|invoke-expression)"
+    r"(?:\.exe)?(?![\w.-])",
+    re.I,
+)
+
+
+def _piped_code_args(text: str) -> list[str]:
+    """Quoted strings piped straight into a shell or interpreter, whole."""
+    out: list[str] = []
+    pos = 0
+    while len(out) < 50:
+        m = _QUOTE.search(text, pos)
+        if m is None:
+            break
+        end = _quoted_at(text, m.start())
+        if end is None or end == -1:
+            break  # unterminated: the rest is not split into strings
+        if _PIPE_TO_RUNNER.match(text, end):
+            out.append(text[m.start() + 1 : end - 1])
+        pos = end
+    return out
+
+
+def _scan_connecting(segment: str) -> str | None:
+    toks, marks = _tokenise(segment)
+    n = len(toks)
+    table = _Positionals(toks, marks)
+    feeder = next((k for k, t in enumerate(toks) if t in _FEEDERS), None)
+    stream = next((k for k, t in enumerate(toks) if t in _STREAM_FEEDERS), None)
+    last_text_op = next(
+        (k for k in range(n - 1, -1, -1) if toks[k] in _PS_TEXT_OPS), None
+    )
+
+    def fed(i: int, start: int) -> str | None:
+        # xargs / parallel append their input to the command: always blocked.
+        # A ForEach-Object loop is fine when the subcommand is written out.
+        if feeder is None or feeder >= i:
+            return None
+        if (stream is not None and stream < i) or not _literal_offline_sub(
+            toks, table, start
+        ):
             return "arguments fed by xargs/ForEach-Object to MainStoinker are not visible"
         return None
 
@@ -662,7 +810,7 @@ def _scan_connecting(segment: str) -> str | None:
             if mod == "runpy":
                 return "`-m runpy` runs a module by name (MainStoinker is named)"
             continue
-        why = fed(i)
+        why = fed(i, rest_at)
         if why:
             return why
         if mod == "mainstoinker.ib" or mod.startswith("mainstoinker.ib."):
@@ -671,7 +819,9 @@ def _scan_connecting(segment: str) -> str | None:
             why = _check_subcommand(toks, table, rest_at, "-m MainStoinker")
             if why:
                 return why
-        elif mod not in _OTHER_OFFLINE_MODULES:
+            if last_text_op is not None and last_text_op >= rest_at:
+                return "a PowerShell text operator (-replace, -join) rewrites MainStoinker arguments"
+        else:
             return f"`-m {mod}` is not an offline entry point of MainStoinker"
     # Script runs: .../MainStoinker/__main__.py, the package directory and files
     # under MainStoinker/ib. Another -m module (pdb, cProfile, coverage run) does
@@ -685,7 +835,7 @@ def _scan_connecting(segment: str) -> str | None:
             break
         if tok.endswith("mainstoinker/__main__.py"):
             # The entry file of the package: judged whatever runs it.
-            why = fed(i) or _check_subcommand(
+            why = fed(i, i + 1) or _check_subcommand(
                 toks, table, i + 1, "MainStoinker/__main__.py"
             )
             if why:
@@ -695,7 +845,7 @@ def _scan_connecting(segment: str) -> str | None:
         elif tok in ("mainstoinker", "mainstoinker/") or tok.endswith(
             ("/mainstoinker", "/mainstoinker/")
         ):
-            why = fed(i) or _check_subcommand(
+            why = fed(i, i + 1) or _check_subcommand(
                 toks, table, i + 1, "the MainStoinker directory"
             )
             if why:
@@ -742,8 +892,8 @@ def _scan_in_package(segment: str, ctx: _Ctx, weak: bool = False) -> str | None:
     earlier call is invisible), so only ``python __main__.py <x>`` and
     ``python . <x>`` with a non-offline ``<x>`` count.
     """
-    toks = [t for t in _TOKEN_SPLIT.split(segment) if t]
-    table = _positional_table(toks)
+    toks, marks = _tokenise(segment)
+    table = _Positionals(toks, marks)
     start = None
     for k, t in enumerate(toks):
         if _PYTHON_TOKEN.match(t.rsplit("/", 1)[-1]):
@@ -792,6 +942,37 @@ def _scan_in_package(segment: str, ctx: _Ctx, weak: bool = False) -> str | None:
     return None
 
 
+_MODULE_HINT = re.compile(r"(?:^|\s)-[a-z]*m|--module")
+_GLOB_SAMPLES = ("mainstoinker", "mainstoinker.ib", "mainstoinker.ib.cli", "mainstoinker.__main__")
+
+
+def _dynamic_module(segment: str, mentions: bool) -> str | None:
+    """``-m`` followed by a name that is not a literal dotted identifier.
+
+    Such a name (``$M``, ``%M%``, ``Main$(x)Stoinker``, a glob) may be built into
+    ``MainStoinker`` at run time: blocked when the command names the package
+    anywhere, or when a glob could match the package.
+    """
+    toks = segment.split()  # whole words: ``[M]ainStoinker`` is one name
+    for i, tok in enumerate(toks):
+        mod = None
+        if _MODULE_FLAG.match(tok):
+            if i + 1 < len(toks):
+                mod = toks[i + 1]
+        else:
+            attached = _ATTACHED_DYNAMIC.match(tok)
+            if attached:
+                mod = attached.group(1)
+        if mod is None or _LITERAL_MODULE.match(mod.rstrip(")}")):
+            continue
+        glob = _GLOB_CHARS.search(mod) is not None and (
+            len(mod) > 200 or any(fnmatchcase(s, mod) for s in _GLOB_SAMPLES)
+        )
+        if mentions or glob:
+            return f"`-m {mod}` is not a literal module name and could be MainStoinker"
+    return None
+
+
 def _connecting_reason(
     segment: str,
     text_ok: bool = True,
@@ -804,8 +985,21 @@ def _connecting_reason(
         ctx = _Ctx()
     words = segment.split()
     _note_cd(words, ctx)
-    if any(w in _FEEDERS for w in words):
-        ctx.fed = True
+    for w in words:
+        if w in _LOOP_FEEDERS:
+            ctx.fed_loop = True
+        elif w in _STREAM_FEEDERS:
+            ctx.fed_stream = True
+    if _MODULE_HINT.search(segment) and _has_interpreter(segment):
+        is_text = (
+            text_ok
+            and not as_code
+            and _is_text_segment(words)
+            and not _SCRIPT_REDIRECT.search(segment)
+        )
+        why = None if is_text else _dynamic_module(segment, ctx.mentions)
+        if why:
+            return why
     weak = "mainstoinker" not in segment and not ctx.in_pkg
     if weak and not _WEAK_HINT.search(segment):
         return None
@@ -833,10 +1027,11 @@ def _connecting_reason(
     if weak:
         return _scan_in_package(segment, ctx, weak=True)
     why = _scan_connecting(segment)
-    if not why and ctx.fed:
-        # An earlier ForEach-Object / % feeds this command: its arguments are
-        # not visible, so a run of the package is blocked whatever they are.
-        why = _scan_connecting("% " + segment)
+    if not why and (ctx.fed_loop or ctx.fed_stream):
+        # An earlier ForEach-Object / xargs feeds this command: its arguments
+        # are not all visible. A loop is accepted when the subcommand is written
+        # out; xargs and parallel are blocked whatever the arguments are.
+        why = _scan_connecting(("xargs " if ctx.fed_stream else "% ") + segment)
     if why:
         return why
     if as_code:
@@ -887,9 +1082,9 @@ def _heredoc_bodies(text: str) -> list[str]:
     return bodies
 
 
-def _judge_connecting(text: str) -> str | None:
+def _judge_connecting(text: str, resolve: bool = True) -> str | None:
     """The T10 rule over a command whose continuation lines are joined."""
-    segs = _connect_segments(text)
+    segs = _connect_segments(text, resolve)
     # An unbalanced quote means message removal may not have covered the text:
     # then nothing counts as "just text" any more.
     text_ok = text.count('"') % 2 == 0 and text.count("'") % 2 == 0
@@ -899,6 +1094,7 @@ def _judge_connecting(text: str) -> str | None:
         if segs[i][1] == "|" and (_is_pipe_consumer(segs[i + 1][0]) or feeds[i + 1]):
             feeds[i] = True
     ctx = _Ctx()
+    ctx.mentions = "mainstoinker" in _normalise_connect(text, resolve)
     for i, (segment, _sep) in enumerate(segs):
         try:
             why = _connecting_reason(segment, text_ok, ctx, feeds[i])
@@ -912,7 +1108,14 @@ def _judge_connecting(text: str) -> str | None:
             return why
     for body in _heredoc_bodies(text):
         if "mainstoinker" in body.lower():
-            why = _scan_code(_normalise_connect(body))
+            why = _scan_code(_normalise_connect(body, resolve))
+            if why:
+                return why
+    # A ``-c`` argument is code as a whole, also past the ``;`` that split it.
+    for code in _python_code_args(text) + _piped_code_args(text):
+        norm = _normalise_connect(code, resolve)
+        if "mainstoinker" in norm:
+            why = _scan_code(norm)
             if why:
                 return why
     return None
@@ -944,9 +1147,20 @@ def decide(command: str) -> tuple[bool, str]:
 
 
 def _decide(command: str, depth: int) -> tuple[bool, str]:
+    """The command as typed, then its NFKC form (full-width look-alikes): a block in either wins."""
+    result = _decide_text(command, depth)
+    if result[0]:
+        return result
+    folded = unicodedata.normalize("NFKC", command).casefold()
+    if folded != command.casefold():
+        return _decide_text(folded, depth)
+    return result
+
+
+def _decide_text(command: str, depth: int) -> tuple[bool, str]:
     low = command.lower()
     # Quotes, backticks, backslashes and carets inside the name do not hide it.
-    deobfuscated = _ESCAPES.sub("", low)
+    deobfuscated = _ESCAPES.sub("", low).replace("$()", "")
     mentions = "mainstoinker" in low or "mainstoinker" in deobfuscated
     # Backstop: nobody types this by accident, and it is not analysed.
     if mentions and len(command) > _BACKSTOP_LEN:
@@ -989,6 +1203,8 @@ def _decide(command: str, depth: int) -> tuple[bool, str]:
         )
     try:
         why = _judge_connecting(joined)
+        if why is None and ".." in joined:
+            why = _judge_connecting(joined, resolve=False)  # as typed, too
     except Exception:  # noqa: BLE001 - a rule bug must fail closed
         why = "the hook could not analyse a MainStoinker command" if mentions else None
     if why:
