@@ -59,6 +59,7 @@ from tests.test_ib_recorder import (
     reasons,
     recorder,
     session,
+    settle,
     write_recording,
 )
 
@@ -525,6 +526,7 @@ def _script_with_pacing_error(fake: FakeIbClient) -> None:
 
 
 def _ask(conn: Any, skip: int) -> list[Any]:
+    head = settle(conn)
     for _ in range(skip):
         conn.next_request_id()
     c = contract()
@@ -538,7 +540,7 @@ def _ask(conn: Any, skip: int) -> list[Any]:
         and any(isinstance(e, events.IbError) and e.code == 162 for e in evs)
         and any(isinstance(e, events.ContractDetailsEnd) for e in evs)
         and any(isinstance(e, events.HeadTimestamp) for e in evs)
-    ))
+    ), head)
 
 
 def test_pacing_error_session_replays_to_the_same_events_with_new_request_ids(tmp_path: Path) -> None:
@@ -703,6 +705,7 @@ def _history_script() -> Any:
 
 
 def _history_requests(conn: Any, skip: int, with_error: bool) -> list[Any]:
+    head = settle(conn)
     for _ in range(skip):
         conn.next_request_id()
     c = contract()
@@ -719,7 +722,7 @@ def _history_requests(conn: Any, skip: int, with_error: bool) -> list[Any]:
         and any(isinstance(e, events.ContractDetailsEnd) for e in evs)
         and any(isinstance(e, events.HeadTimestamp) for e in evs)
         and (not with_error or any(isinstance(e, events.IbError) and e.code == 162 for e in evs))
-    ))
+    ), head)
 
 
 def _record_and_replay(
@@ -917,7 +920,10 @@ def test_private_words_do_not_rename_events_requests_or_ibapi_attributes(tmp_pat
     assert parsed.problems == [] and rec.failures == 0
     private_lines = read_lines(tmp_path / "private.jsonl")[1:]
     names = [ln["name"] for ln in private_lines]
-    assert names == [ln["name"] for ln in read_lines(tmp_path / "plain.jsonl")[1:]]
+    # the reader thread's farm messages interleave with the requests: compare as a multiset
+    assert collections.Counter(names) == collections.Counter(
+        ln["name"] for ln in read_lines(tmp_path / "plain.jsonl")[1:]
+    )
     assert "historicalData" in names and "reqHeadTimeStamp" in names
     cd = next(ln for ln in private_lines if ln["name"] == "contractDetails")
     assert {"tradingHours", "liquidHours", "timeZoneId"} <= set(cd["args"][1])
@@ -1005,6 +1011,17 @@ def test_an_id_split_over_a_dict_key_and_its_value_is_caught_cold(tmp_path: Path
     assert args[0]["other"] == 1  # the rest of the dict is kept
 
 
+def test_an_id_split_inside_a_dict_key_and_over_its_value_loses_the_key_too(tmp_path: Path) -> None:
+    digits = digits_of(make_id("U", 307))
+    key = "U" + digits[:2]
+    rec = recorder(tmp_path)
+    rec.on_raw("custom", ({key: digits[2:], "other": 1},))
+    rec.close()
+    text = written(tmp_path / "rec.jsonl")
+    assert key not in text and digits[2:] not in text and rec.failures == 0
+    assert read_lines(tmp_path / "rec.jsonl")[1]["args"][0]["other"] == 1
+
+
 def test_plain_dict_keys_and_values_that_do_not_join_into_an_id_are_kept() -> None:
     out = Redactor().sanitise("raw", "custom", ({"conId": "x", "size": 7, "id": "abc"},))
     assert out == [{"conId": "x", "size": 7, "id": "abc"}]
@@ -1088,9 +1105,12 @@ def test_scan_flags_long_digits_under_numeric_names_when_the_value_is_not_a_numb
         ev(3, "tickPrice", 1, 1, [d], {}),  # a list under `price`
         ev(4, "custom", {"__class__": "BarData", "volume": "1234567", "wap": "186.1234", "barCount": 42}),
         ev(5, "custom", {"__class__": "BarData", "volume": "12345678x"}),
+        ev(6, "custom", {"volume": [d]}),  # a list under a Decimal-text name is not a Decimal
     )
     found = scan_recording(path)
-    assert [(f.line, f.reason) for f in found] == [(3, LONG_RUN), (4, LONG_RUN), (6, LONG_RUN)]
+    assert [(f.line, f.reason) for f in found] == [
+        (3, LONG_RUN), (4, LONG_RUN), (6, LONG_RUN), (7, LONG_RUN),
+    ]
 
 
 def test_scan_does_not_flag_an_exchange_token_or_a_date_after_a_word(tmp_path: Path) -> None:

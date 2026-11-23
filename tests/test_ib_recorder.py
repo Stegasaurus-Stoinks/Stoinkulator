@@ -140,8 +140,22 @@ def session(
         conn.close()
 
 
-def collect(conn: IbConnection, done: Callable[[list[Any]], bool]) -> list[Any]:
-    got: list[Any] = []
+def settle(conn: IbConnection, farm_messages: int = 3) -> list[Any]:
+    """The events of the handshake, up to and including its farm messages.
+
+    The reader thread delivers them while the test thread starts asking; which comes first in
+    the recording (and so whether a replay re-creates them) is a race. A test that compares a
+    recorded session with its replay waits here before the first request."""
+    return collect(
+        conn,
+        lambda evs: sum(isinstance(e, events.IbError) and e.req_id == -1 for e in evs) >= farm_messages,
+    )
+
+
+def collect(
+    conn: IbConnection, done: Callable[[list[Any]], bool], got: list[Any] | None = None,
+) -> list[Any]:
+    got = [] if got is None else got
     for _ in range(2000):  # a bound on polls, each at most a few ms; never a sleep
         ev = conn.next_event(0.01)
         if ev is not None:
@@ -175,6 +189,7 @@ def contract(symbol: str = "AAPL") -> Contract:
 
 def run_requests(conn: IbConnection, first_id_skip: int = 0) -> list[Any]:
     """The same four requests, with request ids that depend on `first_id_skip`."""
+    head = settle(conn)
     for _ in range(first_id_skip):
         conn.next_request_id()
     c = contract()
@@ -197,7 +212,7 @@ def run_requests(conn: IbConnection, first_id_skip: int = 0) -> list[Any]:
             and any(isinstance(e, events.IbError) and e.code == 200 for e in evs)
         )
 
-    return collect(conn, done)
+    return collect(conn, done, head)
 
 
 def script_ib(fake: FakeIbClient) -> None:
