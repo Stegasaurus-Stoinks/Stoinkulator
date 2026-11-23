@@ -1,0 +1,57 @@
+[
+ {
+  "id": "AAPL-orc0",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-19 06:33:00",
+  "openPrice": 225.08,
+  "closeTime": "2024-08-19 07:17:00",
+  "closePrice": 223.34,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-orc1",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-20 07:40:00",
+  "openPrice": 226.29,
+  "closeTime": "2024-08-20 12:56:00",
+  "closePrice": 226.64,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-orc2",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 1,
+  "openTime": "2024-08-21 06:45:00",
+  "openPrice": 226.74,
+  "closeTime": "2024-08-21 07:54:00",
+  "closePrice": 226.11,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-orc3",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-22 06:38:00",
+  "openPrice": 227.1,
+  "closeTime": "2024-08-22 06:51:00",
+  "closePrice": 227.79,
+  "status": "Closed"
+ },
+ {
+  "id": "AAPL-orc4",
+  "symbol": "AAPL",
+  "volume": 10,
+  "direction": 0,
+  "openTime": "2024-08-26 06:49:00",
+  "openPrice": 226.12,
+  "closeTime": "2024-08-26 12:56:00",
+  "closePrice": 226.82,
+  "status": "Closed"
+ }
+]

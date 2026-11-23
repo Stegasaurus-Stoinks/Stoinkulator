@@ -13,7 +13,7 @@ SQLite details (stdlib `sqlite3` only):
 - Money, prices and quantities are INTEGER columns in units of 0.0001 (`_e4`)
   and come back as exact `Decimal`. A value finer than 0.0001 is refused.
 - Run start and end are UTC ISO text. Bar times are stored exactly as given
-  (naive local time of the data).
+  (naive America/New_York time of the data; runs stored before that change keep Pacific times).
 - `begin_run` and `write_algos` commit at once. A run that is never ended
   stays `running`; a second connection can read committed data meanwhile.
 - Order events are stored as the event log (`order_events` table, one row per

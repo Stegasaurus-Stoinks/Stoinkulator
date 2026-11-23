@@ -80,7 +80,7 @@ class Algo(ParentAlgo):
                 self.AlgoData.at[self.AlgoData.index[-1],'Trade'] = midpoint
 
                 #End of day trade closing
-                endofDay = self.curStockData['date'].replace(hour=12, minute=55, second=0, microsecond=0)
+                endofDay = self.curStockData['date'].replace(hour=15, minute=55, second=0, microsecond=0)
                 if self.curStockData['date'] > endofDay:
                     self.logger.info("***end of day close position***")
                     self.trade.close_position(self.curStockData['close'],self.curStockData['date'])

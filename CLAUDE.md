@@ -62,7 +62,8 @@ uv pip install --python .venv\Scripts\python.exe -e .
 - `MainStoinker/api/` read-only web API (FastAPI, GET only) and static dashboard, started by `serve`;
   may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy
   (enforced by `tests/test_api_boundary.py`); the engine never imports it.
-- `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests.
+- `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests. Data time is naive
+  `America/New_York` wall-clock time (session 09:30 to 16:00); algos' hard-coded times use it too.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.
 
 ## Testing conventions
