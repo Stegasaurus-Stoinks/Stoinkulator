@@ -34,6 +34,7 @@ from MainStoinker.ib.connection import (
     IbConnection,
     NotConnected,
     ReaderStopped,
+    _Attempt,
 )
 from MainStoinker.Util.broker_guard import BrokerPortRefused
 from tests.fake_ib import REQUEST_ARGS, ConnectBehavior, FakeIbClient
@@ -616,8 +617,39 @@ def test_close_between_attempts_makes_no_further_connect(rig_factory: Callable[.
     with pytest.raises(ConnectionClosedDuringOpen):
         rig.conn.open()
     assert rig.connects == 1
+    assert len(rig.fakes) == 1  # not even a new client is built for the attempt that never runs
     assert rig.conn.state is ConnState.CLOSED
     assert not rig.any_connected()
+
+
+class CloseInDisconnectFake(ProbeFake):
+    """The first disconnect() on the opener thread (the end-of-attempt cleanup) is followed
+    by a close() on that thread, as a signal handler could do."""
+
+    target: IbConnection | None = None
+    fired = False
+
+    def disconnect(self) -> None:
+        super().disconnect()
+        if threading.current_thread().name == "probe-caller" and not CloseInDisconnectFake.fired:
+            CloseInDisconnectFake.fired = True
+            assert CloseInDisconnectFake.target is not None
+            CloseInDisconnectFake.target.close()
+
+
+def test_a_close_during_the_cleanup_of_the_last_failed_attempt_is_reported_as_a_close(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    rig = rig_factory(B.CLIENT_ID_IN_USE, fake_cls=CloseInDisconnectFake, attempts=1)
+    CloseInDisconnectFake.target, CloseInDisconnectFake.fired = rig.conn, False
+    try:
+        opener, out = run_in_thread(rig.conn.open, name="probe-caller")
+        opener.join(WAIT)
+    finally:
+        CloseInDisconnectFake.target = None
+    assert not opener.is_alive()
+    assert type(out[0][1]) is ConnectionClosedDuringOpen  # not ClientIdInUse
+    assert rig.conn.state is ConnState.CLOSED
 
 
 def test_a_connect_that_succeeds_while_close_runs_is_disconnected(rig_factory: Callable[..., Rig]) -> None:
@@ -1719,6 +1751,56 @@ def test_that_failed_attempt_is_retried_like_any_other(
     assert rig.fakes[1].calls_named("reqCurrentTime") and not rig.fakes[0].calls_named("reqCurrentTime")
 
 
+class WaitsForTheCloseNotice(IbConnection):
+    """The opener goes on only when attempt 1 has seen its connection close, and the reader
+    is still alive then (the fake's `run_slow` holds it after `run` returned)."""
+
+    def _pop(self, att: Any, wait: float) -> Any:
+        if att.number == 1 and att.reader is not None:
+            wait_until(lambda: att.closed_seen)
+        return IbConnection._pop(att, wait)
+
+
+def test_a_close_seen_by_a_reader_that_is_still_alive_keeps_ready_from_being_set(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    def hook(fake: Any, n: int) -> None:
+        fake.run_slow.clear()  # the reader thread outlives run(): is_alive() is still True
+        fake.drop("connectionClosed")
+
+    rig = rig_factory(
+        B.ACCEPT, conn_cls=WaitsForTheCloseNotice, attempts=1, join_timeout=0.05, on_connect=hook
+    )
+    with pytest.raises(ConnectFailed) as info:
+        rig.conn.open()
+    assert "right after nextValidId" in info.value.failures[0].message
+    assert rig.conn.state is ConnState.CLOSED
+    rig.fake.run_slow.set()
+
+
+def test_ready_is_refused_for_a_dead_or_stale_attempt() -> None:
+    conn = IbConnection("127.0.0.1", 7497, 21, env={})
+    release = threading.Event()
+    reader = threading.Thread(target=release.wait, args=(WAIT,), name="probe-reader", daemon=True)
+    reader.start()
+    try:
+        assert conn._set_phase(ConnState.CONNECTING)
+        att, other = _Attempt(1), _Attempt(2)
+        att.reader = other.reader = reader
+        conn._att = att
+        assert not conn._set_phase(ConnState.READY, other)  # not the current attempt
+        att.dead = True
+        assert not conn._set_phase(ConnState.READY, att)  # over
+        att.dead, att.closed_seen = False, True
+        assert not conn._set_phase(ConnState.READY, att)  # its connection closed
+        att.closed_seen = False
+        assert conn._set_phase(ConnState.READY, att)  # the live current attempt: allowed
+        assert conn.state is ConnState.READY
+    finally:
+        release.set()
+        reader.join(WAIT)
+
+
 class CloserOnNextValidId(IbConnection):
     """close() starts on another thread and has set its flag when the opener goes on."""
 
@@ -1838,12 +1920,22 @@ def test_close_while_the_factory_builds_the_client_starts_no_connect(
     assert rig.conn.state is ConnState.CLOSED
 
 
+class SlowPollConnection(IbConnection):
+    """A poll interval of 1 s, whatever the rig asks for."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["poll_interval"] = 1.0
+        super().__init__(*args, **kwargs)
+
+
 def test_close_before_connect_has_a_connection_object_still_ends_open_promptly(
     rig_factory: Callable[..., Rig],
 ) -> None:
     # close()'s disconnect lands before connect() exists (a no-op), then the handshake hangs.
-    # The clock never moves, so only the close check in the connect wait can end open().
-    rig = rig_factory(B.HANG, fake_cls=StuckConnectFake, join_timeout=0.2)
+    # The clock never moves and close() would wait 30 s for open() before its own second
+    # disconnect, so only the close check in the connect wait (which wakes after one poll
+    # of 1 s and disconnects the client that exists by then) can end open() within WAIT.
+    rig = rig_factory(B.HANG, fake_cls=StuckConnectFake, join_timeout=30, conn_cls=SlowPollConnection)
     opener, out = run_in_thread(rig.conn.open)
     wait_until(lambda: bool(rig.fakes) and rig.fake.stuck_entered.is_set())
     closer, _ = run_in_thread(rig.conn.close, name="probe-closer")
@@ -1867,7 +1959,7 @@ def test_close_with_a_reader_blocked_in_an_observer_ends_the_ready_wait_without_
         def on_raw(self, name: str, args: tuple[Any, ...]) -> None:
             if name == "managedAccounts":
                 entered.set()
-                release.wait(WAIT)
+                release.wait(10 * WAIT)  # released by the test; never by its own timeout
 
     # ready_timeout 300 s on a clock that never moves: only the close check ends the wait.
     rig = rig_factory(B.NO_NEXT_VALID_ID, observers=(Block(),), ready_timeout=300, join_timeout=0.05)
