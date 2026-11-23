@@ -5,7 +5,6 @@ thread is started through the fake (joined by ``close``) or joined by the test.
 """
 import ast
 import inspect
-import queue
 import socket
 import threading
 from decimal import Decimal
@@ -21,13 +20,15 @@ from ibapi.wrapper import EWrapper
 from tests.fake_ib import (
     CLIENT_ID_IN_USE,
     IMPLEMENTED,
+    REQUEST_ARGS,
+    WAIT,
     Call,
     ConnectBehavior,
     FakeIbClient,
+    HangNeverReleased,
+    Recorder,
     make_bar,
 )
-
-WAIT = 5.0  # an upper bound for a join or a queue get, never a sleep
 
 ORDER_CAPABLE = (
     "placeOrder",
@@ -49,75 +50,6 @@ ORDER_CAPABLE = (
     "sendMsgProtoBuf",
 )
 
-
-# Every request the fake implements, with valid arguments (request id 77 where it has one).
-REQUEST_ARGS: dict[str, tuple[Any, ...]] = {
-    "reqCurrentTime": (),
-    "reqMktData": (77, Contract(), "", False, False, []),
-    "cancelMktData": (77,),
-    "reqMarketDataType": (3,),
-    "reqContractDetails": (77, Contract()),
-    "reqHeadTimeStamp": (77, Contract(), "TRADES", 1, 2),
-    "cancelHeadTimeStamp": (77,),
-    "reqHistoricalData": (77, Contract(), "", "1 D", "1 min", "TRADES", 1, 2, True, []),
-    "cancelHistoricalData": (77,),
-}
-
-
-class Recorder(EWrapper):
-    """An EWrapper that puts every callback it gets on a queue, with its thread id."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.events: queue.Queue[tuple[str, tuple[Any, ...], int]] = queue.Queue()
-
-    def _put(self, name: str, *args: Any) -> None:
-        self.events.put((name, args, threading.get_ident()))
-
-    def get(self) -> tuple[str, tuple[Any, ...], int]:
-        return self.events.get(timeout=WAIT)
-
-    def names(self, n: int) -> list[str]:
-        return [self.get()[0] for _ in range(n)]
-
-    def connectAck(self):
-        self._put("connectAck")
-
-    def nextValidId(self, orderId):
-        self._put("nextValidId", orderId)
-
-    def managedAccounts(self, accountsList):
-        self._put("managedAccounts", accountsList)
-
-    def connectionClosed(self):
-        self._put("connectionClosed")
-
-    def error(self, reqId, errorTime, errorCode, errorString, advancedOrderRejectJson=""):
-        self._put("error", reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
-
-    def historicalData(self, reqId, bar):
-        self._put("historicalData", reqId, bar)
-
-    def historicalDataEnd(self, reqId, start, end):
-        self._put("historicalDataEnd", reqId, start, end)
-
-    def historicalDataUpdate(self, reqId, bar):
-        self._put("historicalDataUpdate", reqId, bar)
-
-    def contractDetails(self, reqId, contractDetails):
-        self._put("contractDetails", reqId, contractDetails)
-
-    def contractDetailsEnd(self, reqId):
-        self._put("contractDetailsEnd", reqId)
-
-    def tickPrice(self, reqId, tickType, price, attrib):
-        self._put("tickPrice", reqId, tickType, price, attrib)
-
-    def marketDataType(self, reqId, marketDataType):
-        self._put("marketDataType", reqId, marketDataType)
-
-    def currentTime(self, time):
-        self._put("currentTime", time)
 
 
 @pytest.fixture
@@ -150,7 +82,11 @@ def test_fake_callbacks_exist_on_ewrapper_with_matching_arity(rec: Recorder) -> 
     # callbacks a scripted session plays, is checked against EWrapper.
     seen: set[str] = set()
     for behavior in ConnectBehavior:
-        if behavior in (ConnectBehavior.HANG, ConnectBehavior.REFUSE):
+        if behavior in (
+            ConnectBehavior.HANG,
+            ConnectBehavior.REFUSE,
+            ConnectBehavior.CLOSED_IN_HANDSHAKE,
+        ):
             continue
         with FakeIbClient(rec, connect_behavior=behavior) as f:
             connect(f)
@@ -193,10 +129,24 @@ def test_fake_delivers_callbacks_on_run_thread(fake: FakeIbClient, rec: Recorder
     assert {d.thread_id for d in fake.delivered if d.name != "connectAck"} == {run_thread.ident}
 
 
+def connect_in_thread(fake: FakeIbClient, errors: list[BaseException]) -> threading.Thread:
+    """connect() on its own thread; whatever it raises is appended to ``errors``."""
+
+    def target() -> None:
+        try:
+            connect(fake)
+        except BaseException as exc:  # noqa: BLE001 - the test inspects it
+            errors.append(exc)
+
+    t = threading.Thread(target=target, name="fake-ib-connect")
+    t.start()
+    return t
+
+
 def test_fake_hang_released_by_disconnect(rec: Recorder) -> None:
     fake = FakeIbClient(rec, connect_behavior=ConnectBehavior.HANG)
-    t = threading.Thread(target=connect, args=(fake,))
-    t.start()
+    errors: list[BaseException] = []
+    t = connect_in_thread(fake, errors)
     try:
         assert fake.connect_entered.wait(WAIT)
         t.join(0.05)
@@ -209,10 +159,41 @@ def test_fake_hang_released_by_disconnect(rec: Recorder) -> None:
         fake.disconnect()
         t.join(WAIT)
     assert not fake.isConnected()
+    # Real ibapi: the connecting thread dies with AttributeError (conn is None after reset()).
+    assert [type(e) for e in errors] == [AttributeError]
+    assert "isConnected" in str(errors[0])
     # A hung connect has no connectAck. Its socket is open, so disconnect() reports
     # connectionClosed once (client.py), on the thread that called disconnect().
     assert rec.get()[::2] == ("connectionClosed", threading.get_ident())
     assert rec.events.empty()
+
+
+def test_hang_never_released_fails_loudly_not_silently(rec: Recorder) -> None:
+    fake = FakeIbClient(rec, connect_behavior=ConnectBehavior.HANG, hang_timeout=0.05)
+    with pytest.raises(HangNeverReleased, match="never released"):
+        connect(fake)
+    assert issubclass(HangNeverReleased, AssertionError)
+    assert not fake.isConnected()
+    fake.connect_entered.clear()
+    fake.script_connect(ConnectBehavior.ACCEPT)
+    connect(fake)  # the client holds no connection afterwards, so a retry is possible
+    assert fake.isConnected()
+    fake.close()
+
+
+def test_connect_entered_is_usable_per_attempt(rec: Recorder) -> None:
+    fake = FakeIbClient(rec, connect_behavior=[ConnectBehavior.HANG, ConnectBehavior.HANG])
+    errors: list[BaseException] = []
+    for attempt in (1, 2):
+        t = connect_in_thread(fake, errors)
+        assert fake.wait_for_hang(attempt, WAIT), f"hang {attempt} never started"
+        assert fake.connect_entered.is_set() and fake.hangs_entered == attempt
+        fake.disconnect()
+        t.join(WAIT)
+        assert not t.is_alive()
+    assert [type(e) for e in errors] == [AttributeError] * 2
+    assert not fake.wait_for_hang(3, 0.01)
+    fake.close()
 
 
 def test_fake_has_no_order_methods() -> None:
@@ -270,11 +251,11 @@ def test_fake_never_opens_a_socket(monkeypatch: pytest.MonkeyPatch, rec: Recorde
         IMPLEMENTED
     )
     with FakeIbClient(rec, connect_behavior=ConnectBehavior.HANG) as f:
-        t = threading.Thread(target=connect, args=(f,))
-        t.start()
+        t = connect_in_thread(f, errors := [])
         assert f.connect_entered.wait(WAIT)
         f.disconnect()
         t.join(WAIT)
+        assert [type(e) for e in errors] == [AttributeError]
     assert touched == []
 
 
@@ -308,11 +289,18 @@ def test_accept_plays_the_handshake_on_run(fake: FakeIbClient, rec: Recorder) ->
 def test_refuse_reports_502_on_the_calling_thread(rec: Recorder) -> None:
     f = FakeIbClient(rec, connect_behavior=ConnectBehavior.REFUSE)
     connect(f)
+    # client.py 355-359: error 502 (four arguments), then disconnect() -> connectionClosed,
+    # both on the calling thread, before connect() returns.
     name, args, tid = rec.get()
     assert (name, args[2], tid) == ("error", 502, threading.get_ident())
     assert "Couldn't connect to TWS" in args[3]
+    assert len(f.delivered[0].args) == 4
+    assert rec.get()[::2] == ("connectionClosed", threading.get_ident())
     assert not f.isConnected()
     assert rec.events.empty()
+    f.disconnect()
+    assert rec.events.empty(), "the refused connection is already closed"
+    assert [d.name for d in f.delivered] == ["error", "connectionClosed"]
 
 
 def test_client_id_in_use_is_326_then_close(rec: Recorder) -> None:
@@ -356,12 +344,61 @@ def test_connect_behaviours_script_per_attempt(rec: Recorder) -> None:
     f.close()
 
 
-def test_connect_twice_reports_already_connected(fake: FakeIbClient, rec: Recorder) -> None:
+def test_connect_twice_without_disconnect_raises_assertion_error(
+    fake: FakeIbClient, rec: Recorder
+) -> None:
+    # Real ibapi has no 501: it opens a second socket and orphans the first.
     connect(fake)
-    connect(fake)
+    with pytest.raises(AssertionError, match="second socket"):
+        connect(fake)
     assert fake.connects == 1
     assert rec.names(1) == ["connectAck"]
-    assert rec.get()[1][2] == 501
+    assert rec.events.empty()
+    fake.disconnect()
+    connect(fake)  # after a disconnect it is fine
+    assert fake.connects == 2
+
+
+def test_connect_after_a_refused_or_closed_attempt_is_allowed(
+    rec: Recorder,
+) -> None:
+    f = FakeIbClient(rec, connect_behavior=[ConnectBehavior.REFUSE, ConnectBehavior.CLOSED_IN_HANDSHAKE,
+                                            ConnectBehavior.ACCEPT])
+    connect(f)  # refused: the client disconnected itself
+    connect(f)  # closed in the handshake: reset by the client itself
+    connect(f)
+    assert f.isConnected() and f.connects == 3
+    f.close()
+
+
+def test_closed_in_handshake_returns_silently(rec: Recorder) -> None:
+    # client.py 326-331: recvMsg() saw the close -> reset() and return. No callback at all.
+    f = FakeIbClient(rec, connect_behavior=ConnectBehavior.CLOSED_IN_HANDSHAKE)
+    connect(f)
+    assert rec.events.empty() and f.delivered == []
+    assert not f.isConnected()
+    assert f.connState == EClient.DISCONNECTED and f.serverVersion() is None
+    f.disconnect()
+    assert rec.events.empty(), "no connection object is left, so disconnect() reports nothing"
+    f.run()  # nothing queued, nothing open: returns at once
+    assert rec.events.empty()
+
+
+def test_drop_texts_per_code(fake: FakeIbClient, rec: Recorder) -> None:
+    connect(fake)
+    fake.run_in_thread()
+    for _ in range(6):
+        rec.get()
+    for code, needle in ((1100, "lost"), (1101, "data lost"), (1102, "data maintained"),
+                         (2110, "broken")):
+        fake.drop(code)
+        got = rec.get()
+        assert (got[0], got[1][2]) == ("error", code)
+        assert needle in got[1][3]
+    fake.drop(1300, "Socket port has been reset")
+    assert rec.get()[1][3] == "Socket port has been reset"
+    with pytest.raises(ValueError, match="needs a text"):
+        fake.drop(1300)
 
 
 # -- requests, responses, pushes, drops --------------------------------------
@@ -481,6 +518,8 @@ def test_close_joins_threads(rec: Recorder) -> None:
     f = FakeIbClient(rec)
     connect(f)
     t = f.run_in_thread()
+    for _ in range(6):  # let run() deliver what is queued: a disconnect first would lose it
+        rec.get()
     f.close()
     assert not t.is_alive()
 

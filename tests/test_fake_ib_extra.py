@@ -6,6 +6,7 @@ Same rules as test_fake_ib.py: no real socket, no real sleep, every thread joine
 import inspect
 import re
 import threading
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -13,10 +14,16 @@ import pytest
 from ibapi.client import EClient
 from ibapi.contract import Contract
 
-from tests.fake_ib import IMPLEMENTED, ConnectBehavior, FakeIbClient, make_bar
-from tests.test_fake_ib import REQUEST_ARGS, Recorder
-
-WAIT = 5.0
+from tests.fake_ib import (
+    IMPLEMENTED,
+    REQUEST_ARGS,
+    WAIT,
+    ConnectBehavior,
+    FakeIbClient,
+    HangNeverReleased,
+    Recorder,
+    make_bar,
+)
 
 # Encoder message ids (ibapi.message.OUT) that place, change or cancel an order,
 # or otherwise only make sense for a trading client.
@@ -119,14 +126,26 @@ def test_push_before_connect_waits_and_a_disconnect_does_not_lose_it(rec: Record
     assert not t.is_alive()
 
 
-def test_push_after_disconnect_is_delivered_by_the_next_run(rec: Recorder) -> None:
+def test_run_after_caller_disconnect_with_queued_messages_raises_type_error(rec: Recorder) -> None:
+    # client.py 426: reset() left serverVersion_ None; `None >= MIN_SERVER_VER_PROTOBUF` raises
+    # for the first queued message. Pinned against the real client in the comparison tests.
     f = FakeIbClient(rec)
     connect(f)
     f.disconnect()
     f.push("currentTime", 5)
-    f.run()  # not open, but the queue is not empty: ibapi's loop condition too
-    names = [rec.get()[0] for _ in range(rec.events.qsize())]
-    assert "currentTime" in names
+    assert isinstance(_run_catching(f.run), TypeError)
+    assert [d.name for d in f.delivered] == ["connectAck", "connectionClosed"]
+    f.close()
+
+
+def test_run_after_peer_close_still_drains_the_queue(rec: Recorder) -> None:
+    f = FakeIbClient(rec)
+    connect(f)
+    f.push("currentTime", 5)
+    f.drop("connectionClosed")  # no reset(): serverVersion() stays set
+    assert _run_catching(f.run) is None
+    names = [d.name for d in f.delivered]
+    assert names[:1] == ["connectAck"] and "currentTime" in names and names[-1] == "connectionClosed"
     f.close()
 
 
@@ -144,17 +163,20 @@ def test_drop_while_a_request_is_pending_still_delivers_the_response(rec: Record
 
 def test_hang_is_released_by_close(rec: Recorder) -> None:
     f = FakeIbClient(rec, connect_behavior=ConnectBehavior.HANG)
-    t = threading.Thread(target=connect, args=(f,))
+    errors: list[BaseException] = []
+    t = threading.Thread(target=_catching(lambda: connect(f), errors))
     t.start()
     assert f.connect_entered.wait(WAIT)
     f.close()
     t.join(WAIT)
     assert not t.is_alive()
+    assert [type(e) for e in errors] == [AttributeError]
 
 
-def test_hang_timeout_ends_the_connect_by_itself(rec: Recorder) -> None:
+def test_hang_timeout_is_an_error_not_a_silent_failed_connect(rec: Recorder) -> None:
     f = FakeIbClient(rec, connect_behavior=ConnectBehavior.HANG, hang_timeout=0.05)
-    connect(f)  # returns after the (injected, short) timeout
+    with pytest.raises(HangNeverReleased, match="never released"):
+        connect(f)  # the (injected, short) valve fires
     assert not f.isConnected()
 
 
@@ -341,14 +363,112 @@ class _StubSocket:
         pass
 
 
-def _real_connected_client(wrapper: Recorder) -> EClient:
+def _real_connected_client(wrapper: Recorder, server_version: int | None = None) -> EClient:
     from ibapi.connection import Connection
 
     client = EClient(wrapper)
     client.conn = Connection("127.0.0.1", 7497)  # __init__ opens nothing
     client.conn.socket = _StubSocket()
     client.setConnState(EClient.CONNECTED)
+    if server_version is not None:
+        from ibapi import decoder
+
+        client.serverVersion_ = server_version
+        client.decoder = decoder.Decoder(wrapper, server_version)
     return client
+
+
+def _catching(fn: Callable[[], Any], errors: list[BaseException]) -> Callable[[], None]:
+    def target() -> None:
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - the test inspects it
+            errors.append(exc)
+
+    return target
+
+
+def _run_catching(run: Callable[[], Any]) -> BaseException | None:
+    """Run ``run()`` on a daemon thread with a join timeout, so a mistake fails, not hangs."""
+    errors: list[BaseException] = []
+    t = threading.Thread(target=_catching(run, errors), name="run-under-test", daemon=True)
+    t.start()
+    t.join(WAIT)
+    assert not t.is_alive(), "run() did not end"
+    return errors[0] if errors else None
+
+
+class _RawRecorder(Recorder):
+    """Records ``error`` with exactly the positional arguments it was called with."""
+
+    def error(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        assert not kwargs
+        self._put("error", *args)
+
+
+class _StubConnection:
+    """A stand-in for ibapi's ``Connection``, installed under ``ibapi.client.Connection``.
+
+    It has no socket and no DNS: ``EClient.connect`` runs for real against it. It
+    keeps the real ``Connection``'s observable behaviour for each mode:
+
+    * ``refuse``: ``connect`` swallows the refusal (connection.py 44-47, its wrapper
+      is None) and ``sendMsg`` then raises ``OSError`` (an unconnected socket).
+    * ``hang``: TCP is up, ``recvMsg`` returns an empty buffer on every 1 s timeout.
+      ``disconnect`` leaves ``isConnected`` True, which pins the dominant ordering:
+      the handshake loop reaches ``self.conn`` after ``reset()`` made it None.
+    * ``close``: the first ``recvMsg`` sees the close (``isConnected`` False, empty buffer).
+    """
+
+    mode = "refuse"
+    entered = threading.Event()
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host, self.port = host, port
+        self.open = False
+
+    def connect(self) -> None:
+        self.open = self.mode != "refuse"
+
+    def sendMsg(self, msg: bytes) -> int:
+        if self.mode == "refuse":
+            raise OSError(10057, "socket is not connected")
+        return len(msg)
+
+    def recvMsg(self) -> bytes:
+        if self.mode == "close":
+            self.open = False
+        else:
+            self.entered.set()
+            threading.Event().wait(0.002)  # stands in for the socket timeout
+        return b""
+
+    def isConnected(self) -> bool:
+        return self.open
+
+    def disconnect(self) -> None:
+        if self.mode != "hang":
+            self.open = False
+
+
+@pytest.fixture
+def stub_connection(monkeypatch: pytest.MonkeyPatch) -> type[_StubConnection]:
+    class Stub(_StubConnection):
+        entered = threading.Event()
+
+    monkeypatch.setattr("ibapi.client.Connection", Stub)
+    return Stub
+
+
+def _outcome(rec: Recorder, client: Any) -> dict[str, Any]:
+    """What a connect left behind, comparable between the real client and the fake."""
+    me = threading.get_ident()
+    events = []
+    while not rec.events.empty():
+        name, args, tid = rec.get()
+        extra = (args[2], len(args)) if name == "error" else ()
+        events.append((name, extra, tid == me))
+    return {"events": events, "connected": client.isConnected(), "state": client.connState}
 
 
 def _closed(rec: Recorder) -> list[int]:
@@ -393,8 +513,11 @@ def test_peer_close_is_not_connected_at_once_and_closed_once_on_the_run_thread(
     real.conn.socket = None  # the reader saw the close
     assert not real.isConnected()
     assert real_rec.events.empty()
-    real.run()
-    assert _closed(real_rec) == [threading.get_ident()]
+    t = threading.Thread(target=real.run, daemon=True)  # reported on the run thread
+    t.start()
+    t.join(WAIT)
+    assert not t.is_alive()
+    assert _closed(real_rec) == [t.ident]
     real.disconnect()
     assert real_rec.events.empty()
 
@@ -432,7 +555,7 @@ def test_caller_disconnect_closes_once_on_the_caller_thread_and_run_adds_nothing
     real.disconnect()
     assert not real.isConnected()
     assert _closed(real_rec) == [threading.get_ident()]
-    real.run()  # the finally disconnect() finds no connection object
+    assert _run_catching(real.run) is None  # the finally disconnect() finds no connection object
     real.disconnect()
     assert real_rec.events.empty()
 
@@ -529,3 +652,135 @@ def test_respond_with_a_list_hands_the_wrapper_a_fresh_object_each_time(rec: Rec
         rec.get()
         delivered = rec.get()[1][1]
         assert delivered is not contract and delivered.symbol == "AAPL"
+
+
+# -- the fake against the real EClient.connect, driven through a stand-in Connection ----------
+#
+# ``EClient.connect`` runs for real; only ``ibapi.client.Connection`` is replaced by
+# _StubConnection (no socket, no DNS lookup). Each test makes the real client do the
+# scenario, makes the fake do it, and compares what the wrapper saw and the state left.
+
+
+def test_refused_connect_matches_real_ibapi(stub_connection: type[_StubConnection]) -> None:
+    stub_connection.mode = "refuse"
+    real_rec = _RawRecorder()
+    real = EClient(real_rec)
+    real.connect("127.0.0.1", 7497, 21)
+    expected = _outcome(real_rec, real)
+    assert [e[:2] for e in expected["events"]] == [("error", (502, 4)), ("connectionClosed", ())]
+    assert all(e[2] for e in expected["events"]), "both on the calling thread"
+    assert not expected["connected"]
+    real.disconnect()
+    assert real_rec.events.empty()
+
+    fake_rec = _RawRecorder()
+    fake = FakeIbClient(fake_rec, connect_behavior=ConnectBehavior.REFUSE)
+    connect(fake)
+    assert _outcome(fake_rec, fake) == expected
+    fake.disconnect()
+    assert fake_rec.events.empty()
+
+
+def test_hung_connect_released_by_disconnect_matches_real_ibapi(
+    stub_connection: type[_StubConnection],
+) -> None:
+    stub_connection.mode = "hang"
+    real_rec = _RawRecorder()
+    real = EClient(real_rec)
+    real_errors: list[BaseException] = []
+    t = threading.Thread(
+        target=_catching(lambda: real.connect("127.0.0.1", 7497, 21), real_errors), daemon=True
+    )
+    t.start()
+    assert stub_connection.entered.wait(WAIT)
+    assert not real.isConnected()  # state CONNECTING
+    real.disconnect()
+    t.join(WAIT)
+    assert not t.is_alive()
+    assert [type(e) for e in real_errors] == [AttributeError]
+    expected = _outcome(real_rec, real)
+    assert expected["events"] == [("connectionClosed", (), True)]
+
+    fake_rec = _RawRecorder()
+    fake = FakeIbClient(fake_rec, connect_behavior=ConnectBehavior.HANG)
+    fake_errors: list[BaseException] = []
+    t = threading.Thread(target=_catching(lambda: connect(fake), fake_errors), daemon=True)
+    t.start()
+    assert fake.wait_for_hang(1, WAIT)
+    assert not fake.isConnected()
+    fake.disconnect()
+    t.join(WAIT)
+    assert not t.is_alive()
+    assert [type(e) for e in fake_errors] == [AttributeError]
+    assert _outcome(fake_rec, fake) == expected
+
+
+def test_socket_closed_during_handshake_matches_real_ibapi(
+    stub_connection: type[_StubConnection],
+) -> None:
+    stub_connection.mode = "close"
+    real_rec = _RawRecorder()
+    real = EClient(real_rec)
+    real.connect("127.0.0.1", 7497, 21)
+    expected = _outcome(real_rec, real)
+    assert expected == {"events": [], "connected": False, "state": EClient.DISCONNECTED}
+    assert real.serverVersion() is None and real.conn is None
+    real.disconnect()
+    assert real_rec.events.empty(), "nothing is left to close"
+
+    fake_rec = _RawRecorder()
+    fake = FakeIbClient(fake_rec, connect_behavior=ConnectBehavior.CLOSED_IN_HANDSHAKE)
+    connect(fake)
+    assert _outcome(fake_rec, fake) == expected
+    assert fake.serverVersion() is None
+    fake.disconnect()
+    assert fake_rec.events.empty()
+
+
+def test_run_after_caller_disconnect_matches_real_ibapi() -> None:
+    real_rec = _RawRecorder()
+    real = _real_connected_client(real_rec)
+    real.msg_queue.put(b"\x00\x00\x00\x31" + b"1\x001700000000\x00")  # a queued currentTime
+    real.disconnect()
+    error = _run_catching(real.run)
+    assert isinstance(error, TypeError), error
+    expected = _outcome(real_rec, real)
+    assert [e[0] for e in expected["events"]] == ["connectionClosed"]
+
+    fake_rec = _RawRecorder()
+    fake = FakeIbClient(fake_rec)
+    connect(fake)
+    fake.disconnect()  # the connect's handshake messages are still queued
+    assert isinstance(_run_catching(fake.run), TypeError)
+    got = _outcome(fake_rec, fake)
+    assert [e[0] for e in got["events"]] == ["connectAck", "connectionClosed"]
+    assert got["connected"] == expected["connected"] and got["state"] == expected["state"]
+
+
+def test_run_after_peer_close_drains_the_queue_on_the_real_client_too() -> None:
+    real_rec = _RawRecorder()
+    real = _real_connected_client(real_rec, server_version=222)
+    real.msg_queue.put(b"\x00\x00\x00\x31" + b"1\x001700000000\x00")
+    real.conn.socket = None  # what the reader does when TWS closes
+    assert _run_catching(real.run) is None
+    assert [e[0] for e in _outcome(real_rec, real)["events"]] == ["currentTime", "connectionClosed"]
+
+
+def test_second_connect_on_real_ibapi_builds_a_second_connection(
+    stub_connection: type[_StubConnection],
+) -> None:
+    # Why the fake raises instead of reporting 501: the real client has no such check.
+    stub_connection.mode = "hang"
+    real = EClient(Recorder())
+    first = _StubConnection("h", 1)
+    real.conn = first  # a connection object exists, as after a first connect()
+    errors: list[BaseException] = []
+    t = threading.Thread(
+        target=_catching(lambda: real.connect("127.0.0.1", 7497, 21), errors), daemon=True
+    )
+    t.start()
+    assert stub_connection.entered.wait(WAIT)
+    assert real.conn is not first, "connect() built a new Connection over the old one"
+    real.disconnect()
+    t.join(WAIT)
+    assert not t.is_alive()

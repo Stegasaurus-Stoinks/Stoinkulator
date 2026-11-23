@@ -9,37 +9,71 @@ through the client factory, while the real factory stays blocked.
 Behaviour follows ibapi 10.37 (``client.py``, ``connection.py``, ``reader.py``):
 
 * ``connect`` returns once the handshake is done. ``wrapper.connectAck()`` is
-  called on the calling thread, last, before ``connect`` returns (``client.py``:
-  after ``startApi``). A refused connection is reported through
-  ``wrapper.error(502)`` on the calling thread. Everything TWS says after the
-  handshake (``nextValidId``, ``managedAccounts``, the 21xx notices) is queued
-  and delivered by ``run``.
-* ``connectionClosed`` is called exactly once per connection, by
-  ``EClient.disconnect`` and on the thread that runs it: the caller's thread for
-  ``disconnect()``, the ``run`` thread for the ``finally`` of ``run()``.
-  ``Connection.disconnect`` never reports it, because ``EClient`` never sets
-  ``Connection.wrapper``. A later ``disconnect()`` of an already disconnected
-  client reports nothing.
+  called on the calling thread, last, before ``connect`` returns (``client.py``
+  348-354: after ``startApi``). Everything TWS says after the handshake
+  (``nextValidId``, ``managedAccounts``, the 21xx notices) is queued and
+  delivered by ``run``.
+* A refused connection (``REFUSE``; also a DNS failure or a connect timeout) is
+  one ``error(-1, t, 502, text)`` and then one ``connectionClosed``, both on the
+  calling thread, before ``connect`` returns (``connection.py`` 44-47 swallows
+  the refusal, ``sendMsg`` at ``client.py`` 317 raises, the ``except socket.error``
+  at 355-359 reports 502 and calls ``disconnect()``). ``isConnected()`` is False
+  afterwards and a later ``disconnect()`` reports nothing.
+* ``HANG`` (TWS accepted the socket but never answers the handshake) blocks
+  ``connect`` until ``disconnect()`` is called from another thread. Real ibapi
+  then raises ``AttributeError`` on the connecting thread (``reset()`` has set
+  ``conn`` to None, and the handshake loop at ``client.py`` 325-326 uses it), so
+  the fake raises ``AttributeError`` from ``connect`` too, after the
+  ``connectionClosed`` the disconnecting thread reported. If the test never
+  releases the hang, ``hang_timeout`` ends it with ``HangNeverReleased`` (an
+  ``AssertionError``): a silent timeout would let code that never disconnects pass.
+* ``CLOSED_IN_HANDSHAKE`` (TWS accepts the socket and closes it during the
+  handshake): ``connect`` returns silently (``client.py`` 326-331: ``reset()``
+  and ``return``): no 502, no ``connectAck``, no ``connectionClosed``;
+  ``isConnected()`` is False, the client holds no connection, and a later
+  ``disconnect()`` reports nothing.
+* A second ``connect`` while the client still holds a connection (before
+  ``disconnect()``: hung, connected or peer-closed) raises ``AssertionError``.
+  Real ibapi has no "already connected" error (``ALREADY_CONNECTED`` in
+  ``errors.py`` is never used); it silently opens a second socket and orphans
+  the first, so a retry that forgets ``disconnect()`` must fail loudly here.
+* ``connectionClosed`` is called once per connection, by ``EClient.disconnect``
+  and on the thread that runs it: the caller's thread for ``disconnect()``, the
+  ``run`` thread for the ``finally`` of ``run()``. ``Connection.disconnect``
+  never reports it, because ``EClient`` never sets ``Connection.wrapper``. A
+  later ``disconnect()`` of a disconnected client reports nothing.
 * A socket closed by the peer (``drop("connectionClosed")``, the end of the
   CLIENT_ID_IN_USE script) makes ``isConnected()`` False at once, as the real
   reader thread does; ``run`` then drains what is queued, ends, and its
-  ``disconnect()`` reports ``connectionClosed``. The one difference: the fake
-  has no reader thread; the socket closes on the thread that calls ``drop`` (or
-  ``connect``), and nothing is delivered from it.
+  ``disconnect()`` reports ``connectionClosed``. A peer close does not reset the
+  client, so draining works. After a caller ``disconnect()`` (which does reset,
+  so ``serverVersion()`` is None) ``run`` raises ``TypeError`` as soon as it
+  dequeues a message (``client.py`` 426), as real ibapi does; the message is lost.
 * The error a request answers when not connected (504) carries the request id
   for ``reqMktData``, ``cancelMktData`` and ``reqHistoricalData`` and
   ``NO_VALID_ID`` for the others, as in ``client.py``; it comes on the calling
-  thread.
+  thread. The client-side errors the fake raises itself (502, 504) pass four
+  arguments, as ``client.py`` does; errors TWS sends (326, 1100, 21xx) pass five,
+  as ``decoder.py`` does.
 * Everything else the fake plays is delivered on the thread that runs
   ``run()``. A callback's arguments are deep-copied at delivery.
 * Callback names and argument lists are checked against ``EWrapper`` when they
   are queued, so a wrong script fails loudly in the test that wrote it.
 
-Known differences: the connect-refused script reports 502 but no
-``connectionClosed`` (real ``EClient.connect`` probably reports one, after a
-second 502, but that depends on the OS socket and cannot be checked offline);
-``disconnect()`` claims the connection atomically, so two threads
-disconnecting at once report one ``connectionClosed`` in total, never a race.
+Known differences from real ibapi: the fake has no reader thread and no socket
+timing, so a peer close happens on the thread that calls ``drop`` (or
+``connect``); for CLIENT_ID_IN_USE ``isConnected()`` is already False when
+``connect`` returns, where real TWS closes asynchronously and a poll right after
+``connect`` usually still sees True. ``disconnect()`` claims the connection
+atomically, so two threads disconnecting at once report one ``connectionClosed``
+in total, where real ibapi can report two or raise. A hung connect released by
+``disconnect()`` always raises ``AttributeError``, where real ibapi may return
+cleanly if its loop runs in the narrow window between the socket close and
+``reset()``. ``host``, ``port`` and ``clientId`` are kept after a disconnect
+(real ``reset()`` clears them). The message that makes ``run`` raise
+``TypeError`` is dropped; no other decoder failure (``BadMessage``, over-long
+messages) is modelled. The 1101, 1102 and 2110 texts of ``drop`` are IB's
+documented wording, not taken from ibapi, which has no such table.
 
 Nothing here sleeps. ``run`` blocks on a queue with a short timeout only to
 notice a disconnect; a hang is a ``threading.Event`` released by
@@ -107,12 +141,27 @@ _NEEDS_CONNECTION = frozenset(IMPLEMENTED) - {
 _WAKE = "__wake__"  # internal queue item: re-check the loop condition
 
 
+class HangNeverReleased(AssertionError):
+    """A HANG connect reached ``hang_timeout``: the code under test never called disconnect()."""
+
+
+# What TWS says for the connectivity codes ``drop`` can push (IB's documented wording).
+DROP_TEXTS: dict[int, str] = {
+    1100: "Connectivity between IB and Trader Workstation has been lost.",
+    1101: "Connectivity between IB and TWS has been restored- data lost.*",
+    1102: "Connectivity between IB and TWS has been restored- data maintained.",
+    2110: "Connectivity between Trader Workstation and server is broken. "
+    "It will be restored automatically.",
+}
+
+
 class ConnectBehavior(enum.Enum):
     ACCEPT = "accept"
-    REFUSE = "refuse"  # error 502 from connect()
+    REFUSE = "refuse"  # error 502, then connectionClosed, both from connect()
     HANG = "hang"  # connect() blocks until disconnect() (TWS accept dialog open)
     CLIENT_ID_IN_USE = "client_id_in_use"  # error 326, then the socket closes
     NO_NEXT_VALID_ID = "no_next_valid_id"  # accepted, but nextValidId never comes
+    CLOSED_IN_HANDSHAKE = "closed_in_handshake"  # socket accepted, then closed: silent return
 
 
 @dataclass(frozen=True)
@@ -180,7 +229,9 @@ def _recorded(fn: Callable[..., Any]) -> Callable[..., Any]:
         self._record(Call(name, args))
         if name in _NEEDS_CONNECTION and not self._connected():
             req_id = args[0] if name in _504_WITH_REQ_ID else NO_VALID_ID
-            self.wrapper.error(req_id, self._clock_ms(), NOT_CONNECTED.code(), NOT_CONNECTED.msg())
+            self._deliver(
+                "error", (req_id, self._clock_ms(), NOT_CONNECTED.code(), NOT_CONNECTED.msg())
+            )
             return None
         result = fn(self, *bound.args[1:], **bound.kwargs)
         if name in _NEEDS_CONNECTION:
@@ -212,7 +263,11 @@ class FakeIbClient:
         self.next_valid_id = next_valid_id
         self.managed_accounts = managed_accounts
         self.hang_timeout = hang_timeout
-        self.connect_entered = threading.Event()  # set when a HANG connect starts waiting
+        # Cleared at each connect() entry, set when a HANG connect starts waiting. For a
+        # script with several hangs use hangs_entered / wait_for_hang(n), which count.
+        self.connect_entered = threading.Event()
+        self.hangs_entered = 0
+        self._hang_cond = threading.Condition()
         self.calls: list[Call] = []
         self.delivered: list[Delivery] = []
         self.connects = 0
@@ -265,10 +320,11 @@ class FakeIbClient:
         _check_callback(callback, args)
         self._q.put((callback, args))
 
-    def drop(self, code: int | str = CONNECTION_LOST) -> None:
+    def drop(self, code: int | str = CONNECTION_LOST, text: str | None = None) -> None:
         """Simulate the connection going away.
 
-        ``1100`` (or any int) pushes ``error(-1, t, code, ...)``; ``"connectionClosed"``
+        An int pushes ``error(-1, t, code, text, "")`` with IB's wording for 1100,
+        1101, 1102 and 2110 (any other code needs ``text``); ``"connectionClosed"``
         closes the socket under the client: ``isConnected()`` is False at once and
         ``run()`` drains its queue, delivers ``connectionClosed`` (once) and returns.
         """
@@ -277,8 +333,16 @@ class FakeIbClient:
             return
         if not isinstance(code, int):
             raise ValueError(f"drop() takes an IB error code or 'connectionClosed', not {code!r}")
-        text = "Connectivity between IB and Trader Workstation has been lost."
+        if text is None:
+            if code not in DROP_TEXTS:
+                raise ValueError(f"drop({code}) needs a text; known codes: {sorted(DROP_TEXTS)}")
+            text = DROP_TEXTS[code]
         self.push("error", NO_VALID_ID, self._clock_ms(), code, text, "")
+
+    def wait_for_hang(self, count: int = 1, timeout: float = 5.0) -> bool:
+        """Wait until ``count`` HANG connects in total have started waiting."""
+        with self._hang_cond:
+            return self._hang_cond.wait_for(lambda: self.hangs_entered >= count, timeout)
 
     # -- recorded inspection helpers -----------------------------------------
     def calls_named(self, name: str) -> list[Call]:
@@ -317,29 +381,44 @@ class FakeIbClient:
     def connect(self, host, port, clientId):
         self.host, self.port, self.clientId = host, port, clientId
         with self._lock:
-            if self._connected():
-                self.wrapper.error(NO_VALID_ID, self._clock_ms(), 501, "Already connected.", "")
-                return
+            if self._conn:
+                raise AssertionError(
+                    "connect() called again before disconnect(): real ibapi has no 'already "
+                    "connected' error (ALREADY_CONNECTED in errors.py is never used); it would "
+                    "silently open a second socket and orphan the first, so the code under test "
+                    "must disconnect() before it connects again"
+                )
             self.connects += 1
             behavior = self._behaviors[min(self.connects, len(self._behaviors)) - 1]
             self._release.clear()
-            self._conn = behavior is not ConnectBehavior.REFUSE
+            self.connect_entered.clear()
+            self._conn = True  # client.py 299: self.conn = Connection(...) comes first
             self.connState = EClient.CONNECTING
         if behavior is ConnectBehavior.HANG:
             with self._lock:
                 self._sock = True  # TCP is up; TWS has not answered the handshake
-            self.connect_entered.set()
+            with self._hang_cond:
+                self.connect_entered.set()
+                self.hangs_entered += 1
+                self._hang_cond.notify_all()
             if not self._release.wait(self.hang_timeout):  # safety valve, not ibapi behaviour
-                with self._lock:
-                    self._sock = self._conn = False
-                    self.connState = EClient.DISCONNECTED
-            return
+                self._reset()
+                raise HangNeverReleased(
+                    f"connect() hung for {self.hang_timeout}s and the test never released it: "
+                    "the code under test must call disconnect() to end a hung connect"
+                )
+            # client.py 325-326: disconnect() has reset() the client, so conn is None here.
+            raise AttributeError("'NoneType' object has no attribute 'isConnected'")
         if behavior is ConnectBehavior.REFUSE:
-            with self._lock:
-                self.connState = EClient.DISCONNECTED
-            self.wrapper.error(
-                NO_VALID_ID, self._clock_ms(), CONNECT_FAIL.code(), CONNECT_FAIL.msg(), ""
+            # client.py 355-359: error 502 (four arguments), then disconnect() -> connectionClosed.
+            self._deliver(
+                "error", (NO_VALID_ID, self._clock_ms(), CONNECT_FAIL.code(), CONNECT_FAIL.msg())
             )
+            self._disconnect()
+            return
+        if behavior is ConnectBehavior.CLOSED_IN_HANDSHAKE:
+            # client.py 326-331: recvMsg() saw the close; reset() and return, silently.
+            self._reset()
             return
         with self._lock:
             self._sock = True
@@ -384,6 +463,14 @@ class FakeIbClient:
                     continue
                 if name == _WAKE:
                     continue
+                with self._lock:
+                    version = self._server_version_now
+                if version is None:
+                    # client.py 426: reset() by a caller disconnect() left serverVersion_
+                    # None, and `None >= MIN_SERVER_VER_PROTOBUF` raises. The message is lost.
+                    raise TypeError(
+                        "'>=' not supported between instances of 'NoneType' and 'int'"
+                    )
                 self._deliver(name, args)
         finally:
             self._disconnect()
@@ -475,16 +562,26 @@ class FakeIbClient:
         ``connectionClosed`` is reported once, on this thread, and only if the
         client still had a connection object (client.py: ``if self.conn is not None``).
         """
-        with self._lock:
+        with self._lock:  # claim the connection atomically: one thread reports
             had_conn = self._conn
+            self._conn = False
+            self._sock = False
+            self.connState = EClient.DISCONNECTED
+        # Real order (client.py 366-371): report connectionClosed, then reset().
+        # A thread hung in connect() is released only by the reset, as in ibapi.
+        if had_conn:
+            self._deliver("connectionClosed", ())
+        self._reset()
+
+    def _reset(self) -> None:
+        """EClient.reset(): no connection object, no server version, state DISCONNECTED."""
+        with self._lock:
             self._conn = False
             self._sock = False
             self.connState = EClient.DISCONNECTED
             self._server_version_now = None
         self._release.set()
         self._q.put((_WAKE, ()))
-        if had_conn:
-            self._deliver("connectionClosed", ())
 
     def _peer_close(self) -> None:
         """The peer closed the socket: the reader thread's part, which reports nothing."""
@@ -506,3 +603,77 @@ class FakeIbClient:
             args = copy.deepcopy(args)  # a handler list or a pushed object is never shared
             self.delivered.append(Delivery(name, args, threading.get_ident()))
         getattr(self.wrapper, name)(*args)
+
+
+WAIT = 5.0  # an upper bound for a join or a queue get, never a sleep
+
+
+# Every request the fake implements, with valid arguments (request id 77 where it has one).
+REQUEST_ARGS: dict[str, tuple[Any, ...]] = {
+    "reqCurrentTime": (),
+    "reqMktData": (77, Contract(), "", False, False, []),
+    "cancelMktData": (77,),
+    "reqMarketDataType": (3,),
+    "reqContractDetails": (77, Contract()),
+    "reqHeadTimeStamp": (77, Contract(), "TRADES", 1, 2),
+    "cancelHeadTimeStamp": (77,),
+    "reqHistoricalData": (77, Contract(), "", "1 D", "1 min", "TRADES", 1, 2, True, []),
+    "cancelHistoricalData": (77,),
+}
+
+
+class Recorder(EWrapper):
+    """An EWrapper that puts every callback it gets on a queue, with its thread id."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: queue.Queue[tuple[str, tuple[Any, ...], int]] = queue.Queue()
+
+    def _put(self, name: str, *args: Any) -> None:
+        self.events.put((name, args, threading.get_ident()))
+
+    def get(self) -> tuple[str, tuple[Any, ...], int]:
+        return self.events.get(timeout=WAIT)
+
+    def names(self, n: int) -> list[str]:
+        return [self.get()[0] for _ in range(n)]
+
+    def connectAck(self):
+        self._put("connectAck")
+
+    def nextValidId(self, orderId):
+        self._put("nextValidId", orderId)
+
+    def managedAccounts(self, accountsList):
+        self._put("managedAccounts", accountsList)
+
+    def connectionClosed(self):
+        self._put("connectionClosed")
+
+    def error(self, reqId, errorTime, errorCode, errorString, advancedOrderRejectJson=""):
+        self._put("error", reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+
+    def historicalData(self, reqId, bar):
+        self._put("historicalData", reqId, bar)
+
+    def historicalDataEnd(self, reqId, start, end):
+        self._put("historicalDataEnd", reqId, start, end)
+
+    def historicalDataUpdate(self, reqId, bar):
+        self._put("historicalDataUpdate", reqId, bar)
+
+    def contractDetails(self, reqId, contractDetails):
+        self._put("contractDetails", reqId, contractDetails)
+
+    def contractDetailsEnd(self, reqId):
+        self._put("contractDetailsEnd", reqId)
+
+    def tickPrice(self, reqId, tickType, price, attrib):
+        self._put("tickPrice", reqId, tickType, price, attrib)
+
+    def marketDataType(self, reqId, marketDataType):
+        self._put("marketDataType", reqId, marketDataType)
+
+    def currentTime(self, time):
+        self._put("currentTime", time)
+
