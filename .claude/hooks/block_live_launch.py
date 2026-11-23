@@ -50,22 +50,28 @@ the package. Blocked by design, even though they only print help:
 The ONE allowance (``allowed_paper_data_command``, owner decision 2026-11-23): an agent
 may run a DATA session against the PAPER account, written as one whole plain command
 ``<venv python> [-P] -m MainStoinker (fetch-bars|probe-data) <args>``. ``<venv python>``
-is a path ending in ``.venv\\Scripts\\python.exe`` or ``.venv/Scripts/python.exe``
-(optionally double-quoted, optionally preceded by ``& ``); ``<args>`` are plain tokens
-(letters, digits and ``_ , . : = \\ / -``, or a double-quoted token that may also hold
-spaces) that include ``--paper`` and ``--no-prompt`` as exact standalone tokens;
-``--port`` only ``7497``, ``--host`` only ``127.0.0.1``. The match is anchored on the
-whole string: no separator, wrapper, redirect, expansion, quote other than ``"``,
+is exactly ``.venv\\Scripts\\python.exe`` (or ``.venv/Scripts/python.exe``) or a
+drive-absolute path ``X:\\...\\.venv\\Scripts\\python.exe`` (no ``..``, no ``=``, no other
+colon; never a UNC or ``/c/...`` path), optionally double-quoted, optionally preceded by
+``& ``. It is recognised by that path, not by identity: any python copied to such a
+path, or another checkout's venv, would match. ``<args>`` are plain tokens (letters,
+digits and ``_ , . : = \\ / -``, or a double-quoted token that may also hold spaces) that
+include ``--paper`` and ``--no-prompt`` as exact standalone tokens; ``--port`` only
+``7497``, ``--host`` only ``127.0.0.1``; a backslash only inside path VALUES, never in an
+option token; ``--help`` and single-dash options are refused. The match is anchored on
+the whole string: no separator, wrapper, redirect, expansion, quote other than ``"``,
 newline, ``cd`` or variable assignment, and the live opt-in variable name nowhere. A
 command that merely CONTAINS that shape is not covered and is judged by the rules above.
-It is not a free pass: after the match the connecting rule still judges the same text
-with only the subcommand word replaced by ``backtest``, and every other rule judges the
-text unchanged, so a command blocked for any other reason stays blocked. The allowance
-applies to the command as typed, never to its NFKC form or to decoded text. What it
-permits is data requests against the paper account: ``--paper`` makes the command itself
-refuse any port but 7497, any host but 127.0.0.1 and any non-paper account (see
-``MainStoinker/ib/cli.py``). Order placement, the live account and the live ports remain
-the owner's alone.
+It is not a free pass: ``allowed_paper_data_command`` also judges the same text with
+only the subcommand word replaced by ``backtest`` by ALL the rules here, and every other
+rule has already judged the text unchanged, so a command blocked for any other reason
+stays blocked. The allowance applies to the command as typed, never to its NFKC form or
+to decoded text. What it permits is data requests against the paper account: ``--paper``
+makes the command itself refuse any port but 7497, any host but 127.0.0.1 and any
+non-paper account (see ``MainStoinker/ib/cli.py``). The hook does NOT check which code
+is checked out: a paper session must be run from an unmodified, merged ``origin/revival``
+checkout (a rule in CLAUDE.md, not enforced here). Order placement, the live account and
+the live ports remain the owner's alone.
 Not seen: a script or file that itself imports and runs the package (written
 in one call, run in another), ``bash script.sh``, aliases/functions, a module
 name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
@@ -572,9 +578,11 @@ _CONNECT_MESSAGE = (
     "runs, report and serve are allowed) and only the owner runs connecting "
     "commands (see CLAUDE.md safety rules). The one exception is a DATA session on "
     "the PAPER account, written as ONE plain command and nothing else: "
-    '"<project>\\.venv\\Scripts\\python.exe" [-P] -m MainStoinker fetch-bars|probe-data '
+    ".venv\\Scripts\\python.exe [-P] -m MainStoinker fetch-bars|probe-data "
     "<args> with --paper and --no-prompt among the args (--port only 7497, --host only "
-    "127.0.0.1). No ; && || | & ` $ % < > ( ) quotes other than \", newline, cd, "
+    "127.0.0.1; quote a symbol list: --symbols \"AAPL,MSFT\"; no --help). A "
+    "drive-absolute path ending in .venv\\Scripts\\python.exe also works, in double "
+    "quotes if it has spaces. No ; && || | & ` $ % < > ( ) quotes other than \", newline, cd, "
     "variable assignment or wrapper (start, cmd /c, powershell -c, bash -c) may appear, "
     "and the live opt-in variable name may not appear at all."
 )
@@ -1207,8 +1215,14 @@ _PAPER_COMMAND = re.compile(
     rf"(?P<sub>fetch-bars|probe-data)(?P<args>(?: +{_PAPER_TOKEN})+)"
 )
 _PAPER_TOKEN_RE = re.compile(_PAPER_TOKEN)
-_PAPER_PYTHON = re.compile(r"(?:^|[\\/])\.venv[\\/]Scripts[\\/]python\.exe$")
+# The interpreter: the project venv, written relative (``.venv\Scripts\python.exe``) or as
+# a drive-absolute path (``X:\...\.venv\Scripts\python.exe``, no other colon). Never a UNC
+# or ``/c/...`` path, never ``..``, never an assignment or an option.
+_PAPER_PYTHON_REL = re.compile(r"\.venv[\\/]Scripts[\\/]python\.exe")
+_PAPER_PYTHON_ABS = re.compile(r"[A-Za-z]:[\\/](?:[^:]*[\\/])?\.venv[\\/]Scripts[\\/]python\.exe")
 _PAPER_QUOTED_OPTION = re.compile(r" -\S")
+# After a comma, PowerShell starts a new argument; a backslash may precede a dash in bash.
+_PAPER_COMMA_OPTION = re.compile(r",[\\-]")
 _PAPER_GUARDED = ("--port", "--host", "--paper", "--no-prompt")
 _PAPER_PORT = "7497"
 _PAPER_HOST = "127.0.0.1"
@@ -1223,14 +1237,25 @@ def _paper_token_ok(token: str) -> bool:
         inner = token[1:-1]
         return not (
             not inner
-            or inner.startswith("-")  # a quoted option is not looked at as an option
+            or inner.replace("\\", "").startswith("-")  # a quoted option is not looked at as one
             or inner.endswith("\\")  # bash reads backslash-quote as an escaped quote
             or _PAPER_QUOTED_OPTION.search(inner)
-            or ",-" in inner
+            or _PAPER_COMMA_OPTION.search(inner)
         )
-    # A backslash at the end can swallow the next space; ``a,--port`` is an array
-    # of two arguments in PowerShell.
-    return not (token.endswith("\\") or ",-" in token or (token[0] == "-" and token[1:2] != "-"))
+    # A backslash at the end can swallow the next space; ``a,--port`` is an array of two
+    # arguments in PowerShell. Bash drops a backslash before a letter or a dash, so a
+    # backslash may appear in path VALUES only: never first, and never in an option name.
+    if token.endswith("\\") or token.startswith("\\") or _PAPER_COMMA_OPTION.search(token):
+        return False
+    if token.replace("\\", "").startswith("-"):
+        return token.startswith("--") and "\\" not in token.split("=", 1)[0]
+    return True
+
+
+def _paper_python_ok(path: str) -> bool:
+    if ".." in path or "=" in path or path.startswith("-"):
+        return False
+    return bool(_PAPER_PYTHON_REL.fullmatch(path) or _PAPER_PYTHON_ABS.fullmatch(path))
 
 
 def _paper_match(command: str) -> re.Match[str] | None:
@@ -1243,7 +1268,7 @@ def _paper_match(command: str) -> re.Match[str] | None:
         return None
     py = m.group("py")
     path = py[1:-1] if py.startswith('"') else py
-    if not _paper_token_ok(py) or _PAPER_PYTHON.search(path) is None:
+    if not _paper_token_ok(py) or not _paper_python_ok(path):
         return None
     tokens = _PAPER_TOKEN_RE.findall(m.group("args"))
     if not all(_paper_token_ok(t) for t in tokens):
@@ -1254,8 +1279,16 @@ def _paper_match(command: str) -> re.Match[str] | None:
         if tok.startswith('"') or not tok.startswith("--"):
             continue
         name = tok.split("=", 1)[0]
+        if name.lower() == "--help":  # keeps the rule to real runs
+            return None
         # an abbreviation or a differently cased spelling of a guarded option
         if any(g.startswith(name.lower()) and name != g for g in _PAPER_GUARDED):
+            return None
+        # a guarded name followed by anything but ``=`` (``--port,7496``, ``--port:7496``,
+        # ``--paperx``); the ``=`` forms of the flags and of port and host are checked below
+        if any(tok.startswith(g) and tok != g and tok[len(g)] != "=" for g in _PAPER_GUARDED):
+            return None
+        if tok.startswith(("--paper=", "--no-prompt=")):
             return None
         following = tokens[i + 1] if i + 1 < len(tokens) else None
         if tok == "--port" and following != _PAPER_PORT:
@@ -1281,8 +1314,9 @@ def allowed_paper_data_command(command: str) -> bool:
 def _paper_neutral(command: str) -> str | None:
     """The allowed command with only the subcommand word replaced by ``backtest``, else None.
 
-    The connecting rule judges this text, so every OTHER reason to block the command
-    still applies: only "connecting subcommand of ``-m MainStoinker``" is suppressed.
+    The whole hook judges this text (``allowed_paper_data_command``), so every OTHER reason
+    to block the command still applies: only "connecting subcommand of ``-m MainStoinker``"
+    is suppressed.
     """
     m = _paper_match(command)
     if m is None:
@@ -1359,17 +1393,15 @@ def _decide_text(command: str, depth: int, allow_paper: bool = False) -> tuple[b
         return True, _CONNECT_MESSAGE.format(
             what="an -EncodedCommand value that cannot be decoded, next to MainStoinker"
         )
-    judged = joined
     if allow_paper and allowed_paper_data_command(command):
-        # THE one place of the paper allowance: for the allowed shape only, the connecting
-        # rule judges the same text with the subcommand word replaced by an offline one.
-        neutral = _paper_neutral(command)
-        if neutral is not None:
-            judged = _join_continuations(_strip_message_args(_strip_heredocs(neutral)))
+        # THE one place of the paper allowance. Every rule above judged the command as
+        # typed and let it through; the function has just judged the same text with only
+        # the subcommand word replaced by an offline one (the connecting rule included).
+        return False, ""
     try:
-        why = _judge_connecting(judged)
-        if why is None and ".." in judged:
-            why = _judge_connecting(judged, resolve=False)  # as typed, too
+        why = _judge_connecting(joined)
+        if why is None and ".." in joined:
+            why = _judge_connecting(joined, resolve=False)  # as typed, too
     except Exception:  # noqa: BLE001 - a rule bug must fail closed
         why = "the hook could not analyse a MainStoinker command" if mentions else None
     if why:

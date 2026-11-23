@@ -78,10 +78,11 @@ ALLOWED = [
     fetch(UP, mid=" -P"),
     fetch('".venv\\Scripts\\python.exe"'),
     fetch("C:/Stonks/.venv/Scripts/python.exe"),
-    fetch("./.venv/Scripts/python.exe "),
+    fetch(".venv/Scripts/python.exe "),
     fetch(args=f'--symbols "AAPL,MSFT,TSLA" {DATES} --paper --no-prompt'),
     probe(args='--symbols "AAPL,MSFT" --paper --no-prompt'),
-    fetch("..\\.venv\\Scripts\\python.exe"),
+    fetch('"D:\\work dir\\Stonks\\.venv\\Scripts\\python.exe"'),
+    fetch("C:\\.venv\\Scripts\\python.exe"),
     probe(),
     probe(UPF),
     probe(QP),
@@ -193,6 +194,44 @@ def refused_table() -> list[str]:
                "call .venv\\Scripts\\python.exe",
                "start .venv\\Scripts\\python.exe", "'.venv/Scripts/python.exe'",
                "& '.venv/Scripts/python.exe'", '"' + ".venv\\Scripts\\python.exe -P" + '"'):
+        add(fetch(py))
+    # review of PR 165, finding 3: a backslash in an option token (Git Bash drops it, so the
+    # real option would be --port / --host while the hook sees another word), and the PowerShell
+    # forms that glue a value to an option name
+    ok = f"--symbols AAPL {DATES}"
+    for odd in ("\\--port 7496", "--po\\rt=7496", "\\--host 8.8.8.8", "--host\\=8.8.8.8", "-\\-port 7496",
+                "--port\\ 7496", "--port\\", "\\--port", "\\--port=7497", "--port=\\7496",
+                "--ho\\st 8.8.8.8",
+                "-\\-host 8.8.8.8", "--port,7496", "--port:7496", "--port.7496", "--port;7496",
+                "--host,8.8.8.8", "--host:8.8.8.8", "--host.8.8.8.8", "--port7497", "--host127.0.0.1",
+                "--port-7496", "--port,7497", "--port:7497", "--port.7497", "--host:127.0.0.1",
+                "--paper,x", "--paper:x", "--paperx", "--paper=1", "--no-prompt,x", "--no-prompt:x",
+                "--no-prompt=1", "--no-promptx", "--help", "--help=x", "-h", "--HELP"):
+        add(fetch(args=f"{ok} --paper --no-prompt {odd}"), fetch(args=f"{ok} {odd} --paper --no-prompt"))
+    for spelled in ("\\--paper", "--pa\\per", "--paper\\", "-\\-paper", "--\\paper", "\\--no-prompt",
+                    "--no-pr\\ompt", "--no-prompt\\", "-\\-no-prompt", "--no\\-prompt"):
+        # as the required token: it must not count as one; and next to the real one
+        add(fetch(args=f"{ok} {spelled} --no-prompt"), fetch(args=f"{ok} --paper {spelled}"),
+            fetch(args=f"{ok} --paper --no-prompt {spelled}"))
+    add(fetch(args=f"{ok} \\--paper \\--no-prompt"), fetch(args=f"{ok} --pa\\per --no-pr\\ompt"))
+    # review of PR 165, finding 4 and 5: what may stand in the interpreter position
+    for py in ("PYTHONSTARTUP=x/.venv/Scripts/python.exe", "X=/c/.venv/Scripts/python.exe",
+               "X=.venv/Scripts/python.exe", "A=1 .venv/Scripts/python.exe", "--x/.venv/Scripts/python.exe",
+               "-x/.venv/Scripts/python.exe", "=/.venv/Scripts/python.exe", "=.venv/Scripts/python.exe",
+               "\\\\evil\\share\\.venv\\Scripts\\python.exe", '"\\\\evil\\share\\.venv\\Scripts\\python.exe"',
+               "//evil/share/.venv/Scripts/python.exe", '"//evil/share/.venv/Scripts/python.exe"',
+               "/c/Windows/System32/.venv/Scripts/python.exe", "/.venv/Scripts/python.exe",
+               "\\.venv\\Scripts\\python.exe", "./.venv/Scripts/python.exe", ".\\.venv\\Scripts\\python.exe",
+               "..\\.venv\\Scripts\\python.exe", "../.venv/Scripts/python.exe",
+               "C:\\a\\..\\.venv\\Scripts\\python.exe", "C:/a/../.venv/Scripts/python.exe",
+               "C:\\..\\.venv\\Scripts\\python.exe", "C:\\a\\b:c\\.venv\\Scripts\\python.exe",
+               "C:\\a:\\.venv\\Scripts\\python.exe", ".venv\\Scripts\\python.exe:x",
+               "C:.venv\\Scripts\\python.exe", "C:\\x=y\\.venv\\Scripts\\python.exe",
+               '"C:\\x=y\\.venv\\Scripts\\python.exe"', "sub\\.venv\\Scripts\\python.exe",
+               "sub/.venv/Scripts/python.exe", "CC:\\x\\.venv\\Scripts\\python.exe",
+               "1:\\x\\.venv\\Scripts\\python.exe", "C:x\\.venv\\Scripts\\python.exe",
+               "MainStoinker\\ib\\.venv\\Scripts\\python.exe", "C:\\.venv\\.venv\\Scripts\\python.exe:",
+               '"C:\\x\\.venv\\Scripts\\python.exe" "-x"'):
         add(fetch(py))
     # a second -P, wrong flags before -m, -c code, other modules and subcommands
     add(
@@ -494,13 +533,18 @@ def test_the_function_is_called_in_one_place_in_the_decision_flow() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     calls = re.findall(r"allowed_paper_data_command\(", text)
     assert len(calls) == 2  # its definition and the one call in `_decide_text`
-    assert text.count("_paper_neutral(") == 3  # definition, one call in the function, one in the flow
+    assert text.count("_paper_neutral(") == 2  # its definition and its one call, in the function
 
 
 def test_the_block_message_teaches_the_allowed_form() -> None:
     reason = hook.decide(f"{UP} -m MainStoinker fetch-bars --port 7497")[1]
     for word in ("--paper", "--no-prompt", ".venv", "7497", "127.0.0.1", "fetch-bars|probe-data", "PAPER"):
         assert word in reason
+    # the form shown parses in PowerShell as typed: relative, no quotes around the interpreter
+    assert ".venv\\Scripts\\python.exe [-P] -m MainStoinker fetch-bars|probe-data" in reason
+    assert '"<project>' not in reason
+    shown = ".venv\\Scripts\\python.exe -m MainStoinker fetch-bars --symbols \"AAPL,MSFT\" "
+    assert hook.allowed_paper_data_command(shown + "--start 2024-08-16 --end 2024-08-26 --paper --no-prompt")
     assert ENV_NAME not in reason
 
 
@@ -524,6 +568,14 @@ def test_claude_md_states_the_paper_rules() -> None:
         "Exit code 5 (`fetch-bars`) or 4 (`probe-data`)",
         "Order placement on the paper account is NOT allowed yet",
         "Tests never connect.",
+        "A paper session is run only by the main session, from the main checkout at an unmodified "
+        "`origin/revival` commit",
+        "clean `git status` for tracked files, `HEAD` equal to or contained in `origin/revival`",
+        "never from a task branch or worktree and never with uncommitted changes",
+        "code that connects must have been reviewed and merged before it talks to TWS",
+        "The hook cannot check this; the rule does.",
+        "the owner confirms it in one attended `--paper` session before the first `--no-prompt` run",
+        "The hook does not check which code is checked out or which interpreter file it is.",
     ):
         assert phrase in text, phrase
 
@@ -533,6 +585,7 @@ def test_claude_md_states_the_paper_rules() -> None:
 FORBIDDEN_CHARS = [
     ";", "&&", "||", "|", "&", "`", "$", "%X%", "$(x)", "${x}", "<", ">", ">>", "2>&1", "(", ")", "{", "}",
     "[", "]", "'", '"', "^", "*", "?", "~", "!", "#", "@", "\n", "\r", "\r\n", "\0", "\\\n", "`\n", "^\n",
+    "\\", ",--", ",\\--",
     "\t", "\u2011", "\uff0d", "\u00a0", "\u200b", "<<EOF", "<<<", "@'", "'@", "|iex", "\x0b", "\x0c",
 ]
 START_WRAPPERS = [
@@ -592,6 +645,21 @@ def test_any_forbidden_character_or_wrapper_anywhere_is_refused(original: str) -
             continue
         assert hook.allowed_paper_data_command(mutated) is False, (label, mutated)
         assert not_looser(mutated), (label, mutated)  # the hook before the allowance blocked it too
+
+
+@pytest.mark.parametrize("original", PROPERTY_BASES)
+def test_a_backslash_inside_any_option_token_is_refused(original: str) -> None:
+    tokens = SPLIT.findall(original.strip())
+    count = 0
+    for i, tok in enumerate(tokens):
+        if not tok.startswith("--"):
+            continue
+        for k in range(1, len(tok)):
+            mutated = " ".join([*tokens[:i], tok[:k] + "\\" + tok[k:], *tokens[i + 1 :]])
+            assert hook.allowed_paper_data_command(mutated) is False, mutated
+            assert not_looser(mutated), mutated
+            count += 1
+    assert count > 30
 
 
 def test_every_allowed_spelling_survives_each_character_at_each_place_only_as_refused() -> None:

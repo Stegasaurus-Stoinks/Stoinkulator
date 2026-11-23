@@ -18,6 +18,13 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
 - One broker session at a time, started by the main session, never by parallel
   subagents. Exit code 5 (`fetch-bars`) or 4 (`probe-data`) means TWS is not
   signed into a paper account: stop, do not retry, tell the owner.
+- A paper session is run only by the main session, from the main checkout at an
+  unmodified `origin/revival` commit (clean `git status` for tracked files, `HEAD`
+  equal to or contained in `origin/revival`), never from a task branch or worktree
+  and never with uncommitted changes: code that connects must have been reviewed
+  and merged before it talks to TWS. The hook cannot check this; the rule does.
+- Everything rests on the paper-id rule (`D[UFI][0-9]+`): the owner confirms it in
+  one attended `--paper` session before the first `--no-prompt` run.
 - Order placement on the paper account is NOT allowed yet: it is a separate
   owner decision.
 - Tests never connect.
@@ -41,11 +48,13 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   (`.claude/settings.json`, `.claude/hooks/block_live_launch.py`) blocks shell
   commands that would run the entry script or the launcher, and every
   `python -m MainStoinker` subcommand except `backtest`, `runs`, `report`,
-  `serve` and ONE whole-command shape: `<project venv python.exe> [-P] -m
-  MainStoinker fetch-bars|probe-data <args>` with `--paper` and `--no-prompt`,
-  `--port` only 7497, `--host` only `127.0.0.1`, and no shell syntax, wrapper,
-  `cd` or variable assignment; the live opt-in name may not appear at all.
-  The hook is a tripwire against accidents, not a security boundary.
+  `serve` and ONE whole-command shape: `.venv\Scripts\python.exe [-P] -m
+  MainStoinker fetch-bars|probe-data <args>` (or a drive-absolute path ending in
+  `.venv\Scripts\python.exe`) with `--paper` and `--no-prompt`, `--port` only 7497,
+  `--host` only `127.0.0.1`, no `--help`, and no shell syntax, wrapper, `cd` or
+  variable assignment; the live opt-in name may not appear at all. The hook does
+  not check which code is checked out or which interpreter file it is. It is a
+  tripwire against accidents, not a security boundary.
 - Never set that variable, and never weaken, disable, bypass or work around
   any of the guards or their tests. Changing them is only allowed as an
   approved task with `needs-human-review`.
