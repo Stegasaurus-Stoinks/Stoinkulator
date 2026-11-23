@@ -23,9 +23,22 @@ def _serve(argv: list[str]) -> int:
     return serve_main(argv)
 
 
+def _fetch_bars(argv: list[str]) -> int:
+    # Lazy, like `serve`: the four offline commands never import MainStoinker.ib (or ibapi).
+    try:
+        from MainStoinker.ib.cli import main as fetch_main
+    except ImportError as exc:
+        print(f"error: fetch-bars could not load the IB client ({type(exc).__name__}): "
+              "install requirements.txt", file=sys.stderr)
+        return 2
+    return fetch_main(argv)
+
+
 def _run(argv: list[str]) -> int:
     if argv[:1] == ["serve"]:
         return _serve(argv[1:])
+    if argv[:1] == ["fetch-bars"]:
+        return _fetch_bars(argv[1:])
     from MainStoinker.engine.cli import main
 
     return main(argv)
