@@ -1,6 +1,11 @@
-"""The `fetch-bars` command: owner-run download of 1-minute bars from TWS or IB Gateway.
+"""The `fetch-bars` and `probe-data` commands: owner-run, they talk to TWS or IB Gateway.
 
     python -m MainStoinker fetch-bars --symbols AAPL,MSFT,TSLA --start 2024-08-16 --end 2024-08-26 --port 7496
+    python -m MainStoinker probe-data --port 7496 --symbols AAPL,MSFT
+
+`probe-data` (what market data this account gets) shares everything here: the checks below,
+the console gate, the scrubbed printer, the recording and the session (`run_session`). Its
+steps live in `MainStoinker/ib/probe.py`, loaded only when the command runs.
 
 Only the owner runs it, in a real terminal. It is built on `IbConnection` and
 `IbMarketData` (a data-only client: it cannot send anything but data requests) and
@@ -42,6 +47,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
@@ -69,7 +75,7 @@ from MainStoinker.ib.fetch import (
 )
 from MainStoinker.ib.history import DATA_ZONE, check_symbol
 from MainStoinker.ib.market_data import IbMarketData
-from MainStoinker.ib.recorder import SessionRecorder, scan_recording
+from MainStoinker.ib.recorder import Finding, SessionRecorder, scan_recording
 from MainStoinker.Util.broker_guard import ALLOW_LIVE_ENV, BrokerPortRefused, check_broker_port
 
 EXIT_OK = 0
@@ -90,6 +96,19 @@ exit codes:
   130  interrupted with Ctrl-C (the connection and the recording were closed)
 """
 
+PROBE_EXIT_CODES_TEXT = """\
+exit codes:
+  0    every step was done (delayed data is still a success)
+  1    connected, but a step failed (including NO data for a symbol)
+  2    refused: console gate, port guard, bad arguments, unusable path
+  3    could not connect to TWS or IB Gateway
+  130  interrupted with Ctrl-C (the connection and the recording were closed)
+"""
+FETCH_BARS = "fetch-bars"
+PROBE_DATA = "probe-data"
+PROBE_MAX_SYMBOLS = 5
+PROBE_QUOTE_SECONDS = 20.0
+PROBE_MAX_QUOTE_SECONDS = 120
 DEFAULT_CLIENT_ID = 21
 DEFAULT_CONNECT_TIMEOUT = 30.0
 MAX_CONNECT_TIMEOUT = 300.0
@@ -101,7 +120,8 @@ SECONDS_PER_SYMBOL_DAY = 10  # IB's pacing: one history request per 10 s; the es
 VOLUME_NOTE = (
     "Volumes are stored exactly as IB sent them: shares only if the TWS API setting for US stock sizes "
     "in lots is UNTICKED (Global Configuration, API, Settings).\n"
-    "Ticked, IB sends much smaller numbers that cannot be converted back: fetch that data again.\n"
+    "Ticked, IB sends much smaller numbers that cannot be converted back: delete the symbol's folder "
+    "under the output folder (or use a new --out) and run again; a rerun skips days already on disk.\n"
     "Check: a large stock's opening-minute volume is normally hundreds of thousands to millions of "
     "shares; tens of thousands means the setting is ticked."
 )
@@ -159,6 +179,31 @@ def _iso_date(text: str) -> date:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _add_connection_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--port", type=int, required=True, help="TWS or Gateway API port (no default)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
+
+
+def _add_record_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--record", default=None, metavar="FILE",
+                       help=r"session recording file, never overwritten (default: a new file in "
+                            r"%%USERPROFILE%%\Stoinkulator\recordings)")
+    group.add_argument("--no-record", action="store_true", help="do not record the session")
+    parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT,
+                        help="seconds per connection attempt; TWS may show a dialog (default 30)")
+
+
+def _check_connection_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be 1 to 65535")
+    if not 1 <= args.client_id <= MAX_CLIENT_ID or args.client_id in REFUSED_CLIENT_IDS:
+        parser.error(f"--client-id must be 1 to {MAX_CLIENT_ID} and not {sorted(REFUSED_CLIENT_IDS)}")
+    if not 0 < args.connect_timeout <= MAX_CONNECT_TIMEOUT:
+        parser.error(f"--connect-timeout must be above 0 and at most {MAX_CONNECT_TIMEOUT:g}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m MainStoinker fetch-bars",
@@ -177,19 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="tickers, comma or space separated, e.g. AAPL,MSFT,TSLA")
     parser.add_argument("--start", type=_iso_date, required=True, metavar="YYYY-MM-DD")
     parser.add_argument("--end", type=_iso_date, required=True, metavar="YYYY-MM-DD")
-    parser.add_argument("--port", type=int, required=True, help="TWS or Gateway API port (no default)")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
+    _add_connection_arguments(parser)
     parser.add_argument("--out", default=None, metavar="DIR",
                         help=r"bars folder (default %%USERPROFILE%%\Stoinkulator\bars; "
                              "not in the repo or OneDrive)")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--record", default=None, metavar="FILE",
-                       help=r"session recording file, never overwritten (default: a new file in "
-                            r"%%USERPROFILE%%\Stoinkulator\recordings)")
-    group.add_argument("--no-record", action="store_true", help="do not record the session")
-    parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT,
-                        help="seconds per connection attempt; TWS may show a dialog (default 30)")
+    _add_record_arguments(parser)
     parser.add_argument("--settle-hours", type=float, default=DEFAULT_SETTLE_HOURS, metavar="HOURS",
                         help="a day with no bars counts as a holiday only when its session closed at "
                              "least this many hours ago; sooner it is retried next run (0 to "
@@ -219,14 +256,56 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     args.symbols = names
     if args.start > args.end:
         parser.error(f"--start {args.start} is after --end {args.end}")
-    if not 1 <= args.port <= 65535:
-        parser.error("--port must be 1 to 65535")
-    if not 1 <= args.client_id <= MAX_CLIENT_ID or args.client_id in REFUSED_CLIENT_IDS:
-        parser.error(f"--client-id must be 1 to {MAX_CLIENT_ID} and not {sorted(REFUSED_CLIENT_IDS)}")
-    if not 0 < args.connect_timeout <= MAX_CONNECT_TIMEOUT:
-        parser.error(f"--connect-timeout must be above 0 and at most {MAX_CONNECT_TIMEOUT:g}")
+    _check_connection_arguments(parser, args)
     if not 0 <= args.settle_hours <= MAX_SETTLE_HOURS:
         parser.error(f"--settle-hours must be 0 to {MAX_SETTLE_HOURS:g}")
+    return args
+
+
+def build_probe_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m MainStoinker probe-data",
+        description=(
+            "Owner-run: find out what market data this account gets. Connects, reads the "
+            "data farms and IB's clock, resolves each symbol, streams quotes (live first, "
+            "delayed if no price arrives) and fetches one day of 1-minute bars. Sends data "
+            "requests only. Needs a real terminal; you type the port number to confirm."
+        ),
+        epilog=PROBE_EXIT_CODES_TEXT,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_connection_arguments(parser)
+    parser.add_argument("--symbols", default="AAPL", metavar="A,B",
+                        help=f"tickers, comma separated, at most {PROBE_MAX_SYMBOLS} (default AAPL)")
+    parser.add_argument("--quote-seconds", type=float, default=PROBE_QUOTE_SECONDS, metavar="S",
+                        help=f"seconds of quotes per symbol, 1 to {PROBE_MAX_QUOTE_SECONDS} "
+                             f"(default {PROBE_QUOTE_SECONDS:g})")
+    parser.add_argument("--no-history", action="store_true", help="skip the one day of 1-minute bars")
+    _add_record_arguments(parser)
+    return parser
+
+
+def parse_probe_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = build_probe_parser()
+    args = parser.parse_args(argv)
+    names: list[str] = []
+    for raw in args.symbols.split(","):
+        if not raw.strip():
+            continue
+        try:
+            name = check_symbol(raw.strip().upper())
+        except ValueError as exc:
+            parser.error(f"bad --symbols entry {raw!r}: {exc}")
+        if name not in names:
+            names.append(name)
+    if not names:
+        parser.error("--symbols names no symbol")
+    if len(names) > PROBE_MAX_SYMBOLS:
+        parser.error(f"--symbols names {len(names)} symbols; at most {PROBE_MAX_SYMBOLS}")
+    args.symbols = names
+    _check_connection_arguments(parser, args)
+    if not 1 <= args.quote_seconds <= PROBE_MAX_QUOTE_SECONDS:
+        parser.error(f"--quote-seconds must be 1 to {PROBE_MAX_QUOTE_SECONDS}")
     return args
 
 
@@ -308,10 +387,10 @@ def remove_empty(created: Sequence[Path]) -> None:
             pass
 
 
-def next_recording_path(folder: Path, day: date) -> Path:
-    """The first `fetch-bars-<date>-<n>.jsonl` in `folder` that does not exist yet."""
+def next_recording_path(folder: Path, day: date, command: str = FETCH_BARS) -> Path:
+    """The first `<command>-<date>-<n>.jsonl` in `folder` that does not exist yet."""
     for number in range(1, 10_000):
-        candidate = folder / f"fetch-bars-{day:%Y-%m-%d}-{number:03d}.jsonl"
+        candidate = folder / f"{command}-{day:%Y-%m-%d}-{number:03d}.jsonl"
         if not candidate.exists():
             return candidate
     raise PathRefused(f"no free recording name in {folder}")
@@ -341,12 +420,15 @@ def private_values(env: Mapping[str, str], cwd: Path) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def resolve_paths(args: argparse.Namespace, env: Mapping[str, str], today: date, cwd: Path) -> None:
-    """Fill `args.out`, `args.record` and `args.private`; `PathRefused` for a bad path."""
+def resolve_paths(args: argparse.Namespace, env: Mapping[str, str], today: date, cwd: Path,
+                  command: str = FETCH_BARS) -> None:
+    """Fill `args.out` (fetch-bars only), `args.record` and `args.private`; `PathRefused` for a bad path."""
     home = home_folder(env)
-    out = Path(args.out) if args.out else home / "Stoinkulator" / "bars"
-    check_path(out, env, "the bars folder")
-    check_folder_usable(out, "the bars folder")
+    out: Path | None = None
+    if command == FETCH_BARS:
+        out = Path(args.out) if args.out else home / "Stoinkulator" / "bars"
+        check_path(out, env, "the bars folder")
+        check_folder_usable(out, "the bars folder")
     record: Path | None = None
     if not args.no_record:
         if args.record:
@@ -360,8 +442,9 @@ def resolve_paths(args: argparse.Namespace, env: Mapping[str, str], today: date,
             folder = home / "Stoinkulator" / "recordings"
             check_path(folder, env, "the recording folder")
             check_folder_usable(folder, "the recording folder")
-            record = next_recording_path(folder, today)
-    args.out = out
+            record = next_recording_path(folder, today, command)
+    if out is not None:
+        args.out = out
     args.record = record
     args.private = private_values(env, cwd)
 
@@ -395,9 +478,15 @@ def format_duration(seconds: float) -> str:
     return f"{total // 3600} h {total % 3600 // 60:02d} min"
 
 
+def _count(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
 def describe_estimate(requests: int, symbols: int, days: int, min_seconds: float) -> str:
-    return (f"up to {requests} requests ({symbols} symbols x {days} days), "
-            f"at least {format_duration(min_seconds)} at the pacing limits")
+    text = f"up to {_count(requests, 'request')} ({_count(symbols, 'symbol')} x {_count(days, 'day')})"
+    if min_seconds >= 1:  # never "at least 0 s"
+        text += f", at least {format_duration(min_seconds)} at the pacing limits"
+    return text
 
 
 def describe_session(args: argparse.Namespace) -> str:
@@ -418,13 +507,30 @@ def describe_session(args: argparse.Namespace) -> str:
     ])
 
 
-def gate(args: argparse.Namespace, stdin: TextIO, input_fn: Callable[[str], str], say: _Say) -> bool:
+def describe_probe(args: argparse.Namespace) -> str:
+    record = f"{args.record}" if args.record else "none (--no-record)"
+    history = "none (--no-history)" if args.no_history else "one day of 1-minute bars per symbol"
+    return "\n".join([
+        "This command connects to TWS or IB Gateway. Only the owner runs it.",
+        f"  Connects to:      {args.host}:{args.port}",
+        f"  Client id:        {args.client_id}",
+        f"  Symbols:          {', '.join(args.symbols)}",
+        f"  Quotes:           about {args.quote_seconds:g} s per symbol (delayed data is tried "
+        "if no live price comes)",
+        f"  History:          {history}",
+        f"  Recording file:   {record}",
+        "  It sends data requests only: the client cannot send anything else.",
+    ])
+
+
+def gate(args: argparse.Namespace, stdin: TextIO, input_fn: Callable[[str], str], say: _Say,
+         describe: Callable[[argparse.Namespace], str] = describe_session) -> bool:
     isatty = getattr(stdin, "isatty", None)
     if isatty is None or not isatty():
         say("Refusing to run: this command connects to TWS and only the owner runs it, "
             "from an interactive terminal (stdin is not one).")
         return False
-    say(describe_session(args))
+    say(describe(args))
     try:
         typed = input_fn(f"To proceed, type the port number ({args.port}) and press Enter: ")
     except (EOFError, KeyboardInterrupt):
@@ -499,6 +605,19 @@ def _hm(value: datetime | None) -> str:
     return "-" if value is None else f"{value:%H:%M}"
 
 
+def gap_counts_text(res: Any) -> str:
+    """`2 complete, 1 failed, 0 no data`: the gap report calls a day without bars `no_data`,
+    also a day that FAILED, so the failed days (from `res.failures`) are counted on their own."""
+    failed_days = {f.day for f in res.failures}
+    counts: dict[str, int] = {}
+    for row in res.gaps:
+        status = "failed" if row.status == "no_data" and row.day in failed_days else row.status
+        counts[status] = counts.get(status, 0) + 1
+    if "failed" in counts and "no_data" not in counts:
+        counts["no_data"] = 0
+    return ", ".join(f"{n} {s.replace('_', ' ')}" for s, n in sorted(counts.items())) or "no days"
+
+
 def _summary(say: _Say, result: FetchResult, out_dir: Path) -> None:
     say()
     say("Summary")
@@ -525,10 +644,7 @@ def _summary(say: _Say, result: FetchResult, out_dir: Path) -> None:
         if res.gap_error:
             say(f"  {name}: gap report failed: {res.gap_error}")
         elif res.con_id is not None:
-            counts: dict[str, int] = {}
-            for row in res.gaps:
-                counts[row.status] = counts.get(row.status, 0) + 1
-            text = ", ".join(f"{n} {s}" for s, n in sorted(counts.items())) or "no days"
+            text = gap_counts_text(res)
             files = "" if res.gap_files is None else f"; gap files: {res.gap_files[0]} and {res.gap_files[1]}"
             say(f"  {name}: gaps: {text}{files}")
     say(f"Days with missing minutes (short or partial, bars kept): {result.days_with_gaps}")
@@ -595,6 +711,123 @@ def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: li
     return None
 
 
+SessionBody = Callable[[_Say, IbConnection, IbMarketData, list[str]], int]
+"""What a command does once connected: returns its exit code; appends its advice lines to the list."""
+
+FindingsReport = Callable[[_Say, Path, list[Finding]], None]
+
+
+@dataclass(frozen=True)
+class SessionKind:
+    """What differs between the commands in `run_session`."""
+
+    labels: dict[int, str]
+    interrupted: str
+    unexpected: int
+    report_findings: FindingsReport
+
+
+def report_findings(say: _Say, record: Path, findings: list[Finding]) -> None:
+    """The recording check of `fetch-bars`: every finding by line number and reason."""
+    say(f"Recording check: {len(findings)} finding(s). "
+        "Read the file yourself before it is ever committed.")
+    list_findings(say, findings)
+
+
+def list_findings(say: _Say, findings: Sequence[Finding]) -> None:
+    if findings:
+        say("  Where to look (line number and reason only):")
+    for finding in findings[:SHOWN_FINDINGS]:
+        say(f"  line {finding.line}: {finding.reason}")
+    if len(findings) > SHOWN_FINDINGS:
+        say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
+
+
+FETCH_KIND = SessionKind(
+    labels=_LABELS,
+    interrupted="Interrupted (Ctrl-C). What was finished is on disk; run the same command again to resume.",
+    unexpected=EXIT_STOPPED,
+    report_findings=report_findings,
+)
+
+
+def _header_only(path: Path) -> bool:
+    """True when the recording holds the session header and no event."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return len([line for line in text.split("\n") if line.strip()]) <= 1
+
+
+def run_session(
+    args: argparse.Namespace,
+    kind: SessionKind,
+    body: SessionBody,
+    *,
+    connection_factory: ConnectionFactory,
+    market_data_factory: MarketDataFactory,
+    recorder_factory: RecorderFactory,
+    out: TextIO,
+) -> int:
+    """Start the recording, connect, run `body`, always close the connection and the recorder.
+
+    `args` carries `record` (Path or None), `private`, `host`, `port`, `client_id` and
+    `connect_timeout`. A recording of a connection that was refused or could not be opened
+    holds only the header, so this run deletes the file it made. Returns the exit code.
+    """
+    say = _Say(out)
+    try:
+        recorder = recorder_factory(args)
+    except (OSError, PathRefused) as exc:
+        say(f"Cannot start the session recording: {type(exc).__name__}: {exc}")
+        say(f"Result: {kind.labels[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
+        return EXIT_REFUSED
+    conn: IbConnection | None = None
+    code = kind.unexpected
+    advice: list[str] = []
+    not_connected = False
+    try:
+        conn = connection_factory(args, [recorder] if recorder is not None else [])
+        refused = _connect(say, conn, args, advice)
+        if refused is not None:
+            code = refused
+            not_connected = True
+        else:
+            code = body(say, conn, market_data_factory(conn), advice)
+    except KeyboardInterrupt:
+        say()
+        say(kind.interrupted)
+        code = EXIT_INTERRUPTED
+    except Exception as exc:  # noqa: BLE001 - reported with the exit code, not a traceback
+        say(f"Unexpected {type(exc).__name__}: {exc}")
+        code = kind.unexpected
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as exc:  # noqa: BLE001
+                say(f"Closing the connection raised {type(exc).__name__}: {exc}")
+        if recorder is not None:
+            recorder.close()
+    for line in advice:  # each cause is added once, so each line is distinct
+        say(f"What to do: {line}")
+    if args.record is not None and recorder is not None:
+        if not_connected and _header_only(args.record):
+            try:
+                args.record.unlink(missing_ok=True)  # made by this run; nothing was recorded but the header
+            except OSError as exc:
+                say(f"Could not delete the empty recording {args.record}: {type(exc).__name__}")
+        else:
+            words = [w for w in args.private if len(w) >= 3]
+            findings = scan_recording(args.record, words)
+            say(f"Recording: {args.record}")
+            kind.report_findings(say, args.record, findings)
+    say(f"Result: {kind.labels[code]} (exit {code})")
+    say(PATHS_NOTE)
+    return code
+
+
 def run_fetch_bars(
     args: argparse.Namespace,
     *,
@@ -610,66 +843,21 @@ def run_fetch_bars(
     `args` carries `symbols`, `start`, `end`, `out` (Path), `record` (Path or None),
     `private`, `host`, `port`, `client_id` and `connect_timeout`. Returns the exit code.
     """
-    say = _Say(out)
-    try:
-        recorder = recorder_factory(args)
-    except (OSError, PathRefused) as exc:
-        say(f"Cannot start the session recording: {type(exc).__name__}: {exc}")
-        say(f"Result: {_LABELS[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
-        return EXIT_REFUSED
-    conn: IbConnection | None = None
-    code = EXIT_STOPPED
-    advice: list[str] = []
-    try:
-        conn = connection_factory(args, [recorder] if recorder is not None else [])
-        refused = _connect(say, conn, args, advice)
-        if refused is not None:
-            code = refused
-        else:
-            md = market_data_factory(conn)
-            try:
-                result = fetch(md, args.symbols, args.start, args.end, args.out, connection=conn,
-                               clock=clock, sleep=sleep, on_progress=_progress(say),
-                               settle_seconds=args.settle_hours * 3600.0)
-            except FetchSetupError as exc:
-                say(f"Refused: {exc}")
-                code = EXIT_REFUSED
-            else:
-                _summary(say, result, args.out)
-                advice.extend(advice_for(result))
-                code = exit_code_for(result)
-    except KeyboardInterrupt:
-        say()
-        say("Interrupted (Ctrl-C). What was finished is on disk; run the same command again to resume.")
-        code = EXIT_INTERRUPTED
-    except Exception as exc:  # noqa: BLE001 - reported with the exit code, not a traceback
-        say(f"Unexpected {type(exc).__name__}: {exc}")
-        code = EXIT_STOPPED
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception as exc:  # noqa: BLE001
-                say(f"Closing the connection raised {type(exc).__name__}: {exc}")
-        if recorder is not None:
-            recorder.close()
-    for line in advice:  # each cause is added once, so each line is distinct
-        say(f"What to do: {line}")
-    if args.record is not None and recorder is not None:
-        words = [w for w in args.private if len(w) >= 3]
-        findings = scan_recording(args.record, words)
-        say(f"Recording: {args.record}")
-        say(f"Recording check: {len(findings)} finding(s). "
-            "Read the file yourself before it is ever committed.")
-        if findings:
-            say("  Where to look (line number and reason only):")
-        for finding in findings[:SHOWN_FINDINGS]:
-            say(f"  line {finding.line}: {finding.reason}")
-        if len(findings) > SHOWN_FINDINGS:
-            say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
-    say(f"Result: {_LABELS[code]} (exit {code})")
-    say(PATHS_NOTE)
-    return code
+
+    def body(say: _Say, conn: IbConnection, md: IbMarketData, advice: list[str]) -> int:
+        try:
+            result = fetch(md, args.symbols, args.start, args.end, args.out, connection=conn,
+                           clock=clock, sleep=sleep, on_progress=_progress(say),
+                           settle_seconds=args.settle_hours * 3600.0)
+        except FetchSetupError as exc:
+            say(f"Refused: {exc}")
+            return EXIT_REFUSED
+        _summary(say, result, args.out)
+        advice.extend(advice_for(result))
+        return exit_code_for(result)
+
+    return run_session(args, FETCH_KIND, body, connection_factory=connection_factory,
+                       market_data_factory=market_data_factory, recorder_factory=recorder_factory, out=out)
 
 
 # -- the entry point ----------------------------------------------------------------------
@@ -688,55 +876,67 @@ def main(
     clock: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
     today: date | None = None,
+    command: str = FETCH_BARS,
+    wall: Callable[[], datetime] | None = None,
 ) -> int:
-    """Parse, check paths and port, pass the console gate, then `run_fetch_bars`.
+    """Parse, check paths and port, pass the console gate, then run the command.
 
-    The keyword arguments are for tests. This is the only place the process environment
-    is read.
+    `command` is `fetch-bars` or `probe-data` (`probe_data_main`). The keyword arguments
+    are for tests. This is the only place the process environment is read.
     """
-    args = parse_args(argv)  # --help and argument errors exit here, before any client exists
+    probe = command == PROBE_DATA
+    # --help and argument errors exit here, before any client exists
+    args = parse_probe_args(argv) if probe else parse_args(argv)
     variables: Mapping[str, str] = os.environ if env is None else env
     stream = sys.stdout if out is None else out
     say = _Say(stream)
     try:
-        resolve_paths(args, variables, today or date.today(), Path.cwd())
+        resolve_paths(args, variables, today or date.today(), Path.cwd(), command)
     except PathRefused as exc:
         say(f"Refused: {exc}")
         return EXIT_REFUSED
-    if trading_days(args.start, args.end) == 0:
-        say(f"Refused (pre-check from the dates alone): no weekday from {args.start} to {args.end}; "
-            "nothing to fetch.")
-        return EXIT_REFUSED
-    new_york_today = today or datetime.now(ZoneInfo(DATA_ZONE)).date()
-    if args.start > new_york_today:
-        say(f"Refused (pre-check from this computer's clock; after connecting IB's server time "
-            f"decides): --start {args.start} is after today in New York ({new_york_today}), so no "
-            "day of the range has closed. Nothing to fetch.")
-        return EXIT_REFUSED
+    if not probe:
+        if trading_days(args.start, args.end) == 0:
+            say(f"Refused (pre-check from the dates alone): no weekday from {args.start} to {args.end}; "
+                "nothing to fetch.")
+            return EXIT_REFUSED
+        new_york_today = today or datetime.now(ZoneInfo(DATA_ZONE)).date()
+        if args.start > new_york_today:
+            say(f"Refused (pre-check from this computer's clock; after connecting IB's server time "
+                f"decides): --start {args.start} is after today in New York ({new_york_today}), so no "
+                "day of the range has closed. Nothing to fetch.")
+            return EXIT_REFUSED
     try:
         check_broker_port(args.port, variables)
     except BrokerPortRefused as exc:
         say(port_refusal_text(exc))
         return EXIT_REFUSED
-    try:
-        check_layouts(args.out, args.symbols)
-    except FetchSetupError as exc:
-        say(f"Refused: {exc}")
-        return EXIT_REFUSED
-    folders = [args.out] + ([args.record.parent] if args.record is not None else [])
+    if not probe:
+        try:
+            check_layouts(args.out, args.symbols)
+        except FetchSetupError as exc:
+            say(f"Refused: {exc}")
+            return EXIT_REFUSED
+    folders = ([] if probe else [args.out]) + ([args.record.parent] if args.record is not None else [])
     try:
         created = make_folders(folders)  # last of the refusals: the folders must be creatable
     except PathRefused as exc:
         say(f"Refused: {exc}")
         return EXIT_REFUSED
     try:
-        return _after_checks(args, variables, stream, say, stdin, input_fn, connection_factory,
-                             market_data_factory, recorder_factory, clock, sleep)
+        return _after_checks(command, args, variables, stream, say, stdin, input_fn, connection_factory,
+                             market_data_factory, recorder_factory, clock, sleep, wall)
     finally:
         remove_empty(created)  # folders this run made and left empty (a refused gate, no connection)
 
 
+def probe_data_main(argv: Sequence[str] | None = None, **kwargs: Any) -> int:
+    """`probe-data`: the same checks, gate and session as `fetch-bars`, then the probe steps."""
+    return main(argv, command=PROBE_DATA, **kwargs)
+
+
 def _after_checks(
+    command: str,
     args: argparse.Namespace,
     variables: Mapping[str, str],
     stream: TextIO,
@@ -748,10 +948,12 @@ def _after_checks(
     recorder_factory: RecorderFactory | None,
     clock: Callable[[], float] | None,
     sleep: Callable[[float], None] | None,
+    wall: Callable[[], datetime] | None = None,
 ) -> int:
     tty = sys.stdin if stdin is None else stdin
     ask = input if input_fn is None else input_fn
-    if not gate(args, tty, ask, say):
+    probe = command == PROBE_DATA
+    if not gate(args, tty, ask, say, describe_probe if probe else describe_session):
         return EXIT_REFUSED
     logging.getLogger("ibapi").setLevel(logging.WARNING)
     now = clock or time.monotonic
@@ -767,9 +969,22 @@ def _after_checks(
             return None
         a.record.parent.mkdir(parents=True, exist_ok=True)
         # the subcommand and the symbols only: no dates, port, host or paths in the header
-        return SessionRecorder(a.record, clock=now, command=["fetch-bars", *a.symbols], port=a.port,
+        return SessionRecorder(a.record, clock=now, command=[command, *a.symbols], port=a.port,
                                private_values=a.private)
 
+    if probe:
+        from MainStoinker.ib.probe import run_probe_data  # lazy: probe.py imports this module
+
+        return run_probe_data(
+            args,
+            connection_factory=connection_factory or real_connection,
+            market_data_factory=market_data_factory or IbMarketData,
+            recorder_factory=recorder_factory or real_recorder,
+            out=stream,
+            clock=now,
+            sleep=sleep or time.sleep,
+            wall=wall,
+        )
     return run_fetch_bars(
         args,
         connection_factory=connection_factory or real_connection,
