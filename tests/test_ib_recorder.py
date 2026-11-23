@@ -88,7 +88,12 @@ def read_lines(path: Path) -> list[dict[str, Any]]:
 
 
 def forbidden_in(text: str, *secrets: str) -> list[str]:
-    low = text.lower()
+    """The secrets still readable in `text`, also after folding full-width letters and
+    dropping zero-width characters (a file that kept them would still leak)."""
+    folded = "".join(
+        c for c in unicodedata.normalize("NFKC", text) if unicodedata.category(c) != "Cf"
+    )
+    low = (text + "\n" + folded).lower()
     return [s for s in secrets if s.lower() in low]
 
 
