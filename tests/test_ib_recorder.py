@@ -1013,9 +1013,48 @@ def test_private_values_match_case_insensitively_as_substrings_components_and_wo
     assert red.scrub("al bo and al") == "REDACTED and al"  # words of two characters are not removed alone
 
 
+def test_private_value_path_components_and_short_word_joiners() -> None:
+    home = Redactor(private_values=[winpath("C:", "Users", "zedquux")])
+    assert home.scrub("hello ZEDQUUX and users") == "hello REDACTED and REDACTED"  # each component, by itself
+    spaced = Redactor(private_values=[winpath("C:", "Users", "Al Bo")])
+    assert spaced.scrub("hi al.bo") == "hi REDACTED"  # the component "Al Bo" has words under three characters
+    short = Redactor(private_values=["Al Bo"])
+    assert short.scrub("al.bo and albo and al_bo") == "REDACTED and REDACTED and REDACTED"
+
+
+def test_a_short_id_from_managed_accounts_is_learned_for_later_text() -> None:
+    """Only the managedAccounts rule learns ids of under five characters (a name rule needs five)."""
+    red = Redactor()
+    red.sanitise("raw", "managedAccounts", ("ZQ7",))
+    assert red.scrub("later zq7 and ZQ7") == "later ACCOUNT-1 and ACCOUNT-1"
+
+
+def test_the_final_check_catches_a_number_equal_to_a_learned_digit_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rec = recorder(tmp_path)
+    rec.on_raw("managedAccounts", (A,))
+    monkeypatch.setattr(Redactor, "sanitise", lambda self, kind, name, args: [int(digits_of(A)), 5])
+    rec.on_raw("custom", ("anything",))
+    rec.close()
+    assert read_lines(tmp_path / "rec.jsonl")[2]["args"] == "<redaction check failed>"
+    assert rec.failures == 1
+
+
+def test_the_two_string_caps_each_stand_alone_and_together_the_spy_sees_nothing_long() -> None:
+    long = "a" * (MAX_STRING + 1)
+    assert rmod._normalise(long).startswith("<omitted:")
+    assert Redactor()._redact_text(long).startswith("<omitted:")
+    assert Redactor()._walk(long.encode(), False, 0, frozenset())["text"].startswith("<omitted:")
+
+
 def test_an_address_without_a_dot_and_a_mapped_address_are_whole() -> None:
     red = Redactor()
     ip = ".".join(("198", "51", "100", "77"))
+    v6 = "fe80" + "::1"
+    # no letter before the address: the cold id pattern is not what removes it
+    assert red.scrub(f"peer ({ip}) gone") == "peer (IP-REDACTED) gone"
+    assert red.scrub(f"peer ({v6}) gone") == "peer (IP-REDACTED) gone"
     assert red.scrub("mail zed@mailbox now") == "mail EMAIL-REDACTED now"
     assert red.scrub(f"peer ::ffff:{ip} gone") == "peer IP-REDACTED gone"
     assert red.scrub(f"peer 64:ff9b::{ip} gone") == "peer IP-REDACTED gone"
