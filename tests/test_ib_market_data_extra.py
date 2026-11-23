@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 import pytest
 from ibapi.common import TickAttrib
+from ibapi.contract import Contract
 
 from MainStoinker.ib import events
 from MainStoinker.ib import market_data as market_data_module
@@ -42,6 +46,7 @@ from tests.test_ib_market_data import (
     Rig,
     details,
     error_played,
+    flush,
 )
 
 rig = base.rig  # the fixture of that file, under the same name
@@ -115,10 +120,12 @@ def test_successive_waits_return_all_bars_so_far_after_a_loss(rig: Rig) -> None:
     A second `wait_history` never returns a partial tail, so a driver that retries after
     LOST just uses the last result.
     """
+    rig.clock.tick = 0.5
     req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
     rig.fake.push("historicalData", req_id, make_bar(1723815000, 10, 11, 9, 10.5, 1))
     rig.fake.drop(1100)
-    first = rig.md.wait_history(req_id, WAIT)
+    flush(rig, 20)  # queued before the wait starts, so few polls are enough
+    first = rig.md.wait_history(req_id, 20)
     assert first.outcome == LOST and [b.date for b in first.bars] == ["1723815000"]
     rig.fake.drop(1102)
     rig.fake.push("historicalData", req_id, make_bar(1723815060, 10, 11, 9, 10.5, 2))
@@ -136,9 +143,11 @@ def test_successive_waits_return_all_bars_so_far_after_a_loss(rig: Rig) -> None:
 
 
 def test_a_data_lost_restore_is_visible_in_general_events(rig: Rig) -> None:
+    rig.clock.tick = 0.5
     req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
     rig.fake.drop(1100)
-    assert rig.md.wait_history(req_id, WAIT).outcome == LOST
+    flush(rig, 21)
+    assert rig.md.wait_history(req_id, 20).outcome == LOST
     rig.fake.drop(1101)
     outcome = LOST
     for _ in range(5000):
@@ -152,7 +161,7 @@ def test_a_data_lost_restore_is_visible_in_general_events(rig: Rig) -> None:
 
 
 def test_a_large_history_answer_is_collected_whole(rig: Rig) -> None:
-    count = 100_000
+    count = market_data_module._UPDATE_LIMIT + 1_000  # more than any bounded box would keep
     bar = make_bar(1723815000, 10, 11, 9, 10.5, 1)
 
     def handler(req_id: int, *rest: Any) -> list[tuple[Any, ...]]:
@@ -166,23 +175,27 @@ def test_a_large_history_answer_is_collected_whole(rig: Rig) -> None:
     assert result.outcome == END and len(result.bars) == count
 
 
-def test_a_long_quote_stream_is_bounded(rig: Rig) -> None:
+def test_a_long_quote_stream_is_bounded(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    limit = 500
+    monkeypatch.setattr(market_data_module, "_QUOTE_LIMIT", limit)  # a small box, a short test
     rig.clock.tick = 0.0
     quotes = rig.md.request_quotes(AAPL)
     other = rig.md.request_history(AAPL, END_UTC, "1 D")
-    ticks = 100_000
+    ticks = 4 * limit
     attrib = TickAttrib()
     for i in range(ticks):
         rig.fake.push("tickPrice", quotes, 4, 100.0 + i, attrib)
-    for i in range(2000):  # events of ids nobody here issued
+    for i in range(1200):  # events of ids nobody here issued
         rig.fake.push("historicalDataEnd", 50_000 + i, "s", "e")
     rig.fake.push("historicalDataEnd", other, "s", "e")
     assert rig.md.wait_history(other, LONG).outcome == END  # pumps all of it into the boxes
-    assert rig.md.quote_overflow == ticks - 10_000
+    assert rig.md.quote_overflow == ticks - limit
     assert len(rig.md.general_events) == 1000
     # the oldest ticks went, the newest are kept, in order
     first = rig.md.next_event_for(quotes, WAIT)
-    assert isinstance(first, events.TickPrice) and first.price == 100.0 + (ticks - 10_000)
+    assert isinstance(first, events.TickPrice) and first.price == 100.0 + (ticks - limit)
     assert rig.md.cancel_quotes(quotes) is True
     with pytest.raises(ValueError, match="not an open"):
         rig.md.next_event_for(quotes, 1)
@@ -238,7 +251,7 @@ def test_a_wait_times_out_on_its_deadline_even_while_other_events_stream(rig: Ri
     md = IbMarketData(rig.conn, clock=lambda: reads[0] / 1000.0, poll_interval=0.01)
     quotes = md.request_quotes(AAPL)
     silent = md.request_history(AAPL, END_UTC, "1 D")
-    for i in range(20_000):
+    for i in range(6_000):
         rig.fake.push("tickPrice", quotes, 4, 100.0 + i, TickAttrib())
     result = md.wait_history(silent, 1.0)
     assert result.outcome == TIMEOUT
@@ -297,8 +310,13 @@ def test_every_wait_times_out_on_its_deadline_while_other_events_stream(
     busy = md.request_quotes(AAPL)
     silent = md.request_quotes(AAPL)
     md.request_server_time()
-    for i in range(20_000):
-        rig.fake.push("tickPrice", busy, 4, 100.0 + i, TickAttrib())
+    if wait == "resolve":
+        # a request first reads what is already queued, so the traffic must arrive after it
+        rig.fake.respond("reqContractDetails", lambda req_id, c: [
+            ("tickPrice", busy, 4, 100.0 + i, TickAttrib()) for i in range(6_000)])
+    else:
+        for i in range(6_000):
+            rig.fake.push("tickPrice", busy, 4, 100.0 + i, TickAttrib())
     if wait == "resolve":
         with pytest.raises(ResolveTimeout):
             md.resolve_stock("AAPL", 1.0)
@@ -395,10 +413,10 @@ def test_a_lost_connection_honours_the_timeout_and_polls_instead_of_spinning(rig
         md.wait_server_time(0.5)
     calls.clear()
     start = now[0]
-    result = md.wait_history(req_id, 30)
+    result = md.wait_history(req_id, 4)
     assert result.outcome == LOST
-    assert now[0] - start >= 30
-    assert 55 <= len(calls) <= 62
+    assert now[0] - start >= 4
+    assert 7 <= len(calls) <= 10  # 4 s in slices of 0.5 s
     assert all(c == 0.5 for c in calls[:-1]) and calls[-1] in (0.0, 0.5)
 
 
@@ -417,6 +435,7 @@ def test_a_wait_that_cannot_advance_any_clock_is_bounded_by_the_deadline_only(ri
     rig.conn.next_event = scripted  # type: ignore[method-assign]
     md = IbMarketData(rig.conn, clock=lambda: now[0], poll_interval=1.0)
     req_id = md.request_history(AAPL, END_UTC, "1 D")
+    reads[0], now[0] = 0, 0.0  # the request read the queue once; count only the wait
     result = md.wait_history(req_id, 10)
     assert result.outcome == TIMEOUT and 10 <= reads[0] <= 12
 
@@ -471,6 +490,7 @@ def test_a_1101_restore_marks_every_request_in_flight_and_only_those(rig: Rig) -
 
 
 def test_a_close_while_lost_is_closed_and_a_deadline_while_lost_is_lost(rig: Rig) -> None:
+    rig.clock.tick = 0.5  # few polls per simulated second: no real waiting
     req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
     lose(rig)
     assert rig.md.wait_history(req_id, 3).outcome == LOST
@@ -496,8 +516,8 @@ def test_resolve_stock_times_out_while_lost(rig: Rig) -> None:
     rig.fake.respond("reqContractDetails", lambda req_id, c: [error_played(-1, 1100, "lost")])
     before = rig.clock.now
     with pytest.raises(market_data_module.ResolveConnectionLost):
-        rig.md.resolve_stock("AAPL", timeout=5)
-    assert rig.clock.now - before >= 5
+        rig.md.resolve_stock("AAPL", timeout=2)
+    assert rig.clock.now - before >= 2
 
 
 def test_server_time_reports_data_lost_once(rig: Rig) -> None:
@@ -521,11 +541,14 @@ def test_a_quote_stream_reports_data_lost_once_after_its_queued_ticks(rig: Rig) 
         rig.md.next_event_for(quotes, 1000)
     assert caught.value.req_id == quotes
     assert rig.md.poll_event(quotes, 1) == TIMEOUT  # once
-    assert rig.md.cancel_quotes(quotes) is False  # IB dropped it: nothing to cancel
-    assert not rig.fake.calls_named("cancelMktData")
+    # IB may have kept the subscription: the cancel is sent (harmless if it did not)
+    assert rig.md.cancel_quotes(quotes) is True
+    assert [c.args for c in rig.fake.calls_named("cancelMktData")] == [(quotes,)]
+    assert rig.md.cancel_quotes(quotes) is False  # and only once
 
 
 def test_poll_event_says_why_nothing_came(rig: Rig) -> None:
+    rig.clock.tick = 0.5
     quotes = rig.md.request_quotes(AAPL)
     hist = rig.md.request_history(AAPL, END_UTC, "1 D")
     with pytest.raises(ValueError, match="stream"):
@@ -585,9 +608,12 @@ def test_a_timed_out_request_is_still_cancelled_at_ib(rig: Rig) -> None:
 # item 9: bounded state
 
 
-def test_unread_live_history_updates_are_capped_and_counted(rig: Rig) -> None:
+def test_unread_live_history_updates_are_capped_and_counted(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig.clock.tick = 0.0
-    limit = market_data_module._UPDATE_LIMIT
+    limit = 500
+    monkeypatch.setattr(market_data_module, "_UPDATE_LIMIT", limit)  # a small box, a short test
     live = rig.md.request_history(AAPL, None, "300 S", keep_up_to_date=True)
     other = rig.md.request_history(AAPL, END_UTC, "1 D")
     rig.fake.push("historicalDataEnd", live, "s", "e")
@@ -619,3 +645,241 @@ def test_the_ids_of_cancelled_requests_are_pruned_but_cancel_stays_idempotent(
     assert rig.md.late_events == 1
     with pytest.raises(ValueError):
         rig.md.cancel_quotes(ids[-1] + 1000)  # an id never issued is still refused
+
+
+# -- T6 fix round 2 ------------------------------------------------------------------------
+
+
+@contextmanager
+def a_wait_in_progress(rig: Rig) -> Iterator[int]:
+    """A `wait_history` that runs on another thread; yields its request id."""
+    rig.clock.tick = 0.0
+    req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
+    inside = threading.Event()
+    main_id = threading.get_ident()
+    reads = [0]
+
+    def on_read(_: int) -> None:
+        if threading.get_ident() != main_id:
+            reads[0] += 1
+            if reads[0] >= 3:
+                inside.set()
+
+    rig.clock.on_read = on_read
+    thread = threading.Thread(target=lambda: rig.md.wait_history(req_id, 1e6), daemon=True)
+    thread.start()
+    try:
+        assert inside.wait(WAIT)
+        yield req_id
+    finally:
+        rig.fake.push("historicalDataEnd", req_id, "s", "e")
+        thread.join(WAIT)
+    assert not thread.is_alive()
+
+
+# item 1: a restore that is still queued must not mark a later request
+
+
+def test_a_request_after_a_queued_1101_restore_is_not_marked_data_lost(rig: Rig) -> None:
+    a = rig.md.request_history(AAPL, END_UTC, "1 D")
+    rig.fake.drop(1100)
+    assert rig.md.wait_history(a, 1).outcome == LOST
+    rig.fake.drop(1101)  # nobody reads it: events are only routed inside a wait
+    flush(rig, 1)
+    b = rig.md.request_history(AAPL, END_UTC, "2 D")
+    rig.fake.push("historicalData", b, make_bar(1723815000, 10, 11, 9, 10.5, 5))
+    rig.fake.push("historicalDataEnd", b, "s", "e")
+    flush(rig, 2)
+    result = rig.md.wait_history(b, WAIT)
+    assert result.outcome == END and len(result.bars) == 1 and result.end is not None
+    assert rig.md.wait_history(a, 1).outcome == DATA_LOST  # the request in flight did lose its data
+
+
+@pytest.mark.parametrize("kind", ["quotes", "server_time"])
+def test_a_quote_or_time_request_after_a_queued_1101_restore_is_not_marked(
+    rig: Rig, kind: str
+) -> None:
+    rig.fake.drop(1100)
+    rig.fake.drop(1101)
+    flush(rig, 3)
+    if kind == "quotes":
+        quotes = rig.md.request_quotes(AAPL)
+        rig.fake.push("tickPrice", quotes, 4, 190.5, TickAttrib())
+        assert isinstance(rig.md.next_event_for(quotes, WAIT), events.TickPrice)
+    else:
+        rig.md.request_server_time()
+        rig.fake.push("currentTime", 1_723_815_000)
+        assert rig.md.wait_server_time(WAIT) == datetime.fromtimestamp(1_723_815_000, tz=UTC)
+
+
+def test_a_resolve_after_a_queued_1101_restore_is_not_marked_data_lost(rig: Rig) -> None:
+    rig.fake.drop(1100)
+    rig.fake.drop(1101)
+    flush(rig, 4)
+    rig.fake.respond("reqContractDetails", lambda req_id, c: [
+        ("contractDetails", req_id, details(265598)), ("contractDetailsEnd", req_id)])
+    assert rig.md.resolve_stock("AAPL", timeout=WAIT).con_id == 265598
+
+
+@pytest.mark.parametrize("kind", ["history", "quotes", "server_time", "resolve"])
+def test_a_request_during_a_running_wait_is_refused_before_an_id_or_a_send(
+    rig: Rig, kind: str
+) -> None:
+    with a_wait_in_progress(rig) as running:
+        calls = len(rig.fake.calls)
+        with pytest.raises(ConcurrentWait):
+            if kind == "history":
+                rig.md.request_history(AAPL, END_UTC, "2 D")
+            elif kind == "quotes":
+                rig.md.request_quotes(AAPL)
+            elif kind == "server_time":
+                rig.md.request_server_time()
+            else:
+                rig.md.resolve_stock("AAPL", timeout=1)
+        assert len(rig.fake.calls) == calls  # nothing sent
+    assert rig.conn.next_request_id() == running + 1  # and no id taken
+
+
+# item 2: error is sticky and visible
+
+
+def test_an_error_stays_an_error_when_an_end_marker_arrives_after_it(rig: Rig) -> None:
+    a = rig.md.request_history(AAPL, END_UTC, "1 D")
+    b = rig.md.request_history(AAPL, END_UTC, "2 D")
+    rig.fake.push("error", a, 1_700_000_000_000, 162, "pacing violation", "")
+    first = rig.md.wait_history(a, 1)
+    assert first.outcome == ERROR
+    rig.fake.push("historicalDataEnd", a, "s", "e")
+    rig.fake.push("historicalDataEnd", b, "s", "e")
+    assert rig.md.wait_history(b, WAIT).outcome == END  # routes the end marker of `a` on the way
+    again = rig.md.wait_history(a, 1)
+    assert again.outcome == ERROR and [e.code for e in again.failures] == [162]
+    assert again.end is not None  # the marker is recorded, the outcome is not END
+    assert rig.md.cancel_history(a) is False  # dead at IB: nothing to cancel
+    assert not rig.fake.calls_named("cancelHistoricalData")
+
+
+def test_an_error_before_the_end_marker_in_one_read_is_an_error(rig: Rig) -> None:
+    a = rig.md.request_history(AAPL, END_UTC, "1 D")
+    rig.fake.push("error", a, 1_700_000_000_000, 162, "no data", "")
+    rig.fake.push("historicalDataEnd", a, "s", "e")
+    assert rig.md.wait_history(a, WAIT).outcome == ERROR
+
+
+def test_an_error_on_a_live_history_stream_after_its_end_is_visible(rig: Rig) -> None:
+    live = rig.md.request_history(AAPL, None, "1 D", keep_up_to_date=True)
+    rig.fake.push("historicalData", live, make_bar(1723815000, 10, 11, 9, 10.5, 5))
+    rig.fake.push("historicalDataEnd", live, "s", "e")
+    rig.fake.push("historicalDataUpdate", live, make_bar(1723815060, 10, 11, 9, 10.5, 6))
+    text = "Historical Market Data Service error message:API historical data query cancelled: 1"
+    rig.fake.push("error", live, 1_700_000_000_000, 162, text, "")
+    update = rig.md.poll_event(live, WAIT)
+    assert isinstance(update, events.HistoricalBar) and update.volume == 6  # queued ones first
+    assert [rig.md.poll_event(live, 1) for _ in range(3)] == [ERROR, ERROR, ERROR]  # sticky
+    result = rig.md.wait_history(live, 1)
+    assert result.outcome == ERROR and result.failures[0].message == text
+    assert len(result.bars) == 1
+    assert rig.md.cancel_history(live) is False  # IB already ended it
+    assert not rig.fake.calls_named("cancelHistoricalData")
+    with pytest.raises(ValueError, match="not an open"):
+        rig.md.poll_event(live, 1)  # the state is freed
+
+
+# item 3: timeouts
+
+
+BAD_TIMEOUTS = [float("nan"), float("inf"), float("-inf"), -1, -0.5, True, False, "1", None]
+
+
+@pytest.mark.parametrize("bad", BAD_TIMEOUTS, ids=repr)
+def test_every_wait_refuses_a_bad_timeout_before_sending_anything(rig: Rig, bad: Any) -> None:
+    history = rig.md.request_history(AAPL, END_UTC, "1 D")
+    quotes = rig.md.request_quotes(AAPL)
+    rig.md.request_server_time()
+    calls = len(rig.fake.calls)
+    next_id = rig.conn.next_request_id() + 1
+    for call in (
+        lambda: rig.md.wait_history(history, bad),
+        lambda: rig.md.poll_event(quotes, bad),
+        lambda: rig.md.next_event_for(quotes, bad),
+        lambda: rig.md.poll_server_time(bad),
+        lambda: rig.md.wait_server_time(bad),
+        lambda: rig.md.resolve_stock("AAPL", bad),
+    ):
+        with pytest.raises(ValueError, match="timeout"):
+            call()
+    assert len(rig.fake.calls) == calls and not rig.fake.calls_named("reqContractDetails")
+    assert rig.conn.next_request_id() == next_id  # resolve took no id
+
+
+@pytest.mark.parametrize("good", [0, 0.0, 2, 0.25])
+def test_a_timeout_of_zero_or_more_is_accepted(rig: Rig, good: float) -> None:
+    history = rig.md.request_history(AAPL, END_UTC, "1 D")
+    assert rig.md.wait_history(history, good).outcome == TIMEOUT
+
+
+# item 4: server time
+
+
+@pytest.mark.parametrize("where", ["queued", "filed"])
+def test_a_late_server_time_answer_is_not_taken_for_the_next_request(
+    rig: Rig, where: str
+) -> None:
+    rig.md.request_server_time()
+    assert rig.md.poll_server_time(0.2) == TIMEOUT  # never answered in time
+    rig.fake.push("currentTime", 1_000_000_000)  # the late answer of the first request
+    if where == "filed":
+        other = rig.md.request_history(AAPL, END_UTC, "1 D")
+        rig.fake.push("historicalDataEnd", other, "s", "e")
+        assert rig.md.wait_history(other, WAIT).outcome == END  # files the late answer
+    else:
+        flush(rig, 5)
+    rig.md.request_server_time()
+    rig.fake.push("currentTime", 1_700_000_000)
+    assert rig.md.wait_server_time(WAIT) == datetime.fromtimestamp(1_700_000_000, tz=UTC)
+
+
+# item 5: cancel after data lost
+
+
+def test_a_live_history_request_is_cancelled_at_ib_after_data_lost(rig: Rig) -> None:
+    live = rig.md.request_history(AAPL, None, "1 D", keep_up_to_date=True)
+    oneshot = rig.md.request_history(AAPL, END_UTC, "1 D")
+    rig.fake.drop(1100)
+    rig.fake.drop(1101)
+    assert rig.md.poll_event(live, 1000) == DATA_LOST
+    assert rig.md.wait_history(oneshot, 1000).outcome == DATA_LOST
+    assert rig.md.cancel_history(oneshot) is False  # a one-shot request: nothing is sent
+    assert not rig.fake.calls_named("cancelHistoricalData")
+    assert rig.md.cancel_history(live) is True  # a subscription IB may have kept
+    assert [c.args for c in rig.fake.calls_named("cancelHistoricalData")] == [(live,)]
+    assert rig.md.cancel_history(live) is False  # only once
+
+
+# item 6: contracts built by hand
+
+
+@pytest.mark.parametrize("primary", ["SMART", "nasdaq", "N", "NASDAQ!"])
+def test_a_hand_built_contract_with_a_bad_primary_exchange_is_refused(
+    rig: Rig, primary: str
+) -> None:
+    contract = Contract()
+    contract.symbol, contract.secType, contract.exchange = "AAPL", "STK", "SMART"
+    contract.currency, contract.primaryExchange = "USD", primary
+    next_id = rig.conn.next_request_id() + 1
+    for call in (
+        lambda: rig.md.request_history(contract, END_UTC, "1 D"),
+        lambda: rig.md.request_quotes(contract),
+    ):
+        with pytest.raises(ValueError, match="primary exchange"):
+            call()
+    assert not rig.fake.calls_named("reqHistoricalData")
+    assert not rig.fake.calls_named("reqMktData")
+    assert rig.conn.next_request_id() == next_id
+
+
+def test_a_hand_built_contract_with_an_empty_primary_exchange_is_accepted(rig: Rig) -> None:
+    contract = Contract()
+    contract.symbol, contract.secType, contract.exchange = "AAPL", "STK", "SMART"
+    contract.currency = "USD"
+    assert rig.md.request_history(contract, END_UTC, "1 D") >= 0

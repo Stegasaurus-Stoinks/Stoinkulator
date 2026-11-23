@@ -54,6 +54,26 @@ data_lost  IB restored with code 1101 while the    cancel the id, discard the   
            (sticky for history)
 ========== ======================================= ================================ ==========================
 
+When several states hold for a history request the order is `data_lost`, then `error`,
+then `end`: an error is never hidden by an end marker that arrives after it, and a live
+(`keep_up_to_date`) history request that gets an error after its end marker reports
+`error` from `wait_history` and from `poll_event` (sticky). Every wait takes a finite
+timeout of 0 or more (a bool, NaN, infinity or a negative number is a `ValueError`,
+raised before anything is sent).
+
+For the caller
+--------------
+* This object is the only reader of the connection's events; pass it the connection's
+  clock. `IbConnection.wait_for_data_farm` does not consume events.
+* `lost` arrives only at the wait's deadline, not at once on code 1100. Between waits
+  the lost state is not exposed: check the connection's `state` to pause.
+* After `timeout` the caller sends a cancel (`cancel_history`), and a re-request gets a
+  new id; late bars of the old id are dropped by id and never mixed into the new one.
+* Bars are raw `events.HistoricalBar`: the caller converts each with
+  `ib.bars.bar_from_ib` and treats any `BadBar` as a failed day.
+* Use one-shot history only for fetching; `keep_up_to_date` is for streams read with
+  `poll_event`.
+
 Connection loss. While code 1100 is in force a wait keeps waiting (it reads the
 connection with `next_event(poll_interval)`, so it does not spin) until its deadline,
 a restore or a close. A restore with code 1102 (`ConnectionRestored.data_lost` False)
@@ -70,8 +90,11 @@ while still lost, the outcome is `lost`, so the timeout is always honoured.
 Cancelling. The caller cancels every history and quote id when it is done with it
 (ended, errored, timed out or data lost). `cancel_history` and `cancel_quotes` free
 the per-id state; they are idempotent. They send nothing to IB for a request that
-is already dead there: a one-shot history that ended, a history request that got an
-error, or any request after a data-lost restore.
+is already dead there: a one-shot history that ended, errored or was data lost, and a
+history request that got an error. After a data-lost restore a quote stream and a
+`keep_up_to_date` history request DO get the cancel: IB may have kept the subscription,
+and cancelling an unknown id is harmless while a leaked subscription holds a market data
+line.
 
 Events and consumers
 --------------------
@@ -87,9 +110,15 @@ and 10,000 live-history updates, overflow counted in `quote_overflow` and
 `update_overflow`); only the last 10,000 cancelled ids are remembered individually.
 
 Threads: the request and cancel methods are thread-safe (the connection
-serialises sends). The wait methods are single-consumer: a second wait started
-while another is running, on any thread, raises `ConcurrentWait` at once, before
-anything is sent, rather than splitting the event stream. All waits use the
+serialises sends). Events are routed only by the one reader, so before a request
+takes its id (`request_history`, `request_quotes`, `resolve_stock`,
+`request_server_time`) it reads and routes everything already queued; this keeps a
+1101 restore that was queued before the request from marking it data lost. The wait
+methods and those request methods are single-consumer: one started while a wait is
+running, on any thread, raises `ConcurrentWait` at once, before an id is taken or
+anything is sent, rather than splitting the event stream. `reqCurrentTime` carries no
+request id, so a server-time request discards any `CurrentTime` already queued or
+filed and the caller issues at most one server-time request at a time. All waits use the
 injected `clock` (pass the connection's clock) and poll the connection in slices of
 `poll_interval`; none sleeps. The deadline is checked after every event as well, so
 a stream of other events cannot postpone a timeout.
@@ -98,6 +127,7 @@ a stream of other events cannot postpone a timeout.
 from __future__ import annotations
 
 import enum
+import math
 import re
 import threading
 import time
@@ -120,7 +150,7 @@ from MainStoinker.ib.connection import (
     NotConnected,
     ReaderStopped,
 )
-from MainStoinker.ib.contracts import SEC_TYPE, stock
+from MainStoinker.ib.contracts import SEC_TYPE, check_primary_exchange, stock
 from MainStoinker.ib.history import (
     DEFAULT_BAR_SIZE,
     DEFAULT_WHAT_TO_SHOW,
@@ -348,6 +378,7 @@ class IbMarketData:
         if keep_up_to_date and end_utc is not None:
             raise ValueError("keep_up_to_date needs end_utc=None: IB rejects an end time with it")
         end = "" if end_utc is None else format_end_date_time(end_utc)
+        self._route_queued()
         req_id = self._connection.next_request_id()
         box = deque(maxlen=_UPDATE_LIMIT) if keep_up_to_date else None
         self._register(req_id, _Issued("history", live=keep_up_to_date, box=box))
@@ -386,6 +417,7 @@ class IbMarketData:
         Never a snapshot and never a regulatory snapshot (IB bills those).
         """
         _check_stock(contract)
+        self._route_queued()
         req_id = self._connection.next_request_id()
         self._register(req_id, _Issued("quotes", live=True, box=deque(maxlen=_QUOTE_LIMIT)))
         try:
@@ -398,12 +430,18 @@ class IbMarketData:
     def cancel_quotes(self, req_id: int) -> bool:
         """Cancel a quote stream; idempotent and silent after the connection closed.
 
-        Sends nothing after a data-lost restore (IB dropped the stream).
+        After a data-lost restore the cancel is still sent: IB may have kept the stream.
         """
         return self._cancel("quotes", req_id, "cancelMktData")
 
     def request_server_time(self) -> None:
-        """Ask for IB's clock; read the answer with `wait_server_time`."""
+        """Ask for IB's clock; read the answer with `wait_server_time`.
+
+        `reqCurrentTime` has no request id, so any `CurrentTime` already queued or
+        filed (a late answer to an earlier request) is discarded first: the wait only
+        returns an answer that arrived after this request. Issue at most one at a time.
+        """
+        self._route_queued()
         with self._lock:
             self._general = deque(
                 (e for e in self._general if not isinstance(e, events.CurrentTime)),
@@ -422,6 +460,7 @@ class IbMarketData:
         deadline (see the outcome table in the module docstring). Bars accumulate
         inside the request: every result holds all bars so far, in arrival order.
         """
+        _check_timeout(timeout)
         info = self._known(req_id, "history")
         with self._waiting():
             deadline = self._clock() + timeout
@@ -439,6 +478,7 @@ class IbMarketData:
         event. `DATA_LOST` comes once, after the events already queued: the stream is
         gone at IB, so cancel the id and request it again.
         """
+        _check_timeout(timeout)
         info = self._known(req_id, None)
         with self._waiting():
             if info.box is None or info.kind == "contract":
@@ -467,6 +507,7 @@ class IbMarketData:
 
     def poll_server_time(self, timeout: float) -> datetime | Outcome:
         """IB's time as an aware UTC datetime, or an `Outcome` saying why there is none."""
+        _check_timeout(timeout)
         found: list[events.CurrentTime] = []
         with self._waiting():
             deadline = self._clock() + timeout
@@ -496,8 +537,10 @@ class IbMarketData:
         already running raises `ConcurrentWait`, both before anything is sent.
         """
         check_symbol(symbol)
+        _check_timeout(timeout)
         found: list[events.ContractDetailsEvent] = []
         with self._waiting():  # before the send: a refused resolve must not ask IB anything
+            self._route_all_queued()
             req_id = self._connection.next_request_id()
             info = _Issued("contract", box=deque())
             self._register(req_id, info)
@@ -562,7 +605,7 @@ class IbMarketData:
                 return False  # already cancelled
             if info is None or info.kind != kind:
                 raise ValueError(f"request id {req_id!r} is not a {kind} request of this object")
-            send = not info.dead
+            send = not info.dead or (info.live and info.data_lost)
             self._forget(req_id)
         if not send:
             return False
@@ -571,6 +614,18 @@ class IbMarketData:
         except NotConnected:
             return False
         return True
+
+    def _route_queued(self) -> None:
+        """Route every event already queued, as the one reader (`ConcurrentWait` if a wait runs)."""
+        with self._waiting():
+            self._route_all_queued()
+
+    def _route_all_queued(self) -> None:
+        while True:
+            event = self._connection.next_event(0.0)
+            if event is None:
+                return
+            self._route(event)
 
     @contextmanager
     def _waiting(self) -> Iterator[None]:
@@ -596,16 +651,20 @@ class IbMarketData:
         with self._lock:
             if info.data_lost:
                 return DATA_LOST
-            if info.end is not None:
-                return END
             if info.failed:
                 return ERROR
+            if info.end is not None:
+                return END
         return None
 
     def _stream_state(self, info: _Issued) -> str | None:
         with self._lock:
             if info.box:
+                if info.kind == "history" and _is_failure(info.box[0]):
+                    return ERROR  # sticky: the error stays at the head of the box
                 return _READY
+            if info.kind == "history" and info.failed:
+                return ERROR
             if info.stream_lost:
                 info.stream_lost = False  # reported once
                 return DATA_LOST
@@ -720,6 +779,8 @@ class IbMarketData:
                 info.errors.append(event)
             if event.code not in NOTICE_CODES and not info.finished:
                 info.failed = True
+                if info.live and info.end is not None:
+                    self._box(info, event)  # the stream reader sees it: poll_event gives error
 
     def _box(self, info: _Issued, event: ConnectionEvent) -> None:
         box = info.box
@@ -751,11 +812,26 @@ def _outcome(value: str) -> Outcome:
     return Outcome(value)
 
 
+def _is_failure(event: object) -> bool:
+    return isinstance(event, events.IbError) and event.code not in NOTICE_CODES
+
+
+def _check_timeout(timeout: float) -> None:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int | float)
+        or not math.isfinite(timeout)
+        or timeout < 0
+    ):
+        raise ValueError(f"timeout must be a finite number of 0 or more, got {timeout!r}")
+
+
 def _check_stock(contract: Contract) -> None:
     if not isinstance(contract, Contract):
         raise ValueError(f"contract must be an ibapi Contract, got {type(contract).__name__}")
     if contract.secType != SEC_TYPE:
         raise ValueError(f"only stock contracts are supported, got secType {contract.secType!r}")
+    check_primary_exchange(contract.primaryExchange)
 
 
 def _single_stock(symbol: str, found: list[events.ContractDetailsEvent]) -> StockInfo:

@@ -161,6 +161,22 @@ AAPL = stock("AAPL", "NASDAQ", 265598)
 END_UTC = datetime(2024, 8, 16, 20, 0, tzinfo=UTC)
 
 
+def flush(rig: Rig, tag: int) -> None:
+    """Return once everything the fake was given before this call is in the connection's queue.
+
+    A sentinel (an error for an id nobody issued) is pushed behind it; the fake's one reader
+    thread starts delivering the sentinel only after the earlier callbacks returned. Nothing
+    is read from the connection, so the events stay unrouted.
+    """
+    sentinel = 900_000 + tag
+    rig.fake.push("error", sentinel, 1_700_000_000_000, 162, "sentinel", "")
+    for _ in range(5000):
+        if any(d.name == "error" and d.args[0] == sentinel for d in rig.fake.delivered):
+            return
+        time.sleep(0.001)
+    raise AssertionError("the fake did not deliver its callbacks")
+
+
 # -- the narrow face ----------------------------------------------------------
 
 
@@ -381,16 +397,20 @@ def test_wait_history_notice_does_not_end_the_wait(rig: Rig) -> None:
 
 
 def test_wait_history_times_out_on_the_injected_clock(rig: Rig) -> None:
+    rig.clock.tick = 0.5  # a big step per read: few polls, so the test does not wait in real time
     req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
     before = rig.clock.now
-    result = rig.md.wait_history(req_id, 30)
+    result = rig.md.wait_history(req_id, 3)
     assert result.outcome == TIMEOUT and result.bars == ()
-    assert 30 <= rig.clock.now - before < 40  # simulated seconds, not real ones
+    assert 3 <= rig.clock.now - before < 10  # simulated seconds, not real ones
 
 
 def test_wait_history_keeps_partial_bars_on_timeout(rig: Rig) -> None:
     script_history(rig, 1723815000, end=False)
-    result = rig.md.wait_history(rig.md.request_history(AAPL, END_UTC, "1 D"), 3)
+    rig.clock.tick = 0.5
+    req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
+    flush(rig, 10)  # the bar is queued before the wait starts, so few polls are enough
+    result = rig.md.wait_history(req_id, 10)
     assert result.outcome == TIMEOUT and len(result.bars) == 1 and result.end is None
 
 
@@ -404,18 +424,20 @@ def test_wait_history_reports_a_connection_that_closes(rig: Rig) -> None:
 
 
 def test_wait_history_reports_lost_connectivity_and_resumes_after_restore(rig: Rig) -> None:
+    rig.clock.tick = 0.5
     req_id = rig.md.request_history(AAPL, END_UTC, "1 D")
     rig.fake.drop(1100)
+    flush(rig, 11)  # the 1100 is queued before the wait starts
     before = rig.clock.now
-    assert rig.md.wait_history(req_id, 30).outcome == LOST
-    assert rig.clock.now - before >= 30  # T6 fix round: the timeout is honoured while lost
+    assert rig.md.wait_history(req_id, 10).outcome == LOST
+    assert rig.clock.now - before >= 10  # T6 fix round: the timeout is honoured while lost
     rig.fake.drop(1102)
     rig.fake.push("historicalDataEnd", req_id, "s", "e")
     # The restore and the end marker are delivered by the reader thread a moment later; a wait
     # that is still before its deadline keeps reading until they arrive.
     outcome = LOST
     for _ in range(5000):
-        outcome = rig.md.wait_history(req_id, 30).outcome
+        outcome = rig.md.wait_history(req_id, 10).outcome
         if outcome != LOST:
             break
         time.sleep(0.001)
@@ -674,16 +696,18 @@ def test_resolve_stock_ignores_errors_of_other_requests_and_notices(rig: Rig) ->
 
 
 def test_resolve_stock_timeout(rig: Rig) -> None:
+    rig.clock.tick = 0.5
     before = rig.clock.now
     with pytest.raises(ResolveTimeout):
-        rig.md.resolve_stock("AAPL", timeout=20)
-    assert 20 <= rig.clock.now - before < 30
+        rig.md.resolve_stock("AAPL", timeout=2)
+    assert 2 <= rig.clock.now - before < 10
 
 
 def test_resolve_stock_incomplete_answer_times_out(rig: Rig) -> None:
     script_details(rig, details(265598), end=False)
+    rig.clock.tick = 0.5
     with pytest.raises(ResolveTimeout):
-        rig.md.resolve_stock("AAPL", timeout=5)
+        rig.md.resolve_stock("AAPL", timeout=2)
 
 
 def test_resolve_stock_connection_closing_mid_request(rig: Rig) -> None:
@@ -694,8 +718,8 @@ def test_resolve_stock_connection_closing_mid_request(rig: Rig) -> None:
 
 def test_resolve_stock_connection_lost_mid_request(rig: Rig) -> None:
     rig.fake.respond("reqContractDetails", lambda req_id, c: rig.fake.drop(1100))
-    with pytest.raises(ResolveConnectionLost):
-        rig.md.resolve_stock("AAPL", timeout=60)
+    with pytest.raises(ResolveConnectionLost):  # the 1100 arrives while the wait polls
+        rig.md.resolve_stock("AAPL", timeout=2)
 
 
 def test_resolve_stock_failure_kinds_are_distinct() -> None:
