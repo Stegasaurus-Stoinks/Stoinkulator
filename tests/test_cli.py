@@ -315,6 +315,37 @@ def test_misaligned_data_skips_the_missing_minute(env, capsys):
     assert "MSFT: no bar at 1 of " in out
 
 
+@pytest.mark.parametrize("symbols", [["AAPL"], ["AAPL", "MSFT"]])
+def test_error_unsorted_data_file(env, capsys, symbols):
+    # A shuffled file is refused whether it is alone or among other symbols.
+    env.stage(symbols)
+    path = env.data / "_AAPL_offlinedata_"
+    frame = pd.read_csv(path, index_col=0)
+    frame.sample(frac=1.0, random_state=1).to_csv(path)
+    env.write_algos([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT][:len(symbols)]}])
+    _bad(env, capsys, "AAPL")
+    # (the message is one line: _bad checked that; it names the file and the row)
+    assert env.run() == 2
+    err = capsys.readouterr().err
+    assert "_AAPL_offlinedata_" in err and "not sorted" in err and "data row" in err
+
+
+def test_error_symbol_with_only_warmup_bars(env, capsys):
+    env.stage(["AAPL", "MSFT"])
+    path = env.data / "_MSFT_offlinedata_"
+    pd.read_csv(path, index_col=0).iloc[:100].to_csv(path)  # all inside the 2-day warm-up
+    env.write_algos([{"ID": "EMACrossing", "data": [EMA, EMA_MSFT]}])
+    _bad(env, capsys, "MSFT has no bars in the replay window")
+
+
+def test_no_bars_in_the_replay_window_for_any_symbol_stays_a_run_of_zero_bars(env, capsys):
+    # Not changed by the zero-bars check, which needs another symbol that has bars:
+    # many existing tests use data shorter than the warm-up on purpose.
+    single(env)
+    assert env.run("--warmup-days", "3650") == 0
+    assert "replayed 0 bars for AAPL" in capsys.readouterr().out.splitlines()
+
+
 def test_error_negative_warmup(env, capsys):
     single(env)
     assert env.run("--warmup-days", "-1") == 2

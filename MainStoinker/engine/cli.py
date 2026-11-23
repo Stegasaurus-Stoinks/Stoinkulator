@@ -625,6 +625,18 @@ def run_backtest_command(
         feed = CsvBarFeed(data_dir, config_symbols(entries), args.warmup_days)
     except (ValueError, FileNotFoundError) as exc:
         raise CliError(str(exc)) from exc
+    # A symbol with no replay bars while another has some is an input problem (it would
+    # only show as one "no bar at N of N minutes" line). When NO symbol has any, the run
+    # stays a run of zero bars as before: many existing tests use data shorter than the
+    # warm-up on purpose.
+    counts = feed.replay_counts()
+    if any(counts.values()):
+        for symbol, count in counts.items():
+            if count == 0:
+                raise CliError(
+                    f"symbol {symbol} has no bars in the replay window (its data is all "
+                    f"warm-up or empty; check the data and --warmup-days {args.warmup_days})"
+                )
     # One pass over the batches (they are in memory): count them and note the
     # first and last replayed bar, which the stored run records.
     bar_count = 0

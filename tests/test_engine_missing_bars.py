@@ -95,25 +95,37 @@ def test_feed_never_yields_an_empty_batch(tmp_path: Path) -> None:
     assert all(len(bars) == 1 for _, bars in batches)
 
 
-def test_duplicate_timestamp_in_one_symbol_raises(tmp_path: Path) -> None:
-    write_symbol(tmp_path, "AAA", ALL, 100.0)
-    write_symbol(tmp_path, "BBB", [0, 1, 2, 2, 3], 200.0)
-    with pytest.raises(ValueError, match="BBB") as info:
-        CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
-    assert str(minute(2)) in str(info.value)
-
-
-def test_duplicate_in_one_symbol_raises_even_when_the_other_misses_that_minute(
+def test_a_repeat_in_one_symbol_is_replayed_in_file_order_whatever_the_others_do(
     tmp_path: Path,
 ) -> None:
-    write_symbol(tmp_path, "AAA", without(2), 100.0)
-    write_symbol(tmp_path, "BBB", [0, 1, 2, 2, 3], 200.0)
-    with pytest.raises(ValueError, match="BBB"):
-        CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
+    # BBB repeats minute 2; AAA has it once and misses minute 3
+    write_symbol(tmp_path, "AAA", [0, 1, 2, 4], 100.0)
+    write_symbol(tmp_path, "BBB", [0, 1, 2, 2, 3, 4], 200.0)
+    feed = CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
+    batches = list(feed)
+    assert [(stamp, list(bars)) for stamp, bars in batches] == [
+        (minute(0), ["AAA", "BBB"]),
+        (minute(1), ["AAA", "BBB"]),
+        (minute(2), ["AAA", "BBB"]),
+        (minute(2), ["BBB"]),  # AAA has no second bar at minute 2
+        (minute(3), ["BBB"]),
+        (minute(4), ["AAA", "BBB"]),
+    ]
+    assert feed.missing_counts() == {"AAA": 2, "BBB": 0}
+
+
+def test_the_kth_repeat_of_each_symbol_joins_the_kth_batch(tmp_path: Path) -> None:
+    write_symbol(tmp_path, "AAA", [0, 1, 1, 1, 2], 100.0)
+    write_symbol(tmp_path, "BBB", [0, 1, 1, 2], 200.0)
+    batches = list(CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1))
+    at_1 = [bars for stamp, bars in batches if stamp == minute(1)]
+    assert [list(bars) for bars in at_1] == [["AAA", "BBB"], ["AAA", "BBB"], ["AAA"]]
+    # file order: the volume of a row is 100 + its row number (3 warm-up rows come first)
+    assert [bars["AAA"].volume for bars in at_1] == [104, 105, 106]
+    assert [bars["BBB"].volume for bars in at_1[:2]] == [104, 105]
 
 
 def test_the_same_repeated_minute_in_every_symbol_still_replays(tmp_path: Path) -> None:
-    """Kept from before: identical replay times, repeats included, pair by position."""
     write_symbol(tmp_path, "AAA", [0, 1, 1, 2], 100.0)
     write_symbol(tmp_path, "BBB", [0, 1, 1, 2], 200.0)
     batches = list(CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1))
@@ -121,6 +133,23 @@ def test_the_same_repeated_minute_in_every_symbol_still_replays(tmp_path: Path) 
     assert all(list(bars) == ["AAA", "BBB"] for _, bars in batches)
     write_symbol(tmp_path, "CCC", [0, 1, 1, 2], 300.0)
     assert len(list(CsvBarFeed(tmp_path, ["CCC"], warmup_days=1))) == 4
+
+
+def test_a_timestamp_going_backwards_is_refused_with_symbol_file_and_row(tmp_path: Path) -> None:
+    write_symbol(tmp_path, "AAA", ALL, 100.0)
+    write_symbol(tmp_path, "BBB", [0, 1, 3, 2, 4], 200.0)
+    with pytest.raises(ValueError, match="BBB") as info:
+        CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
+    message = str(info.value)
+    assert "_BBB_offlinedata_" in message and "not sorted" in message
+    assert "data row 7 " in message  # 3 warm-up rows, then minutes 0, 1, 3, 2: the 7th row
+    assert str(minute(2)) in message and "\n" not in message
+
+
+def test_a_shuffled_single_symbol_file_is_refused(tmp_path: Path) -> None:
+    write_symbol(tmp_path, "AAA", [5, 4, 3, 2, 1, 0], 100.0)
+    with pytest.raises(ValueError, match="not sorted"):
+        CsvBarFeed(tmp_path, ["AAA"], warmup_days=1)
 
 
 def test_missing_counts(tmp_path: Path) -> None:
@@ -152,6 +181,12 @@ def test_gap_positions(tmp_path: Path, name: str, ks: list[int], missing: int) -
     assert feed.missing_counts() == {"AAA": 0, "BBB": missing}
 
 
+def test_a_minute_missing_from_every_symbol_is_not_replayed_or_counted(tmp_path: Path) -> None:
+    feed = make_feed(tmp_path, AAA=without(4), BBB=without(4, 5))
+    assert [stamp for stamp, _ in feed] == [minute(k) for k in without(4)]  # minute 4 is nowhere
+    assert feed.missing_counts() == {"AAA": 0, "BBB": 1}  # only minute 5; minute 4 is not counted
+
+
 def test_whole_day_missing_for_one_symbol(tmp_path: Path) -> None:
     day2 = pd.Timedelta(days=1)
     for symbol, with_day2 in (("AAA", True), ("BBB", False)):
@@ -170,8 +205,10 @@ def test_whole_day_missing_for_one_symbol(tmp_path: Path) -> None:
 
 
 def test_symbol_with_no_replay_bars_is_skipped_everywhere(tmp_path: Path) -> None:
-    # BBB has warm-up bars only: every replay minute is missing for it, not an error
+    # BBB has warm-up bars only: every replay minute is missing for it. The feed allows
+    # that (replay_counts shows the 0); the backtest command refuses it.
     feed = make_feed(tmp_path, AAA=ALL, BBB=[])
+    assert feed.replay_counts() == {"AAA": 10, "BBB": 0}
     assert len(feed.warmup("BBB")) == 3
     assert [list(bars) for _, bars in feed] == [["AAA"]] * 10
     assert feed.missing_counts() == {"AAA": 0, "BBB": 10}
@@ -181,6 +218,7 @@ def test_no_replay_bars_in_any_symbol_is_an_empty_feed(tmp_path: Path) -> None:
     feed = make_feed(tmp_path, AAA=[], BBB=[])
     assert list(feed) == []
     assert feed.missing_counts() == {"AAA": 0, "BBB": 0}
+    assert feed.replay_counts() == {"AAA": 0, "BBB": 0}
 
 
 def test_warmup_stays_per_symbol(tmp_path: Path) -> None:

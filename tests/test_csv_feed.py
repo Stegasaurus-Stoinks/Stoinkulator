@@ -179,6 +179,32 @@ def test_misaligned_symbols_skip_the_missing_minute(
     assert feed.missing_counts() == {"GOOD": 0, "BAD": 1}
 
 
+def test_shuffled_flat_file_among_two_symbols_is_refused(tmp_path: Path) -> None:
+    write_csv(tmp_path, "GOOD", STAMPS)
+    shuffled = [STAMPS[i] for i in (0, 5, 2, 9, 1, 3, 4, 6, 7, 8, 10, 11)]
+    write_csv(tmp_path, "BAD", shuffled)
+    with pytest.raises(ValueError, match="BAD") as info:
+        CsvBarFeed(tmp_path, ["GOOD", "BAD"])
+    message = str(info.value)
+    assert "_BAD_offlinedata_" in message and "data row 3 " in message  # 5 then 2
+    assert STAMPS[2] in message
+
+
+def test_the_sorted_check_leaves_read_offline_bars_alone(tmp_path: Path) -> None:
+    """`read_offline_bars` (also used by the API's bars route) still returns file order."""
+    write_csv(tmp_path, "BAD", [STAMPS[1], STAMPS[0]])
+    frame = read_offline_bars(tmp_path / "_BAD_offlinedata_")
+    assert list(frame["date"]) == [pd.Timestamp(STAMPS[1]), pd.Timestamp(STAMPS[0])]
+
+
+def test_replay_counts(tmp_path: Path) -> None:
+    write_csv(tmp_path, "GOOD", STAMPS)
+    write_csv(tmp_path, "BAD", STAMPS[:5])  # all inside GOOD's 2-day warm-up window, but BAD's
+    feed = CsvBarFeed(tmp_path, ["GOOD", "BAD"], warmup_days=2)
+    assert feed.replay_counts() == {"GOOD": 8, "BAD": 1}
+    assert feed.replay_counts() is not feed.replay_counts()
+
+
 def test_missing_file_raises_file_not_found(tmp_path: Path) -> None:
     write_csv(tmp_path, "AAA", STAMPS)
     with pytest.raises(FileNotFoundError, match="_NOPE_offlinedata_"):

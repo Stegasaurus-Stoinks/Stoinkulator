@@ -131,25 +131,40 @@ def test_a_gap_minute_leaves_every_open_account_at_its_last_close(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("a_ks", "b_ks"),
+    ("a_ks", "b_ks", "expected"),
     [
-        ([0, 1, 1, 2], [0, 1, 2]),  # only A repeats, B has the minute once
-        ([0, 1, 2], [0, 1, 1, 2]),  # only B repeats
-        ([0, 1, 1, 2, 3], [0, 1, 2, 2, 3]),  # each repeats a different minute
-        ([0, 1, 1, 1, 2], [0, 1, 1, 2]),  # both repeat the same minute, a different number of times
+        # only A repeats, B has the minute once
+        ([0, 1, 1, 2], [0, 1, 2], [(0, "AB"), (1, "AB"), (1, "A"), (2, "AB")]),
+        # only B repeats
+        ([0, 1, 2], [0, 1, 1, 2], [(0, "AB"), (1, "AB"), (1, "B"), (2, "AB")]),
+        # each repeats a different minute
+        ([0, 1, 1, 2, 3], [0, 1, 2, 2, 3],
+         [(0, "AB"), (1, "AB"), (1, "A"), (2, "AB"), (2, "B"), (3, "AB")]),
+        # both repeat the same minute, a different number of times
+        ([0, 1, 1, 1, 2], [0, 1, 1, 2],
+         [(0, "AB"), (1, "AB"), (1, "AB"), (1, "A"), (2, "AB")]),
+        # a repeat in one symbol and a gap in the other elsewhere (this used to raise)
+        ([0, 1, 1, 3], [0, 1, 2, 3], [(0, "AB"), (1, "AB"), (1, "A"), (2, "B"), (3, "AB")]),
     ],
 )
-def test_a_repeat_that_is_not_in_every_symbol_raises(
-    tmp_path: Path, a_ks: list[int], b_ks: list[int]
+def test_repeats_are_replayed_in_file_order_in_any_number_of_symbols(
+    tmp_path: Path, a_ks: list[int], b_ks: list[int], expected: list[tuple[int, str]]
 ) -> None:
     write_symbol(tmp_path, "AAA", a_ks, 100.0)
     write_symbol(tmp_path, "BBB", b_ks, 200.0)
-    with pytest.raises(ValueError, match="more than one bar"):
-        CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
+    feed = CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
+    got = [(int((stamp - minute(0)).total_seconds() // 60),
+            "".join(name[0] for name in bars)) for stamp, bars in feed]
+    assert got == expected
+    # the engine, with a ledger, replays all of it and each algo sees each of its own rows
+    a, b = SpyAlgo("a", "AAA"), SpyAlgo("b", "BBB")
+    run_engine(feed, [a, b], ledger=Ledger())
+    assert [f["date"].iloc[-1] for f in a.frames] == [minute(k) for k in a_ks]
+    assert [f["date"].iloc[-1] for f in b.frames] == [minute(k) for k in b_ks]
 
 
 def test_a_repeated_minute_in_every_symbol_reaches_the_algos_twice(tmp_path: Path) -> None:
-    """The kept exception: both bars of the repeated minute are replayed, in file order."""
+    """Both bars of the repeated minute are replayed, in file order."""
     write_symbol(tmp_path, "AAA", [0, 1, 1, 2], 100.0)
     write_symbol(tmp_path, "BBB", [0, 1, 1, 2], 200.0)
     feed = CsvBarFeed(tmp_path, ["AAA", "BBB"], warmup_days=1)
@@ -254,11 +269,11 @@ def _paper_run(data: Path, symbols: Sequence[str]) -> tuple[dict, list[str], Led
 
 
 GAPS = {
-    "mid_session": {"AAPL": ["2024-08-19 09:45:00", "2024-08-19 09:46:00"],
-                    "MSFT": ["2024-08-20 10:10:00"]},
-    "session_tail": {"AAPL": [f"2024-08-19 12:{m}:00" for m in range(56, 60)]},
-    "first_replay_and_last_of_data": {"AAPL": ["2024-08-19 06:30:00", "2024-08-20 12:59:00"],
-                                      "MSFT": ["2024-08-19 06:30:00", "2024-08-20 12:59:00"]},
+    "mid_session": {"AAPL": ["2024-08-19 12:45:00", "2024-08-19 12:46:00"],
+                    "MSFT": ["2024-08-20 13:10:00"]},
+    "session_tail": {"AAPL": [f"2024-08-19 15:{m}:00" for m in range(56, 60)]},
+    "first_replay_and_last_of_data": {"AAPL": ["2024-08-19 09:30:00", "2024-08-20 15:59:00"],
+                                      "MSFT": ["2024-08-19 09:30:00", "2024-08-20 15:59:00"]},
     "whole_day": {"MSFT": ["day:2024-08-19"]},
 }
 

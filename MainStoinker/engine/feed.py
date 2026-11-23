@@ -306,8 +306,8 @@ class CsvBarFeed:
     """Feed backed by `<data_dir>/_<SYMBOL>_offlinedata_` files or month files.
 
     Parsing matches `IBapi.load_offline_data`. Files are read eagerly in the
-    constructor, so every problem (missing file, bad columns, misaligned
-    symbols) surfaces there with a message naming the symbol or file, never
+    constructor, so every problem (missing file, bad columns, dates out of
+    order) surfaces there with a message naming the symbol or file, never
     midway through a run. Paths are resolved from `data_dir` only, never the
     current directory.
 
@@ -316,14 +316,31 @@ class CsvBarFeed:
     (`first_date` = that symbol's first row), as in the legacy loader; warm-up
     stays per symbol, so symbols may have different numbers of warm-up bars.
 
-    After warm-up the feed replays the sorted union of the symbols' timestamps.
-    A batch holds only the symbols that have a bar at that timestamp, in
-    `symbols()` order, and is never empty. A symbol with no bar at a timestamp
-    is skipped there; `missing_counts()` reports how often. A repeated
-    timestamp within one symbol's replay bars is a `ValueError`, with one
-    exception kept from before: when every symbol has exactly the same
-    replay timestamps (repeats included) the bars pair up by position, so a
-    stored run whose data repeats a minute in every symbol still replays.
+    Every symbol's dates must be sorted: no row's date may be before the row
+    above it (month files are stricter, see `read_symbol_bars`). A date going
+    backwards is a `ValueError` naming the symbol, the file and the first such
+    row; the warm-up cutoff comes from the first row, so an unsorted file would
+    otherwise turn most of its bars into warm-up without a word.
+
+    After warm-up the feed replays the sorted union of the symbols'
+    timestamps. A batch holds only the symbols that have a bar at that
+    timestamp, in `symbols()` order, and is never empty. A symbol with no bar
+    at a timestamp is skipped there; `missing_counts()` reports how often. Only
+    timestamps that some symbol has are replayed: a minute missing from EVERY
+    symbol is not in the union, so it is neither replayed, counted nor
+    reported.
+
+    A timestamp may repeat within a symbol (consecutive rows with the same
+    date). The repeats are replayed in file order, one batch each: the k-th
+    bar of a symbol at a repeated timestamp joins the k-th batch for that
+    timestamp, and a symbol with fewer repeats there is absent from the later
+    batches. This does not depend on the other symbols. Each such batch counts
+    as one replayed bar for every symbol in it.
+
+    A symbol with no replay bars at all (warm-up only, or an empty window) is
+    not an error here: it misses every batch and `replay_counts()` shows 0. The
+    `backtest` command refuses it (naming the symbol) when another symbol does
+    have replay bars; when no symbol has any it is a run of zero bars.
     The feed may be iterated repeatedly and yields the same batches each time.
     """
 
@@ -335,19 +352,41 @@ class CsvBarFeed:
         replay: dict[str, pd.DataFrame] = {}
         for symbol in self._symbols:
             data = self._read(Path(data_dir), symbol)
+            self._check_sorted(Path(data_dir), symbol, data)
             cutoff = data["date"].iloc[0] + timedelta(days=warmup_days)
             is_warmup = data["date"] < cutoff
             self._warmup[symbol] = data.loc[is_warmup].reset_index(drop=True)
             replay[symbol] = data.loc[~is_warmup].reset_index(drop=True)
         per_symbol = self._bars_by_symbol(replay)
         self._batches: list[tuple[pd.Timestamp, dict[str, Bar]]] = self._build_batches(per_symbol)
+        self._replayed: dict[str, int] = {s: len(per_symbol[s]) for s in self._symbols}
         self._missing: dict[str, int] = {
-            symbol: len(self._batches) - len(per_symbol[symbol]) for symbol in self._symbols
+            symbol: len(self._batches) - self._replayed[symbol] for symbol in self._symbols
         }
 
     @staticmethod
     def _read(data_dir: Path, symbol: str) -> pd.DataFrame:
         return read_symbol_bars(data_dir, symbol)
+
+    @staticmethod
+    def _check_sorted(data_dir: Path, symbol: str, data: pd.DataFrame) -> None:
+        """Raise `ValueError` at the first row whose date is before the row above it.
+
+        Done here, on the per-symbol read both layouts pass through, and not in
+        `read_offline_bars`, which the API's bars route also calls and which
+        returns the rows as they are in the file. Month files are already
+        strictly increasing, so for them this cannot fail.
+        """
+        dates = data["date"]
+        backwards = (dates < dates.shift()).to_numpy().nonzero()[0]
+        if len(backwards):
+            row = int(backwards[0])
+            name = symbol_bar_files(data_dir, symbol)[0]
+            raise ValueError(
+                f"symbol {symbol}: dates are not sorted in {name}: data row {row + 1} "
+                f"(after the header) is {dates.iloc[row]}, before the row above it "
+                f"({dates.iloc[row - 1]})"
+            )
 
     def _bars_by_symbol(self, replay: Mapping[str, pd.DataFrame]) -> dict[str, list[Bar]]:
         per_symbol: dict[str, list[Bar]] = {}
@@ -361,33 +400,22 @@ class CsvBarFeed:
     def _build_batches(
         self, per_symbol: Mapping[str, list[Bar]]
     ) -> list[tuple[pd.Timestamp, dict[str, Bar]]]:
-        first = self._symbols[0]
-        identical = all(
-            [bar.date for bar in per_symbol[symbol]] == [bar.date for bar in per_symbol[first]]
-            for symbol in self._symbols[1:]
-        )
-        if identical:
-            # Every symbol has the same timestamps: pair the bars by position (this
-            # is also the path that keeps a repeated minute replaying when every
-            # symbol repeats it).
-            return [
-                (bar.date, {s: per_symbol[s][i] for s in self._symbols})
-                for i, bar in enumerate(per_symbol[first])
-            ]
-        by_time: dict[pd.Timestamp, dict[str, Bar]] = {}
-        for symbol in self._symbols:
+        # timestamp -> one mapping per repeat (k-th bar of each symbol at that time)
+        by_time: dict[pd.Timestamp, list[dict[str, Bar]]] = {}
+        for symbol in self._symbols:  # feed order, so each mapping is in feed order
+            seen: dict[pd.Timestamp, int] = {}
             for bar in per_symbol[symbol]:
-                at = by_time.setdefault(bar.date, {})
-                if symbol in at:
-                    raise ValueError(
-                        f"symbol {symbol} has more than one bar at {bar.date}"
-                    )
-                at[symbol] = bar
-        order = {symbol: i for i, symbol in enumerate(self._symbols)}
-        return [
-            (stamp, dict(sorted(by_time[stamp].items(), key=lambda item: order[item[0]])))
-            for stamp in sorted(by_time)
-        ]
+                k = seen.get(bar.date, 0)
+                seen[bar.date] = k + 1
+                rounds = by_time.setdefault(bar.date, [])
+                if k == len(rounds):
+                    rounds.append({})
+                rounds[k][symbol] = bar
+        return [(stamp, rounds) for stamp in sorted(by_time) for rounds in by_time[stamp]]
+
+    def replay_counts(self) -> dict[str, int]:
+        """Per symbol, in `symbols()` order: how many replay bars it has (after warm-up)."""
+        return dict(self._replayed)
 
     def missing_counts(self) -> dict[str, int]:
         """Per symbol, in `symbols()` order: replay timestamps at which it has no bar.
