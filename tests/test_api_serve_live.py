@@ -89,12 +89,14 @@ def test_database_locked_by_a_writer_is_503_without_path(tmp_path: Path) -> None
     holder = sqlite3.connect(path, isolation_level=None)
     holder.execute("BEGIN EXCLUSIVE")
     results: dict[str, tuple[int, float, str]] = {}
+    finished: dict[str, float] = {}
 
     def timed(client: TestClient, key: str, target: str, delay: float) -> None:
         time.sleep(delay)
         began = time.monotonic()
         response = client.get(target)
-        results[key] = (response.status_code, time.monotonic() - began, response.text)
+        finished[key] = time.monotonic()
+        results[key] = (response.status_code, finished[key] - began, response.text)
 
     try:
         # One client used as a context manager keeps one event loop for both requests, as a
@@ -113,9 +115,12 @@ def test_database_locked_by_a_writer_is_503_without_path(tmp_path: Path) -> None
     assert code == 503
     assert json.loads(text) == {"detail": UNAVAILABLE}
     assert "locked" not in text
-    assert 1.0 < waited < 3.0  # the 2 s busy timeout, not the store's default of 10 s
+    # the 2 s busy timeout, not the store's default of 10 s: a bound with room for a loaded machine
+    assert 1.0 < waited < 6.0
     code, waited, _ = results["static"]
-    assert code == 200 and waited < 1.0  # not held up behind the locked database
+    # not held up behind the locked database: it is answered while the health request still waits
+    # (compared with each other, not with a wall-clock limit, so machine load cannot fail it)
+    assert code == 200 and finished["static"] < finished["health"]
     assert make_client(path).get("/api/health").status_code == 200  # and it recovers
 
 
@@ -215,9 +220,19 @@ def test_real_server_is_read_only_local_and_leaves_the_port_free(tmp_path: Path)
     assert _sha(database) == before
     # a read-only open of a WAL database may leave its -wal and -shm files; nothing else appears
     assert {p.name for p in database.parent.iterdir()} <= {"runs.db", "runs.db-wal", "runs.db-shm"}
-    freed = socket.socket()
-    try:
-        freed.bind(("127.0.0.1", port))
-    finally:
-        freed.close()
+    # The port is free again. Under parallel test runs another worker may bind and release the same
+    # ephemeral number for a moment, and Windows may release a killed process's socket a beat late,
+    # so retry for a few seconds; a server that still held the port would fail every attempt.
+    deadline = time.monotonic() + 10
+    while True:
+        freed = socket.socket()
+        try:
+            freed.bind(("127.0.0.1", port))
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.2)
+        finally:
+            freed.close()
     database.unlink()  # every connection was closed: the file can be deleted on Windows

@@ -113,7 +113,13 @@ def test_serve_dispatches_from_main_module(db: Path) -> None:
 
 def test_serve_dispatch_reaches_the_server_call_with_the_stub(db: Path) -> None:
     """Proves the stub is what stops the process: an allowed host gets as far as `uvicorn.run`."""
-    done = _run_module(["serve", "--db", str(db), "--port", "8750"], block_web=False)
+    # The stubbed run still makes the real port check, so use a port nothing listens on: the
+    # default 8750 is taken whenever the dashboard is running on the machine.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    done = _run_module(["serve", "--db", str(db), "--port", str(port)], block_web=False)
     assert done.returncode == NEVER_LISTEN, done.stderr
 
 

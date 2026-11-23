@@ -29,17 +29,12 @@ MULTI_ROWS = 1000
 TWO_ALGO_ROWS = 900
 
 
-def _is_slow(case: object) -> bool:
-    return any(mark.name == "slow" for mark in case.marks)  # type: ignore[attr-defined]
-
-
-FAST_CASES = [c for c in CASES if not _is_slow(c)]
 # The two cheapest golden cases stay in the fast suite for checks that re-run a
 # full backtest; the rest of those re-runs go to the slow suite.
 _CHEAP_IDS = {"openingrangecandle_aapl", "fridayfrenzy_tsla"}
 SUPPLIED_BROKER_CASES = [
     c if c.id in _CHEAP_IDS else pytest.param(*c.values, id=c.id, marks=pytest.mark.slow)
-    for c in FAST_CASES
+    for c in CASES
 ]
 
 EMA_AAPL: Spec = (

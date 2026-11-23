@@ -19,25 +19,35 @@ from MainStoinker.api.routes_runs import last_folder_name
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.run_documents import report_document
 from MainStoinker.engine.store import RunMeta, SqliteStore, Store
-from tests.api_support import NO_ENV, make_client, stored_run_database
+from tests.api_support import NO_ENV, make_client
+from tests.run_support import FAST_CASES, Env, build_once
 from tests.test_api_health import copy_database
-from tests.test_cli_store import full_store_run
+
+COMPARE_ROWS = 600
 
 
 @pytest.fixture(scope="session")
 def compare_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    realistic = stored_run_database(tmp_path_factory, "realistic")
-    env = full_store_run(tmp_path_factory, "realistic")[0]
-    root = tmp_path_factory.mktemp("compare")
-    database = copy_database(realistic, root / "runs.db")
-    algos = json.loads(env.algos.read_text(encoding="utf-8"))
-    subset = root / "subset.json"
-    subset.write_text(json.dumps(algos[:2]), encoding="utf-8")
-    for name, config, fills in (("legacy", env.algos, "legacy"), ("subset", subset, "realistic")):
-        assert main(["backtest", "--algos", str(config), "--data", str(env.data),
-                     "--out", str(root / name), "--quiet", "--fills", fills,
-                     "--db", str(database)]) == 0
-    return database
+    """Runs 1 realistic, 2 legacy, 3 realistic with two algos: on a short slice of the bars.
+
+    The routes only compare what the store holds, so full data is not what these tests are about
+    (the full-data stored runs are checked against the goldens in `test_cli_store.py`).
+    """
+
+    def build(root: Path) -> None:
+        env = Env(root)
+        algos = [{"ID": a, "data": [c]} for a, c, _ in FAST_CASES.values()]
+        env.setup(algos, ["AAPL", "TSLA"], rows=COMPARE_ROWS)
+        subset = root / "subset.json"
+        subset.write_text(json.dumps(algos[:2]), encoding="utf-8")
+        for name, config, fills in (("realistic", env.algos, "realistic"),
+                                    ("legacy", env.algos, "legacy"),
+                                    ("subset", subset, "realistic")):
+            assert main(["backtest", "--algos", str(config), "--data", str(env.data),
+                         "--out", str(root / name), "--quiet", "--fills", fills,
+                         "--db", str(root / "runs.db")]) == 0
+
+    return build_once(tmp_path_factory, "api-compare-db", build) / "runs.db"
 
 
 def reports(database: Path) -> dict[int, dict[str, Any]]:
@@ -64,6 +74,8 @@ def test_compare_legacy_vs_realistic_equals_reports(compare_db: Path) -> None:
         assert row == {"2": expected[2]["accounts"][idname], "1": expected[1]["accounts"][idname]}
     assert body["total"] == {"2": expected[2]["total"], "1": expected[1]["total"]}
     assert body["runs"][0]["costs"] is None and body["runs"][1]["costs"] is not None
+    # the short slice still has trades to compare, in both fill models
+    assert all(body["total"][run_id]["trade_count"] > 0 for run_id in ("1", "2"))
     assert body["runs"][0]["data_directory"] == "OfflineData"
 
 
