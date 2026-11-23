@@ -461,11 +461,21 @@ def test_socket_errors_are_retried(request: pytest.FixtureRequest) -> None:
 def test_callbacks_on_reader_thread_consumed_on_caller_thread(build: Callable[..., Rig]) -> None:
     rig = build()
     rig.conn.open()
+    # open() returns at nextValidId; managedAccounts and the farm messages are still on
+    # their way from the reader thread. Consume until the last of them has arrived.
+    got: list[Any] = []
+
+    def consumed_all() -> bool:
+        while (ev := rig.conn.next_event(0)) is not None:  # consumed here, on the caller thread
+            got.append(ev)
+        codes = {e.code for e in got if isinstance(e, events.IbError)}
+        return any(isinstance(e, events.ManagedAccounts) for e in got) and {2104, 2106, 2158} <= codes
+
+    wait_until(consumed_all)
     me = threading.get_ident()
     by_name = {d.name: d.thread_id for d in rig.fake.delivered}
     assert by_name["nextValidId"] != me
     assert by_name["managedAccounts"] == by_name["nextValidId"]  # one reader thread
-    got = drain(rig.conn)  # consumed here, on the caller thread
     assert events.NextValidId(1) in got
     assert any(isinstance(e, events.ManagedAccounts) for e in got)
     assert {e.code for e in got if isinstance(e, events.IbError)} >= {2104, 2106, 2158}

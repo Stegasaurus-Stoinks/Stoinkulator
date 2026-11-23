@@ -23,6 +23,7 @@ from MainStoinker.ib.connection import (
     ClientIdInUse,
     ClientIdRefused,
     ConnectFailed,
+    ConnectionClosedDuringOpen,
     ConnectionLost,
     ConnectionRestored,
     ConnState,
@@ -502,11 +503,6 @@ def test_other_codes_are_plain_error_events_and_change_no_state(
     assert drain(rig.conn) == []  # no derived connection event
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T4 defect: _lost is not reset between attempts, so a 1100 seen in a failed attempt "
-    "makes the next, healthy connection report LOST",
-)
 def test_1100_before_the_handshake_ends_does_not_poison_the_next_attempt(
     rig_factory: Callable[..., Rig],
 ) -> None:
@@ -526,6 +522,7 @@ def test_1100_before_the_handshake_ends_does_not_poison_the_next_attempt(
 def assert_aborted_by_close(rig: Rig, out: list[Any], connects_at_close: int) -> None:
     assert out, "open() did not return after close()"
     assert out[0][0] == "exc", "open() returned normally after close()"
+    assert type(out[0][1]) is ConnectionClosedDuringOpen, out[0][1]  # not a bare AttributeError
     assert rig.fake.connects == connects_at_close, (
         f"connect() after close(): {rig.raw_sequence()}"
     )
@@ -533,46 +530,87 @@ def assert_aborted_by_close(rig: Rig, out: list[Any], connects_at_close: int) ->
     assert not rig.fake.isConnected()
 
 
-CLOSE_DURING_OPEN = (
-    "T4 defect: close() from another thread does not abort open(); the retry loop connects "
-    "again after close() and may end READY with a live socket that close() (idempotent) "
-    "can no longer release"
-)
-
-
-@pytest.mark.parametrize(
-    "fake_cls",
-    [
-        ProbeFake,
-        pytest.param(
-            QuietProbeFake, marks=pytest.mark.xfail(strict=True, reason=CLOSE_DURING_OPEN)
-        ),
-    ],
-)
+@pytest.mark.parametrize("fake_cls", [ProbeFake, QuietProbeFake])
 def test_close_while_connect_hangs(rig_factory: Callable[..., Rig], fake_cls: type[FakeIbClient]) -> None:
     rig = rig_factory(B.HANG, fake_cls=fake_cls)
     t, out = run_in_thread(rig.conn.open)
     wait_until(lambda: bool(rig.fakes) and rig.fake.hangs_entered >= 1)
     rig.conn.close()
-    rig.clock.auto = 50.0  # lets a retry loop that should be over run out
     t.join(WAIT)
     assert not t.is_alive()
     assert_aborted_by_close(rig, out, 1)
+    assert rig.clock.sleeps == []  # no backoff, no second attempt
 
 
-@pytest.mark.xfail(strict=True, reason=CLOSE_DURING_OPEN)
 def test_close_while_waiting_for_next_valid_id(rig_factory: Callable[..., Rig]) -> None:
     rig = rig_factory(B.NO_NEXT_VALID_ID)
     t, out = run_in_thread(rig.conn.open)
     wait_until(lambda: bool(rig.fakes) and len(rig.fake.delivered) >= 5)
     rig.conn.close()
-    rig.clock.auto = 50.0
     t.join(WAIT)
     assert not t.is_alive()
     assert_aborted_by_close(rig, out, 1)
+    assert rig.clock.jumps == 0 and rig.clock.sleeps == []  # woken by close, not by a timeout
 
 
-@pytest.mark.xfail(strict=True, reason=CLOSE_DURING_OPEN)
+def test_close_between_attempts_makes_no_further_connect(rig_factory: Callable[..., Rig]) -> None:
+    holder: list[IbConnection] = []
+
+    def closing_sleep(seconds: float) -> None:
+        holder[0].close()  # the backoff has begun; nothing is connected now
+
+    rig = rig_factory([B.REFUSE, B.ACCEPT], sleep=closing_sleep)
+    holder.append(rig.conn)
+    with pytest.raises(ConnectionClosedDuringOpen):
+        rig.conn.open()
+    assert rig.fake.connects == 1
+    assert rig.conn.state is ConnState.CLOSED
+    assert not rig.fake.isConnected()
+
+
+def test_a_connect_that_succeeds_while_close_runs_is_disconnected(rig_factory: Callable[..., Rig]) -> None:
+    holder: list[IbConnection] = []
+
+    def close_when_connect_returns(fake: Any, n: int) -> None:
+        holder[0].close()  # on the connect helper thread, after the handshake was accepted
+
+    rig = rig_factory(B.ACCEPT, on_connect=close_when_connect_returns)
+    holder.append(rig.conn)
+    with pytest.raises(ConnectionClosedDuringOpen):
+        rig.conn.open()
+    assert rig.fake.connects == 1
+    assert rig.conn.state is ConnState.CLOSED
+    assert not rig.fake.isConnected()
+
+
+def test_close_from_another_thread_while_the_default_backoff_sleeps_wakes_it(
+    rig_factory: Callable[..., Rig],
+) -> None:
+    # No injected sleep: the default waits on an event that close() sets. A 60 s delay
+    # would block this test for a minute if close() could not end it.
+    clock = SeqClock()
+    made: list[Any] = []
+
+    def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
+        fake = ProbeFake(DataOnlyClient(env, on_event, on_raw, logger), connect_behavior=B.REFUSE)
+        made.append(fake)
+        return fake
+
+    conn = IbConnection(
+        "127.0.0.1", 7497, 21, env={}, client_factory=factory, clock=clock, poll_interval=0.002,
+        retry_delay=60, max_retry_delay=60,
+    )
+    t, out = run_in_thread(conn.open)
+    wait_until(lambda: bool(made) and made[0].connects >= 1 and len(made[0].calls_named("disconnect")) >= 1)
+    time.sleep(0.02)  # let it reach the backoff wait
+    conn.close()
+    t.join(WAIT)
+    assert not t.is_alive(), "close() did not wake the default backoff sleep"
+    assert type(out[0][1]) is ConnectionClosedDuringOpen
+    assert made[0].connects == 1
+    assert conn.state is ConnState.CLOSED
+
+
 def test_close_while_sleeping_in_backoff(rig_factory: Callable[..., Rig]) -> None:
     entered, release = threading.Event(), threading.Event()
 
@@ -590,7 +628,6 @@ def test_close_while_sleeping_in_backoff(rig_factory: Callable[..., Rig]) -> Non
     assert_aborted_by_close(rig, out, 1)
 
 
-@pytest.mark.xfail(strict=True, reason=CLOSE_DURING_OPEN)
 def test_close_during_open_leaves_no_live_connection_behind(rig_factory: Callable[..., Rig]) -> None:
     # The same race with a retry that succeeds: open() reports READY after close() returned.
     entered, release = threading.Event(), threading.Event()
@@ -775,31 +812,65 @@ def test_reader_dying_after_ready_does_not_leave_the_state_ready(rig_factory: Ca
 # -- the attempt tag, and a connect that will not end -----------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T4 defect: a reader that outlives join_timeout is left running on the same client; "
-    "its late events are tagged with the next attempt and read as that attempt's",
-)
-def test_a_reader_slower_than_join_timeout_does_not_leak_events_into_the_next_attempt(
+def test_a_reader_slower_than_join_timeout_stops_the_open_instead_of_sharing_the_client(
     rig_factory: Callable[..., Rig],
 ) -> None:
     def hook(fake: Any, n: int) -> None:
-        if n == 1:
-            fake.gate_on = "currentTime"
-            fake.push("currentTime", 1)  # attempt 1's reader blocks in this callback
-        elif n == 2:
-            fake.gate.set()  # ... and wakes while attempt 2 is connecting
-            wait_until(lambda: any(d.name == "currentTime" for d in fake.delivered))
-            time.sleep(0.02)
+        fake.gate_on = "currentTime"
+        fake.push("currentTime", 1)  # attempt 1's reader blocks in this callback
 
     rig = rig_factory(
-        [B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=2, join_timeout=0.01, on_connect=hook
+        [B.NO_NEXT_VALID_ID, B.ACCEPT], attempts=3, join_timeout=0.01, on_connect=hook
     )
     rig.clock.triggers = [lambda: bool(rig.fakes) and rig.fake.entered.is_set()]
-    rig.conn.open()
-    assert rig.conn.state is ConnState.READY
-    assert not [e for e in drain(rig.conn) if isinstance(e, events.CurrentTime)]
-    assert len([t for t in threading.enumerate() if t.name.startswith("ib-reader")]) == 1
+    with pytest.raises(ConnectFailed) as info:
+        rig.conn.open()
+    assert not isinstance(info.value, ConnectionClosedDuringOpen)
+    assert "ib-reader-1" in str(info.value)
+    assert "did not end" in str(info.value)
+    assert rig.fake.connects == 1  # no second connect, so no second run() loop on this client
+    assert rig.clock.sleeps == []
+    assert rig.conn.state is ConnState.CLOSED
+    assert len([c for c in rig.fake.calls if c.name == "run"]) == 1
+
+
+class _TagStub:
+    """A client whose run() blocks, then reports through the callback it was built with."""
+
+    def __init__(self, on_event: Callable[[Any], None]) -> None:
+        self.on_event = on_event
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(self) -> None:
+        self.started.set()
+        self.release.wait(WAIT)
+        self.on_event(events.IbError(-1, 1100, "late"))
+        self.on_event(events.NextValidId(99))
+
+
+def test_late_callbacks_of_an_old_reader_keep_the_attempt_they_were_started_with() -> None:
+    stubs: list[_TagStub] = []
+
+    def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
+        stubs.append(_TagStub(on_event))
+        return stubs[0]
+
+    conn = IbConnection("127.0.0.1", 7497, 21, env={}, client_factory=factory, poll_interval=0.002)
+    conn._client = factory(env={}, on_event=conn._on_event, on_raw=conn._on_raw, logger=None)
+    conn._begin_attempt(1)
+    reader = threading.Thread(target=conn._read, args=(conn._client, 1), name="ib-reader-1", daemon=True)
+    reader.start()
+    assert stubs[0].started.wait(WAIT)
+    conn._begin_attempt(2)  # the next attempt begins while attempt 1's reader is still running
+    stubs[0].release.set()
+    reader.join(WAIT)
+    assert not reader.is_alive()
+    # Read at callback time, the tag would be 2: attempt 1's 1100 and nextValidId would be
+    # attempt 2's events, and the 1100 would mark attempt 2 lost.
+    assert conn.next_event(0) is None
+    assert conn.next_event(0) is None
+    assert conn._lost is False
 
 
 def test_connect_that_never_returns_is_reported_not_retried(rig_factory: Callable[..., Rig]) -> None:
@@ -832,6 +903,74 @@ def test_farm_messages_that_came_during_open_satisfy_the_wait(rig_factory: Calla
     rig = rig_factory()
     rig.conn.open()
     assert rig.conn.wait_for_data_farm(5.0) is True
+
+
+FARM_CASES = [
+    # (code pushed, kinds that must be satisfied)
+    (2104, {"market"}),
+    (2108, {"market"}),
+    (2106, {"historical"}),
+    (2107, {"historical"}),
+    (2158, {"secdef"}),
+]
+
+
+@pytest.mark.parametrize(("code", "satisfied"), FARM_CASES)
+@pytest.mark.parametrize("kind", ["market", "historical", "secdef"])
+def test_wait_for_a_specific_farm_kind(
+    rig_factory: Callable[..., Rig], code: int, satisfied: set[str], kind: str
+) -> None:
+    rig = rig_factory(fake_kw=NO_FARM)
+    rig.conn.open()
+    rig.fake.push("error", -1, 1, code, "farm", "")
+    wait_for_event(rig.conn, events.IbError)
+    if kind in satisfied:
+        assert rig.conn.wait_for_data_farm(1.0, farm=kind) is True
+    else:
+        rig.clock.triggers = [lambda: True]
+        assert rig.conn.wait_for_data_farm(10.0, farm=kind) is False
+    # the default still accepts any farm
+    assert rig.conn.wait_for_data_farm(1.0) is True
+
+
+def test_the_historical_wait_is_not_satisfied_by_the_market_farm_alone(
+    rig_factory: Callable[..., Rig], caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = rig_factory(fake_kw={"farm_messages": ((2104, "Market data farm connection is OK:usfarm"),)})
+    rig.conn.open()
+    assert rig.conn.wait_for_data_farm(5.0, farm="market") is True
+    rig.clock.triggers = [lambda: True]
+    assert rig.conn.wait_for_data_farm(10.0, farm="historical") is False
+    assert any("2106" in r.getMessage() for r in caplog.records)
+    # the historical farm answers later: the same call now succeeds
+    rig.fake.push("error", -1, 1, 2106, "HMDS data farm connection is OK:ushmds", "")
+    assert rig.conn.wait_for_data_farm(5.0, farm="historical") is True
+
+
+@pytest.mark.parametrize("farm", ["hmds", "", "MARKET", 2106, ("market",)])
+def test_an_unknown_farm_kind_is_refused(rig_factory: Callable[..., Rig], farm: Any) -> None:
+    rig = rig_factory()
+    rig.conn.open()
+    with pytest.raises(ValueError):
+        rig.conn.wait_for_data_farm(1.0, farm=farm)
+
+
+def test_the_farm_event_is_readable_as_soon_as_the_wait_returns(rig_factory: Callable[..., Rig]) -> None:
+    for _ in range(20):
+        rig = rig_factory(fake_kw=NO_FARM)
+        rig.conn.open()
+        rig.fake.push("error", -1, 1, 2106, "HMDS data farm connection is OK", "")
+        assert rig.conn.wait_for_data_farm(5.0, farm="historical") is True
+        got = drain(rig.conn)
+        assert any(isinstance(e, events.IbError) and e.code == 2106 for e in got)
+
+
+def test_the_raw_client_is_not_part_of_the_public_surface(rig_factory: Callable[..., Rig]) -> None:
+    rig = rig_factory()
+    rig.conn.open()
+    assert not hasattr(rig.conn, "client")
+    public = {n for n in dir(rig.conn) if not n.startswith("_")}
+    assert not {"client", "_inner", "disconnect", "connect", "run"} & public
 
 
 # -- request path ------------------------------------------------------------------------------------
@@ -915,15 +1054,91 @@ def test_throttle_never_lets_more_than_the_rate_into_any_one_second(rig_factory:
     assert rig.clock.sleeps  # it waited on the injected sleep; it did not raise
 
 
-@pytest.mark.parametrize("rate", [0, -1])
-@pytest.mark.xfail(
-    strict=True,
-    reason="T4 defect: max_requests_per_second below 1 is not rejected; request() then dies with "
-    "IndexError inside the throttle",
-)
-def test_a_rate_below_one_is_rejected_at_construction(rate: int) -> None:
+@pytest.mark.parametrize("rate", [0, -1, 51, 1000, 20.0, True, "20", None])
+def test_a_rate_outside_one_to_fifty_is_rejected_at_construction(rate: Any) -> None:
     with pytest.raises(ValueError):
         IbConnection("127.0.0.1", 7497, 21, env={}, max_requests_per_second=rate)
+
+
+@pytest.mark.parametrize("rate", [1, 20, 50])
+def test_rates_inside_the_range_are_accepted(rate: int) -> None:
+    IbConnection("127.0.0.1", 7497, 21, env={}, max_requests_per_second=rate)
+
+
+@pytest.mark.parametrize("attempts", [0, -1, 101, 10_000, 3.0, True, None, "3"])
+def test_attempts_outside_one_to_a_hundred_are_rejected(attempts: Any) -> None:
+    with pytest.raises(ValueError):
+        IbConnection("127.0.0.1", 7497, 21, env={}, attempts=attempts)
+
+
+@pytest.mark.parametrize("attempts", [1, 100])
+def test_attempts_at_the_bounds_are_accepted(attempts: int) -> None:
+    IbConnection("127.0.0.1", 7497, 21, env={}, attempts=attempts)
+
+
+BAD_NUMBERS = [0, -1, -0.5, float("inf"), float("nan"), True, "5", None]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["connect_timeout", "ready_timeout", "retry_delay", "max_retry_delay", "poll_interval", "join_timeout"],
+)
+@pytest.mark.parametrize("value", BAD_NUMBERS)
+def test_timeouts_and_delays_must_be_finite_and_positive(name: str, value: Any) -> None:
+    with pytest.raises(ValueError):
+        IbConnection("127.0.0.1", 7497, 21, env={}, **{name: value})
+
+
+@pytest.mark.parametrize("value", [0.99, 0, -2, float("inf"), float("nan"), True, "2", None])
+def test_backoff_below_one_or_not_finite_is_rejected(value: Any) -> None:
+    with pytest.raises(ValueError):
+        IbConnection("127.0.0.1", 7497, 21, env={}, backoff=value)
+
+
+def test_backoff_of_one_and_fractional_timeouts_are_accepted() -> None:
+    IbConnection("127.0.0.1", 7497, 21, env={}, backoff=1, connect_timeout=0.5, join_timeout=0.01)
+
+
+def test_throttle_terminates_when_the_clock_does_not_advance() -> None:
+    sleeps: list[float] = []
+
+    def frozen_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        assert len(sleeps) < 50, "the throttle is spinning on a clock that does not move"
+
+    conn, fake = _ready_connection(sleep=frozen_sleep, max_requests_per_second=2)
+    for _ in range(7):
+        conn.request("reqCurrentTime")
+    assert len(fake.calls_named("reqCurrentTime")) == 7
+    assert 1 <= len(sleeps) < 10
+    assert all(s > 0 for s in sleeps)
+
+
+def _ready_connection(**kw: Any) -> tuple[IbConnection, Any]:
+    """A READY connection over the fake whose clock never moves (`now` stays 0)."""
+    fakes: list[Any] = []
+
+    def factory(*, env: Any, on_event: Any, on_raw: Any, logger: Any) -> Any:
+        fakes.append(ProbeFake(DataOnlyClient(env, on_event, on_raw, logger)))
+        return fakes[0]
+
+    conn = IbConnection(
+        "127.0.0.1", 7497, 21, env={}, client_factory=factory, clock=lambda: 0.0,
+        poll_interval=0.002, **kw,
+    )
+    conn.open()
+    _CLOSE_LATER.append(conn)
+    return conn, fakes[0]
+
+
+_CLOSE_LATER: list[IbConnection] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_helper_connections() -> Iterator[None]:
+    yield
+    while _CLOSE_LATER:
+        _CLOSE_LATER.pop().close()
 
 
 def test_attempts_below_one_is_rejected() -> None:
@@ -934,7 +1149,7 @@ def test_attempts_below_one_is_rejected() -> None:
 # -- client ids ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("client_id", [0, 123, -5, True, False, "21", None, 21.0])
+@pytest.mark.parametrize("client_id", [0, 123, -5, True, False, "21", None, 21.0, 2**31, 2**40])
 def test_bad_client_ids_are_refused_before_a_client_is_built(
     rig_factory: Callable[..., Rig], client_id: Any
 ) -> None:
@@ -945,7 +1160,7 @@ def test_bad_client_ids_are_refused_before_a_client_is_built(
     assert rig.conn.state is ConnState.NEW
 
 
-@pytest.mark.parametrize("client_id", [20, 21])
+@pytest.mark.parametrize("client_id", [1, 20, 21, 2**31 - 1])
 def test_the_owner_client_ids_are_accepted(rig_factory: Callable[..., Rig], client_id: int) -> None:
     rig = rig_factory(client_id=client_id)
     rig.conn.open()
