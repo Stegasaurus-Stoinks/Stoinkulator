@@ -19,7 +19,7 @@ import pytest
 
 from MainStoinker.ib import cli
 from MainStoinker.ib.client import DataOnlyClient
-from MainStoinker.ib.connection import ConnState, IbConnection
+from MainStoinker.ib.connection import ConnState, IbConnection, NotPaperSession
 from MainStoinker.Util.broker_guard import ALLOW_LIVE_ENV
 from tests.fake_ib import FARM_MESSAGES, REQUEST_ARGS, FakeIbClient
 from tests.test_ib_cli import DAYS, REAL_HOME, REAL_LISTING_AT_START, Session, Tty, _listing
@@ -294,9 +294,39 @@ def test_a_failing_list_after_ready_stops_the_run(ps: PaperSession, caplog: pyte
     code = ps.run(command, "--paper")
     assert ps.requests() == ["reqCurrentTime"]  # the first request only; nothing after the list
     assert ps.connections[0].state is ConnState.CLOSED
-    assert code not in (cli.EXIT_OK, cli.EXIT_REFUSED)
+    assert code == NEW_CODE[command]  # not "stopped, run again" and not "a step failed"
     assert ps.connections[0].paper_verified is False
+    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert "paper account verified" not in ps.text
+    assert "run the same command again" not in ps.text and "What to do" not in ps.text
+    assert f"(exit {code})" in ps.text and cli.NOT_PAPER_LABEL in ps.text
     no_account_text(ps, caplog)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_check_broker_port_still_runs_in_paper_mode(ps: PaperSession, monkeypatch: pytest.MonkeyPatch,
+                                                    command: str) -> None:
+    calls: list[int] = []
+    real = cli.check_broker_port
+
+    def spy(port: int, env: Any) -> None:
+        calls.append(port)
+        real(port, env)
+
+    monkeypatch.setattr(cli, "check_broker_port", spy)
+    ps.run(command, "--paper")
+    assert calls == [7497]
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("flag", [["--pape"], ["--pap", "--port", "7497"], ["--por", "7497"]])
+def test_abbreviated_options_are_usage_errors(ps: PaperSession, capsys: pytest.CaptureFixture[str],
+                                              command: str, flag: list[str]) -> None:
+    with pytest.raises(SystemExit) as info:
+        ps.run(command, *flag)
+    assert info.value.code == 2
+    capsys.readouterr()
+    nothing_built(ps)
 
 
 @pytest.mark.parametrize("flag, expected", [(["--paper"], True), ([], False)])
@@ -332,6 +362,20 @@ def test_other_open_errors_are_fatal_in_paper_mode(ps: PaperSession, command: st
     assert "Unexpected RuntimeError" in ps.text
     assert code == (cli.EXIT_STOPPED if command == FETCH else cli.EXIT_FAILED)
     assert "What to do" not in ps.text  # no "check the port and try again" advice
+    result = [ln for ln in ps.text.splitlines() if ln.startswith("Result:")]
+    assert result == [f"Result: {cli.OPEN_FAILED_LABEL} (exit {code})"]
+    assert "connected" not in result[0].lower().replace("connection attempt", "")
+    assert "resume" not in ps.text and "run again" not in ps.text
+    assert "paper account verified" not in ps.text
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_not_paper_session_without_the_flag_is_an_unexpected_error(ps: PaperSession, command: str) -> None:
+    ps.open_error = NotPaperSession("x")
+    argv = ["--port", "7497"]
+    code = ps.run(command, *argv)  # must not raise KeyError
+    assert code == (cli.EXIT_STOPPED if command == FETCH else cli.EXIT_FAILED)
+    assert "Unexpected NotPaperSession" in ps.text and ps.requests() == []
 
 
 def test_the_same_error_without_the_flag_is_still_a_connect_failure(ps: PaperSession) -> None:

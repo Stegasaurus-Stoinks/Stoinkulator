@@ -246,6 +246,7 @@ def _check_connection_arguments(parser: argparse.ArgumentParser, args: argparse.
 def build_parser(paper: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m MainStoinker fetch-bars",
+        allow_abbrev=False,  # `--paper` is matched exactly, here and in `_wants_paper`
         description=(
             "Owner-run: download 1-minute regular-hours bars through TWS or IB Gateway into "
             "one CSV file per symbol per month, resuming where an earlier run stopped. Sends "
@@ -304,6 +305,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def build_probe_parser(paper: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m MainStoinker probe-data",
+        allow_abbrev=False,
         description=(
             "Owner-run: find out what market data this account gets. Connects, reads the "
             "data farms and IB's clock, resolves each symbol, streams quotes (live first, "
@@ -754,6 +756,16 @@ _LABELS = {
 }
 
 
+class _OpenFailed(Exception):
+    """In paper mode, `open()` raised something other than the known connect failures."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+
+
+OPEN_FAILED_LABEL = "the connection attempt failed unexpectedly, nothing was requested"
+
+
 def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: list[str],
             paper: bool = False, not_paper_exit: int = EXIT_NOT_PAPER_FETCH) -> int | None:
     """None when connected, else the exit code (and the advice for the cause)."""
@@ -765,6 +777,8 @@ def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: li
         say(f"REFUSED: {exc}")
         return EXIT_REFUSED
     except NotPaperSession:
+        if not paper:
+            raise  # not expected without --paper: reported by the session as unexpected
         say(NOT_PAPER_LINE)  # never the exception text, never retried
         return not_paper_exit
     except ConnectFailed as exc:
@@ -775,7 +789,7 @@ def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: li
         return EXIT_NO_CONNECTION
     except Exception as exc:  # noqa: BLE001 - reported, not a traceback
         if paper:
-            raise  # fatal in paper mode: reported by the session as unexpected, never retried
+            raise _OpenFailed(exc) from exc  # fatal in paper mode: never retried
         say(f"Could not connect: {type(exc).__name__}: {exc}")
         advice.append(ADVICE_CONNECT)
         return EXIT_NO_CONNECTION
@@ -863,6 +877,7 @@ def run_session(
     advice: list[str] = []
     not_connected = False
     verified = False
+    open_failed = False
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
         refused = _connect(say, conn, args, advice, paper, not_paper_exit)
@@ -878,10 +893,21 @@ def run_session(
         say()
         say(kind.interrupted)
         code = EXIT_INTERRUPTED
+    except _OpenFailed as exc:
+        say(f"Unexpected {exc}")
+        say("The connection attempt failed unexpectedly. Nothing was requested. Not retried.")
+        code = kind.unexpected
+        open_failed = True
     except Exception as exc:  # noqa: BLE001 - reported with the exit code, not a traceback
         say(f"Unexpected {type(exc).__name__}: {exc}")
         code = kind.unexpected
     finally:
+        if verified and conn is not None and conn.paper_verified is not True:
+            # the account list failed after READY: whatever the body saw, this is the result
+            say(NOT_PAPER_LINE)
+            code = not_paper_exit
+            verified = False
+            advice.clear()
         if conn is not None:
             try:
                 conn.close()
@@ -902,7 +928,8 @@ def run_session(
             findings = scan_recording(args.record, words)
             say(f"Recording: {args.record}")
             kind.report_findings(say, args.record, findings)
-    say(f"Result: {labels[code]} (exit {code})" + ("; paper account verified" if verified else ""))
+    label = OPEN_FAILED_LABEL if open_failed else labels[code]
+    say(f"Result: {label} (exit {code})" + ("; paper account verified" if verified else ""))
     say(PATHS_NOTE)
     return code
 
