@@ -50,6 +50,20 @@ ORDER_CAPABLE = (
 )
 
 
+# Every request the fake implements, with valid arguments (request id 77 where it has one).
+REQUEST_ARGS: dict[str, tuple[Any, ...]] = {
+    "reqCurrentTime": (),
+    "reqMktData": (77, Contract(), "", False, False, []),
+    "cancelMktData": (77,),
+    "reqMarketDataType": (3,),
+    "reqContractDetails": (77, Contract()),
+    "reqHeadTimeStamp": (77, Contract(), "TRADES", 1, 2),
+    "cancelHeadTimeStamp": (77,),
+    "reqHistoricalData": (77, Contract(), "", "1 D", "1 min", "TRADES", 1, 2, True, []),
+    "cancelHistoricalData": (77,),
+}
+
+
 class Recorder(EWrapper):
     """An EWrapper that puts every callback it gets on a queue, with its thread id."""
 
@@ -172,9 +186,11 @@ def test_fake_delivers_callbacks_on_run_thread(fake: FakeIbClient, rec: Recorder
     fake.drop(1100)
     got = [rec.get() for _ in range(9)]  # 7 from the handshake + 2 pushed (+ response)
     assert {"currentTime", "marketDataType", "connectAck"} <= {g[0] for g in got}
-    assert {g[2] for g in got} == {run_thread.ident}
+    # connectAck is the one exception: ibapi calls it from connect(), on the caller.
+    assert [g[2] for g in got if g[0] == "connectAck"] == [threading.get_ident()]
+    assert {g[2] for g in got if g[0] != "connectAck"} == {run_thread.ident}
     assert run_thread.ident != threading.get_ident()
-    assert {d.thread_id for d in fake.delivered} == {run_thread.ident}
+    assert {d.thread_id for d in fake.delivered if d.name != "connectAck"} == {run_thread.ident}
 
 
 def test_fake_hang_released_by_disconnect(rec: Recorder) -> None:
@@ -193,7 +209,10 @@ def test_fake_hang_released_by_disconnect(rec: Recorder) -> None:
         fake.disconnect()
         t.join(WAIT)
     assert not fake.isConnected()
-    assert rec.events.empty()  # a hung connect delivers nothing, not even connectAck
+    # A hung connect has no connectAck. Its socket is open, so disconnect() reports
+    # connectionClosed once (client.py), on the thread that called disconnect().
+    assert rec.get()[::2] == ("connectionClosed", threading.get_ident())
+    assert rec.events.empty()
 
 
 def test_fake_has_no_order_methods() -> None:
@@ -237,9 +256,19 @@ def test_fake_never_opens_a_socket(monkeypatch: pytest.MonkeyPatch, rec: Recorde
             continue
         with FakeIbClient(rec, connect_behavior=behavior) as f:
             connect(f)
-            f.reqCurrentTime()
+            for method, args in REQUEST_ARGS.items():  # every request, not only one
+                getattr(f, method)(*args)
+            f.isConnected()
+            f.serverVersion()
             f.run_in_thread()
             f.drop("connectionClosed")
+    # ... and the same requests while not connected (the 504 path).
+    unconnected = FakeIbClient(rec)
+    for method, args in REQUEST_ARGS.items():
+        getattr(unconnected, method)(*args)
+    assert set(REQUEST_ARGS) | {"connect", "disconnect", "run", "isConnected", "serverVersion"} == set(
+        IMPLEMENTED
+    )
     with FakeIbClient(rec, connect_behavior=ConnectBehavior.HANG) as f:
         t = threading.Thread(target=connect, args=(f,))
         t.start()
@@ -266,7 +295,8 @@ def test_accept_plays_the_handshake_on_run(fake: FakeIbClient, rec: Recorder) ->
     connect(fake)
     assert fake.isConnected()
     assert fake.serverVersion() is not None
-    assert rec.events.empty(), "callbacks wait for run()"
+    # Only connectAck is there before run(); the rest waits for run().
+    assert rec.events.qsize() == 1, "callbacks other than connectAck wait for run()"
     fake.run_in_thread()
     first = [rec.get() for _ in range(6)]
     assert [g[0] for g in first] == ["connectAck", "nextValidId", "managedAccounts"] + ["error"] * 3
@@ -288,14 +318,20 @@ def test_refuse_reports_502_on_the_calling_thread(rec: Recorder) -> None:
 def test_client_id_in_use_is_326_then_close(rec: Recorder) -> None:
     with FakeIbClient(rec, connect_behavior=ConnectBehavior.CLIENT_ID_IN_USE) as f:
         connect(f)
-        t = f.run_in_thread()
+        # TWS closed the socket right after the error: not connected at once,
+        # before anything has run (ibapi: the reader thread sees the close).
+        assert not f.isConnected()
         assert rec.names(1) == ["connectAck"]
-        name, args, _ = rec.get()
+        t = f.run_in_thread()
+        name, args, error_tid = rec.get()
         assert (name, args[2]) == ("error", CLIENT_ID_IN_USE)
-        assert rec.names(1) == ["connectionClosed"]
+        # connectionClosed comes once, from run()'s disconnect, on the run thread.
+        assert rec.get()[::2] == ("connectionClosed", t.ident) == ("connectionClosed", error_tid)
         t.join(WAIT)
         assert not t.is_alive(), "run() ends when the socket closes"
-        assert not f.isConnected()
+        assert rec.events.empty()
+        f.disconnect()
+        assert rec.events.empty(), "a later disconnect reports nothing"
 
 
 def test_accept_without_next_valid_id(rec: Recorder) -> None:
@@ -324,6 +360,7 @@ def test_connect_twice_reports_already_connected(fake: FakeIbClient, rec: Record
     connect(fake)
     connect(fake)
     assert fake.connects == 1
+    assert rec.names(1) == ["connectAck"]
     assert rec.get()[1][2] == 501
 
 

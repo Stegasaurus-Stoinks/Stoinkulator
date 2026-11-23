@@ -14,7 +14,7 @@ from ibapi.client import EClient
 from ibapi.contract import Contract
 
 from tests.fake_ib import IMPLEMENTED, ConnectBehavior, FakeIbClient, make_bar
-from tests.test_fake_ib import Recorder
+from tests.test_fake_ib import REQUEST_ARGS, Recorder
 
 WAIT = 5.0
 
@@ -114,7 +114,7 @@ def test_push_before_connect_waits_and_a_disconnect_does_not_lose_it(rec: Record
     assert rec.events.empty()
     connect(f)
     t = f.run_in_thread()
-    assert rec.get()[0] == "marketDataType"
+    assert rec.names(2) == ["connectAck", "marketDataType"]
     f.close()
     assert not t.is_alive()
 
@@ -327,3 +327,205 @@ def test_every_implemented_method_is_called_under_a_socket_spy(
             getattr(f, name)(*args)
         f.run_in_thread()
     assert touched == []
+
+
+# -- fidelity to ibapi 10.37: thread and ordering behaviour -------------------
+#
+# The real client is driven here without a socket: an EClient that was never
+# connected (the 504 path), or one whose Connection holds a stand-in for the
+# socket (the disconnect path). The fake must do what that real code does.
+
+
+class _StubSocket:
+    def close(self) -> None:
+        pass
+
+
+def _real_connected_client(wrapper: Recorder) -> EClient:
+    from ibapi.connection import Connection
+
+    client = EClient(wrapper)
+    client.conn = Connection("127.0.0.1", 7497)  # __init__ opens nothing
+    client.conn.socket = _StubSocket()
+    client.setConnState(EClient.CONNECTED)
+    return client
+
+
+def _closed(rec: Recorder) -> list[int]:
+    """Thread ids of every connectionClosed in rec, in order."""
+    out = []
+    while not rec.events.empty():
+        name, _, tid = rec.get()
+        if name == "connectionClosed":
+            out.append(tid)
+    return out
+
+
+def test_connect_ack_is_called_inside_connect_on_the_calling_thread() -> None:
+    # client.py: connectAck() is the last statement of connect(), after startApi.
+    seen: list[Any] = []
+
+    class Ack(Recorder):
+        def connectAck(self) -> None:
+            seen.append((threading.get_ident(), fake.isConnected(), fake.serverVersion()))
+            super().connectAck()
+
+    ack = Ack()
+    with FakeIbClient(ack) as fake:
+        connect(fake)  # no run() thread exists yet
+        assert seen == [(threading.get_ident(), True, fake.serverVersion())]
+        assert seen[0][2] is not None
+        assert ack.names(1) == ["connectAck"]
+        assert ack.events.empty(), "nextValidId, managedAccounts and the 21xx wait for run()"
+        fake.run_in_thread()
+        assert ack.names(2) == ["nextValidId", "managedAccounts"]
+        assert [d.name for d in fake.delivered][:1] == ["connectAck"]
+
+
+def test_peer_close_is_not_connected_at_once_and_closed_once_on_the_run_thread(
+    rec: Recorder,
+) -> None:
+    # Real: the reader thread closes the socket (isConnected False, nothing reported
+    # because Connection.wrapper is never set); run() drains, then its finally
+    # disconnect() reports connectionClosed once, on the run thread.
+    real_rec = Recorder()
+    real = _real_connected_client(real_rec)
+    real.conn.socket = None  # the reader saw the close
+    assert not real.isConnected()
+    assert real_rec.events.empty()
+    real.run()
+    assert _closed(real_rec) == [threading.get_ident()]
+    real.disconnect()
+    assert real_rec.events.empty()
+
+    with FakeIbClient(rec) as fake:
+        connect(fake)
+        fake.drop("connectionClosed")
+        assert not fake.isConnected(), "not connected at once, not when run() consumes an event"
+        run_thread = fake.run_in_thread()
+        run_thread.join(WAIT)
+        assert not run_thread.is_alive()
+        names = [rec.get() for _ in range(rec.events.qsize())]
+        closed = [n for n in names if n[0] == "connectionClosed"]
+        assert [c[2] for c in closed] == [run_thread.ident]
+        fake.disconnect()
+        assert rec.events.empty(), "a second connectionClosed would be a double callback"
+        assert [d.name for d in fake.delivered].count("connectionClosed") == 1
+
+
+def test_peer_close_with_no_run_reports_nothing_until_disconnect(rec: Recorder) -> None:
+    with FakeIbClient(rec) as fake:
+        connect(fake)
+        fake.drop("connectionClosed")
+        assert not fake.isConnected()
+        assert [d.name for d in fake.delivered] == ["connectAck"]
+        fake.disconnect()  # the caller's disconnect reports it, once, on the caller
+        assert [d.name for d in fake.delivered] == ["connectAck", "connectionClosed"]
+        assert fake.delivered[-1].thread_id == threading.get_ident()
+
+
+def test_caller_disconnect_closes_once_on_the_caller_thread_and_run_adds_nothing(
+    rec: Recorder,
+) -> None:
+    real_rec = Recorder()
+    real = _real_connected_client(real_rec)
+    real.disconnect()
+    assert not real.isConnected()
+    assert _closed(real_rec) == [threading.get_ident()]
+    real.run()  # the finally disconnect() finds no connection object
+    real.disconnect()
+    assert real_rec.events.empty()
+
+    with FakeIbClient(rec) as fake:
+        connect(fake)
+        run_thread = fake.run_in_thread()
+        fake.disconnect()
+        assert not fake.isConnected(), "at once"
+        run_thread.join(WAIT)
+        assert not run_thread.is_alive()
+        fake.disconnect()
+        assert [d.thread_id for d in fake.delivered if d.name == "connectionClosed"] == [
+            threading.get_ident()
+        ]
+
+
+def test_disconnect_of_a_client_that_never_connected_reports_nothing(rec: Recorder) -> None:
+    real_rec = Recorder()
+    EClient(real_rec).disconnect()
+    assert real_rec.events.empty()
+    fake = FakeIbClient(rec)
+    fake.disconnect()
+    fake.close()
+    assert rec.events.empty()
+
+
+_REQUESTS = sorted(set(REQUEST_ARGS))
+
+
+@pytest.mark.parametrize("method", _REQUESTS)
+def test_not_connected_504_matches_real_ibapi_per_method(method: str, rec: Recorder) -> None:
+    args = REQUEST_ARGS[method]
+    real_rec = Recorder()
+    getattr(EClient(real_rec), method)(*args)
+    real = real_rec.get()
+    fake = FakeIbClient(rec)
+    getattr(fake, method)(*args)
+    got = rec.get()
+    assert got[0] == real[0] == "error"
+    assert got[2] == threading.get_ident() == real[2]
+    # reqId, code and text; the timestamp is the clock
+    assert (got[1][0], got[1][2], got[1][3]) == (real[1][0], real[1][2], real[1][3])
+    assert got[1][2] == 504
+    assert rec.events.empty()
+
+
+def test_not_connected_504_uses_the_request_id_where_ibapi_does() -> None:
+    # Guards the parametrized test above against being vacuous: with id 77, the
+    # real client answers 77 for exactly these three and -1 for the rest.
+    ids = {}
+    for method in _REQUESTS:
+        real_rec = Recorder()
+        getattr(EClient(real_rec), method)(*REQUEST_ARGS[method])
+        ids[method] = real_rec.get()[1][0]
+    assert {m for m, i in ids.items() if i == 77} == {
+        "reqMktData",
+        "cancelMktData",
+        "reqHistoricalData",
+    }
+    assert {i for i in ids.values() if i != 77} == {-1}
+
+
+def test_is_connected_and_server_version_are_counted_not_recorded(rec: Recorder) -> None:
+    with FakeIbClient(rec) as f:
+        connect(f)
+        for _ in range(5):
+            f.isConnected()
+        f.serverVersion()
+        f.reqCurrentTime()
+        assert f.call_names == ["connect", "reqCurrentTime"]
+        assert (f.is_connected_calls, f.server_version_calls) == (5, 1)
+
+
+def test_respond_with_a_list_hands_the_wrapper_a_fresh_object_each_time(rec: Recorder) -> None:
+    bar = make_bar(100, 1, 2, 0.5, 1.5, 10)
+    contract = Contract()
+    contract.symbol = "AAPL"
+    with FakeIbClient(rec) as f:
+        connect(f)
+        f.run_in_thread()
+        drain_handshake(rec)
+        f.respond("reqHistoricalData", [("historicalData", 9, bar)])
+        f.reqHistoricalData(9, contract, "", "1 D", "1 min", "TRADES", 1, 2, False, [])
+        f.reqHistoricalData(9, contract, "", "1 D", "1 min", "TRADES", 1, 2, False, [])
+        first, second = rec.get()[1][1], rec.get()[1][1]
+        assert first is not second and first is not bar and second is not bar
+        first.close = 999.0  # a wrapper that mutates what it is given
+        assert second.close == 1.5 and bar.close == 1.5
+        f.respond(
+            "reqContractDetails",
+            lambda *a: [("contractDetailsEnd", 1), ("contractDetails", 1, contract)],
+        )
+        f.reqContractDetails(1, contract)
+        rec.get()
+        delivered = rec.get()[1][1]
+        assert delivered is not contract and delivered.symbol == "AAPL"

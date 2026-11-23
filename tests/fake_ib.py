@@ -6,18 +6,40 @@ method of any kind. It never imports ``ibapi.connection`` and never opens a
 socket, so it needs no exception from the pytest broker block; it is injected
 through the client factory, while the real factory stays blocked.
 
-Behaviour follows ibapi 10.37:
+Behaviour follows ibapi 10.37 (``client.py``, ``connection.py``, ``reader.py``):
 
-* ``connect`` returns once the handshake is done. A refused connection is
-  reported through ``wrapper.error(502)`` on the calling thread, as the real
-  ``EClient.connect`` does. Everything TWS would say after the handshake
-  (``connectAck``, ``nextValidId``, ...) is queued and delivered by ``run``.
-* Every callback played by the fake is delivered on the thread that runs
-  ``run()``, except ``connectionClosed`` after ``disconnect()`` and the
-  ``error(504)`` of a request made while not connected, which (as in ibapi)
-  come on the calling thread.
+* ``connect`` returns once the handshake is done. ``wrapper.connectAck()`` is
+  called on the calling thread, last, before ``connect`` returns (``client.py``:
+  after ``startApi``). A refused connection is reported through
+  ``wrapper.error(502)`` on the calling thread. Everything TWS says after the
+  handshake (``nextValidId``, ``managedAccounts``, the 21xx notices) is queued
+  and delivered by ``run``.
+* ``connectionClosed`` is called exactly once per connection, by
+  ``EClient.disconnect`` and on the thread that runs it: the caller's thread for
+  ``disconnect()``, the ``run`` thread for the ``finally`` of ``run()``.
+  ``Connection.disconnect`` never reports it, because ``EClient`` never sets
+  ``Connection.wrapper``. A later ``disconnect()`` of an already disconnected
+  client reports nothing.
+* A socket closed by the peer (``drop("connectionClosed")``, the end of the
+  CLIENT_ID_IN_USE script) makes ``isConnected()`` False at once, as the real
+  reader thread does; ``run`` then drains what is queued, ends, and its
+  ``disconnect()`` reports ``connectionClosed``. The one difference: the fake
+  has no reader thread; the socket closes on the thread that calls ``drop`` (or
+  ``connect``), and nothing is delivered from it.
+* The error a request answers when not connected (504) carries the request id
+  for ``reqMktData``, ``cancelMktData`` and ``reqHistoricalData`` and
+  ``NO_VALID_ID`` for the others, as in ``client.py``; it comes on the calling
+  thread.
+* Everything else the fake plays is delivered on the thread that runs
+  ``run()``. A callback's arguments are deep-copied at delivery.
 * Callback names and argument lists are checked against ``EWrapper`` when they
   are queued, so a wrong script fails loudly in the test that wrote it.
+
+Known differences: the connect-refused script reports 502 but no
+``connectionClosed`` (real ``EClient.connect`` probably reports one, after a
+second 502, but that depends on the OS socket and cannot be checked offline);
+``disconnect()`` claims the connection atomically, so two threads
+disconnecting at once report one ``connectionClosed`` in total, never a race.
 
 Nothing here sleeps. ``run`` blocks on a queue with a short timeout only to
 notice a disconnect; a hang is a ``threading.Event`` released by
@@ -71,6 +93,8 @@ IMPLEMENTED = (
     "reqMarketDataType",
     "reqCurrentTime",
 )
+# Requests whose not-connected 504 carries the request id (client.py); the rest use -1.
+_504_WITH_REQ_ID = frozenset({"reqMktData", "cancelMktData", "reqHistoricalData"})
 # Methods that need a connection: made while not connected they answer error 504.
 _NEEDS_CONNECTION = frozenset(IMPLEMENTED) - {
     "connect",
@@ -80,7 +104,6 @@ _NEEDS_CONNECTION = frozenset(IMPLEMENTED) - {
     "serverVersion",
 }
 
-_CLOSE = "__close__"  # internal queue item: the socket closed
 _WAKE = "__wake__"  # internal queue item: re-check the loop condition
 
 
@@ -155,10 +178,9 @@ def _recorded(fn: Callable[..., Any]) -> Callable[..., Any]:
         bound.apply_defaults()
         args = tuple(copy.deepcopy(v) for v in list(bound.args)[1:])
         self._record(Call(name, args))
-        if name in _NEEDS_CONNECTION and not self._is_open():
-            self.wrapper.error(
-                NO_VALID_ID, self._clock_ms(), NOT_CONNECTED.code(), NOT_CONNECTED.msg(), ""
-            )
+        if name in _NEEDS_CONNECTION and not self._connected():
+            req_id = args[0] if name in _504_WITH_REQ_ID else NO_VALID_ID
+            self.wrapper.error(req_id, self._clock_ms(), NOT_CONNECTED.code(), NOT_CONNECTED.msg())
             return None
         result = fn(self, *bound.args[1:], **bound.kwargs)
         if name in _NEEDS_CONNECTION:
@@ -194,13 +216,17 @@ class FakeIbClient:
         self.calls: list[Call] = []
         self.delivered: list[Delivery] = []
         self.connects = 0
+        # isConnected() and serverVersion() are polled, so they are counted, not recorded.
+        self.is_connected_calls = 0
+        self.server_version_calls = 0
 
         self._server_version = server_version
         self._server_version_now: int | None = None
         self._clock = clock_ms or (lambda: 1_700_000_000_000)
         self._lock = threading.RLock()
         self._q: queue.Queue[Any] = queue.Queue()
-        self._open = False
+        self._conn = False  # EClient.conn is not None: from connect() to disconnect()
+        self._sock = False  # the socket is open (Connection.isConnected)
         self._release = threading.Event()
         self._behaviors: list[ConnectBehavior] = []
         self._handlers: dict[str, Handler | list[Played]] = {}
@@ -243,10 +269,11 @@ class FakeIbClient:
         """Simulate the connection going away.
 
         ``1100`` (or any int) pushes ``error(-1, t, code, ...)``; ``"connectionClosed"``
-        closes the socket, so ``run()`` delivers ``connectionClosed`` and returns.
+        closes the socket under the client: ``isConnected()`` is False at once and
+        ``run()`` drains its queue, delivers ``connectionClosed`` (once) and returns.
         """
         if code == "connectionClosed":
-            self._q.put((_CLOSE, ()))
+            self._peer_close()
             return
         if not isinstance(code, int):
             raise ValueError(f"drop() takes an IB error code or 'connectionClosed', not {code!r}")
@@ -290,18 +317,22 @@ class FakeIbClient:
     def connect(self, host, port, clientId):
         self.host, self.port, self.clientId = host, port, clientId
         with self._lock:
-            if self._open:
+            if self._connected():
                 self.wrapper.error(NO_VALID_ID, self._clock_ms(), 501, "Already connected.", "")
                 return
             self.connects += 1
             behavior = self._behaviors[min(self.connects, len(self._behaviors)) - 1]
             self._release.clear()
+            self._conn = behavior is not ConnectBehavior.REFUSE
             self.connState = EClient.CONNECTING
         if behavior is ConnectBehavior.HANG:
-            self.connect_entered.set()
-            self._release.wait(self.hang_timeout)
             with self._lock:
-                self.connState = EClient.DISCONNECTED
+                self._sock = True  # TCP is up; TWS has not answered the handshake
+            self.connect_entered.set()
+            if not self._release.wait(self.hang_timeout):  # safety valve, not ibapi behaviour
+                with self._lock:
+                    self._sock = self._conn = False
+                    self.connState = EClient.DISCONNECTED
             return
         if behavior is ConnectBehavior.REFUSE:
             with self._lock:
@@ -311,10 +342,9 @@ class FakeIbClient:
             )
             return
         with self._lock:
-            self._open = True
+            self._sock = True
             self._server_version_now = self._server_version
             self.connState = EClient.CONNECTED
-        self.push("connectAck")
         if behavior is ConnectBehavior.CLIENT_ID_IN_USE:
             self.push(
                 "error",
@@ -324,42 +354,44 @@ class FakeIbClient:
                 "Duplicate client id. Client id is already in use.",
                 "",
             )
-            self._q.put((_CLOSE, ()))
-            return
-        if behavior is not ConnectBehavior.NO_NEXT_VALID_ID:
-            self.push("nextValidId", self.next_valid_id)
-        self.push("managedAccounts", self.managed_accounts)
-        for code, text in FARM_MESSAGES:
-            self.push("error", NO_VALID_ID, self._clock_ms(), code, text, "")
+        else:
+            if behavior is not ConnectBehavior.NO_NEXT_VALID_ID:
+                self.push("nextValidId", self.next_valid_id)
+            self.push("managedAccounts", self.managed_accounts)
+            for code, text in FARM_MESSAGES:
+                self.push("error", NO_VALID_ID, self._clock_ms(), code, text, "")
+        # client.py: connectAck is the last thing connect() does, on this thread.
+        self._deliver("connectAck", ())
+        if behavior is ConnectBehavior.CLIENT_ID_IN_USE:
+            self._peer_close()  # TWS closes right after the error; run() will report it
 
     @_recorded
     def disconnect(self):
         self._disconnect()
 
-    @_recorded
     def isConnected(self):
-        return EClient.CONNECTED == self.connState and self._open
+        with self._lock:
+            self.is_connected_calls += 1
+        return self._connected()
 
     @_recorded
     def run(self):
         try:
-            while self._is_open() or not self._q.empty():
+            while self._connected() or not self._q.empty():
                 try:
                     name, args = self._q.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 if name == _WAKE:
                     continue
-                if name == _CLOSE:
-                    self._close_socket()
-                    continue
                 self._deliver(name, args)
         finally:
             self._disconnect()
 
-    @_recorded
     def serverVersion(self):
-        return self._server_version_now
+        with self._lock:
+            self.server_version_calls += 1
+            return self._server_version_now
 
     @_recorded
     def reqCurrentTime(self):
@@ -428,33 +460,37 @@ class FakeIbClient:
     def _clock_ms(self) -> int:
         return int(self._clock())
 
-    def _is_open(self) -> bool:
-        return self._open and self.connState == EClient.CONNECTED
+    def _connected(self) -> bool:
+        """EClient.isConnected: state CONNECTED and the socket still open."""
+        with self._lock:
+            return self.connState == EClient.CONNECTED and self._sock
 
     def _record(self, call: Call) -> None:
         with self._lock:
             self.calls.append(call)
 
     def _disconnect(self) -> None:
-        """What ``disconnect`` does; ``run`` ends with it too, unrecorded."""
+        """EClient.disconnect; ``run`` ends with it too, unrecorded.
+
+        ``connectionClosed`` is reported once, on this thread, and only if the
+        client still had a connection object (client.py: ``if self.conn is not None``).
+        """
         with self._lock:
-            was_open = self._open
-            self._open = False
+            had_conn = self._conn
+            self._conn = False
+            self._sock = False
             self.connState = EClient.DISCONNECTED
             self._server_version_now = None
         self._release.set()
         self._q.put((_WAKE, ()))
-        if was_open:
+        if had_conn:
             self._deliver("connectionClosed", ())
 
-    def _close_socket(self) -> None:
+    def _peer_close(self) -> None:
+        """The peer closed the socket: the reader thread's part, which reports nothing."""
         with self._lock:
-            was_open = self._open
-            self._open = False
-            self.connState = EClient.DISCONNECTED
-            self._server_version_now = None
-        if was_open:
-            self._deliver("connectionClosed", ())
+            self._sock = False
+        self._q.put((_WAKE, ()))
 
     def _play_response(self, method: str, args: tuple[Any, ...]) -> None:
         with self._lock:
@@ -467,5 +503,6 @@ class FakeIbClient:
 
     def _deliver(self, name: str, args: tuple[Any, ...]) -> None:
         with self._lock:
+            args = copy.deepcopy(args)  # a handler list or a pushed object is never shared
             self.delivered.append(Delivery(name, args, threading.get_ident()))
         getattr(self.wrapper, name)(*args)
