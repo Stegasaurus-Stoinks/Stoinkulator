@@ -71,8 +71,10 @@ is correct because `open()` re-checks the close flag and raises.
 caller                   change
 =======================  =============================================================
 `open()`                 NEW -> CONNECTING; any failure or abort -> CLOSED
-`_await_ready`           CONNECTING -> READY, on `nextValidId` (if `_set_phase` agrees)
+`_await_ready`           CONNECTING -> READY, on `nextValidId` (if `_set_phase` agrees; with
+                         `require_paper` also needs a passing `managedAccounts` list)
 `_on_event`              READY -> CLOSED, on the `ConnectionClosed` of the current attempt
+                         (or, with `require_paper`, on a failing `managedAccounts` list)
 `close()`                any -> CLOSED, at the end of its cleanup
 =======================  =============================================================
 
@@ -121,6 +123,7 @@ import logging
 import math
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -218,6 +221,14 @@ class BrokerConnectionRefusedHere(RuntimeError):
     """
 
 
+class NotPaperSession(RuntimeError):
+    """`require_paper=True` and the session is not verified as a paper account session.
+
+    Deliberately neither a `ConnectFailed` nor an `OSError`: no retry path may swallow it.
+    Its message never contains an account id.
+    """
+
+
 class ClientIdRefused(ValueError):
     """The client id is not allowed (0 and 123, or not an int from 1 to 2147483647)."""
 
@@ -296,6 +307,8 @@ class _Attempt:
         self.farm_codes: set[int] = set()
         self.closed_seen = False  # at most one ConnectionClosed per attempt is delivered
         self.dead = False  # set when the attempt is over: later callbacks are ignored
+        self.accounts_ok = False  # require_paper: a passing managedAccounts list has arrived
+        self.accounts_bad: tuple[int, int] | None = None  # (listed, failed) of a failing list; sticky
 
 
 _EClient = next(c for c in DataOnlyClient.__mro__ if c.__name__ == "EClient")
@@ -309,6 +322,23 @@ def _broker_blocked_here(env: Mapping[str, str]) -> bool:
     outside the command line; the process environment is read on purpose, whatever `env` says.
     """
     return "STOINK_BROKER_BLOCKED" in os.environ or "STOINK_BROKER_BLOCKED" in env
+
+
+_PAPER_ID = re.compile(r"D[A-Z]?[0-9]+")
+PAPER_PORTS: frozenset[int] = frozenset({7497, 4002})
+"""TWS paper and IB Gateway paper: the only ports `require_paper=True` accepts."""
+
+
+def _all_paper_accounts(text: str) -> tuple[bool, int, int]:
+    """(ok, listed, failed) for a comma-separated `managedAccounts` list.
+
+    Items are stripped and empty items ignored. `ok` needs at least one id and every id
+    to match `D[A-Z]?[0-9]+` (case-sensitive, whole item). The rule and its source are in
+    the `IbConnection` docstring.
+    """
+    ids = [item.strip() for item in text.split(",") if item.strip()]
+    failed = sum(1 for item in ids if _PAPER_ID.fullmatch(item) is None)
+    return bool(ids) and failed == 0, len(ids), failed
 
 
 def _positive_number(name: str, value: Any, maximum: float) -> None:
@@ -366,6 +396,25 @@ class IbConnection:
     `farm="historical"` (codes 2106, 2107); the other kinds are `"market"` (2104,
     2108) and `"secdef"` (2158). It stays true if a farm breaks later.
 
+    Paper check (`require_paper=True`, off by default; with False nothing below applies and
+    behaviour is unchanged). A port number does not prove a paper session, so the connection
+    verifies the account before it is READY. (1) The port must be 7497 or 4002 (`PAPER_PORTS`),
+    else `open()` raises `NotPaperSession` before any client is built; the ordinary port guard
+    still runs as well. (2) READY needs both `nextValidId` and `managedAccounts` of the
+    attempt, in either order, and a list that is non-empty with EVERY id matching
+    `^D[A-Z]?[0-9]+$` (case-sensitive; items stripped, empty items ignored). Source of the
+    rule: IB paper account ids start with `D` (the `DU` prefix), live ids with `U`, `F` or
+    `I`. THIS IS AN ASSUMPTION, TO BE CONFIRMED IN THE OWNER'S FIRST PAPER SESSION. (3) A
+    failing or empty list disconnects at once and `open()` raises `NotPaperSession` (fatal,
+    never retried, state CLOSED, no request possible). (4) `nextValidId` without a
+    `managedAccounts` by the ready deadline fails the attempt like a missing `nextValidId`
+    (retried; `ConnectFailed` at the end). (5) A later failing `managedAccounts` while READY
+    closes the connection (CLOSED, a `ConnectionClosed` event, `request()` raises
+    `NotConnected`). `paper_verified` tells whether READY was granted with a passing list.
+    Under `require_paper` the `ManagedAccounts` event is not passed to the consumer, no
+    account id is logged, and `NotPaperSession` states only how many ids were listed and
+    how many failed.
+
     A `sleep` passed to the constructor is used for the retry backoff and the rate
     limit. It must be interruptible or short: `close()` cannot wake it, so an abort of
     `open()` waits for it. The default (None) is a real sleep that `close()` wakes.
@@ -392,7 +441,10 @@ class IbConnection:
         poll_interval: float = 0.05,
         join_timeout: float = 5.0,
         logger: logging.Logger | None = None,
+        require_paper: bool = False,
     ) -> None:
+        if type(require_paper) is not bool:
+            raise ValueError(f"require_paper must be a bool, not {require_paper!r}")
         if type(attempts) is not int or not 1 <= attempts <= MAX_ATTEMPTS:
             raise ValueError(f"attempts must be an int from 1 to {MAX_ATTEMPTS}, not {attempts!r}")
         if type(max_requests_per_second) is not int or not (
@@ -437,6 +489,7 @@ class IbConnection:
         self._poll = poll_interval
         self._join_timeout = join_timeout
         self._log = logger if logger is not None else logging.getLogger(__name__)
+        self._require_paper = require_paper
 
         self._lock = threading.RLock()
         self._backlog: deque[ConnectionEvent] = deque()  # consumer thread only
@@ -467,6 +520,19 @@ class IbConnection:
                 return ConnState.LOST
             return self._phase
 
+    @property
+    def paper_verified(self) -> bool:
+        """True only while READY was granted under `require_paper` with a passing account list."""
+        with self._lock:
+            att = self._att
+            return (
+                self._require_paper
+                and self._phase is ConnState.READY
+                and att is not None
+                and att.accounts_ok
+                and att.accounts_bad is None
+            )
+
     def __enter__(self) -> IbConnection:
         if self.state is ConnState.NEW:
             self.open()
@@ -487,6 +553,12 @@ class IbConnection:
             self._refuse_if_blocked()  # before the port guard, the factory and any thread
         if type(self.port) is not int:
             raise BrokerPortRefused(f"Refusing to connect: broker port {self.port!r} is not an int.")
+        if self._require_paper and self.port not in PAPER_PORTS:
+            self._set_phase(ConnState.CLOSED)
+            raise NotPaperSession(
+                "require_paper is set and the port is not a paper port (7497 or 4002); "
+                "nothing was built or requested."
+            )
         check_broker_port(self.port, self._env)
         if (
             type(self.client_id) is not int
@@ -648,6 +720,9 @@ class IbConnection:
                 or not att.reader.is_alive()
                 or self._close_started  # defensive: `_close_evt` is set in the same lock block
                 or self._close_evt.is_set()
+                or (  # paper check passed when required
+                    self._require_paper and not (att.accounts_ok and att.accounts_bad is None)
+                )
             ):
                 return False
             self._phase = new
@@ -770,12 +845,32 @@ class IbConnection:
         deadline = self._clock() + self._ready_timeout
         last_error: events.IbError | None = None
         closed = False
+        got_id: events.NextValidId | None = None
         while True:
             self._check_open()
+            if att.accounts_bad is not None:
+                raise self._not_paper(att)
+            if got_id is not None and (att.accounts_ok or not self._require_paper):
+                with self._lock:
+                    # Refused after a close() or when this attempt's connection already
+                    # closed (the peer closed right after nextValidId): never READY then.
+                    if self._set_phase(ConnState.READY, att):
+                        self.next_valid_id = got_id.order_id
+                        return None, False
+                if self._close_evt.is_set():
+                    raise self._closed_error()
+                if att.accounts_bad is not None:
+                    raise self._not_paper(att)
+                return AttemptFailure(n, None, "connection closed right after nextValidId"), False
             ev = self._pop(att, self._poll)
             if ev is None:
                 if self._clock() >= deadline:
                     why = f"no nextValidId within {self._ready_timeout}s"
+                    if got_id is not None:
+                        why = (
+                            "nextValidId arrived but the account list never arrived "
+                            f"within {self._ready_timeout}s"
+                        )
                     return self._no_ready(n, last_error, why), False
                 if reader.is_alive():
                     continue
@@ -786,16 +881,8 @@ class IbConnection:
                     return self._no_ready(n, last_error, why), False
             self._backlog.append(ev)
             if isinstance(ev, events.NextValidId):
-                with self._lock:
-                    # Refused after a close() or when this attempt's connection already
-                    # closed (the peer closed right after nextValidId): never READY then.
-                    if self._set_phase(ConnState.READY, att):
-                        self.next_valid_id = ev.order_id
-                        return None, False
-                if self._close_evt.is_set():
-                    raise self._closed_error()
-                return AttemptFailure(n, None, "connection closed right after nextValidId"), False
-            if isinstance(ev, events.IbError):
+                got_id = ev  # granted at the top of the loop (with require_paper: once the list passed)
+            elif isinstance(ev, events.IbError):
                 if ev.code == CLIENT_ID_IN_USE:
                     return AttemptFailure(n, ev.code, ev.message), True
                 if not (2100 <= ev.code < 2200 or CONNECTION_LOST <= ev.code <= RESTORED_DATA_KEPT):
@@ -804,6 +891,14 @@ class IbConnection:
                 closed = True
             elif isinstance(ev, ReaderStopped):
                 return AttemptFailure(n, None, f"reader stopped: {ev.error!r}"), False
+
+    @staticmethod
+    def _not_paper(att: _Attempt) -> NotPaperSession:
+        listed, failed = att.accounts_bad or (0, 0)
+        return NotPaperSession(
+            "The IB session is not a paper account session; nothing was requested "
+            f"({listed} account id(s) listed, {failed} failed the paper check)."
+        )
 
     @staticmethod
     def _no_ready(n: int, last_error: events.IbError | None, why: str) -> AttemptFailure:
@@ -840,10 +935,26 @@ class IbConnection:
     def _on_event(self, att: _Attempt, event: events.Event) -> None:
         derived: ConnectionEvent | None = None
         farm_code: int | None = None
+        refuse_now = False
         with self._lock:
             if att.dead:
                 return
-            if isinstance(event, events.IbError):
+            if isinstance(event, events.ManagedAccounts) and self._require_paper:
+                # Checked here, never forwarded or logged. Before READY `_await_ready` reads
+                # the result; a failing list is sticky.
+                ok, listed, failed = _all_paper_accounts(event.accounts)
+                if ok and att.accounts_bad is None:
+                    att.accounts_ok = True
+                    return
+                att.accounts_ok = False
+                if att.accounts_bad is None:
+                    att.accounts_bad = (listed, failed)
+                if att is not self._att or self._phase is not ConnState.READY:
+                    return
+                att.closed_seen = True
+                self._set_phase(ConnState.CLOSED)
+                refuse_now = True
+            elif isinstance(event, events.IbError):
                 code = event.code
                 if code in DATA_FARM_CODES:
                     farm_code = code
@@ -861,6 +972,11 @@ class IbConnection:
                 att.closed_seen = True
                 if att is self._att and self._phase is ConnState.READY:
                     self._set_phase(ConnState.CLOSED)
+        if refuse_now:
+            att.queue.put(events.ConnectionClosed())
+            self._log.error("IB session closed: a later account list is not a paper account list")
+            self._disconnect(att)
+            return
         att.queue.put(event)
         if derived is not None:
             if isinstance(derived, ConnectionRestored) and derived.data_lost:
