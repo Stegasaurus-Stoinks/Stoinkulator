@@ -256,8 +256,10 @@ class FakeIbClient:
         server_version: int = DEFAULT_SERVER_VERSION,
         clock_ms: Callable[[], int] | None = None,
         hang_timeout: float = 30.0,
+        farm_messages: Iterable[tuple[int, str]] = FARM_MESSAGES,
     ) -> None:
         self.wrapper = wrapper
+        self.farm_messages = tuple(farm_messages)
         self.host: str | None = None
         self.port: int | None = None
         self.clientId: int | None = None
@@ -474,7 +476,7 @@ class FakeIbClient:
             if behavior is not ConnectBehavior.NO_NEXT_VALID_ID:
                 self.push("nextValidId", self.next_valid_id)
             self.push("managedAccounts", self.managed_accounts)
-            for code, text in FARM_MESSAGES:
+            for code, text in self.farm_messages:
                 self.push("error", NO_VALID_ID, self._clock_ms(), code, text, "")
         # client.py: connectAck is the last thing connect() does, on this thread.
         self._deliver("connectAck", ())
