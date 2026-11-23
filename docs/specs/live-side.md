@@ -273,6 +273,56 @@ session.
 Stage 1 gives more offline data early, which every later stage and the algo
 work benefit from, and proves the connection with no order code present.
 
+## Corrections from the task split (2026-11-22)
+
+The task divider checked this spec against the code and the installed IB
+client. Where the text above differs, these apply. Stage 1 is tasks T1 to
+T17, GitHub issues 114 to 130.
+
+- **First owner session.** Data only, against the live user on port 7496,
+  because the paper account is awaiting approval. "Read-Only API" stays on.
+  The owner sets `STOINK_ALLOW_LIVE_PORT` himself for that session. No order
+  is ever placed on the live account; stage 3 also refuses orders unless
+  every account TWS reports is a paper account.
+- **Port guard.** It lives in `Util/broker_guard.py`, not `apiApi.py`. It is
+  reused unchanged in stage 1 and moved in stage 4.
+- **Three more barriers before a connecting command exists.** The data-only
+  client refuses order messages before they reach the socket. The pre-tool
+  hook blocks every `MainStoinker` command except the offline ones. A test
+  run blocks broker connections from the processes it starts. And the
+  connecting commands only run in a real terminal after the owner types the
+  port number.
+- **Connecting.** The client's `connect` has no timeout and does not raise on
+  failure. Connection runs on a helper thread with a timeout; failure is
+  read from the error callback and the missing `nextValidId`; attempts are
+  bounded. The data-farm wait accepts codes 2104, 2106, 2107, 2108 and 2158
+  and is bounded.
+- **Data time.** Bar times are naive `America/Los_Angeles` wall-clock times,
+  fixed in code and pinned by a test over every committed row. "Machine local
+  time" above is wrong: the committed data and three algos' cut-off times are
+  Pacific, and the machine's zone must not change the bars.
+- **Fetched data.** Regular trading hours only, one request per trading day,
+  bars filtered to the requested day (IB returns the previous session for a
+  holiday), one file per symbol per month under
+  `%USERPROFILE%\Stoinkulator\bars`. About 3.5 minutes per symbol-month at
+  IB's pacing limit.
+- **A missing bar.** The feed replays the union of all symbols' timestamps.
+  At a minute where a symbol has no bar, that symbol's algos and brokers are
+  not called and no bar is invented; the ledger keeps its last price.
+- **Market data face.** It also carries quote requests, which the probe
+  needs. Regulatory snapshots stay off because IB bills for them.
+- **Contracts.** The legacy stock contract sets the primary exchange wrongly;
+  new code asks IB for the contract details.
+- **Client ids.** 21 for the data commands, 20 for the engine; never 0 or 123.
+- **Recordings.** TWS sends account numbers on every connect. The recorder
+  removes them, and recordings are committed only after the owner has looked
+  at them.
+- **The probe on the live user says nothing about the paper account.** It is
+  run again on the paper port before stage 3.
+- **Review.** The two guard changes (T10, T11) wait for the owner. The other
+  stage 1 tasks merge on green CI after the planner has checked the diff;
+  none touches order placement.
+
 ## Not in this spec
 
 - Trading the real account, risk limits beyond the two above, kill switch,
