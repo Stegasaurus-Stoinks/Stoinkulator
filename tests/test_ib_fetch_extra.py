@@ -12,7 +12,7 @@ import json
 import re
 import shutil
 from collections import defaultdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,7 @@ from tests.test_ib_fetch import (
     SimClock,
     bars_played,
     day_rows,
+    empty_end,
     end_played,
     error_behaviour,
     error_played,
@@ -631,7 +632,8 @@ def test_truncated_manifest_stops_that_symbol_and_is_set_aside_not_deleted(out: 
 
 
 @pytest.mark.parametrize("damage", ["garbage", "empty", "header_only", "duplicate_rows", "out_of_order"])
-def test_a_hand_damaged_month_file_fails_those_days_and_is_left_alone(out: Path, damage: str) -> None:
+def test_a_hand_damaged_month_file_fails_the_first_day_stops_the_symbol_and_is_left_alone(
+        out: Path, damage: str) -> None:
     with make_rig() as rig:
         assert rig.run(["AAPL"], WEEK[0], WEEK[0], out).complete
     path = month_file_path(out, "AAPL", 2024, 8)
@@ -648,11 +650,12 @@ def test_a_hand_damaged_month_file_fails_those_days_and_is_left_alone(out: Path,
     with make_rig() as rig2:
         result = rig2.run(["AAPL"], WEEK[0], WEEK[2], out)  # does not raise
     sym = result.symbols["AAPL"]
-    assert (sym.ok, sym.failed) == (0, 2)
+    # adapted: the first failing day now stops the symbol (it used to fail both remaining days)
+    assert (sym.ok, sym.failed, sym.state) == (0, 1, "stopped")
     assert {f.reason for f in sym.failures} == {"damaged_file"}
+    assert rig2.days_requested() == [WEEK[1]]
     assert path.read_text(encoding="utf-8") == bad  # left exactly as the owner's hand left it
-    assert manifest_days(out) == {WEEK[0].isoformat(): "ok", WEEK[1].isoformat(): "failed",
-                                  WEEK[2].isoformat(): "failed"}
+    assert manifest_days(out) == {WEEK[0].isoformat(): "ok", WEEK[1].isoformat(): "failed"}
     assert_no_stray_files(out)
     assert_paced(rig2.requests)
 
@@ -807,3 +810,142 @@ def test_all_committed_days_fetched_through_the_fake_equal_the_committed_files(
         if fills == "realistic":
             assert (outs["fetched"] / "ledger.json").read_bytes() == (
                 outs["committed"] / "ledger.json").read_bytes()
+
+
+# -- T12 fix round: settle time, short days, damaged month file -------------------------------
+
+
+def minutes_after_close(day: date, seconds: float) -> datetime:
+    """A server time `seconds` after the 16:00 New York close of `day`."""
+    close = datetime(day.year, day.month, day.day, 16, 0, tzinfo=NY).astimezone(UTC)
+    return close + timedelta(seconds=seconds)
+
+
+@pytest.mark.parametrize("how", ["empty_end", "previous_session", "no_data_162"])
+def test_no_data_right_after_the_close_is_failed_and_retried_next_run(out: Path, how: str) -> None:
+    day = date(2024, 8, 20)
+    behaviour = {"empty_end": empty_end, "previous_session": holiday_behaviour(date(2024, 8, 19)),
+                 "no_data_162": error_behaviour(162, NO_DATA_TEXT)}[how]
+    with make_rig(server_now=minutes_after_close(day, 600)) as rig:  # closed 10 minutes ago
+        rig.script(day, behaviour)
+        first = rig.run(["AAPL"], day, day, out)
+    sym = first.symbols["AAPL"]
+    assert (sym.ok, sym.no_data, sym.failed) == (0, 0, 1) and not first.complete
+    assert "no data yet (session closed less than 180 minutes ago)" in sym.failures[0].text
+    assert manifest_days(out) == {day.isoformat(): "failed"}
+    with make_rig(server_now=minutes_after_close(day, 3 * 3600 + 1)) as rig2:  # asked again
+        rig2.script(day, behaviour)
+        second = rig2.run(["AAPL"], day, day, out)
+    assert rig2.days_requested() == [day]  # the failed day is retried
+    assert second.symbols["AAPL"].no_data == 1 and second.complete
+    assert manifest_days(out) == {day.isoformat(): "no_data"}
+
+
+def test_no_data_three_hours_and_a_second_after_the_close_is_no_data(out: Path) -> None:
+    day = date(2024, 8, 20)
+    with make_rig(server_now=minutes_after_close(day, 3 * 3600 + 1)) as rig:
+        rig.script(day, empty_end)
+        result = rig.run(["AAPL"], day, day, out)
+    assert result.symbols["AAPL"].no_data == 1 and result.complete
+    assert manifest_days(out) == {day.isoformat(): "no_data"}
+
+
+def test_a_holiday_two_days_ago_is_no_data(out: Path) -> None:
+    holiday = date(2024, 9, 2)  # Labor Day
+    with make_rig(server_now=minutes_after_close(date(2024, 9, 4), 0)) as rig:
+        rig.script(holiday, holiday_behaviour(date(2024, 8, 30)))
+        result = rig.run(["AAPL"], holiday, holiday, out)
+    assert result.symbols["AAPL"].no_data == 1 and result.complete
+
+
+def test_settle_seconds_is_an_argument_and_zero_is_allowed(out: Path) -> None:
+    day = date(2024, 8, 20)
+    with make_rig(server_now=minutes_after_close(day, 60)) as rig:
+        rig.script(day, empty_end)
+        result = rig.run(["AAPL"], day, day, out, settle_seconds=0)
+    assert result.symbols["AAPL"].no_data == 1
+    with make_rig(server_now=minutes_after_close(day, 60)) as rig2:
+        rig2.script(day, empty_end)
+        result2 = rig2.run(["MSFT"], day, day, out, settle_seconds=90 * 60)
+    assert result2.symbols["MSFT"].failed == 1
+    assert "less than 90 minutes ago" in result2.symbols["MSFT"].failures[0].text
+
+
+@pytest.mark.parametrize("bad", [-1, float("inf"), float("nan"), True, "10"])
+def test_settle_seconds_is_validated_before_anything_is_sent(out: Path, bad: Any) -> None:
+    with make_rig() as rig:
+        with pytest.raises(fetch_module.FetchSetupError, match="settle_seconds"):
+            rig.run(["AAPL"], WEEK[0], WEEK[0], out, settle_seconds=bad)
+    assert rig.requests == []
+
+
+def test_early_close_day_is_listed_in_short_days_and_stays_ok(out: Path) -> None:
+    half = date(2024, 11, 29)
+
+    def early(req_id: int, day: date, symbol: str) -> list[Played]:
+        return [*bars_played(req_id, day_rows(day, 210, symbol)), end_played(req_id)]
+
+    with make_rig(server_now=after(date(2024, 12, 3))) as rig:
+        rig.script(date(2024, 11, 28), holiday_behaviour(date(2024, 11, 27)))
+        rig.script(half, early)
+        result = rig.run(["AAPL"], date(2024, 11, 27), half, out)
+    sym = result.symbols["AAPL"]
+    assert sym.short_days == [(half, 210, "short")]  # the holiday (no bars) is not in the list
+    assert result.days_with_gaps == 1 and result.complete and sym.ok == 2
+    event = next(e for e in rig.events if e.kind == "gaps")
+    assert event.detail["short_days"] == [(half.isoformat(), 210, "short")]
+    assert event.detail["days_with_gaps"] == 1
+
+
+def test_a_one_bar_day_is_listed_in_short_days_as_partial(out: Path) -> None:
+    day = date(2024, 8, 14)
+    one = [day_rows(day, 390)[0]]
+
+    def single(req_id: int, d: date, symbol: str) -> list[Played]:
+        return [*bars_played(req_id, one), end_played(req_id)]
+
+    with make_rig() as rig:
+        rig.script(day, single)
+        result = rig.run(["AAPL"], WEEK[0], WEEK[3], out)
+    assert result.symbols["AAPL"].short_days == [(day, 1, "partial")]
+    assert result.days_with_gaps == 1 and result.complete
+
+
+def test_a_clean_run_has_no_short_days(out: Path) -> None:
+    with make_rig() as rig:
+        result = rig.run(["AAPL"], WEEK[0], WEEK[3], out)
+    assert result.symbols["AAPL"].short_days == [] and result.days_with_gaps == 0
+    event = next(e for e in rig.events if e.kind == "gaps")
+    assert event.detail["short_days"] == [] and event.detail["days_with_gaps"] == 0
+
+
+def test_already_present_short_days_are_listed_too(out: Path) -> None:
+    day = date(2024, 8, 13)
+    with make_rig() as rig:
+        rig.script(day, lambda r, d, s: [*bars_played(r, day_rows(d, 100, s)), end_played(r)])
+        assert rig.run(["AAPL"], WEEK[0], WEEK[2], out).complete
+    with make_rig() as rig2:
+        again = rig2.run(["AAPL"], WEEK[0], WEEK[2], out)
+    assert rig2.requests == [] and again.symbols["AAPL"].short_days == [(day, 100, "partial")]
+    assert again.days_with_gaps == 1
+
+
+def test_a_damaged_month_file_stops_that_symbol_after_one_request_and_the_others_go_on(
+        out: Path) -> None:
+    with make_rig() as rig:
+        assert rig.run(["AAPL"], WEEK[0], WEEK[0], out).complete
+    path = month_file_path(out, "AAPL", 2024, 8)
+    bad = b"this is not a csv\x00\n" + path.read_bytes()
+    path.write_bytes(bad)
+    with make_rig() as rig2:
+        result = rig2.run(["AAPL", "MSFT"], WEEK[0], WEEK[4], out)
+    aapl, msft = result.symbols["AAPL"], result.symbols["MSFT"]
+    assert rig2.days_requested(CON_IDS["AAPL"]) == [WEEK[1]]  # exactly one request after the damage
+    assert (aapl.state, aapl.ok, aapl.failed) == ("stopped", 0, 1)
+    assert path.name in aapl.message and "untouched" in aapl.message
+    assert path.read_bytes() == bad
+    assert (msft.state, msft.ok, msft.failed) == ("done", 5, 0)
+    assert rig2.days_requested(CON_IDS["MSFT"]) == weekdays(WEEK[0], WEEK[4])
+    assert result.stop_reason is None and not result.complete  # AAPL did not finish
+    assert any(e.kind == "symbol_stopped" and e.symbol == "AAPL" for e in rig2.events)
+    assert_paced(rig2.requests)

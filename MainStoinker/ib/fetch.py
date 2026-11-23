@@ -42,10 +42,13 @@ Outcomes of one day
 ==================================================== ===========================================
 what IB did                                          what is recorded
 ==================================================== ===========================================
-end marker, bars of the day                          `ok`
-end marker, no bar of the requested day (holiday:    `no_data` (complete answer)
-IB returns the previous session)
-error 162 with "no data" text (`NO_DATA_PHRASES`),   `no_data` (complete answer)
+end marker, bars of the day                          `ok` (also with fewer than 390 bars: listed in
+                                                     `SymbolResult.short_days`, never fails the run)
+end marker, no bar of the requested day (holiday:    `no_data` (complete answer), but only when the
+IB returns the previous session)                     session closed at least `settle_seconds` before
+                                                     the server time; sooner: `failed` ("no data
+                                                     yet"), so the next run asks again
+error 162 with "no data" text (`NO_DATA_PHRASES`),   as the line above
 no bars
 error 162 with "pacing violation" text               wait `pacing_backoff` seconds (sliced),
 (`PACING_VIOLATION_PHRASES`)                         retry the day ONCE; a second pacing
@@ -58,7 +61,18 @@ code 1101 (`data_lost`)                              cancel, discard, ask again 
 timeout, any other IB error (162 with other text,    `failed` with the code and IB's text, never
 200, 321, 354, 366, 504, 10089, 10167, ...), a       `no_data`; the next run asks again
 `BadBar`, a `filter_day` error
+a month file that cannot be merged into (damaged     day `failed`, THAT SYMBOL stops (state `stopped`,
+or inconsistent)                                     file untouched, no more requests for it), the
+                                                     next symbol goes on
 ==================================================== ===========================================
+
+Verbatim texts
+--------------
+The texts in progress events, in the result (`ib_errors`, `failures`, `message`) and in
+`manifest.json` are verbatim from IB and may contain account identifiers. This module
+does not scrub them (the owner needs the real text on the first run); the command layer
+must scrub before it displays anything, and the manifest must be treated like a
+recording: never commit one without reading it first.
 
 What the owner's first session must confirm (cannot be checked offline)
 -----------------------------------------------------------------------
@@ -96,6 +110,8 @@ from MainStoinker.ib.history import (
     DATA_ZONE,
     DEFAULT_BAR_SIZE,
     DEFAULT_WHAT_TO_SHOW,
+    GAP_PARTIAL,
+    GAP_SHORT,
     STATUS_FAILED,
     STATUS_NO_DATA,
     STATUS_OK,
@@ -147,6 +163,7 @@ DEFAULT_SERVER_TIME_TIMEOUT = 10.0
 DEFAULT_FARM_TIMEOUT = 30.0
 DEFAULT_PACING_BACKOFF = 600.0
 DEFAULT_PAUSE_SLICE = 5.0
+DEFAULT_SETTLE_SECONDS = 3 * 3600.0
 MAX_RECORDED_ERRORS = 1000
 
 
@@ -263,6 +280,9 @@ class SymbolResult:
     gaps: list[GapRow] = field(default_factory=list)
     gap_files: tuple[Path, Path] | None = None
     gap_error: str = ""
+    # (day, bars on disk, gap status "short" or "partial") for every day of the range with
+    # bars that is not a full session; the days stay `ok` (missing minutes are data)
+    short_days: list[tuple[date, int, str]] = field(default_factory=list)
 
     @property
     def remaining(self) -> int:
@@ -282,6 +302,7 @@ class FetchResult:
     fatal: str | None = None  # the run could not start or hit a fault (no server time, no farm, disk)
     ib_errors: list[IbErrorRecord] = field(default_factory=list)
     ib_errors_dropped: int = 0
+    days_with_gaps: int = 0  # total of `SymbolResult.short_days`; does not affect `complete`
 
     @property
     def complete(self) -> bool:
@@ -405,8 +426,9 @@ class _Run:
         self, md: IbMarketData, connection: IbConnection, out_dir: Path, zone: str,
         clock: Callable[[], float], sleep: Callable[[float], None], on_progress: Progress | None,
         pacer: Pacer, request_timeout: float, resolve_timeout: float, pacing_backoff: float,
-        pause_slice: float,
+        pause_slice: float, settle_seconds: float = DEFAULT_SETTLE_SECONDS,
     ) -> None:
+        self.settle_seconds = settle_seconds
         self.md = md
         self.conn = connection
         self.out_dir = out_dir
@@ -581,7 +603,10 @@ class _Run:
                   pending=len(pending), already_done=res.already_done)
         res.state = "stopped"  # until the loop finishes
         for day in pending:
-            self._day(sym, day)
+            if not self._day(sym, day):
+                self.emit("symbol_stopped", f"{symbol}: {res.message}", symbol, state=res.state)
+                self.current = None
+                return
         res.state = "done"
         self.emit("symbol_done", f"{symbol}: {res.ok} ok, {res.no_data} no data, {res.failed} failed",
                   symbol, ok=res.ok, no_data=res.no_data, failed=res.failed)
@@ -664,7 +689,8 @@ class _Run:
             return _Answer("failed", "timeout", None,
                            f"no complete answer from IB within {self.request_timeout:g} s")
 
-    def _day(self, sym: _Symbol, day: date) -> None:
+    def _day(self, sym: _Symbol, day: date) -> bool:
+        """Fetch and store one day; False when this symbol must not go on (damaged month file)."""
         res = sym.result
         answer = self._answer(sym, day)
         status, bars, code, text, reason = self._settle(sym, day, answer)
@@ -680,6 +706,19 @@ class _Run:
                   res.symbol, day, status=status, bars=bars, code=code, text=text, reason=reason)
         if answer.stop is not None:
             raise answer.stop
+        if reason == "damaged_file":
+            res.message = (f"{text}. The file was left untouched; nothing more is fetched for "
+                           f"{res.symbol} in this run (the other symbols go on). Repair or move "
+                           "the file yourself, then run again.")
+            return False
+        return True
+
+    def _too_soon(self, day: date) -> str | None:
+        """The failure text when `day`'s session closed less than `settle_seconds` ago, else None."""
+        closed_for = (self.fetched_utc() - session_close_utc(day)).total_seconds()
+        if closed_for >= self.settle_seconds:
+            return None
+        return (f"no data yet (session closed less than {self.settle_seconds / 60:g} minutes ago)")
 
     def _record(self, sym: _Symbol, day: date, status: str, *, bars: int = 0,
                 code: int | None = None, text: str = "") -> None:
@@ -705,6 +744,9 @@ class _Run:
             self._first(sym, day, STATUS_FAILED, None, None, first)
             return STATUS_FAILED, 0, answer.code, answer.text, answer.reason
         if answer.kind == "no_data":
+            soon = self._too_soon(day)
+            if soon is not None:
+                return self._fail(sym, day, soon, "no_data_yet", first)
             self._record(sym, day, STATUS_NO_DATA, code=answer.code, text=answer.text)
             self._first(sym, day, STATUS_NO_DATA, None, None, first)
             return STATUS_NO_DATA, 0, answer.code, answer.text, ""
@@ -720,6 +762,9 @@ class _Run:
         except ValueError as exc:
             return self._fail(sym, day, str(exc), "invalid_data", first, raw)
         if kept.empty:
+            soon = self._too_soon(day)
+            if soon is not None:
+                return self._fail(sym, day, soon, "no_data_yet", first, raw)
             text = (f"complete answer without bars for {day}"
                     + (f" ({len(raw)} bar(s) of other dates dropped)" if len(raw) else ""))
             self._record(sym, day, STATUS_NO_DATA, text=text)
@@ -782,13 +827,18 @@ class _Run:
                     bars = _minute_frame([])
                 rows = gap_report(self.days, bars, data_zone=self.zone)
                 res.gaps = rows
+                res.short_days = [(r.day, r.present, r.status) for r in rows
+                                  if r.status in (GAP_SHORT, GAP_PARTIAL)]
                 res.gap_files = write_gap_files(symbol_folder(self.out_dir, symbol), rows, symbol,
                                                 sleep=self.sleep, clock=self.clock)
                 counts: dict[str, int] = {}
                 for row in rows:
                     counts[row.status] = counts.get(row.status, 0) + 1
+                self.result.days_with_gaps += len(res.short_days)
                 self.emit("gaps", f"{symbol}: gap report " + ", ".join(
-                    f"{n} {s}" for s, n in sorted(counts.items())), symbol, counts=counts)
+                    f"{n} {s}" for s, n in sorted(counts.items())), symbol, counts=counts,
+                    short_days=[(d.isoformat(), n, s) for d, n, s in res.short_days],
+                    days_with_gaps=len(res.short_days))
             except Exception as exc:  # noqa: BLE001 - a broken report must not hide the run's result
                 res.gap_error = f"{type(exc).__name__}: {exc}"
                 self.emit("gaps", f"{symbol}: gap report failed: {res.gap_error}", symbol,
@@ -830,6 +880,7 @@ def fetch(
     farm_timeout: float = DEFAULT_FARM_TIMEOUT,
     pacing_backoff: float = DEFAULT_PACING_BACKOFF,
     pause_slice: float = DEFAULT_PAUSE_SLICE,
+    settle_seconds: float = DEFAULT_SETTLE_SECONDS,
 ) -> FetchResult:
     """Download the 1-minute regular-hours bars of `symbols` for `start` to `end` into `out_dir`.
 
@@ -839,7 +890,9 @@ def fetch(
     the data time zone (default New York). `pacer` defaults to one `Pacer(clock)` with
     IB's limits; it is the only pacer of the run. `pacing_backoff` is the wait after a
     first pacing violation, `pause_slice` the longest single sleep inside any wait, so
-    a lost connection is noticed. Returns the `FetchResult`; it raises only
+    a lost connection is noticed. `settle_seconds` (default 3 hours): a day without bars
+    counts as `no_data` only when its session closed at least that long before the
+    server time, else it is `failed` and retried by the next run. Returns the `FetchResult`; it raises only
     `FetchSetupError` (bad arguments or layout, before anything is sent) and whatever a
     broken `on_progress` raises. Never raises for what IB does.
     """
@@ -860,9 +913,12 @@ def fetch(
                          ("pacing_backoff", pacing_backoff), ("pause_slice", pause_slice)):
         if isinstance(value, bool) or not isinstance(value, int | float) or not 0 < value < float("inf"):
             raise FetchSetupError(f"{label} must be a finite number above 0, got {value!r}")
+    if (isinstance(settle_seconds, bool) or not isinstance(settle_seconds, int | float)
+            or not 0 <= settle_seconds < float("inf")):
+        raise FetchSetupError(f"settle_seconds must be a finite number, at least 0, got {settle_seconds!r}")
     out = Path(out_dir)
     check_layouts(out, names)
     run = _Run(market_data, connection, out, zone, clock, sleep, on_progress,
                pacer if pacer is not None else Pacer(clock), request_timeout, resolve_timeout,
-               pacing_backoff, pause_slice)
+               pacing_backoff, pause_slice, settle_seconds)
     return run.run(names, start, end, server_time_timeout, farm_timeout)
