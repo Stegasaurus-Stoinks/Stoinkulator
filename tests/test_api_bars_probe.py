@@ -78,7 +78,7 @@ def test_run_with_no_last_bar_needs_a_window(tmp_path: Path, real_dir: Path) -> 
     response = client.get("/api/runs/1/bars", params={"symbol": "AAPL"})
     assert response.status_code == 422 and str(tmp_path) not in response.text
     ok = client.get("/api/runs/1/bars", params={
-        "symbol": "AAPL", "start": "2024-08-16T06:30", "end": "2024-08-16T06:32"})
+        "symbol": "AAPL", "start": "2024-08-16T09:30", "end": "2024-08-16T09:32"})
     assert ok.status_code == 200 and len(ok.json()["bars"]) == 3
 
 
@@ -249,7 +249,7 @@ def test_no_path_or_user_in_headers_or_bodies(tmp_path: Path, real_dir: Path) ->
     client = make_client(tmp_path / "runs.db")
     user = os.environ.get("USERNAME", "")
     for params in ({"symbol": "AAPL"}, {"symbol": "NOPE"}, {"symbol": "AAPL", "start": "x", "end": "y"},
-                   {"symbol": "AAPL", "start": "2024-08-16T06:30"}):
+                   {"symbol": "AAPL", "start": "2024-08-16T09:30"}):
         response = client.get("/api/runs/1/bars", params=params)
         blob = response.text + str(dict(response.headers))
         assert str(tmp_path) not in blob and "real" not in blob.lower().replace("unreal", "")
