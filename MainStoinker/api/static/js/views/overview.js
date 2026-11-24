@@ -105,6 +105,23 @@ export function runNotes(doc) {
   if (uncovered > 0) {
     notes.push(uncovered + (uncovered === 1 ? " minute" : " minutes") + " with no bar for any symbol.");
   }
+  // The gap rule (no new position on a bar that follows a gap); absent for older runs.
+  const rule = run.gap_rule && typeof run.gap_rule === "object" ? run.gap_rule : {};
+  const afterGap = rule.bars_after_gap && typeof rule.bars_after_gap === "object" ? rule.bars_after_gap : {};
+  const gappedBars = Object.entries(afterGap).filter(([, n]) => numberOrNull(n) > 0);
+  if (gappedBars.length > 0) {
+    notes.push("Bars that follow a gap (entries signalled on them were refused): "
+      + gappedBars.map(([symbol, n]) => symbol + " " + n).join(", ") + ".");
+  }
+  const refused = rule.suppressed_entries && typeof rule.suppressed_entries === "object" ? rule.suppressed_entries : {};
+  const refusedCount = numberOrNull(refused.count) || 0;
+  if (refusedCount > 0) {
+    const byAlgo = Array.isArray(refused.by_algo) ? refused.by_algo : [];
+    notes.push(refusedCount + (refusedCount === 1 ? " entry" : " entries") + " refused on bars that follow a gap"
+      + (byAlgo.length > 0
+        ? " (" + byAlgo.map((e) => String(e.algo) + " " + String(e.symbol) + ": " + String(e.count)).join(", ") + ")"
+        : "") + ".");
+  }
   if (Array.isArray(run.data_warnings)) {
     for (const warning of run.data_warnings) notes.push("Data warning: " + String(warning) + ".");
   }

@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
+from .gaprule import RefusedEntry
 from .ledger import IGNORED_KINDS, Ledger
 from .paper_broker import CostModel
 from .stats import account_summary, fmt4, round_trip_record
@@ -81,10 +82,14 @@ def trade_records(algo: Any) -> list[dict[str, Any]]:
     `symbol`, `volume`, `direction` (int), `openTime` (str), `openPrice`
     (rounded to 4 places), `closeTime` (str; "None" while open), `closePrice`
     (rounded, or None while open) and `status` (None when the trade has none).
-    This is the exact shape stored in `tests/golden/*.json`.
+    This is the exact shape stored in `tests/golden/*.json`. An entry the gap
+    rule refused (its `brokerRef` is a `RefusedEntry`) never became a position
+    and is left out; `GapRuleReport` has it.
     """
     records = []
     for trade in algo.trades:
+        if isinstance(getattr(trade, "brokerRef", None), RefusedEntry):
+            continue
         records.append(
             {
                 "id": trade.tradeID,

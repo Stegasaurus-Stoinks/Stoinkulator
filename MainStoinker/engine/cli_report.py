@@ -42,6 +42,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 
+from .gaprule import GapRuleReport
 from .ledger import IGNORED_KINDS
 from .run_documents import report_document, run_header, run_net, run_summary_record
 from .stats import fmt4, run_statistics
@@ -261,6 +262,7 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
             for symbol, count in missing.items() if count))
     if header["uncovered_minutes"]:
         lines.append(f"minutes with no bar for any symbol: {header['uncovered_minutes']}")
+    lines.extend(gap_rule_lines(s.data.gap_rule))
     lines.extend(f"data warning: {text}" for text in header["data_warnings"])
     if s.fills == "realistic":
         capital = header["capital"]
@@ -285,6 +287,23 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
                  f"trades), {ignored} ignored events, {total['cancelled_entries']} cancelled entries")
     _write(lines)
     return 0
+
+
+def gap_rule_lines(report: GapRuleReport | None) -> list[str]:
+    """The lines about the gap rule (issue 175); empty when it counted and refused nothing."""
+    if report is None or report.empty:
+        return []
+    lines = []
+    after = [f"{symbol} {count}" for symbol, count in report.bars_after_gap if count]
+    if after:
+        lines.append("bars that follow a gap (entries signalled on them were refused): " + ", ".join(after))
+    if report.total_suppressed:
+        lines.append(f"entries refused on bars that follow a gap: {report.total_suppressed}")
+        for e in report.suppressed:
+            shown = ", ".join(t.isoformat(sep=" ") for t in e.times[:5])
+            more = f", ... ({e.count - 5} more)" if e.count > 5 else ""
+            lines.append(f"  {e.algo} {e.symbol}: {e.count} at {shown}{more}")
+    return lines
 
 
 def _opt_str_money(text: Any) -> str | None:
