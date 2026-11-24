@@ -1041,7 +1041,7 @@ def test_first_open_from_many_threads_at_once(tmp_path):
         assert errors == []
         con = sqlite3.connect(path)
         try:
-            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+            assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
             assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         finally:
             con.close()
@@ -1243,7 +1243,8 @@ def make_v1_file(src: Path, dest: Path) -> None:
     con.execute("PRAGMA user_version=1")
     con.execute("ATTACH DATABASE ? AS src", (str(src),))
     for table in V1_TABLES:
-        con.execute(f"INSERT INTO {table} SELECT * FROM src.{table}")
+        cols = ", ".join(r[1] for r in con.execute(f"PRAGMA main.table_info({table})"))
+        con.execute(f"INSERT INTO {table} ({cols}) SELECT {cols} FROM src.{table}")
     con.commit()
     con.execute("DETACH DATABASE src")
     import json
@@ -1280,14 +1281,14 @@ def test_migration_v1_to_v2_keeps_existing_runs(db, tmp_path):
     assert con.execute("PRAGMA user_version").fetchone()[0] == 1
     con.close()
     with SqliteStore(db) as store:
-        assert store.schema_version == 2
+        assert store.schema_version == SCHEMA_VERSION
         loaded = store.load_run(1)
         assert loaded == expected
         assert loaded.series == ()
         assert loaded.summary.data.files == ()
         assert store.load_series(1, "a1") == ()
     con = sqlite3.connect(db)
-    assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     con.close()
     assert {"algo_series", "algo_series_points"} <= tables
@@ -1503,7 +1504,7 @@ def test_failed_migration_leaves_a_v1_file_untouched(db, tmp_path, monkeypatch):
         stored_run(w)
         expected = w.load_run(1)
     make_v1_file(src, db)
-    broken = (*MIGRATIONS[:1], (MIGRATIONS[1][0], "CREATE TABLE boom ("))
+    broken = (*MIGRATIONS[:1], (MIGRATIONS[1][0], "CREATE TABLE boom ("), *MIGRATIONS[2:])
     monkeypatch.setattr(store_module, "MIGRATIONS", broken)
     with pytest.raises(StoreError):
         SqliteStore(db)
@@ -1517,7 +1518,7 @@ def test_failed_migration_leaves_a_v1_file_untouched(db, tmp_path, monkeypatch):
     monkeypatch.undo()
     for _ in range(2):  # a retry migrates; opening again does nothing more
         with SqliteStore(db) as store:
-            assert store.schema_version == 2
+            assert store.schema_version == SCHEMA_VERSION
             assert store.load_run(1) == expected
 
 
@@ -1556,7 +1557,7 @@ def test_several_writers_migrate_the_same_v1_file_at_once(tmp_path):
             try:
                 barrier.wait()
                 with SqliteStore(path, env=NO_ENV) as store:
-                    assert store.schema_version == 2
+                    assert store.schema_version == SCHEMA_VERSION
                     assert store.load_run(1) == expected
             except BaseException as exc:  # noqa: BLE001 - collected and asserted below
                 errors.append(exc)

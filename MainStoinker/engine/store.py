@@ -210,6 +210,23 @@ class RunSummary:
     fills: str
     code_version: str
     data: DataMeta
+    # Schema 3 (live runs). None for a run stored earlier, for a database opened
+    # read-only that is older than schema 3, and while nothing has set them.
+    last_write_at: datetime | None = None  # UTC, aware; set by the live-run writers
+    end_reason: str | None = None  # one of `END_REASONS`
+
+
+@dataclass(frozen=True)
+class StoredBar:
+    """One closed 1-minute bar as the store keeps it (`time` is naive data time)."""
+
+    symbol: str
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 @dataclass(frozen=True)
@@ -285,7 +302,15 @@ class Store(Protocol):
 
     def write_gap_rule(self, run_id: int, report: GapRuleReport) -> None: ...
 
-    def end_run(self, run_id: int, status: RunStatus) -> None: ...
+    def touch(self, run_id: int) -> None: ...
+
+    def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None: ...
+
+    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None: ...
+
+    def update_run_data(self, run_id: int, data: DataMeta) -> None: ...
+
+    def end_run(self, run_id: int, status: RunStatus, reason: str | None = None) -> None: ...
 
     def list_runs(self) -> tuple[RunSummary, ...]: ...
 
@@ -334,7 +359,19 @@ class NullStore:
     def write_gap_rule(self, run_id: int, report: GapRuleReport) -> None:
         return None
 
-    def end_run(self, run_id: int, status: RunStatus) -> None:
+    def touch(self, run_id: int) -> None:
+        return None
+
+    def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None:
+        return None
+
+    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None:
+        return None
+
+    def update_run_data(self, run_id: int, data: DataMeta) -> None:
+        return None
+
+    def end_run(self, run_id: int, status: RunStatus, reason: str | None = None) -> None:
         return None
 
     def list_runs(self) -> tuple[RunSummary, ...]:
@@ -519,8 +556,35 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             value REAL NOT NULL,
             PRIMARY KEY (series_id, time)) WITHOUT ROWID""",
     ),
+    # 3: live runs (issue 191). Columns are added with ALTER TABLE, so every old
+    # run reads back with NULL (None) in them.
+    (
+        "ALTER TABLE runs ADD COLUMN last_write_at TEXT",
+        "ALTER TABLE runs ADD COLUMN end_reason TEXT",
+        # The bars the engine consumed. `time` is the bar's data time (naive).
+        """CREATE TABLE run_bars (
+            run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            symbol TEXT NOT NULL,
+            time TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL,
+            PRIMARY KEY (run_id, symbol, time)) WITHOUT ROWID""",
+        # Live counts: scope is "symbol" or "algo", key its name.
+        """CREATE TABLE run_counts (
+            run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            scope TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value INTEGER NOT NULL,
+            PRIMARY KEY (run_id, scope, key)) WITHOUT ROWID""",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
+END_REASONS: tuple[str, ...] = (
+    "session_end", "minutes_elapsed", "stop_file", "connection_closed", "not_paper",
+    "interrupted", "error", "abandoned")
 
 
 def _to_e4(value: Decimal | int | str) -> int:
@@ -664,6 +728,44 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _data_json_dict(data: DataMeta) -> dict[str, Any]:
+    return {
+        "source": data.source,
+        "directory": data.directory,
+        "symbols": list(data.symbols),
+        "first_bar": None if data.first_bar is None else data.first_bar.isoformat(),
+        "last_bar": None if data.last_bar is None else data.last_bar.isoformat(),
+        "files": [_data_file(entry) for entry in data.files],
+        "replayed_minutes": data.replayed_minutes,
+        "missing_minutes": (None if data.missing_minutes is None
+                            else {s: n for s, n in data.missing_minutes}),
+        "uncovered_minutes": data.uncovered_minutes,
+        "warnings": list(data.warnings),
+        "gap_rule": None if data.gap_rule is None else gap_rule_to_json(data.gap_rule),
+    }
+
+
+def _data_json(data: DataMeta) -> str:
+    return _dumps(_data_json_dict(data), "data")
+
+
+def _bar_row(run_id: int, bar: StoredBar) -> tuple[Any, ...]:
+    return (run_id, _text(bar.symbol, "bar symbol"), _series_time(bar.time),
+            _finite(bar.open), _finite(bar.high), _finite(bar.low), _finite(bar.close),
+            _finite(bar.volume))
+
+
+def _count_rows(run_id: int, counts: Mapping[str, Mapping[str, int]]) -> list[tuple[Any, ...]]:
+    rows = []
+    for scope, keyed in counts.items():
+        _text(scope, "count scope")
+        for key, value in keyed.items():
+            if not isinstance(value, int) or isinstance(value, bool) or abs(value) > _INT64_MAX:
+                raise StoreError(f"count {scope}/{key} = {value!r} must be a 64-bit integer")
+            rows.append((run_id, scope, _text(key, "count key"), value))
+    return rows
+
+
 def _enable_wal(conn: sqlite3.Connection, wait: float = 10.0) -> None:
     """Switch to WAL. The switch needs an exclusive lock and fails at once, ignoring
     the busy timeout, when another opener holds it; retry until it is free. A
@@ -730,6 +832,7 @@ class SqliteStore:
             # switch to WAL rewrites the file header.
             self._refuse_newer(self._conn.execute("PRAGMA user_version").fetchone()[0])
             _enable_wal(self._conn, busy_timeout)
+            self._require_wal(self._conn)
             self._migrate()
             self._schema_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         except StoreError:
@@ -811,6 +914,17 @@ class SqliteStore:
             _rollback(conn)
             raise StoreError(f"commit failed: {exc}") from exc
 
+    def _require_wal(self, conn: sqlite3.Connection) -> None:
+        """The switch to WAL can be silently refused (a network share, a VFS without
+        shared memory): the pragma then returns the old mode. Incremental writers
+        and the dashboard reading beside them need WAL, so refuse a file without it."""
+        if self._path == ":memory:":
+            return  # an in-memory database has no journal file
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            raise StoreError(f"cannot switch {self._path} to WAL journal mode (it is "
+                             f"{mode!r}); a live run needs WAL. Use a local disk.")
+
     @staticmethod
     def _refuse_newer(version: int) -> None:
         if version > SCHEMA_VERSION:
@@ -844,21 +958,7 @@ class SqliteStore:
     # --- writing ----------------------------------------------------------
 
     def begin_run(self, meta: RunMeta) -> int:
-        data = meta.data
-        data_json = _dumps({
-            "source": data.source,
-            "directory": data.directory,
-            "symbols": list(data.symbols),
-            "first_bar": None if data.first_bar is None else data.first_bar.isoformat(),
-            "last_bar": None if data.last_bar is None else data.last_bar.isoformat(),
-            "files": [_data_file(entry) for entry in data.files],
-            "replayed_minutes": data.replayed_minutes,
-            "missing_minutes": (None if data.missing_minutes is None
-                                else {s: n for s, n in data.missing_minutes}),
-            "uncovered_minutes": data.uncovered_minutes,
-            "warnings": list(data.warnings),
-            "gap_rule": None if data.gap_rule is None else gap_rule_to_json(data.gap_rule),
-        }, "data")
+        data_json = _data_json(meta.data)
         config_json = _dumps(dict(meta.config), "config")
         with self._tx() as conn:
             cur = conn.execute(
@@ -984,10 +1084,75 @@ class SqliteStore:
             conn.execute("UPDATE runs SET data_json=? WHERE id=?",
                          (_dumps(data, "data"), run_id))
 
-    def end_run(self, run_id: int, status: RunStatus) -> None:
-        """Flush the last equity point of every series and close the run."""
+    # --- live runs (schema 3) ---------------------------------------------
+
+    def _stamp(self, conn: sqlite3.Connection, run_id: int) -> None:
+        conn.execute("UPDATE runs SET last_write_at=? WHERE id=?",
+                     (self._clock().astimezone(timezone.utc).isoformat(), run_id))
+
+    def touch(self, run_id: int) -> None:
+        """Set the running run's `last_write_at` to now: a heartbeat for a reader
+        that wants to know whether the writer is alive."""
+        with self._tx() as conn:
+            self._require_run(conn, run_id, running=True)
+            self._stamp(conn, run_id)
+
+    def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None:
+        """Store the bars the engine consumed, in one transaction (all or none).
+
+        A second bar for the same symbol and minute raises `StoreError` and
+        nothing of the call is kept. Also sets `last_write_at`.
+        """
+        rows = [_bar_row(run_id, b) for b in bars]
+        with self._tx() as conn:
+            self._require_run(conn, run_id, running=True)
+            try:
+                conn.executemany(
+                    "INSERT INTO run_bars (run_id, symbol, time, open, high, low, close, volume)"
+                    " VALUES (?,?,?,?,?,?,?,?)", rows)
+            except sqlite3.IntegrityError as exc:
+                raise StoreError(f"a bar is already stored for that symbol and minute: {exc}"
+                                 ) from exc
+            self._stamp(conn, run_id)
+
+    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None:
+        """Upsert live counts: `{scope: {key: value}}`, scope "symbol" or "algo".
+
+        A (scope, key) already stored is overwritten, others are kept. Also
+        sets `last_write_at`.
+        """
+        rows = _count_rows(run_id, counts)
+        with self._tx() as conn:
+            self._require_run(conn, run_id, running=True)
+            conn.executemany(
+                "INSERT INTO run_counts (run_id, scope, key, value) VALUES (?,?,?,?)"
+                " ON CONFLICT (run_id, scope, key) DO UPDATE SET value=excluded.value", rows)
+            self._stamp(conn, run_id)
+
+    def update_run_data(self, run_id: int, data: DataMeta) -> None:
+        """Replace the run's `DataMeta` (the last bar, minute counts, warnings) in `data_json`.
+
+        A `gap_rule` of None keeps the one `write_gap_rule` recorded. Also sets
+        `last_write_at`.
+        """
+        fresh = _data_json_dict(data)
+        with self._tx() as conn:
+            self._require_run(conn, run_id, running=True)
+            if data.gap_rule is None:
+                row = conn.execute("SELECT data_json FROM runs WHERE id=?", (run_id,)).fetchone()
+                fresh["gap_rule"] = json.loads(row[0]).get("gap_rule")
+            conn.execute("UPDATE runs SET data_json=? WHERE id=?", (_dumps(fresh, "data"), run_id))
+            self._stamp(conn, run_id)
+
+    def end_run(self, run_id: int, status: RunStatus, reason: str | None = None) -> None:
+        """Flush the last equity point of every series and close the run.
+
+        `reason` (one of `END_REASONS`, or None) is stored as `end_reason`.
+        """
         if status not in ("completed", "failed"):
             raise StoreError(f"cannot end a run as {status!r}")
+        if reason is not None and reason not in END_REASONS:
+            raise StoreError(f"unknown end reason {reason!r}; use one of {END_REASONS}")
         with self._tx() as conn:
             self._require_run(conn, run_id, running=True)
             pending = [(key, st) for key, st in self._equity_state.items()
@@ -998,8 +1163,9 @@ class SqliteStore:
                 [(run_id, p.account, p.time.isoformat(), _to_e4(p.cash), _to_e4(p.position_value),
                   _to_e4(p.realised), _to_e4(p.unrealised), _to_e4(p.equity))
                  for _, st in pending for p in (st.prev,)])
-            conn.execute("UPDATE runs SET status=?, ended_at=? WHERE id=?",
-                         (status, self._clock().astimezone(timezone.utc).isoformat(), run_id))
+            conn.execute("UPDATE runs SET status=?, ended_at=?, end_reason=? WHERE id=?",
+                         (status, self._clock().astimezone(timezone.utc).isoformat(), reason,
+                          run_id))
         for key in [k for k in self._equity_state if k[0] == run_id]:
             del self._equity_state[key]
 
@@ -1053,8 +1219,8 @@ class SqliteStore:
 
     def list_runs(self) -> tuple[RunSummary, ...]:
         rows = self._db().execute(
-            "SELECT id, started_at, ended_at, status, kind, fills, code_version, data_json"
-            " FROM runs ORDER BY id").fetchall()
+            f"SELECT id, started_at, ended_at, status, kind, fills, code_version, data_json"
+            f"{self._live_columns()} FROM runs ORDER BY id").fetchall()
         return tuple(self._summary(r) for r in rows)
 
     def load_series(self, run_id: int, algo: str, start: datetime | None = None,
@@ -1102,7 +1268,13 @@ class SqliteStore:
                         d.get("uncovered_minutes"),
                         tuple(d.get("warnings") or ()),
                         gap_rule_from_json(d.get("gap_rule")))
-        return RunSummary(r[0], _dt(r[1]), _opt_dt(r[2]), r[3], r[4], r[5], r[6], data)
+        last_write, reason = (r[8], r[9]) if len(r) >= 10 else (None, None)
+        return RunSummary(r[0], _dt(r[1]), _opt_dt(r[2]), r[3], r[4], r[5], r[6], data,
+                          _opt_dt(last_write), reason)
+
+    def _live_columns(self) -> str:
+        """The schema-3 columns to select, or nothing for an older (read-only) database."""
+        return ", last_write_at, end_reason" if self._schema_version >= 3 else ""
 
     def load_run(self, run_id: int) -> RunData:
         conn = self._db()
@@ -1116,8 +1288,8 @@ class SqliteStore:
 
     def _load(self, conn: sqlite3.Connection, run_id: int) -> RunData:
         row = conn.execute(
-            "SELECT id, started_at, ended_at, status, kind, fills, code_version, data_json,"
-            " config_json FROM runs WHERE id=?", (run_id,)).fetchone()
+            f"SELECT id, started_at, ended_at, status, kind, fills, code_version, data_json"
+            f"{self._live_columns()}, config_json FROM runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             raise StoreError(f"no run {run_id}")
         algos = tuple(
@@ -1164,7 +1336,7 @@ class SqliteStore:
                 for r in conn.execute(
                     "SELECT algo, name, draw_type, position FROM algo_series WHERE run_id=?"
                     " ORDER BY position, id", (run_id,)))
-        return RunData(self._summary(row[:8]), json.loads(row[8]), algos, orders, fills, trips,
+        return RunData(self._summary(row[:-1]), json.loads(row[-1]), algos, orders, fills, trips,
                        equity, ignored, series)
 
 
