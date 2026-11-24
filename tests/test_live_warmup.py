@@ -67,12 +67,30 @@ def test_excludes_today_rows(tmp_path: Path) -> None:
     assert any("only 2 trading days" in w for w in warnings)
 
 
-def test_frame_shape_matches_feed_warmup(tmp_path: Path) -> None:
-    write_days(tmp_path, "AAPL", ["2024-10-07", "2024-10-08", "2024-10-09"])
-    frames, _, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
-    feed_frame = CsvBarFeed(tmp_path, ["AAPL"], warmup_days=2).warmup("AAPL")
-    pd.testing.assert_frame_equal(frames["AAPL"], feed_frame.iloc[: len(frames["AAPL"])])
-    assert frames["AAPL"].index.equals(pd.RangeIndex(len(frames["AAPL"])))
+@pytest.mark.parametrize(
+    ("days", "today"),
+    [
+        (["2024-10-07", "2024-10-08"], date(2024, 10, 9)),
+        (["2024-09-26", "2024-10-01", "2024-10-08"], date(2024, 10, 9)),
+        (["2024-11-27", "2024-12-30", "2024-12-31", "2025-01-02", "2025-01-03"], date(2025, 1, 6)),
+    ],
+)
+def test_frame_shape_matches_feed_warmup(tmp_path: Path, days: list[str], today: date) -> None:
+    write_days(tmp_path, "AAPL", days)
+    frames, _, _ = live_warmup(tmp_path, ["AAPL"], today, 10)
+    frame = frames["AAPL"]
+    assert frame.dtypes.astype(str).to_dict() == {
+        "date": "datetime64[us]",
+        "time": "int64",
+        "open": "float64",
+        "high": "float64",
+        "low": "float64",
+        "close": "float64",
+        "volume": "int64",
+    }
+    feed_frame = CsvBarFeed(tmp_path, ["AAPL"], warmup_days=3650).warmup("AAPL")
+    pd.testing.assert_frame_equal(frame, feed_frame, check_dtype=True)
+    assert frame.index.equals(pd.RangeIndex(len(frame)))
 
 
 def test_last_n_trading_days_across_month_boundary(tmp_path: Path) -> None:
@@ -155,16 +173,36 @@ def test_description_files_and_warmup_digest_ignore_today_and_later_months(tmp_p
     assert one["data_snapshot_sha256"] != two["data_snapshot_sha256"]
 
 
-def test_warmup_digest_changes_with_one_value(tmp_path: Path) -> None:
+@pytest.mark.parametrize("column", ["close", "open", "high", "low", "volume", "time"])
+def test_warmup_digest_changes_with_one_value(tmp_path: Path, column: str) -> None:
     write_days(tmp_path, "AAPL", ["2024-10-07", "2024-10-08"])
     _, before, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
     path = month_file_path(tmp_path, "AAPL", 2024, 10)
     frame = pd.read_csv(path)
-    frame.loc[1, "close"] += 0.01
+    frame.loc[1, column] += 1
     frame["date"] = pd.to_datetime(frame["date"])
     write_month_file(path, frame)
     _, after, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
     assert before["symbols"]["AAPL"]["warmup_sha256"] != after["symbols"]["AAPL"]["warmup_sha256"]
+
+
+def test_warmup_digest_depends_on_values_not_dtypes(tmp_path: Path) -> None:
+    rows = pd.DataFrame(day_rows("2024-10-07") + day_rows("2024-10-08"))[list(COLUMNS)]
+    whole = rows.copy()
+    for col in ("open", "high", "low", "close"):
+        whole[col] = whole[col].round().astype("int64")
+    legacy_dir, month_dir = tmp_path / "legacy", tmp_path / "month"
+    legacy_dir.mkdir()
+    whole.to_csv(offline_data_path(legacy_dir, "AAPL"))
+    write_month_file(month_file_path(month_dir, "AAPL", 2024, 10), whole.astype(
+        {c: "float64" for c in ("open", "high", "low", "close")}
+    ))
+    legacy_frame = live_warmup(legacy_dir, ["AAPL"], date(2024, 10, 9), 2)[0]["AAPL"]
+    month_frame = live_warmup(month_dir, ["AAPL"], date(2024, 10, 9), 2)[0]["AAPL"]
+    assert legacy_frame["open"].dtype != month_frame["open"].dtype
+    assert warmup.warmup_digest(legacy_frame) == warmup.warmup_digest(month_frame)
+    as_float_volume = month_frame.astype({"volume": "float64"})
+    assert warmup.warmup_digest(as_float_volume) == warmup.warmup_digest(month_frame)
 
 
 def test_legacy_file_must_be_strictly_increasing(tmp_path: Path) -> None:

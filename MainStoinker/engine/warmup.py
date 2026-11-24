@@ -40,32 +40,47 @@ def previous_weekday(today: date) -> date:
 def warmup_digest(frame: pd.DataFrame) -> str:
     """sha256 hex of `frame` serialised as the month-file writer does.
 
-    `frame[COLUMNS].to_csv(index=False, lineterminator="\\n", date_format=
-    "%Y-%m-%d %H:%M:%S")` encoded as UTF-8 (header line included). Floats use
-    pandas' shortest round-trip repr, so equal values give equal bytes.
+    The columns are first cast to fixed dtypes (`date` datetime64, `time` and
+    `volume` int64, `open`/`high`/`low`/`close` float64), so only values
+    matter (`100` and `100.0` hash alike). Then `to_csv(index=False,
+    lineterminator="\\n", date_format="%Y-%m-%d %H:%M:%S")` encoded as UTF-8
+    (header line included); floats use pandas' shortest round-trip repr.
     """
-    text = frame[list(COLUMNS)].to_csv(index=False, lineterminator="\n", date_format=_STAMP)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _empty_like_bars() -> pd.DataFrame:
-    return pd.DataFrame(
+    fixed = frame[list(COLUMNS)].astype(
         {
-            "date": pd.Series([], dtype="datetime64[ns]"),
-            "time": pd.Series([], dtype="int64"),
-            "open": pd.Series([], dtype="float64"),
-            "high": pd.Series([], dtype="float64"),
-            "low": pd.Series([], dtype="float64"),
-            "close": pd.Series([], dtype="float64"),
-            "volume": pd.Series([], dtype="int64"),
+            "date": "datetime64[ns]",
+            "time": "int64",
+            "open": "float64",
+            "high": "float64",
+            "low": "float64",
+            "close": "float64",
+            "volume": "int64",
         }
-    )[list(COLUMNS)]
+    )
+    text = fixed.to_csv(index=False, lineterminator="\n", date_format=_STAMP)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _month_of(path: Path) -> tuple[int, int]:
     match = _MONTH_FILE.fullmatch(path.name)
     assert match is not None
     return int(match.group(1)), int(match.group(2))
+
+
+def _read_month(path: Path, symbol: str) -> pd.DataFrame:
+    """One month file via `read_offline_bars`, with the checks `read_symbol_bars` makes."""
+    frame = read_offline_bars(path)
+    year, month = _month_of(path)
+    dates = frame["date"]
+    if getattr(dates.dt, "tz", None) is not None:
+        raise ValueError(f"month file {path} has time-zone aware dates")
+    outside = (dates.dt.year != year) | (dates.dt.month != month)
+    if outside.any():
+        raise ValueError(
+            f"month file {path} has a row outside {year:04d}-{month:02d}: {dates[outside].iloc[0]}"
+        )
+    _check_increasing(symbol, frame)
+    return frame
 
 
 def _check_increasing(symbol: str, data: pd.DataFrame) -> None:
@@ -98,24 +113,18 @@ def _read_needed(
     candidates = [p for p in files if _month_of(p) <= (today.year, today.month)]
     if not candidates:
         raise ValueError(f"symbol {symbol}: no bars before {today.isoformat()}")
-    cache: dict[Path, pd.DataFrame] = {}
-
-    def reader(path: Path) -> pd.DataFrame:
-        if path not in wanted:
-            return _empty_like_bars()
-        if path not in cache:
-            cache[path] = read_offline_bars(path)
-        return cache[path]
-
-    wanted: set[Path] = set()
+    parts: list[pd.DataFrame] = []
+    read: list[Path] = []
+    days: set[pd.Timestamp] = set()
     for path in reversed(candidates):
-        wanted.add(path)
-        data = read_symbol_bars(bars_dir, symbol, reader)
-        before = data.loc[data["date"] < cutoff].reset_index(drop=True)
-        if before["date"].dt.normalize().nunique() >= trading_days:
+        frame = _read_month(path, symbol)
+        read.append(path)
+        parts.insert(0, frame)
+        days.update(frame.loc[frame["date"] < cutoff, "date"].dt.normalize().unique())
+        if len(days) >= trading_days:
             break
-    _check_increasing(symbol, before)
-    return before, sorted(wanted)
+    data = pd.concat(parts, ignore_index=True)[list(COLUMNS)]
+    return data.loc[data["date"] < cutoff].reset_index(drop=True), sorted(read)
 
 
 def live_warmup(
