@@ -2192,6 +2192,21 @@ def test_no_prompt_usage_errors_exit_2_before_anything_is_built(rig: Rig, argv: 
     assert not rig.live.exists()
 
 
+@pytest.mark.parametrize("argv,message", [
+    (["--no-prompt", "--port", "7497", "--minutes", "5"], "--no-prompt is valid only together with --paper"),
+    (["--paper", "--no-prompt"], "--minutes is required with --no-prompt"),
+    (["--paper", "--no-prompt", "--symbols", "AAPL"], "--minutes is required with --no-prompt"),
+    (["--paper", "--no-prompt", "--minutes", "0"], "--minutes must be 1 to 420"),
+    (["--paper", "--no-prompt", "--minutes", "421"], "--minutes must be 1 to 420"),
+])
+def test_no_prompt_usage_errors_are_raised_by_the_parser(
+        argv: list[str], message: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        watch_bars.parse_args(argv)
+    assert raised.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 def test_the_minutes_bounds_with_no_prompt_are_1_to_420() -> None:
     for good in ("1", "30", "420"):
         assert watch_bars.parse_args(["--paper", "--no-prompt", "--minutes", good]).minutes == int(good)
