@@ -17,6 +17,9 @@ loads every run to count its algos and trades. With `--json`:
 `{"runs": [{"run_id", "started_at", "ended_at", "duration_seconds", "status",
 "incomplete", "kind", "fills", "code_version", "symbols", "algo_count",
 "trade_count", "net"}]}`, `status` as stored, money as 4-decimal strings.
+A live run (`run_documents.is_live_run`) also has `liveness`, `end_reason` and
+`last_write_at`; no other run has a new key. Live runs show their liveness
+(`running`, `stale`) in the status column instead of `incomplete`.
 
 `report RUN`: a header (run, status with a note unless `completed`, kind,
 fills, times, code version, symbols, bar range, capital and costs for
@@ -27,6 +30,14 @@ rate has 1 decimal. With `--json`: `{"run": {...}, "accounts": {idname:
 {"symbol", "algo", "mode", ...statistics}}, "total": {...statistics}}`, the
 statistics being `stats.statistics_record` (4-decimal strings, `win_rate` a
 fraction). Definitions of every figure are in `stats.py`.
+
+For a live run the report adds, only where there is something to say: the
+liveness (a run still `running` is `running` or, when nothing was written for
+`STALE_AFTER`, `stale`), the end reason, the live counts (minutes fed, dropped
+per reason, late and not fed) and the open positions with their unrealised
+result at the last stored bar. In `--json` they are the keys described in
+`run_documents`. The current time is read here, at the edge, and passed down
+(`now`); tests inject it.
 """
 
 from __future__ import annotations
@@ -37,16 +48,26 @@ import re
 import sqlite3
 import sys
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 
 from .gaprule import GapRuleReport
 from .ledger import IGNORED_KINDS
-from .run_documents import report_document, run_header, run_net, run_summary_record
+from .run_documents import (
+    STALE_AFTER,
+    is_live_run,
+    live_counts_record,
+    liveness,
+    open_positions,
+    report_document,
+    run_header,
+    run_net,
+    run_summary_record,
+)
 from .stats import fmt4, run_statistics
-from .store import RunData, RunSummary, Store, StoreError, open_store_readonly
+from .store import RunData, RunSummary, Store, StoredBar, StoreError, open_store_readonly
 
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 _RUN_ID = re.compile(r"[0-9]+")
@@ -192,23 +213,32 @@ def _read(action: Any) -> Any:
 # --- runs ------------------------------------------------------------------------
 
 
+def _now(now: datetime | None) -> datetime:
+    """The edge's clock: the injected time, else the wall clock (UTC)."""
+    return datetime.now(timezone.utc) if now is None else now
+
+
 def run_runs_command(spec: str | None, *, as_json: bool,
-                     env: Mapping[str, str] | None = None) -> int:
+                     env: Mapping[str, str] | None = None, now: datetime | None = None,
+                     stale_after: timedelta = STALE_AFTER) -> int:
     store = _open_existing(spec, env)
     try:
         entries: list[tuple[RunSummary, RunData]] = _read(
             lambda: [(s, store.load_run(s.run_id)) for s in store.list_runs()])
     finally:
         store.close()
+    now = _now(now)
     if as_json:
-        records = [run_summary_record(summary, run) for summary, run in entries]
+        records = [run_summary_record(summary, run, now=now, stale_after=stale_after)
+                   for summary, run in entries]
         _write([json.dumps({"runs": records}, indent=1)])
         return 0
     if not entries:
         _write(["no runs stored"])
         return 0
     rows = [[str(s.run_id), _utc(s.started_at), _duration(s.started_at, s.ended_at),
-             _status_shown(s.status), s.kind, s.fills, str(len(r.algos)),
+             liveness(s, now, stale_after) if is_live_run(s) and s.status == "running"
+             else _status_shown(s.status), s.kind, s.fills, str(len(r.algos)),
              str(len(r.round_trips)), _money2(run_net(r)), _short_version(s.code_version)]
             for s, r in entries]
     headers = ["id", "started (UTC)", "duration", "status", "kind", "fills", "algos", "trades",
@@ -221,23 +251,33 @@ def run_runs_command(spec: str | None, *, as_json: bool,
 
 
 def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
-                       env: Mapping[str, str] | None = None) -> int:
+                       env: Mapping[str, str] | None = None, now: datetime | None = None,
+                       stale_after: timedelta = STALE_AFTER) -> int:
     run_id = _parse_run_id(run_text)
     store = _open_existing(spec, env)
+    counts: dict[str, dict[str, int]] | None = None
+    last_bars: dict[str, StoredBar] | None = None
     try:
         if run_id > _INT64_MAX:
             raise ReportError(f"no run {run_id}")
         run: RunData = _read(lambda: store.load_run(run_id))
+        if is_live_run(run.summary):
+            counts = _read(lambda: store.load_counts(run_id))
+            last_bars = _read(lambda: {b.symbol: b for b in store.load_last_bars(run_id)})
     finally:
         store.close()
+    now = _now(now)
     data_directory = _data_directory(run.summary.data.directory)
     if as_json:
-        _write([json.dumps(report_document(run, data_directory=data_directory), indent=1)])
+        _write([json.dumps(report_document(run, data_directory=data_directory, now=now,
+                                           stale_after=stale_after, counts=counts,
+                                           last_bars=last_bars), indent=1)])
         return 0
 
     stats = run_statistics(run, IGNORED_KINDS)
     header = run_header(run, data_directory=data_directory)
     s = run.summary
+    live = is_live_run(s)
     lines = [f"run {s.run_id}"]
     if s.status == "completed":
         lines.append("status: completed")
@@ -246,6 +286,8 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
                      "process was killed). Figures cover only what was stored.")
     else:
         lines.append("status: failed. The run did not finish; figures cover only what was stored.")
+    if live:
+        lines.extend(_liveness_lines(s, now, stale_after))
     lines.append(f"kind: {s.kind}")
     lines.append(f"fills: {s.fills}")
     lines.append(f"started: {_utc(s.started_at)} UTC")
@@ -264,6 +306,8 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
         lines.append(f"minutes with no bar for any symbol: {header['uncovered_minutes']}")
     lines.extend(gap_rule_lines(s.data.gap_rule))
     lines.extend(f"data warning: {text}" for text in header["data_warnings"])
+    if live and counts is not None:
+        lines.extend(live_count_lines(live_counts_record(counts, s.data.gap_rule)))
     if s.fills == "realistic":
         capital = header["capital"]
         lines.append("capital per algo: " + (_opt_str_money(capital) or "-"))
@@ -285,8 +329,58 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
     ignored = sum(total["ignored_events"].values())
     lines.append(f"TOTAL: {total['synthetic_closes']} synthetic end-of-data closes (counted in the "
                  f"trades), {ignored} ignored events, {total['cancelled_entries']} cancelled entries")
+    if live:
+        lines.extend(open_position_lines(open_positions(run, last_bars)))
     _write(lines)
     return 0
+
+
+def _liveness_lines(s: RunSummary, now: datetime, stale_after: timedelta) -> list[str]:
+    """Liveness (only for a run still marked running) and the end reason (when stored)."""
+    lines = []
+    state = liveness(s, now, stale_after)
+    if state in ("running", "stale"):
+        last = s.last_write_at if s.last_write_at is not None else s.started_at
+        text = f"liveness: {state} (last write {_utc(last)} UTC"
+        if state == "stale":
+            text += f", {_duration(last, now)} ago"
+        lines.append(text + ")")
+    if s.end_reason is not None:
+        lines.append(f"end reason: {s.end_reason}")
+    return lines
+
+
+def _counts_line(label: str, counts: Mapping[str, int]) -> str | None:
+    shown = [f"{symbol} {n}" for symbol, n in counts.items() if n]
+    return f"{label}: " + ", ".join(shown) if shown else None
+
+
+def live_count_lines(record: Mapping[str, Any]) -> list[str]:
+    """Lines for the live counts of a run; nothing when every count is zero or absent."""
+    dropped = [f"{symbol} {sum(by.values())} ("
+               + ", ".join(f"{reason} {n}" for reason, n in by.items() if n) + ")"
+               for symbol, by in record["dropped"].items() if sum(by.values())]
+    lines = [line for line in (
+        _counts_line("minutes fed", record["fed"]),
+        "minutes dropped by the watcher: " + ", ".join(dropped) if dropped else None,
+        _counts_line("late, not fed", record["late"])) if line]
+    for scope, keyed in record.get("other", {}).items():
+        shown = [f"{key} {n}" for key, n in keyed.items() if n]
+        if shown:
+            lines.append(f"{scope} counts: " + ", ".join(shown))
+    return lines
+
+
+def open_position_lines(positions: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The open positions as a table; nothing when there are none."""
+    if not positions:
+        return []
+    headers = ["algo", "symbol", "side", "quantity", "entry", "entry time", "stop", "target",
+               "last close", "unrealised"]
+    rows = [[p["account"], p["symbol"], p["side"], p["quantity"], p["entry_price"],
+             p["entry_time"] or "-", p["stop"] or "-", p["target"] or "-",
+             p.get("last_close", "-"), p.get("unrealised", "-")] for p in positions]
+    return ["", "open positions:", *_table(headers, rows, right={3, 4, 6, 7, 8, 9})]
 
 
 def gap_rule_lines(report: GapRuleReport | None) -> list[str]:
