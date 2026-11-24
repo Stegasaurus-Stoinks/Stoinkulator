@@ -169,7 +169,7 @@ ADVICE_FARM = ("No historical data farm: TWS is not connected to IB's history se
                "minute and retry.")
 NO_DATA_YET_TEXT = "IB had no data for this day yet; it will be retried next run"
 
-_ACCOUNT_SHAPE = re.compile(r"[A-Za-z]{1,2}[0-9]{5,}")
+_ACCOUNT_SHAPE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{1,3}[0-9]{5,}(?![A-Za-z0-9])")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -183,7 +183,20 @@ class PathRefused(ValueError):
 
 
 def scrub(text: str) -> str:
-    """Replace anything shaped like an account id (1-2 letters then 5+ digits) with ACCOUNT."""
+    """Replace anything shaped like an account id with ACCOUNT.
+
+    The shape is 1 to 3 ASCII letters then 5 or more digits, and the WHOLE id (a three-letter
+    prefix included) is replaced. An id is masked only when it stands on its own: it must not be
+    preceded or followed by another ASCII letter or digit. Punctuation, quotes, `=`, `:`, `,`,
+    `_`, `-`, path separators and the ends of the line all count as boundaries, so `acct_<id>`,
+    `<id>-x` and a whole path segment are still masked.
+
+    Trade-off: an id glued directly to other letters or digits (inside a hex string, a UUID
+    segment or a longer word, as in a temp folder name) is NOT masked by shape any more; that
+    keeps printed paths intact. This function is shape-only: `private_values` (see
+    `private_values`) is not applied here, it goes to the session recorder, so such a glued id
+    printed to the console is not masked by anything else.
+    """
     return _ACCOUNT_SHAPE.sub("ACCOUNT", text)
 
 
