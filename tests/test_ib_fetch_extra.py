@@ -833,9 +833,9 @@ def test_no_data_right_after_the_close_is_failed_and_retried_next_run(out: Path,
         first = rig.run(["AAPL"], day, day, out)
     sym = first.symbols["AAPL"]
     assert (sym.ok, sym.no_data, sym.failed) == (0, 0, 1) and not first.complete
-    assert "no data yet (session closed less than 180 minutes ago)" in sym.failures[0].text
+    assert "no data yet (the day's bars are not final until 06:00 New York time" in sym.failures[0].text
     assert manifest_days(out) == {day.isoformat(): "failed"}
-    with make_rig(server_now=minutes_after_close(day, 3 * 3600 + 1)) as rig2:  # asked again
+    with make_rig(server_now=minutes_after_close(day, 14 * 3600)) as rig2:  # 06:00 next day: asked again
         rig2.script(day, behaviour)
         second = rig2.run(["AAPL"], day, day, out)
     assert rig2.days_requested() == [day]  # the failed day is retried
@@ -843,9 +843,12 @@ def test_no_data_right_after_the_close_is_failed_and_retried_next_run(out: Path,
     assert manifest_days(out) == {day.isoformat(): "no_data"}
 
 
-def test_no_data_three_hours_and_a_second_after_the_close_is_no_data(out: Path) -> None:
+def test_no_data_at_the_final_time_is_no_data_and_three_hours_after_the_close_is_not(out: Path) -> None:
     day = date(2024, 8, 20)
-    with make_rig(server_now=minutes_after_close(day, 3 * 3600 + 1)) as rig:
+    with make_rig(server_now=minutes_after_close(day, 3 * 3600 + 1)) as early:  # the old 3 h rule
+        early.script(day, empty_end)
+        assert early.run(["AAPL"], day, day, out).symbols["AAPL"].failed == 1
+    with make_rig(server_now=minutes_after_close(day, 14 * 3600)) as rig:  # 06:00 New York next day
         rig.script(day, empty_end)
         result = rig.run(["AAPL"], day, day, out)
     assert result.symbols["AAPL"].no_data == 1 and result.complete
@@ -860,24 +863,10 @@ def test_a_holiday_two_days_ago_is_no_data(out: Path) -> None:
     assert result.symbols["AAPL"].no_data == 1 and result.complete
 
 
-def test_settle_seconds_is_an_argument_and_zero_is_allowed(out: Path) -> None:
-    day = date(2024, 8, 20)
-    with make_rig(server_now=minutes_after_close(day, 60)) as rig:
-        rig.script(day, empty_end)
-        result = rig.run(["AAPL"], day, day, out, settle_seconds=0)
-    assert result.symbols["AAPL"].no_data == 1
-    with make_rig(server_now=minutes_after_close(day, 60)) as rig2:
-        rig2.script(day, empty_end)
-        result2 = rig2.run(["MSFT"], day, day, out, settle_seconds=90 * 60)
-    assert result2.symbols["MSFT"].failed == 1
-    assert "less than 90 minutes ago" in result2.symbols["MSFT"].failures[0].text
-
-
-@pytest.mark.parametrize("bad", [-1, float("inf"), float("nan"), True, "10"])
-def test_settle_seconds_is_validated_before_anything_is_sent(out: Path, bad: Any) -> None:
+def test_the_settle_seconds_argument_is_gone(out: Path) -> None:
     with make_rig() as rig:
-        with pytest.raises(fetch_module.FetchSetupError, match="settle_seconds"):
-            rig.run(["AAPL"], WEEK[0], WEEK[0], out, settle_seconds=bad)
+        with pytest.raises(TypeError, match="settle_seconds"):
+            rig.run(["AAPL"], WEEK[0], WEEK[0], out, settle_seconds=0)
     assert rig.requests == []
 
 

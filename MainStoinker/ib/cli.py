@@ -145,8 +145,6 @@ PROBE_MAX_QUOTE_SECONDS = 120
 DEFAULT_CLIENT_ID = 21
 DEFAULT_CONNECT_TIMEOUT = 30.0
 MAX_CONNECT_TIMEOUT = 300.0
-DEFAULT_SETTLE_HOURS = 3.0
-MAX_SETTLE_HOURS = 24.0
 MAX_SYMBOLS = 20
 SHOWN_FINDINGS = 5
 SECONDS_PER_SYMBOL_DAY = 10  # IB's pacing: one history request per 10 s; the estimate rule
@@ -292,10 +290,6 @@ def build_parser(paper: bool = False) -> argparse.ArgumentParser:
                         help=r"bars folder (default %%USERPROFILE%%\Stoinkulator\bars; "
                              "not in the repo or OneDrive)")
     _add_record_arguments(parser)
-    parser.add_argument("--settle-hours", type=float, default=DEFAULT_SETTLE_HOURS, metavar="HOURS",
-                        help="a day with no bars counts as a holiday only when its session closed at "
-                             "least this many hours ago; sooner it is retried next run (0 to "
-                             f"{MAX_SETTLE_HOURS:g}, default {DEFAULT_SETTLE_HOURS:g})")
     return parser
 
 
@@ -322,8 +316,6 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     if args.start > args.end:
         parser.error(f"--start {args.start} is after --end {args.end}")
     _check_connection_arguments(parser, args)
-    if not 0 <= args.settle_hours <= MAX_SETTLE_HOURS:
-        parser.error(f"--settle-hours must be 0 to {MAX_SETTLE_HOURS:g}")
     return args
 
 
@@ -751,7 +743,15 @@ def _summary(say: _Say, result: FetchResult, out_dir: Path) -> None:
     say("Summary")
     for name, res in result.symbols.items():
         say(f"  {name}: {res.ok} ok, {res.no_data} no data, {res.failed} failed, "
-            f"{res.already_done} already done, {res.not_closed} not closed [{res.state}]")
+            f"{res.already_done} already done, {res.not_closed} not closed"
+            + (f", {len(res.provisional_days)} provisional" if res.provisional_days else "")
+            + f" [{res.state}]")
+        if res.provisional_days:
+            say("    provisional (fetched before the day's bars are final; a run after 06:00 New "
+                "York next day will refetch): " + ", ".join(d.isoformat() for d in res.provisional_days))
+        for kept_day, (stored, got) in sorted(res.refetch_kept.items()):
+            say(f"    {kept_day}: the refetch returned {got} bars, fewer than the {stored} stored; "
+                "the stored day was kept")
         if res.state != "done" and res.message:
             say(f"    {res.message}")
         for failure in res.failures:
@@ -1033,8 +1033,7 @@ def run_fetch_bars(
     def body(say: _Say, conn: IbConnection, md: IbMarketData, advice: list[str]) -> int:
         try:
             result = fetch(md, args.symbols, args.start, args.end, args.out, connection=conn,
-                           clock=clock, sleep=sleep, on_progress=_progress(say),
-                           settle_seconds=args.settle_hours * 3600.0)
+                           clock=clock, sleep=sleep, on_progress=_progress(say))
         except FetchSetupError as exc:
             say(f"Refused: {exc}")
             return EXIT_REFUSED
