@@ -116,7 +116,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -321,6 +321,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bt.add_argument(
         "--warmup-days", type=int, default=2, metavar="N", help="days of warm-up history (default 2)"
+    )
+    bt.add_argument(
+        "--replay-from",
+        metavar="DATE",
+        help="replay only the New York dates from DATE (YYYY-MM-DD); the warm-up is then "
+        "the --warmup-days trading days before it",
+    )
+    bt.add_argument(
+        "--replay-to",
+        metavar="DATE",
+        help="last New York date to replay, inclusive (default: --replay-from); "
+        "needs --replay-from",
     )
     bt.add_argument(
         "--fills",
@@ -587,6 +599,32 @@ def _db_display(spec: str) -> str:
     return path if path == ":memory:" else str(Path(path).expanduser().resolve())
 
 
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def parse_window(args: argparse.Namespace) -> tuple[date, date] | None:
+    """The `(first, last)` replay dates from `--replay-from/--replay-to`, or None without them.
+
+    Raises `CliError` for `--replay-to` alone, a malformed date or `to` before `from`.
+    """
+    if args.replay_from is None:
+        if args.replay_to is not None:
+            raise CliError("--replay-to needs --replay-from")
+        return None
+    dates = []
+    for flag, text in (("--replay-from", args.replay_from),
+                       ("--replay-to", args.replay_to or args.replay_from)):
+        try:
+            if not _DATE.fullmatch(text):
+                raise ValueError(text)
+            dates.append(date.fromisoformat(text))
+        except ValueError:
+            raise CliError(f"{flag} must be a date as YYYY-MM-DD, got {ascii(text)}") from None
+    if dates[1] < dates[0]:
+        raise CliError(f"--replay-to {dates[1]} is before --replay-from {dates[0]}")
+    return dates[0], dates[1]
+
+
 def run_backtest_command(
     args: argparse.Namespace,
     *,
@@ -609,6 +647,7 @@ def run_backtest_command(
     out_dir = Path(args.out).resolve()
     if args.warmup_days < 0:
         raise CliError("--warmup-days must be 0 or more")
+    window = parse_window(args)
     if args.db is not None and args.db.removeprefix("sqlite:///") == ":memory:":
         raise CliError("--db :memory: would keep nothing once the command ends; "
                        "give a database file")
@@ -622,9 +661,12 @@ def run_backtest_command(
     if not data_dir.is_dir():
         raise CliError(f"data directory not found: {data_dir}")
     try:
-        feed = CsvBarFeed(data_dir, config_symbols(entries), args.warmup_days)
+        feed = CsvBarFeed(data_dir, config_symbols(entries), args.warmup_days, window=window)
     except (ValueError, FileNotFoundError) as exc:
         raise CliError(str(exc)) from exc
+    if window is not None and not any(feed.replay_counts().values()):
+        raise CliError(f"no data for any symbol between {window[0]} and {window[1]} "
+                       f"(--replay-from/--replay-to); check the dates and the data")
     # A symbol with no replay bars while another has some is an input problem (it would
     # only show as one "no bar at N of N minutes" line). When NO symbol has any, the run
     # stays a run of zero bars as before: many existing tests use data shorter than the
@@ -722,6 +764,8 @@ def run_backtest_command(
                     config={
                         "entries": entries,
                         "warmup_days": args.warmup_days,
+                        **({"window": {"from": window[0].isoformat(),
+                                       "to": window[1].isoformat()}} if window else {}),
                         "capital": fmt4(capital),
                         "costs": {
                             "commission_per_share": fmt4(costs.commission_per_share),
