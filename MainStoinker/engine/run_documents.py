@@ -114,14 +114,16 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
     Replays the fills with the ledger's rules (average cost; exits release the
     pending entry commission). `entry_time` is the time of the first entry fill of
     the current position (a reused broker reference starts afresh once flat).
-    `stop` and `target` are the last price of the `stop` / `target` order placed
-    for that position, after modifications, null when none was recorded or it
+    `stop` and `target` are the last price of the `stop` / `target` order recorded
+    for that position (an order recorded before the reference last went flat
+    belongs to the earlier position), after modifications, null when none was recorded or it
     was cancelled. When `last_bars` has the
     position's symbol, `last_close` and `unrealised` (the ledger's: marked
     against the remaining cost, less the commission still pending) are added.
     A run closed by synthetic end-of-data fills has none.
     """
     book: dict[str, dict[Hashable, _Pos]] = {a.idname: {} for a in run.algos}
+    closed_at: dict[tuple[str, Hashable], datetime] = {}
     for fill in run.fills:
         held = book.setdefault(fill.account, {})
         pos = held.get(fill.broker_ref)
@@ -142,15 +144,19 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
             pos.pending -= release
             if pos.qty <= 0:
                 del held[fill.broker_ref]
+                closed_at[(fill.account, fill.broker_ref)] = fill.time
     levels: dict[tuple[str, Hashable], dict[str, Decimal | None]] = {}
     placed: dict[int, tuple[tuple[str, Hashable], str]] = {}
     for event in run.order_events:
         if event.kind == "placed" and event.order_type in ("stop", "target"):
             key = (event.account, event.broker_ref)
-            current = book.get(event.account, {}).get(event.broker_ref)
-            # an order placed before the current position's first entry belongs to an
-            # earlier position of a reused reference
-            if current is None or current.entry_time is None or event.time < current.entry_time:
+            # Orders belong to the position of their reference that was current when they
+            # were recorded: those recorded before the last time the reference went flat
+            # belong to an earlier position (a stop placed with an entry order, one bar
+            # before its fill, is recorded after the previous position's close).
+            closed = closed_at.get(key)
+            if event.broker_ref not in book.get(event.account, {}) or (
+                    closed is not None and event.time < closed):
                 continue
             placed[event.order_id] = (key, event.order_type)
             levels.setdefault(key, {})[event.order_type] = event.price

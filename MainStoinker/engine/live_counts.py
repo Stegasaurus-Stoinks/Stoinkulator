@@ -23,6 +23,28 @@ COUNT_FED, COUNT_LATE, COUNT_DROPPED = "fed", "late", "dropped"
 COUNT_KINDS: tuple[str, ...] = (COUNT_FED, COUNT_LATE, COUNT_DROPPED)
 COUNT_SEPARATOR = ":"
 
+# Why the watcher dropped a minute (the `reason` of a dropped count), and the
+# watcher counter (`MainStoinker/ib/watch_bars.py`, not imported) each stands for:
+#
+#   identifier        watcher counter        meaning
+#   snapshot_only     snapshot_only          seen only in the backfill snapshot
+#   connection_lost   lost_not_written       overlapped a connection loss
+#   farm_break        farm_not_written       overlapped a data farm break
+#   stalled           stale_not_written      closed by time after a stalled stream
+#   rerequest_gap     gap_not_written        dropped by a re-requested backfill
+#   previous_session  previous_session       backfill bar of an earlier date
+DROP_REASONS: tuple[str, ...] = (
+    "snapshot_only", "connection_lost", "farm_break", "stalled", "rerequest_gap",
+    "previous_session")
+DROP_REASON_LABELS: dict[str, str] = {
+    "snapshot_only": "seen only in the backfill",
+    "connection_lost": "connection lost",
+    "farm_break": "data farm break",
+    "stalled": "stalled stream",
+    "rerequest_gap": "re-request gap",
+    "previous_session": "previous session",
+}
+
 
 class CountKey(NamedTuple):
     symbol: str
@@ -36,6 +58,8 @@ def count_key(symbol: str, kind: str, reason: str | None = None) -> str:
         raise ValueError(f"unknown count kind {kind!r}; use one of {COUNT_KINDS}")
     if (reason is None) != (kind != COUNT_DROPPED):
         raise ValueError("a reason is required for dropped counts and refused for others")
+    if reason is not None and reason not in DROP_REASONS:
+        raise ValueError(f"unknown drop reason {reason!r}; use one of {DROP_REASONS}")
     parts = [symbol, kind] + ([] if reason is None else [reason])
     for part in (symbol, *parts[2:]):
         if not part or COUNT_SEPARATOR in part:

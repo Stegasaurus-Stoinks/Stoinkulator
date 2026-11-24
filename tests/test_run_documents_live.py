@@ -13,11 +13,15 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.cli_report import run_report_command, run_runs_command
+from MainStoinker.engine.engine import Engine
+from MainStoinker.engine.feed import Bar
 from MainStoinker.engine.gaprule import GapRuleReport
 from MainStoinker.engine.ledger import Ledger
 from MainStoinker.engine.live_counts import (
@@ -25,11 +29,14 @@ from MainStoinker.engine.live_counts import (
     COUNT_FED,
     COUNT_LATE,
     COUNT_SCOPE_SYMBOL,
+    DROP_REASON_LABELS,
+    DROP_REASONS,
     HEARTBEAT_INTERVAL,
     LIVE_KINDS,
     count_key,
     parse_count_key,
 )
+from MainStoinker.engine.paper_broker import CostModel, PaperBroker
 from MainStoinker.engine.run_documents import (
     STALE_AFTER,
     is_live_run,
@@ -52,7 +59,7 @@ D = Decimal
 SNAPSHOTS = Path(__file__).parent / "snapshots"
 START = datetime(2025, 3, 3, 15, 0, tzinfo=timezone.utc)
 COUNTS = {"symbol": {"AAPL:fed": 3, "MSFT:fed": 2, "AAPL:dropped:stalled": 1,
-                     "AAPL:dropped:backfill_only": 2, "MSFT:late": 1},
+                     "AAPL:dropped:snapshot_only": 2, "MSFT:late": 1},
           "algo": {"a1": 5}}
 
 
@@ -338,7 +345,7 @@ def test_report_shows_live_counts_and_open_positions(db, capsys):
     assert any(ln.startswith("liveness: running (last write 2025-03-03 15:05:00 UTC)")
                for ln in lines)
     assert "minutes fed: AAPL 3, MSFT 2" in lines
-    assert "minutes dropped by the watcher: AAPL 3 (backfill_only 2, stalled 1)" in lines
+    assert "minutes dropped by the watcher: AAPL 3 (seen only in the backfill 2, stalled stream 1)" in lines
     assert "late, not fed: MSFT 1" in lines
     assert any(ln.startswith("bars that follow a gap") and "AAPL 2" in ln for ln in lines)
     assert "open positions:" in lines
@@ -361,7 +368,7 @@ def test_report_shows_live_counts_and_open_positions(db, capsys):
     assert [p["account"] for p in document["open_positions"]] == ["a1", "a2"]
     assert document["live_counts"] == {
         "fed": {"AAPL": 3, "MSFT": 2},
-        "dropped": {"AAPL": {"stalled": 1, "backfill_only": 2}},
+        "dropped": {"AAPL": {"stalled": 1, "snapshot_only": 2}},
         "late": {"MSFT": 1},
         "gap_rule": {"bars_after_gap": {"AAPL": 2, "MSFT": 0}, "suppressed_entries": 0},
         "other": {"algo": {"a1": 5}},
@@ -421,8 +428,8 @@ def test_live_counts_record_keeps_keys_it_does_not_know():
 def test_count_keys_round_trip_through_the_store(db):
     keys = [count_key("AAPL", COUNT_FED), count_key("BRK.B", COUNT_FED),
             count_key("BRK.B", COUNT_LATE), count_key("AAPL", COUNT_DROPPED, "stalled"),
-            count_key("BRK.B", COUNT_DROPPED, "backfill_only")]
-    assert keys[1] == "BRK.B:fed" and keys[4] == "BRK.B:dropped:backfill_only"
+            count_key("BRK.B", COUNT_DROPPED, "snapshot_only")]
+    assert keys[1] == "BRK.B:fed" and keys[4] == "BRK.B:dropped:snapshot_only"
     for key in keys:
         parsed = parse_count_key(COUNT_SCOPE_SYMBOL, key)
         assert parsed is not None and count_key(*parsed) == key
@@ -434,7 +441,7 @@ def test_count_keys_round_trip_through_the_store(db):
     record = live_counts_record(loaded, None)
     assert record["fed"] == {"AAPL": 1, "BRK.B": 2}
     assert record["late"] == {"BRK.B": 3}
-    assert record["dropped"] == {"AAPL": {"stalled": 4}, "BRK.B": {"backfill_only": 5}}
+    assert record["dropped"] == {"AAPL": {"stalled": 4}, "BRK.B": {"snapshot_only": 5}}
     assert "other" not in record
 
 
@@ -495,3 +502,115 @@ def test_a_reused_broker_reference_starts_afresh(db):
     (position,) = open_positions(run)
     assert position["entry_time"] == minute(5).isoformat()
     assert position["stop"] is None and position["target"] is None
+
+
+# --- protective orders of a real PaperBroker session ---------------------------------
+
+
+def pb_bar(i: int, o: float, h: float, low: float, c: float) -> Bar:
+    stamp = pd.Timestamp(minute(i))
+    return Bar(stamp, int(stamp.timestamp()), o, h, low, c, 1000)
+
+
+def pb_time(i: int) -> pd.Timestamp:
+    return pd.Timestamp(minute(i))
+
+
+def check_against_end_live(tmp_path: Path, led: Ledger, name: str) -> list[dict]:
+    """Store the ledger through the real writers, read it back, compare with `end_live`'s logic."""
+    path = tmp_path / f"{name}.db"
+    store_live_run(path, led=led, counts=False)
+    run, _ = load(path)
+    shown = open_positions(run)
+    held = Engine._open_positions(SimpleNamespace(_ledger=led))  # what end_live returns
+    assert len(shown) == len(held)
+    for doc, pos in zip(shown, held, strict=True):
+        assert (doc["account"], doc["symbol"], doc["side"], doc["quantity"], doc["entry_price"],
+                doc["entry_time"]) == (pos.account, pos.symbol, pos.side, fmt4(pos.quantity),
+                                       fmt4(pos.entry_price), pos.entry_time.isoformat())
+        assert doc["stop"] == (None if pos.stop is None else fmt4(pos.stop))
+        assert doc["target"] == (None if pos.target is None else fmt4(pos.target))
+    return shown
+
+
+def test_a_paper_broker_stop_placed_with_the_entry_order_is_shown(tmp_path):
+    led = Ledger()
+    b1 = PaperBroker(led.open_account("a1", "AAPL", 10000), CostModel())
+    b2 = PaperBroker(led.open_account("a2", "MSFT", 10000), CostModel())
+    r1 = b1.open_position(symbol="AAPL", volume=10, direction=1, price=100, time=pb_time(0),
+                          limit=False, stop_price=99.0, oca_group="g")
+    r2 = b2.open_position(symbol="MSFT", volume=7, direction=0, price=50, time=pb_time(0),
+                          limit=False, stop_price=51.0, oca_group="g")
+    assert check_against_end_live(tmp_path, led, "pending") == []  # not filled yet
+    b1.on_bar("AAPL", pb_bar(1, 100.1, 100.5, 99.9, 100.3))
+    b2.on_bar("MSFT", pb_bar(1, 50.0, 50.2, 49.8, 49.9))
+    first = check_against_end_live(tmp_path, led, "entered")
+    assert [(p["stop"], p["target"]) for p in first] == [("99.0000", None), ("51.0000", None)]
+
+    b1.modify_stop(r1, 99.8)
+    second = check_against_end_live(tmp_path, led, "modified")
+    assert second[0]["stop"] == "99.8000"
+
+    b1.set_take_profit(r1, 103.0, 10)
+    b2.set_take_profit(r2, 48.0, 7)
+    third = check_against_end_live(tmp_path, led, "target")
+    assert [p["target"] for p in third] == ["103.0000", "48.0000"]
+
+    b2.close_position(r2, price=49.9, time=pb_time(2))  # cancels the stop and the target
+    fourth = check_against_end_live(tmp_path, led, "closing")
+    assert (fourth[1]["stop"], fourth[1]["target"]) == (None, None)
+    assert (fourth[0]["stop"], fourth[0]["target"]) == ("99.8000", "103.0000")
+
+
+def test_a_reused_reference_with_its_stop_placed_before_the_new_entry_fill(db):
+    led = Ledger()
+    a1 = led.open_account("a1", "AAPL", 1000)
+    a1.order_placed("x", time=minute(0), side="buy", quantity=1, order_type="entry")
+    stop = a1.order_placed("x", time=minute(0), side="sell", quantity=1, order_type="stop",
+                           price=D("9"))
+    a1.fill("x", side="buy", quantity=1, price=D("10"), commission=0, time=minute(1),
+            reason="entry")
+    a1.fill("x", side="sell", quantity=1, price=D("9"), commission=0, time=minute(2),
+            reason="stop", order_id=stop)
+    # the algo reopens on the bar the stop was hit: its stop is recorded at that time,
+    # one bar before the new fill
+    new = a1.order_placed("x", time=minute(2), side="sell", quantity=1, order_type="stop",
+                          price=D("8"))
+    a1.fill("x", side="buy", quantity=1, price=D("11"), commission=0, time=minute(3),
+            reason="entry")
+    a1.order_modified(new, time=minute(4), price=D("8.5"))
+    a1.order_modified(stop, time=minute(4), price=D("1"))  # an old order: ignored
+    store_live_run(db, led=led, counts=False)
+    run, _ = load(db)
+    (position,) = open_positions(run)
+    assert position["entry_time"] == minute(3).isoformat()
+    assert position["stop"] == "8.5000"
+
+
+# --- drop reasons ------------------------------------------------------------------
+
+
+def test_drop_reasons_are_a_fixed_vocabulary_with_labels():
+    assert DROP_REASONS == ("snapshot_only", "connection_lost", "farm_break", "stalled",
+                            "rerequest_gap", "previous_session")
+    assert set(DROP_REASON_LABELS) == set(DROP_REASONS)
+    for reason in DROP_REASONS:
+        assert parse_count_key(COUNT_SCOPE_SYMBOL, count_key("AAPL", COUNT_DROPPED, reason)
+                               ) == ("AAPL", COUNT_DROPPED, reason)
+    for bad in ("backfill_only", "cannot resolve", "STALLED", "lost_not_written"):
+        with pytest.raises(ValueError):
+            count_key("AAPL", COUNT_DROPPED, bad)
+
+
+def test_report_prints_a_label_for_every_drop_reason(db, capsys):
+    counts = {COUNT_SCOPE_SYMBOL: {count_key("AAPL", COUNT_DROPPED, r): i + 1
+                                   for i, r in enumerate(DROP_REASONS)}}
+    with SqliteStore(db, clock=Clock()) as store:
+        run_id = store.begin_run(meta("paper-live"))
+        store.write_algos(run_id, algos())
+        store.set_counts(run_id, counts)
+    text = report_text(db, START, capsys)
+    line = next(ln for ln in text.splitlines() if ln.startswith("minutes dropped"))
+    for i, reason in enumerate(DROP_REASONS):
+        assert f"{DROP_REASON_LABELS[reason]} {i + 1}" in line
+    assert "_" not in line

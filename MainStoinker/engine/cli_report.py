@@ -55,6 +55,7 @@ from typing import Any
 
 from .gaprule import GapRuleReport
 from .ledger import IGNORED_KINDS
+from .live_counts import DROP_REASON_LABELS
 from .run_documents import (
     STALE_AFTER,
     is_live_run,
@@ -361,7 +362,8 @@ def _counts_line(label: str, counts: Mapping[str, int]) -> str | None:
 def live_count_lines(record: Mapping[str, Any]) -> list[str]:
     """Lines for the live counts of a run; nothing when every count is zero or absent."""
     dropped = [f"{symbol} {sum(by.values())} ("
-               + ", ".join(f"{reason} {n}" for reason, n in by.items() if n) + ")"
+               + ", ".join(f"{DROP_REASON_LABELS.get(reason, reason)} {n}"
+                           for reason, n in by.items() if n) + ")"
                for symbol, by in record["dropped"].items() if sum(by.values())]
     lines = [line for line in (
         _counts_line("minutes fed", record["fed"]),
