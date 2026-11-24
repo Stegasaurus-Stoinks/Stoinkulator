@@ -133,6 +133,7 @@ from MainStoinker.ib.cli import (
     PathRefused,
     check_folder_usable,
     check_path,
+    closed_without_rejection,
     home_folder,
     make_folders,
     paper_refusal,
@@ -690,7 +691,7 @@ class _Watcher:
         except _NotPaper:
             code = EXIT_NOT_PAPER  # said once, with the result, by `run_watch`
         except _Closed:
-            if getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True:
+            if self._not_paper():
                 code = EXIT_NOT_PAPER  # the list failed and closed the connection: said by `run_watch`
             else:
                 self.say("STOPPED: the connection to TWS closed.")
@@ -811,8 +812,14 @@ class _Watcher:
             if outage[2] in kinds and outage[1] == math.inf:
                 outage[1] = self.server_now()
 
+    def _not_paper(self) -> bool:
+        """In paper mode: True when `paper_verified` is not True and the connection was not merely
+        closed (see `cli.closed_without_rejection`: a failing list, or any doubt, is not paper)."""
+        return (getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True
+                and not closed_without_rejection(self.conn))
+
     def _check_state(self) -> None:
-        if getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True:
+        if self._not_paper():
             raise _NotPaper  # before anything else: a failing account list ends the watch
         state = self.conn.state
         if state is ConnState.CLOSED:
@@ -1429,6 +1436,7 @@ def run_watch(
     not_connected = False
     paper = getattr(args, "paper", False) is True
     verified = False
+    verified_at_start = False  # verified, then closed or lost without a failing list
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
         refused = _connect(say, conn, args, advice, paper)
@@ -1450,17 +1458,28 @@ def run_watch(
         say(f"Unexpected {type(exc).__name__}: {exc}")
         code = EXIT_STOPPED
     finally:
+        said_not_paper = False
         if verified and conn is not None and conn.paper_verified is not True:
-            # the account list failed after READY: whatever the watch saw, this is the result
-            say(NOT_PAPER_LINE)
-            code = EXIT_NOT_PAPER
-            advice.clear()
+            if closed_without_rejection(conn):
+                verified_at_start = True  # closed or lost, no failing list: the watch's own outcome stands
+            else:
+                # the account list failed after READY: whatever the watch saw, this is the result
+                say(NOT_PAPER_LINE)
+                code = EXIT_NOT_PAPER
+                advice.clear()
+                said_not_paper = True
         files.close()
         if conn is not None:
             try:
                 conn.close()
             except Exception as exc:  # noqa: BLE001
                 say(f"Closing the connection raised {type(exc).__name__}: {exc}")
+            if verified and not said_not_paper and conn.paper_rejected:
+                # a failing list delivered while close() joined the reader: this is the result
+                say(NOT_PAPER_LINE)
+                code = EXIT_NOT_PAPER
+                advice.clear()
+                verified_at_start = False
         if recorder is not None:
             recorder.close()
     for line in advice:
@@ -1483,7 +1502,8 @@ def run_watch(
                 say(f"  line {finding.line}: {finding.reason}")
             if len(findings) > SHOWN_FINDINGS:
                 say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
-    say(f"Result: {_LABELS[code]} (exit {code})")
+    say(f"Result: {_LABELS[code]} (exit {code})"
+        + ("; paper account verified at start" if verified_at_start else ""))
     say(PATHS_NOTE)
     return code
 

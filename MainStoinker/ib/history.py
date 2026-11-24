@@ -56,7 +56,7 @@ import math
 import os
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
@@ -680,6 +680,7 @@ GAP_COMPLETE = "complete"
 GAP_SHORT = "short"
 GAP_PARTIAL = "partial"
 GAP_NO_DATA = "no_data"
+GAP_NOT_FETCHED = "not_fetched"  # a day this run never asked IB for (the run stopped first)
 GAPS_CSV = "gaps.csv"
 GAPS_SUMMARY = "gaps_summary.txt"
 
@@ -719,11 +720,14 @@ def _ranges(missing: Sequence[datetime]) -> tuple[tuple[datetime, datetime], ...
 
 def gap_report(
     days: Iterable[date], bars: pd.DataFrame, *, data_zone: str = DATA_ZONE,
+    not_requested: Collection[date] = (),
 ) -> list[GapRow]:
     """One `GapRow` per day, in the order given, comparing `bars` (naive data-zone `date`) to the session.
 
     Status: `no_data` (no bar in the session minutes, so also a day that was
-    never fetched), `complete` (all 390 minutes), `short` (bars complete from
+    never fetched, unless it is in `not_requested`), `not_fetched` (no bar, and the
+    day is in `not_requested`: the run stopped before it was asked for; a day with
+    bars keeps its bar-based status), `complete` (all 390 minutes), `short` (bars complete from
     09:30 to 12:59, an early close at 13:00, and nothing after) or `partial`
     (any other gap: a hole, a missing tail such as only 15:59, a one-bar day).
     Bars outside 09:30 to 15:59 are ignored; duplicates count once and order
@@ -739,7 +743,7 @@ def gap_report(
         have = len(minutes) - len(missing)
         ranges = _ranges(missing)
         if have == 0:
-            status = GAP_NO_DATA
+            status = GAP_NOT_FETCHED if day in not_requested else GAP_NO_DATA
         elif not missing:
             status = GAP_COMPLETE
         elif have == EARLY_CLOSE_MINUTES and missing == minutes[EARLY_CLOSE_MINUTES:]:
@@ -770,13 +774,17 @@ def gaps_summary_text(rows: Sequence[GapRow], symbol: str = "") -> str:
     counts = {s: sum(1 for r in rows if r.status == s)
               for s in (GAP_COMPLETE, GAP_SHORT, GAP_PARTIAL, GAP_NO_DATA)}
     head = f"Gap report{' for ' + symbol if symbol else ''}: {len(rows)} days"
+    not_fetched = sum(1 for r in rows if r.status == GAP_NOT_FETCHED)
     lines = [head] + [f"  {s}: {n}" for s, n in counts.items()]
+    if not_fetched:  # only after a stopped run: a run that asked for every day has no such line
+        lines.append(f"  {GAP_NOT_FETCHED}: {not_fetched}")
     lines.append(f"  missing minutes in days with data: "
-                 f"{sum(r.missing_count for r in rows if r.status != GAP_NO_DATA)}")
+                 f"{sum(r.missing_count for r in rows if r.status not in (GAP_NO_DATA, GAP_NOT_FETCHED))}")
     for r in rows:
         if r.status == GAP_COMPLETE:
             continue
-        detail = "" if r.status == GAP_NO_DATA else " " + ", ".join(_range_text(s) for s in r.missing)
+        detail = ("" if r.status in (GAP_NO_DATA, GAP_NOT_FETCHED)
+                  else " " + ", ".join(_range_text(s) for s in r.missing))
         lines.append(f"{r.day.isoformat()} {r.status}{detail}")
     return "\n".join(lines) + "\n"
 
