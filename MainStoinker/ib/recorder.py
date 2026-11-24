@@ -73,7 +73,7 @@ then, in order:
    replaced too, so the bare digits of an id are caught once the id was learned.
    Learned ids are matched with several small patterns (32 ids each); learning one id
    recompiles at most one of them.
-4. The pattern `ACCOUNT_PATTERN`: one or two letters, then up to three separator
+4. The pattern `ACCOUNT_PATTERN`: one to three letters, then up to three separator
    characters of any kind (anything that is not a letter or a digit: space, dot,
    colon, slash, non-breaking space, comma, equals, pipe, dash, underscore...; a
    backslash followed by a quote, as JSON writes a quote inside a string, counts as one),
@@ -85,10 +85,12 @@ then, in order:
    digit run is not learned alone. Once an id is learned, its digit run also matches with
    up to two separator characters of any kind between its digits. It covers
    IB's id shapes (`U`, `DU`, `F`, `DF`, `I`, `DI` plus seven digits, longer for
-   some institutional ids; a sub-account suffix after a dot goes with the digits
-   when it is a number). It over-redacts on purpose: any token of one or two letters
-   and five or more digits (an ISIN, a version string such as a letter, a space and a
-   dotted number, a time such as `at 14:30:00`). There are three exemptions, all
+   some institutional ids; `DU`, one more upper-case letter and six digits, the
+   three-letter form of some paper accounts; a sub-account suffix after a dot goes with
+   the digits when it is a number). The three letters are taken whole, so no letter of
+   an id is left beside its placeholder. It over-redacts on purpose: any token of one to
+   three letters and five or more digits (an ISIN, a version string such as a letter, a
+   space and a dotted number, a time such as `at 14:30:00`). There are three exemptions, all
    narrow. (a) An option symbol in OCC shape, `_OCC`: an optional root of up to six
    letters (IB pads it with spaces: `AAPL  240816C00220000`), six digits, `C` or `P`,
    eight digits, standing alone. (b) A trading-hours date after a word: IB writes a
@@ -96,7 +98,10 @@ then, in order:
    take the last two letters of CLOSED, the semicolon and the next date for an id,
    learn the date, and remove it from every later string, so a normal session would
    no longer replay. A hit is therefore left alone, and never learned, when its letters
-   are immediately preceded by another letter (the tail of a longer word), its first
+   are immediately preceded by another ASCII letter (the tail of a longer word; a letter
+   outside ASCII, and the end of a placeholder such as `IP-REDACTED`, are not a word), or
+   are three (the pattern's longest prefix, which then begins at the word's third letter from
+   the end), its first
    run of digits is exactly eight and a valid calendar date `YYYYMMDD` (year 1990 to
    2100), and the hit goes on with nothing or with a colon and digits only. What this
    loosens: cold only, an id of eight digits that happen to form a valid date AND is
@@ -164,10 +169,14 @@ the arguments are replaced by a marker naming the exception type. Both are count
 
 Not covered: ids written in a look-alike alphabet (Cyrillic or Greek letters),
 split across two *events*, split by something other than directly adjacent
-arguments (an id split over a dict key and its value IS caught, for keys of a plain
-dict), encoded (percent, base64, HTML entities, hex, reversed) or spelled out in words;
-more than three separators between the letters and the digits cold, or more than two
-between digits cold; an eight-digit id that forms a valid date and is glued to a
+arguments (an id split over a dict key and its value is caught only for keys of a plain
+dict, and only when the key ends in the letters of the id, with at most one dash or
+underscore after them), encoded (percent, base64, HTML
+entities, hex, reversed) or spelled out in words; more than three separators between
+the letters and the digits cold, or more than two between digits (cold AND warm: a
+learned digit run is matched with at most two separators between its digits too, so a gap
+of three characters inside the digits is not caught even once `managedAccounts` was
+seen); an eight-digit id that forms a valid date and is glued to a
 preceding letter, cold (see step 4); private data that is not an account, an address,
 a path, an e-mail address or one of `private_values`; a recording's timing, which says
 when the owner traded (bar times are kept; for a request that ends "now" they also
@@ -244,9 +253,9 @@ MAX_PATTERN_IDS = 256  # ids learned from pattern hits; ids from managedAccounts
 _TIER_SIZE = 32  # learned ids per compiled pattern
 
 ACCOUNT_PATTERN = re.compile(
-    r"[A-Za-z]{1,2}(?:\\[\"']|[^A-Za-z0-9]){0,3}\d(?:[^A-Za-z0-9]{0,2}\d){4,}"
+    r"[A-Za-z]{1,3}(?:\\[\"']|[^A-Za-z0-9]){0,3}\d(?:[^A-Za-z0-9]{0,2}\d){4,}"
 )
-_SPLIT_PATTERN = re.compile(r"[A-Za-z]{1,2}[-_]?\d{5,9}(?!\d)")
+_SPLIT_PATTERN = re.compile(r"[A-Za-z]{1,3}[-_]?\d{5,9}(?!\d)")
 _DATE = re.compile(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])")
 _OCC = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,6} *)?\d{6}[CcPp]\d{8}(?![A-Za-z0-9])")
 _ACCOUNT_NAME = re.compile(r"acc(?:ount|t)", re.IGNORECASE)
@@ -344,13 +353,21 @@ def _glued_date(text: str, m: re.Match[str]) -> bool:
     """The one exemption from `ACCOUNT_PATTERN`: a pattern hit that is the tail of a word
     followed by a date, as in `CLOSED;<date>:0400-...` of IB's trading hours.
 
-    All of: the hit's letters are immediately preceded by another letter; its first run of
-    digits is exactly eight and a valid date; what follows that run inside the hit is
-    nothing or a colon and more digits (a time)."""
+    All of: the hit's letters are the tail of a longer word (they are immediately preceded by
+    another ASCII letter, which is not the end of a placeholder such as `IP-REDACTED`, or
+    they are three letters, the pattern's longest prefix: it then starts a letter earlier than
+    the two-letter tail did); its first run of digits is exactly eight and a valid date; what
+    follows that run inside the hit is nothing or a colon and more digits (a time)."""
     start = m.start()
-    if start == 0 or not text[start - 1].isalpha():
-        return False
     hit = m.group(0)
+    count = len(re.match(r"[A-Za-z]*", hit).group(0))  # type: ignore[union-attr]
+    # an id glued to a placeholder (`IP-REDACTED<id>`): the placeholder's last letters are no word
+    if any(text.startswith("REDACTED", p - 8) for p in range(max(start, 8), start + count + 1)):
+        return False
+    if count < 3:
+        before = text[start - 1] if start > 0 else ""
+        if not (before.isascii() and before.isalpha()):
+            return False
     lead = re.search(r"\d+", hit)
     if lead is None or not _is_date(lead.group(0)):
         return False
@@ -1091,6 +1108,14 @@ _S_EXCHANGE_TOKEN = re.compile(r"[A-Z0-9]{1,6}@[A-Z]+")
 _S_EMAIL_TOKEN = re.compile(r"(?<![\w.+-])[\w.+-]*+@[\w.+-]*+")  # linear: starts at a run's beginning
 _S_DIGIT_KEY = re.compile(r"\d{5,}")
 _S_EPOCH_LIMIT = 4102444800  # 2100-01-01
+_TICK_LAST_TIMESTAMP = 45
+_TICK_RT_VOLUME = 48
+_S_TICK_EPOCH = re.compile(r"\d{9,10}")
+# price;size;time (13 digits, ms);total volume;vwap;single trade: numbers only, empty fields allowed
+_S_RT_NUMBER = r"(?:\d{1,9}(?:\.\d{1,9})?)?"
+_S_RT_VOLUME = re.compile(
+    rf"{_S_RT_NUMBER};{_S_RT_NUMBER};(\d{{13}});(?:\d{{1,12}})?;{_S_RT_NUMBER};(?:true|false)"
+)
 
 
 def _s_valid_date(run: str) -> bool:
@@ -1208,6 +1233,23 @@ def _s_walk(
     return out
 
 
+def _s_known_tick_string(args: list[Any]) -> bool:
+    """`tickString(reqId, tickType, value)` whose value has the exact shape of its tick type:
+    type 45 (last timestamp) is an epoch in seconds; type 48 (RTVolume) is
+    `price;size;time in ms;total volume;vwap;single trade flag`. Anything else is not known."""
+    if len(args) != 3 or not isinstance(args[2], str):
+        return False
+    if type(args[0]) is not int or type(args[1]) is not int:
+        return False
+    tick_type, value = args[1], args[2]
+    if tick_type == _TICK_LAST_TIMESTAMP:
+        return _S_TICK_EPOCH.fullmatch(value) is not None and _s_valid_epoch(value)
+    if tick_type == _TICK_RT_VOLUME:
+        m = _S_RT_VOLUME.fullmatch(value)
+        return m is not None and _s_valid_epoch(m.group(1))
+    return False
+
+
 def _s_event_findings(event: dict[str, Any], line: int, words: Sequence[str]) -> list[Finding]:
     out: list[Finding] = []
     kind, name, args = event.get("kind"), event.get("name"), event.get("args")
@@ -1232,6 +1274,10 @@ def _s_event_findings(event: dict[str, Any], line: int, words: Sequence[str]) ->
         except (TypeError, ValueError):
             params = []
     for i, arg in enumerate(args):
+        if kind == "raw" and name == "tickString" and i == 2 and _s_known_tick_string(args):
+            # a last-trade stamp or a real-time volume string: known numeric shapes, only the words count
+            out.extend(_s_text_findings(arg, line, None, words, structured=False))
+            continue
         out.extend(_s_walk(arg, line, params[i] if i < len(params) else None, words))
     return out
 
@@ -1251,7 +1297,11 @@ def scan_recording(path: str | Path, words: Iterable[str] = ()) -> list[Finding]
     address (not `SYMBOL@EXCHANGE`), IP address or path; any of `words`
     (case-insensitive: user name, machine name, folder names, the account number; not
     held against the name of an `EWrapper` / `EClient` method); any line that is not
-    valid JSON. It fails closed: a file that cannot be read, is not UTF-8, is empty or
+    valid JSON. The value of a `tickString` of type 45 (an epoch in seconds) or 48 (real-time
+    volume, `price;size;time;volume;vwap;flag`, numbers only) is a known numeric shape and is
+    held against `words` only, so market data does not drown the findings; any other
+    shape of those, and every other tick type, is scanned as text. It fails closed: a file
+    that cannot be read, is not UTF-8, is empty or
     has no session header is itself a finding.
 
     It cannot see: encodings (base64, percent-encoding, HTML entities, hex), an id split

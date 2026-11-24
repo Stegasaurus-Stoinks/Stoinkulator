@@ -19,7 +19,9 @@ answer left raises `ReplayExhausted` on the calling thread, so an unexpected ext
 request fails the test that made it. Callbacks before the first request are the
 handshake (`handshake_kwargs`); later callbacks that belong to no request (1100,
 1102, `currentTime` without a request, errors with id -1) are `Recording.unsolicited`
-and are pushed by the test when it wants them (`push_unsolicited`).
+and are pushed by the test when it wants them (`push_unsolicited`); data farm messages
+(codes 2100 to 2199, id -1) are the exception, they are taken from anywhere in the file by
+`handshake_kwargs` and never pushed.
 
 Unreplayable requests. A redaction marker line, a torn last line or a value that was
 redacted inside a number or a bar (a conId, a price, a volume) does not make the
@@ -352,18 +354,34 @@ def _matches(recorded: Any, actual: Any) -> bool:
 # -- installing -----------------------------------------------------------------------
 
 
+def is_farm_message(ev: RecordedEvent) -> bool:
+    """A data farm status message: an `error` callback with id -1 and a code from 2100 to 2199."""
+    return (
+        ev.kind == "raw" and ev.name == "error" and len(ev.args) >= 4
+        and ev.args[0] == NO_REQUEST_ID and isinstance(ev.args[2], int)
+        and not isinstance(ev.args[2], bool) and 2100 <= ev.args[2] < 2200
+    )
+
+
 def handshake_kwargs(rec: Recording) -> dict[str, Any]:
-    """`FakeIbClient` constructor arguments that reproduce the recorded handshake."""
+    """`FakeIbClient` constructor arguments that reproduce the recorded handshake.
+
+    Farm messages are taken from anywhere in the file, in file order: in a real session
+    one that arrives after the first request is filed as unsolicited, not as handshake,
+    and the replayed connection would otherwise only see it after `push_unsolicited`
+    (which skips them, so none is delivered twice)."""
     kwargs: dict[str, Any] = {}
-    farm: list[tuple[int, str]] = []
     for ev in rec.handshake:
         if ev.name == "nextValidId" and ev.args:
             kwargs["next_valid_id"] = ev.args[0]
         elif ev.name == "managedAccounts" and ev.args:
             kwargs["managed_accounts"] = ev.args[0]
-        elif ev.name == "error" and len(ev.args) >= 4 and ev.args[0] == NO_REQUEST_ID:
-            if isinstance(ev.args[2], int) and 2100 <= ev.args[2] < 2200:
-                farm.append((ev.args[2], ev.args[3]))
+    farm = [
+        (ev.args[2], ev.args[3]) for ev in sorted(
+            (e for e in (*rec.handshake, *rec.unsolicited) if is_farm_message(e)),
+            key=lambda e: e.line,
+        )
+    ]
     if farm:
         kwargs["farm_messages"] = tuple(farm)
     return kwargs
@@ -429,7 +447,10 @@ def install(fake: FakeIbClient, rec: Recording) -> Replay:
 
 
 def push_unsolicited(fake: FakeIbClient, rec: Recording) -> int:
-    """Queue the callbacks that belonged to no request (1100, 1102...); returns how many."""
-    for ev in rec.unsolicited:
+    """Queue the callbacks that belonged to no request (1100, 1102...); returns how many.
+
+    Farm messages are not queued: `handshake_kwargs` already hands them to the fake."""
+    pushed = [ev for ev in rec.unsolicited if not is_farm_message(ev)]
+    for ev in pushed:
         fake.push(ev.name, *decode_callback(ev))
-    return len(rec.unsolicited)
+    return len(pushed)
