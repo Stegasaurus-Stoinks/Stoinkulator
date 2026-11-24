@@ -20,7 +20,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -313,6 +313,26 @@ def _uncovered_minutes(stamps: Sequence[pd.Timestamp]) -> int:
     return total
 
 
+def _split_window(
+    data: pd.DataFrame, warmup_days: int, window: tuple[date, date]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """`(warm-up, replay)` frames of one symbol for the New York dates `window` (inclusive).
+
+    Replay is every row dated within the window. Warm-up is every row of the
+    `warmup_days` latest days before the window start that have rows in this
+    symbol's data (its trading days: weekends and holidays have none).
+    """
+    first, last = window
+    days = data["date"].dt.normalize()
+    in_window = (days >= pd.Timestamp(first)) & (days <= pd.Timestamp(last))
+    before = days[days < pd.Timestamp(first)].drop_duplicates()
+    chosen = before.iloc[max(len(before) - warmup_days, 0):] if warmup_days > 0 else before.iloc[:0]
+    return (
+        data.loc[days.isin(chosen)].reset_index(drop=True),
+        data.loc[in_window].reset_index(drop=True),
+    )
+
+
 class CsvBarFeed:
     """Feed backed by `<data_dir>/_<SYMBOL>_offlinedata_` files or month files.
 
@@ -349,6 +369,11 @@ class CsvBarFeed:
     batches. This does not depend on the other symbols. Each such batch counts
     as one replayed bar for every symbol in it.
 
+    With `window=(first, last)` (inclusive New York dates) the replay is exactly the
+    rows dated in the window and the warm-up is the rows of the `warmup_days`
+    latest days before `first` that the symbol has data for; the rest is unused.
+    Without it nothing above changes.
+
     A symbol with no replay bars at all (warm-up only, or an empty window) is
     not an error here: it misses every batch and `replay_counts()` shows 0. The
     `backtest` command refuses it (naming the symbol) when another symbol does
@@ -356,7 +381,13 @@ class CsvBarFeed:
     The feed may be iterated repeatedly and yields the same batches each time.
     """
 
-    def __init__(self, data_dir: Path, symbols: Sequence[str], warmup_days: int = 2) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        symbols: Sequence[str],
+        warmup_days: int = 2,
+        window: tuple[date, date] | None = None,
+    ) -> None:
         self._symbols: list[str] = list(dict.fromkeys(symbols))
         if not self._symbols:
             raise ValueError("CsvBarFeed needs at least one symbol")
@@ -365,6 +396,9 @@ class CsvBarFeed:
         for symbol in self._symbols:
             data = self._read(Path(data_dir), symbol)
             self._check_sorted(Path(data_dir), symbol, data)
+            if window is not None:
+                self._warmup[symbol], replay[symbol] = _split_window(data, warmup_days, window)
+                continue
             cutoff = data["date"].iloc[0] + timedelta(days=warmup_days)
             is_warmup = data["date"] < cutoff
             self._warmup[symbol] = data.loc[is_warmup].reset_index(drop=True)
