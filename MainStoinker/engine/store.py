@@ -130,18 +130,33 @@ class DataMeta:
 
 def gap_rule_to_json(report: GapRuleReport) -> dict[str, Any]:
     """The `data_json` / API form of a gap-rule report (times as ISO text)."""
-    return {
+    doc: dict[str, Any] = {
         "bars_after_gap": {s: n for s, n in report.bars_after_gap},
-        "suppressed_entries": {
-            "count": report.total_suppressed,
-            "by_algo": [
-                {"algo": e.algo, "symbol": e.symbol, "count": e.count,
-                 "times": [t.isoformat() for t in e.times],
-                 "times_truncated": e.count > len(e.times)}
-                for e in report.suppressed
-            ],
-        },
+        "suppressed_entries": _suppressed_json(report.total_suppressed, report.suppressed),
     }
+    if report.total_cancelled:  # absent when zero: a run without any is stored as before
+        doc["cancelled_pending_entries"] = _suppressed_json(report.total_cancelled,
+                                                            report.cancelled)
+    return doc
+
+
+def _suppressed_json(count: int, entries: tuple[SuppressedEntries, ...]) -> dict[str, Any]:
+    return {
+        "count": count,
+        "by_algo": [
+            {"algo": e.algo, "symbol": e.symbol, "count": e.count,
+             "times": [t.isoformat() for t in e.times],
+             "times_truncated": e.count > len(e.times)}
+            for e in entries
+        ],
+    }
+
+
+def _suppressed_from_json(value: Any) -> tuple[SuppressedEntries, ...]:
+    return tuple(
+        SuppressedEntries(str(e["algo"]), str(e["symbol"]), int(e["count"]),
+                          tuple(datetime.fromisoformat(t) for t in e["times"]))
+        for e in value["by_algo"])
 
 
 def gap_rule_from_json(value: Any) -> GapRuleReport | None:
@@ -150,13 +165,12 @@ def gap_rule_from_json(value: Any) -> GapRuleReport | None:
         return None
     try:
         bars = tuple((str(s), int(n)) for s, n in value["bars_after_gap"].items())
-        suppressed = tuple(
-            SuppressedEntries(str(e["algo"]), str(e["symbol"]), int(e["count"]),
-                              tuple(datetime.fromisoformat(t) for t in e["times"]))
-            for e in value["suppressed_entries"]["by_algo"])
+        suppressed = _suppressed_from_json(value["suppressed_entries"])
+        pending = value.get("cancelled_pending_entries")  # absent in older runs
+        cancelled = () if pending is None else _suppressed_from_json(pending)
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
-    return GapRuleReport(bars, suppressed)
+    return GapRuleReport(bars, suppressed, cancelled)
 
 
 @dataclass(frozen=True)
