@@ -28,6 +28,7 @@ from typing import Any
 
 import pandas as pd
 
+from MainStoinker.engine.gaprule import RefusedEntry
 from MainStoinker.engine.report import trade_records  # noqa: F401  (re-export)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -187,6 +188,20 @@ def view_problem(
     return None, live
 
 
+def view_problem_after_refusal(
+    in_trade: bool, current_state: str | None, unsettled_states: list[str], refused_now: bool
+) -> tuple[str | None, int]:
+    """`view_problem`, except on the one bar on which the gap rule refused the algo's entry.
+
+    The algo still believes it is in a trade on that bar (it learns on its next bar), so
+    `in_trade` with a flat broker is allowed there and only there; a later bar, or a
+    disagreement of any other kind, is reported as usual.
+    """
+    if refused_now and current_state == "refused":
+        return view_problem(False, current_state, unsettled_states)
+    return view_problem(in_trade, current_state, unsettled_states)
+
+
 def run_paper_backtest(
     algo_id: str,
     cfg: dict,
@@ -220,15 +235,22 @@ def run_paper_backtest(
     run = PaperRun(ledger, broker, algo, Decimal(str(capital)))
     unsettled: list = []  # refs of trades not yet closed or cancelled
 
+    def state_of(ref: Any) -> str:
+        # An entry the gap rule refused never reached the broker: nothing is open there.
+        return "refused" if isinstance(ref, RefusedEntry) else broker.position_state(ref)
+
     def check() -> None:
         run.bars_checked += 1
         trades = algo.trades
-        unsettled.extend(t.brokerRef for t in trades[len(run_seen) :])
+        new_refs = [t.brokerRef for t in trades[len(run_seen) :]]
+        unsettled.extend(new_refs)
         run_seen[:] = trades
-        states = {ref: broker.position_state(ref) for ref in unsettled}
-        unsettled[:] = [r for r, s in states.items() if s not in ("closed", "cancelled")]
-        current = broker.position_state(trades[-1].brokerRef) if trades else None
-        problem, live = view_problem(algo.inTrade, current, list(states.values()))
+        states = {ref: state_of(ref) for ref in unsettled}
+        unsettled[:] = [r for r, s in states.items() if s not in ("closed", "cancelled", "refused")]
+        current = state_of(trades[-1].brokerRef) if trades else None
+        refused_now = bool(new_refs) and isinstance(new_refs[-1], RefusedEntry)
+        problem, live = view_problem_after_refusal(
+            algo.inTrade, current, list(states.values()), refused_now)
         run.max_live = max(run.max_live, live)
         if problem:
             run.violations.append(f"bar {run.bars_checked}: {problem}")

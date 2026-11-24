@@ -110,7 +110,7 @@ export function runNotes(doc) {
   const afterGap = rule.bars_after_gap && typeof rule.bars_after_gap === "object" ? rule.bars_after_gap : {};
   const gappedBars = Object.entries(afterGap).filter(([, n]) => numberOrNull(n) > 0);
   if (gappedBars.length > 0) {
-    notes.push("Bars that follow a gap (no new position opened on them): "
+    notes.push("Bars that follow a gap (entries signalled on them were refused): "
       + gappedBars.map(([symbol, n]) => symbol + " " + n).join(", ") + ".");
   }
   const refused = rule.suppressed_entries && typeof rule.suppressed_entries === "object" ? rule.suppressed_entries : {};

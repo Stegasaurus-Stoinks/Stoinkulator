@@ -592,7 +592,7 @@ def gapped_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stamps: Sequence
 MINUTES = [f"09:{m:02d}" for m in range(30, 45)]
 WITH_GAP = [t for t in MINUTES if t != "09:31"]  # 09:32 is the second bar: it follows a gap
 LINES = [
-    "bars that follow a gap (no new position opened on them): AAA 1",
+    "bars that follow a gap (entries signalled on them were refused): AAA 1",
     "entries refused on bars that follow a gap: 1",
     "  AAA-ft AAA: 1 at 2024-01-04 09:32:00",
 ]
@@ -684,7 +684,64 @@ console.log(JSON.stringify({
     for name in ("none", "nullRule", "zero", "junk"):
         assert out[name] == [], name
     assert out["shown"] == [
-        "Bars that follow a gap (no new position opened on them): AAA 2.",
+        "Bars that follow a gap (entries signalled on them were refused): AAA 2.",
         "3 entries refused on bars that follow a gap (a AAA: 3).",
     ]
     assert out["one"][1] == "1 entry refused on bars that follow a gap."
+
+
+# ------------------------------------------- the paper harness and a refusal
+
+
+def test_view_problem_after_refusal_allows_only_the_refusal_bar() -> None:
+    from tests import harness
+    # the refusal bar: the algo still says in a trade, the broker has nothing: allowed
+    assert harness.view_problem_after_refusal(True, "refused", ["refused"], True)[0] is None
+    # any later bar with the same disagreement is a violation
+    assert harness.view_problem_after_refusal(True, "refused", ["refused"], False)[0] is not None
+    # on the refusal bar a different disagreement still fails (two live positions)
+    assert harness.view_problem_after_refusal(True, "refused", ["open", "open"], True)[0] is not None
+    # without a refusal the old rules apply
+    assert harness.view_problem_after_refusal(True, "closed", [], False)[0] is not None
+    assert harness.view_problem_after_refusal(True, "open", ["open"], False) == (None, 1)
+
+
+def test_paper_run_on_gapped_data_completes_and_still_checks_later_bars(tmp_path: Path) -> None:
+    import contextlib
+
+    from tests import harness
+    harness.stage_offline_data(tmp_path, ["TSLA"])
+    path = tmp_path / "OfflineData" / "_TSLA_offlinedata_"
+    frame = pd.read_csv(path, index_col=0)
+    frame = frame[frame["date"] != "2024-08-19 09:42:00"]  # one minute removed
+    frame.to_csv(path)
+    cfg = {"idname": "TSLA-ff", "ticker": "TSLA", "RRRatio": 3}
+    with contextlib.chdir(tmp_path):
+        try:
+            run = harness.run_paper_backtest("FridayFrenzy", cfg)
+        finally:
+            harness.reset_runtime_state()
+    assert any(isinstance(t.brokerRef, RefusedEntry) for t in run.algo.trades)  # an entry was refused
+    assert run.violations == []
+    assert run.bars_checked > 0
+
+
+# ------------------------------------------------------- exception safety
+
+
+def test_an_algo_that_raises_on_a_gap_bar_leaves_the_broker_restored_and_nothing_blocked(
+    tmp_path: Path,
+) -> None:
+    def boom(algo: Probe, row: pd.Series) -> None:
+        raise RuntimeError("algo failed")
+
+    algo = Probe("a", "AAA", {4: boom})  # update 4 is the gap bar (09:34)
+    write_ohlc(tmp_path, "AAA", quiet_rows(*GAPPED))
+    feed = CsvBarFeed(tmp_path, ["AAA"], warmup_days=1)
+    broker = SimBroker()
+    engine = Engine(EngineConfig(), feed, broker, NullSink(), [algo])
+    with pytest.raises(RuntimeError, match="algo failed"):
+        engine.run_backtest()
+    assert algo.broker is broker  # restored although the replay failed
+    assert engine._gap_rule.blocked("AAA") is False  # end_bar ran: no symbol left blocked
+    assert engine.gap_report.bars_after_gap == (("AAA", 1),)

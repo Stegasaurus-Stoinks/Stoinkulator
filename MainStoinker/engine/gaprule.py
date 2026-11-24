@@ -20,6 +20,13 @@ bar that follows a gap is refused. `close_position`, `modify_stop` and
 `set_take_profit` of positions that exist are never refused; a reversal's exit
 leg goes through and only its entry leg is refused, whatever their order.
 
+Known limit: the rule judges the bar on which the signal was made, not the bar
+on which the order fills. Under realistic fills (`PaperBroker`) a market entry
+ordered on the bar BEFORE a gap fills on the gap bar (at its open, after the
+missing minutes); it is not refused and not counted. Under `SimBroker` the
+same order fills at the request bar. Whether to cancel such a pending entry is
+undecided (a follow-up issue).
+
 Where it is enforced: `GapGuardBroker` wraps the broker of each algo while
 `Engine.run_backtest` runs, so it holds for every algo and every broker, and no
 algo changes. The algo still gets every bar: `update` runs, its indicators stay

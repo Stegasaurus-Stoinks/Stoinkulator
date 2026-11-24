@@ -296,7 +296,7 @@ def gap_rule_lines(report: GapRuleReport | None) -> list[str]:
     lines = []
     after = [f"{symbol} {count}" for symbol, count in report.bars_after_gap if count]
     if after:
-        lines.append("bars that follow a gap (no new position opened on them): " + ", ".join(after))
+        lines.append("bars that follow a gap (entries signalled on them were refused): " + ", ".join(after))
     if report.total_suppressed:
         lines.append(f"entries refused on bars that follow a gap: {report.total_suppressed}")
         for e in report.suppressed:
