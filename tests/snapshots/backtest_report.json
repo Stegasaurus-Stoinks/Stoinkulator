@@ -1,0 +1,103 @@
+{
+ "run": {
+  "run_id": 1,
+  "status": "completed",
+  "incomplete": false,
+  "kind": "backtest",
+  "fills": "realistic",
+  "started_at": "2025-03-03T15:00:00+00:00",
+  "ended_at": "2025-03-03T15:00:02+00:00",
+  "code_version": "abc123",
+  "symbols": [
+   "AAPL",
+   "MSFT"
+  ],
+  "first_bar": "2024-01-02T09:30:00",
+  "last_bar": "2024-01-03T09:30:00",
+  "data_directory": "OfflineData",
+  "replayed_minutes": null,
+  "missing_minutes": null,
+  "uncovered_minutes": null,
+  "gap_rule": null,
+  "data_warnings": [],
+  "capital": null,
+  "costs": null
+ },
+ "accounts": {
+  "a1": {
+   "symbol": "AAPL",
+   "algo": "EMACrossing",
+   "mode": "backtest",
+   "trade_count": 1,
+   "wins": 0,
+   "losses": 1,
+   "break_even": 0,
+   "win_rate": "0.0000",
+   "net": "-5.7340",
+   "total_win": "0.0000",
+   "total_loss": "-5.7340",
+   "commission": "2.0000",
+   "avg_win": null,
+   "avg_loss": "-5.7340",
+   "max_drawdown": "13.5010",
+   "final_equity": "9994.2660",
+   "synthetic_closes": 0,
+   "ignored_events": {
+    "close": 1,
+    "modify_stop": 0,
+    "take_profit": 0
+   },
+   "cancelled_entries": 0,
+   "capital": "10000.0000"
+  },
+  "a2": {
+   "symbol": "MSFT",
+   "algo": "Elliot",
+   "mode": "paper",
+   "trade_count": 1,
+   "wins": 0,
+   "losses": 1,
+   "break_even": 0,
+   "win_rate": "0.0000",
+   "net": "-17.0000",
+   "total_win": "0.0000",
+   "total_loss": "-17.0000",
+   "commission": "2.0000",
+   "avg_win": null,
+   "avg_loss": "-17.0000",
+   "max_drawdown": "17.0000",
+   "final_equity": "2483.5000",
+   "synthetic_closes": 1,
+   "ignored_events": {
+    "close": 0,
+    "modify_stop": 0,
+    "take_profit": 0
+   },
+   "cancelled_entries": 0,
+   "capital": "2500.5000"
+  }
+ },
+ "total": {
+  "trade_count": 2,
+  "wins": 0,
+  "losses": 2,
+  "break_even": 0,
+  "win_rate": "0.0000",
+  "net": "-22.7340",
+  "total_win": "0.0000",
+  "total_loss": "-22.7340",
+  "commission": "4.0000",
+  "avg_win": null,
+  "avg_loss": "-11.3670",
+  "max_drawdown": "30.5010",
+  "final_equity": "12477.7660",
+  "synthetic_closes": 1,
+  "ignored_events": {
+   "close": 1,
+   "modify_stop": 0,
+   "take_profit": 0
+  },
+  "cancelled_entries": 0,
+  "capital": "12500.5000"
+ }
+}
