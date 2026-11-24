@@ -104,11 +104,11 @@ def test_equity_has_one_point_per_timestamp_and_never_zero_across_gaps(tmp_path:
     for account in ("a", "b"):
         last = [p for p in ledger.equity_points if p.account == account][-1]
         assert last.equity == ledger.equity(account) == ledger.cash(account)
-    # AAA's last bar is minute 8, but its synthetic close is stamped at the run's last minute
-    # (the spec's wording: finish runs at the last timestamp); the price is AAA's own last close.
+    # AAA's last bar is minute 8: its synthetic close is at AAA's own last close and stamped at
+    # that bar (issue 144; it used to be stamped at the run's last minute).
     (aaa,) = [t for t in ledger.round_trips if t.account == "a"]
     assert (aaa.exit_reason, aaa.exit_time, aaa.exit_price) == (
-        "end_of_data", minute(9), Decimal("108.5"))
+        "end_of_data", minute(8), Decimal("108.5"))
 
 
 def test_a_gap_minute_leaves_every_open_account_at_its_last_close(tmp_path: Path) -> None:

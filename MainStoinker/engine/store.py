@@ -113,6 +113,14 @@ class DataMeta:
     # (symbol, sha256 hex, size in bytes) of each data file; kept in `data_json`.
     # Rows written before schema 2 have no such key and read back as ().
     files: tuple[tuple[str, str, int], ...] = ()
+    # Gaps in the replayed bars, kept in `data_json` (rows written before they were
+    # recorded read back as None / ()): the number of replayed timestamps, per symbol
+    # the timestamps it had no bar at, the minutes missing from every symbol, and the
+    # plain-text coverage warnings the run was started with.
+    replayed_minutes: int | None = None
+    missing_minutes: tuple[tuple[str, int], ...] | None = None
+    uncovered_minutes: int | None = None
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -803,6 +811,11 @@ class SqliteStore:
             "first_bar": None if data.first_bar is None else data.first_bar.isoformat(),
             "last_bar": None if data.last_bar is None else data.last_bar.isoformat(),
             "files": [_data_file(entry) for entry in data.files],
+            "replayed_minutes": data.replayed_minutes,
+            "missing_minutes": (None if data.missing_minutes is None
+                                else {s: n for s, n in data.missing_minutes}),
+            "uncovered_minutes": data.uncovered_minutes,
+            "warnings": list(data.warnings),
         }, "data")
         config_json = _dumps(dict(meta.config), "config")
         with self._tx() as conn:
@@ -1027,7 +1040,12 @@ class SqliteStore:
         d = json.loads(r[7])
         data = DataMeta(d["source"], d["directory"], tuple(d["symbols"]),
                         _opt_dt(d["first_bar"]), _opt_dt(d["last_bar"]),
-                        tuple((f[0], f[1], f[2]) for f in d.get("files", ())))
+                        tuple((f[0], f[1], f[2]) for f in d.get("files", ())),
+                        d.get("replayed_minutes"),
+                        None if d.get("missing_minutes") is None
+                        else tuple((s, int(n)) for s, n in d["missing_minutes"].items()),
+                        d.get("uncovered_minutes"),
+                        tuple(d.get("warnings") or ()))
         return RunSummary(r[0], _dt(r[1]), _opt_dt(r[2]), r[3], r[4], r[5], r[6], data)
 
     def load_run(self, run_id: int) -> RunData:

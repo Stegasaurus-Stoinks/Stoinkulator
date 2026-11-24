@@ -376,9 +376,9 @@ class MarkSpy(Ledger):
         self.marks.append((time, dict(closes_by_symbol)))
         return super().mark(time, closes_by_symbol)
 
-    def finish(self, time, closes_by_symbol, commission=None):  # type: ignore[no-untyped-def]
+    def finish(self, time, closes_by_symbol, commission=None, **kwargs):  # type: ignore[no-untyped-def]
         self.finishes.append((time, dict(closes_by_symbol)))
-        return super().finish(time, closes_by_symbol, commission)
+        return super().finish(time, closes_by_symbol, commission, **kwargs)
 
 
 class Scripted:
@@ -538,7 +538,8 @@ def test_ledger_finish_closes_a_symbol_at_its_own_last_bar(tmp_path: Path) -> No
     assert stamp == minute(9)
     assert closes == {"AAA": 109.5, "BBB": 207.5}  # BBB's last bar is minute 7
     trips = {t.account: t for t in ledger.round_trips}
-    assert trips["b"].exit_reason == "end_of_data" and trips["b"].exit_time == minute(9)
+    # stamped at BBB's own last bar (minute 7), not the run's last timestamp (issue 144)
+    assert trips["b"].exit_reason == "end_of_data" and trips["b"].exit_time == minute(7)
     assert trips["b"].exit_price == Decimal("207.5")
 
 

@@ -637,6 +637,16 @@ def run_backtest_command(
                     f"symbol {symbol} has no bars in the replay window (its data is all "
                     f"warm-up or empty; check the data and --warmup-days {args.warmup_days})"
                 )
+    # Symbols whose replay data never overlap (no minute with a bar for every symbol)
+    # are an input problem: nothing would be tested together. Anything less (a stale
+    # file, a different start or end) only warns, below and in the stored run.
+    if len(feed.symbols()) > 1 and any(counts.values()) and feed.shared_count() == 0:
+        raise CliError(
+            f"no minute has a bar for every symbol ({', '.join(feed.symbols())}): the "
+            f"symbols' data do not overlap; check the data files and --warmup-days "
+            f"{args.warmup_days}"
+        )
+    coverage_warnings = feed.coverage_warnings()
     # One pass over the batches (they are in memory): count them and note the
     # first and last replayed bar, which the stored run records.
     bar_count = 0
@@ -721,7 +731,11 @@ def run_backtest_command(
                     },
                     data=DataMeta(source="csv", directory=str(data_dir),
                                   symbols=tuple(feed.symbols()), first_bar=first_bar,
-                                  last_bar=last_bar, files=data_files),
+                                  last_bar=last_bar, files=data_files,
+                                  replayed_minutes=bar_count,
+                                  missing_minutes=tuple(feed.missing_counts().items()),
+                                  uncovered_minutes=feed.uncovered_minutes(),
+                                  warnings=tuple(coverage_warnings)),
                 ))
                 store.write_algos(run_id, [
                     AlgoMeta(cfg["idname"], entry["ID"], cfg["ticker"], router.modes[cfg["idname"]],
@@ -816,6 +830,8 @@ def run_backtest_command(
     for symbol, count in feed.missing_counts().items():
         if count:
             print(f"{symbol}: no bar at {count} of {bar_count} minutes (skipped for those minutes)")
+    for text in coverage_warnings:
+        print(f"warning: {text}", file=sys.stderr)
     for idname, records in result.items():
         extra = f" ({summary[idname]})" if idname in summary else ""
         print(f"{idname}: {len(records)} trades{extra}")

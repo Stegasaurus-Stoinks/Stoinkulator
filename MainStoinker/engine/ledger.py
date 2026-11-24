@@ -374,9 +374,17 @@ class Ledger:
         return points
 
     def finish(self, time: datetime, closes_by_symbol: Mapping[str, float | Decimal],
-               commission: Callable[[str, Decimal], float | Decimal] | None = None
+               commission: Callable[[str, Decimal], float | Decimal] | None = None,
+               *, symbol_times: Mapping[str, datetime] | None = None
                ) -> list[RoundTrip]:
         """Close every open position with a synthetic `end_of_data` fill at the given close.
+
+        `symbol_times` (optional) gives the time of a symbol's own last bar. A
+        position in such a symbol is closed with a fill stamped at that time
+        instead of `time`, so a symbol whose data ends early does not get an
+        exit (and a duration) stretched to the end of the run; a symbol not in
+        the mapping is stamped at `time`. The final equity points are always
+        stored at `time`.
 
         `commission(idname, quantity)` supplies the charge per synthetic fill
         (each algo has its own broker and cost model); without it the fill is
@@ -395,13 +403,15 @@ class Ledger:
                     raise ValueError(f"no close for open position of account "
                                      f"{acct.info.idname!r} in symbol {pos.symbol!r}")
         self._marks.update(prices)
+        times: Mapping[str, datetime] = symbol_times or {}
         before = len(self._round_trips)
         for acct in self._accounts.values():
             for pos in list(acct.positions.values()):
                 qty = pos.open_qty
                 comm = commission(acct.info.idname, qty) if commission else ZERO
                 self._fill(acct.info.idname, pos.ref, "sell" if pos.long else "buy", qty,
-                           self._marks[pos.symbol], comm, time, "end_of_data", None, True)
+                           self._marks[pos.symbol], comm, times.get(pos.symbol, time),
+                           "end_of_data", None, True)
         points = [self._point(time, idname) for idname in self._accounts]
         points.append(self._point(time, None))
         while self._equity and self._equity[-1].time == time:
