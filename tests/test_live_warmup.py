@@ -4,16 +4,18 @@ Small month files are built under `tmp_path`; nothing else is read.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from MainStoinker.engine import warmup
 from MainStoinker.engine.feed import (
     COLUMNS,
     CsvBarFeed,
     month_file_path,
+    offline_data_path,
     symbol_fingerprint,
     write_month_file,
 )
@@ -121,8 +123,8 @@ def test_description_fingerprints_match_symbol_fingerprint(tmp_path: Path) -> No
     _, description, _ = live_warmup(tmp_path, ["AAPL", "MSFT"], date(2024, 10, 2), 2)
     for symbol in ("AAPL", "MSFT"):
         sha, size = symbol_fingerprint(tmp_path, symbol)
-        assert description["symbols"][symbol]["sha256"] == sha
-        assert description["symbols"][symbol]["size"] == size
+        assert description["symbols"][symbol]["data_snapshot_sha256"] == sha
+        assert description["symbols"][symbol]["data_snapshot_size"] == size
 
 
 def test_only_bars_dir_is_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,3 +141,90 @@ def test_no_rows_before_today_is_an_error(tmp_path: Path) -> None:
     write_days(tmp_path, "AAPL", ["2024-10-08"])
     with pytest.raises(ValueError, match="no bars before"):
         live_warmup(tmp_path, ["AAPL"], date(2024, 10, 8), 2)
+
+
+def test_description_files_and_warmup_digest_ignore_today_and_later_months(tmp_path: Path) -> None:
+    write_days(tmp_path, "AAPL", ["2024-09-30", "2024-10-07", "2024-10-08"])
+    _, before, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+    write_days(tmp_path, "AAPL", ["2024-09-30", "2024-10-07", "2024-10-08", "2024-10-09"])
+    write_days(tmp_path, "AAPL", ["2024-11-04"])
+    _, after, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+    one, two = before["symbols"]["AAPL"], after["symbols"]["AAPL"]
+    assert one["warmup_sha256"] == two["warmup_sha256"]
+    assert one["files"] == two["files"] == ["AAPL_2024-10.csv"]
+    assert one["data_snapshot_sha256"] != two["data_snapshot_sha256"]
+
+
+def test_warmup_digest_changes_with_one_value(tmp_path: Path) -> None:
+    write_days(tmp_path, "AAPL", ["2024-10-07", "2024-10-08"])
+    _, before, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+    path = month_file_path(tmp_path, "AAPL", 2024, 10)
+    frame = pd.read_csv(path)
+    frame.loc[1, "close"] += 0.01
+    frame["date"] = pd.to_datetime(frame["date"])
+    write_month_file(path, frame)
+    _, after, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+    assert before["symbols"]["AAPL"]["warmup_sha256"] != after["symbols"]["AAPL"]["warmup_sha256"]
+
+
+def test_legacy_file_must_be_strictly_increasing(tmp_path: Path) -> None:
+    rows = day_rows("2024-10-07") + day_rows("2024-10-08")
+    unsorted = pd.DataFrame(rows[:2] + rows[3:4] + rows[2:3] + rows[4:])[list(COLUMNS)]
+    unsorted.to_csv(offline_data_path(tmp_path, "AAPL"))
+    with pytest.raises(ValueError, match=r"AAPL.*strictly increasing.*data row 4"):
+        live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+    dup = pd.DataFrame(rows[:2] + rows[1:2] + rows[2:])[list(COLUMNS)]
+    dup.to_csv(offline_data_path(tmp_path, "AAPL"))
+    with pytest.raises(ValueError, match=r"AAPL.*strictly increasing.*data row 3"):
+        live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+
+
+def test_legacy_file_is_read_whole(tmp_path: Path) -> None:
+    rows = day_rows("2024-10-07") + day_rows("2024-10-08") + day_rows("2024-10-09")
+    pd.DataFrame(rows)[list(COLUMNS)].to_csv(offline_data_path(tmp_path, "AAPL"))
+    frames, description, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 1)
+    assert frames["AAPL"]["date"].dt.date.unique().tolist() == [date(2024, 10, 8)]
+    assert description["symbols"]["AAPL"]["files"] == ["_AAPL_offlinedata_"]
+
+
+@pytest.mark.parametrize("stamp", [datetime(2024, 10, 9, 10, 0), datetime(2024, 10, 9, tzinfo=UTC)])
+def test_today_must_not_be_a_datetime(tmp_path: Path, stamp: datetime) -> None:
+    write_days(tmp_path, "AAPL", ["2024-10-08"])
+    with pytest.raises(TypeError, match="datetime.date"):
+        live_warmup(tmp_path, ["AAPL"], stamp, 1)  # type: ignore[arg-type]
+
+
+def test_later_month_files_are_not_opened(tmp_path: Path) -> None:
+    write_days(tmp_path, "AAPL", ["2024-10-07", "2024-10-08"])
+    month_file_path(tmp_path, "AAPL", 2024, 11).write_text("garbage\n", encoding="utf-8")
+    month_file_path(tmp_path, "AAPL", 2024, 12).write_text("", encoding="utf-8")
+    frames, _, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
+    assert len(frames["AAPL"]) == 2 * BARS_PER_DAY
+
+
+def test_only_needed_month_files_are_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    days = [f"2024-{m:02d}-{d:02d}" for m in range(1, 13) for d in (10, 11)]
+    write_days(tmp_path, "AAPL", days)
+    opened: list[str] = []
+    real = warmup.read_offline_bars
+
+    def spy(path: Path) -> pd.DataFrame:
+        opened.append(path.name)
+        return real(path)
+
+    monkeypatch.setattr(warmup, "read_offline_bars", spy)
+    _, description, _ = live_warmup(tmp_path, ["AAPL"], date(2024, 8, 12), 3)
+    assert opened == ["AAPL_2024-08.csv", "AAPL_2024-07.csv"]
+    assert description["symbols"]["AAPL"]["files"] == ["AAPL_2024-07.csv", "AAPL_2024-08.csv"]
+
+
+def test_exact_days_for_n_1_2_and_more_than_data(tmp_path: Path) -> None:
+    write_days(tmp_path, "AAPL", ["2024-10-07", "2024-10-08", "2024-10-09"])
+    today = date(2024, 10, 10)
+    expected = ["2024-10-07", "2024-10-08", "2024-10-09"]
+    for n, want in ((1, expected[-1:]), (2, expected[-2:]), (7, expected)):
+        frames, description, _ = live_warmup(tmp_path, ["AAPL"], today, n)
+        assert description["symbols"]["AAPL"]["days"] == want
+        assert len(frames["AAPL"]) == len(want) * BARS_PER_DAY
