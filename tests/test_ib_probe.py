@@ -837,8 +837,13 @@ def test_genuine_epoch_and_rt_volume_lines_are_expected_and_a_wrong_reason_is_no
     ]) + "\n", encoding="utf-8")
     findings = scan_recording(record, [])
     findings = [f for f in findings if f.line > 1]  # line 1 is the stand-in header of this file
-    assert {f.line for f in findings} == {2, 3, 4}, findings
-    assert {f.reason for f in findings} <= {LONG_RUN_REASON, SEPARATED_RUN_REASON}
+    # issue 156 item 2: scan_recording itself treats genuine type 45 / 48 values as known shapes
+    assert findings == [], findings
+    # split_findings still handles such findings if they occur (an older scan, another tool)
+    findings = [
+        Finding(2, LONG_RUN_REASON, ""), Finding(3, LONG_RUN_REASON, ""),
+        Finding(4, SEPARATED_RUN_REASON, ""),
+    ]
     expected, other = probe.split_findings(record, findings)
     assert (expected, other) == (len(findings), [])
     # the same lines with another reason (an address, say) are not the expected kind

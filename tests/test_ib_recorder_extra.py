@@ -824,9 +824,13 @@ def test_an_id_whose_digits_are_a_date_but_is_not_glued_to_a_letter_is_redacted_
 
 def test_the_glued_form_of_such_an_id_is_redacted_warm_and_kept_cold_by_design() -> None:
     """The one narrow loosening, pinned: cold, an 8-digit id that is a valid date AND glued to a
-    letter is not caught. Warm it is, because `managedAccounts` taught the id."""
+    word of four or more letters is not caught. Warm it is, because `managedAccounts` taught the
+    id. (Issue 156 tightened it: a prefix of up to three letters after a non-letter, `xxU<date>`
+    standing alone, is now redacted cold as well.)"""
     day = ymd(_THURSDAY)
-    glued = "xx" + f"U{day}"
+    standalone = "xx" + f"U{day}"
+    assert day not in Redactor().sanitise("raw", "error", (-1, 0, 1, f"see {standalone} now", ""))[3]
+    glued = "ab" + standalone
     cold = Redactor().sanitise("raw", "error", (-1, 0, 1, f"see {glued} now", ""))[3]
     assert cold == f"see {glued} now"  # documented loosening
     warm = Redactor()

@@ -436,15 +436,36 @@ def test_committed_file_list_covers_every_recorder_replay_and_recording_file() -
 _COMMITTED_SHAPE = rmod.re.compile(r"[A-Za-z]{1,2}[^A-Za-z0-9]?\d(?:[ .,\-_]?\d){4,}")
 
 
+def committed_text_hits(text: str, *, recording: bool = False) -> list[str]:
+    """Account-shaped text in committed text: `_COMMITTED_SHAPE`, minus an option symbol in OCC
+    shape and, for a recording (`.jsonl`, which `scan_recording` also checks) only, the tail of
+    a word followed by a date (`CLOSED;<next date>` in IB's trading hours), the one exemption
+    the recorder itself makes, applied here exactly as it applies it. Any other file is held
+    to the shape as it was before the exemption."""
+    occ = rmod._occ_spans(text)
+    return [
+        m.group(0) for m in _COMMITTED_SHAPE.finditer(text)
+        if not rmod._overlaps(m.span(), occ) and not (recording and rmod._glued_date(text, m))
+    ]
+
+
+def committed_recording_findings(path: Path) -> list[str]:
+    """What `scan_recording` (the owner's checker, with patterns of its own) reports for a
+    committed recording: line and reason only, never the matched text."""
+    return [f"line {f.line}: {f.reason}" for f in scan_recording(path)]
+
+
 def test_no_account_pattern_in_committed_files() -> None:
     files = committed_recorder_files()
     assert any(p.name == "synthetic_history.jsonl" for p in files)
     red = Redactor()
     for p in files:
-        text = p.read_text(encoding="utf-8")
-        occ = rmod._occ_spans(text)
-        found = [m.group(0) for m in _COMMITTED_SHAPE.finditer(text) if not rmod._overlaps(m.span(), occ)]
+        found = committed_text_hits(p.read_text(encoding="utf-8"), recording=p.suffix == ".jsonl")
         assert not found, f"{p}: account-shaped text {found}"
+    recordings = sorted(RECORDINGS.rglob("*.jsonl"))
+    assert recordings
+    for p in recordings:  # the owner's checker as well: it sees what the shape above cannot
+        assert committed_recording_findings(p) == [], p
     assert red.leaks_in_text(f"x {A} y")  # the recorder's own scan does flag one
     assert _COMMITTED_SHAPE.search(f"x {A} y")  # and so does this one
 
