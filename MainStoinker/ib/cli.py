@@ -78,6 +78,7 @@ from MainStoinker.ib.connection import (
     ClientIdInUse,
     ClientIdRefused,
     ConnectFailed,
+    ConnState,
     IbConnection,
     NotPaperSession,
 )
@@ -621,6 +622,29 @@ def paper_session_ok(conn: IbConnection, say: _Say) -> bool:
     return False
 
 
+def closed_without_rejection(conn: IbConnection) -> bool:
+    """After a session that passed `paper_session_ok`: True when `paper_verified` is no longer
+    True only because the connection was closed or lost, not because an account list failed.
+
+    Decision table (the account was verified at the start of the run):
+
+    | `paper_verified` | `paper_rejected` | `state`      | outcome                              |
+    |------------------|------------------|--------------|--------------------------------------|
+    | True             | False            | READY / LOST | ordinary result of the command       |
+    | False            | True             | any          | not-paper line and exit code         |
+    | False            | False            | CLOSED       | ordinary lost-connection result      |
+    | False            | False            | any other    | not-paper line and exit code (doubt) |
+
+    Only the third row returns True. Anything else, including a state that cannot be
+    explained, keeps the not-paper outcome (fail-safe). `paper_rejected` is read first and is
+    sticky, and a failing list closes the connection in the same step that records it, so a
+    closed connection without a rejected list never hides a failing one.
+    """
+    if conn.paper_verified is True or conn.paper_rejected is not False:
+        return False
+    return conn.state is ConnState.CLOSED
+
+
 def port_refusal_text(exc: Exception) -> str:
     return (
         f"{exc}\n"
@@ -872,6 +896,12 @@ def run_session(
     `args` carries `record` (Path or None), `private`, `host`, `port`, `client_id` and
     `connect_timeout`. A recording of a connection that was refused or could not be opened
     holds only the header, so this run deletes the file it made. Returns the exit code.
+
+    In paper mode, when the account was verified and `paper_verified` is no longer True at the
+    end, the not-paper line and code are used only if `closed_without_rejection` is False (see
+    its decision table): a failing list (`paper_rejected`), or any state that is not a plain
+    close, keeps them. A connection that was merely closed or lost keeps the body's own outcome
+    and the result line says "paper account verified at start".
     """
     say = _Say(out)
     paper = getattr(args, "paper", False) is True
@@ -888,6 +918,7 @@ def run_session(
     advice: list[str] = []
     not_connected = False
     verified = False
+    verified_at_start = False  # verified, then closed or lost without a failing list
     open_failed = False
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
@@ -914,11 +945,15 @@ def run_session(
         code = kind.unexpected
     finally:
         if verified and conn is not None and conn.paper_verified is not True:
-            # the account list failed after READY: whatever the body saw, this is the result
-            say(NOT_PAPER_LINE)
-            code = not_paper_exit
             verified = False
-            advice.clear()
+            if closed_without_rejection(conn):
+                # closed or lost, no failing list: the body's own outcome stands (see its table)
+                verified_at_start = True
+            else:
+                # the account list failed after READY: whatever the body saw, this is the result
+                say(NOT_PAPER_LINE)
+                code = not_paper_exit
+                advice.clear()
         if conn is not None:
             try:
                 conn.close()
@@ -940,7 +975,9 @@ def run_session(
             say(f"Recording: {args.record}")
             kind.report_findings(say, args.record, findings)
     label = OPEN_FAILED_LABEL if open_failed else labels[code]
-    say(f"Result: {label} (exit {code})" + ("; paper account verified" if verified else ""))
+    suffix = "; paper account verified" if verified else (
+        "; paper account verified at start" if verified_at_start else "")
+    say(f"Result: {label} (exit {code})" + suffix)
     say(PATHS_NOTE)
     return code
 

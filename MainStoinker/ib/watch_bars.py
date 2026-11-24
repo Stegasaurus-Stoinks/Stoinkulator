@@ -133,6 +133,7 @@ from MainStoinker.ib.cli import (
     PathRefused,
     check_folder_usable,
     check_path,
+    closed_without_rejection,
     home_folder,
     make_folders,
     paper_refusal,
@@ -690,7 +691,7 @@ class _Watcher:
         except _NotPaper:
             code = EXIT_NOT_PAPER  # said once, with the result, by `run_watch`
         except _Closed:
-            if getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True:
+            if self._not_paper():
                 code = EXIT_NOT_PAPER  # the list failed and closed the connection: said by `run_watch`
             else:
                 self.say("STOPPED: the connection to TWS closed.")
@@ -811,8 +812,14 @@ class _Watcher:
             if outage[2] in kinds and outage[1] == math.inf:
                 outage[1] = self.server_now()
 
+    def _not_paper(self) -> bool:
+        """In paper mode: True when `paper_verified` is not True and the connection was not merely
+        closed (see `cli.closed_without_rejection`: a failing list, or any doubt, is not paper)."""
+        return (getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True
+                and not closed_without_rejection(self.conn))
+
     def _check_state(self) -> None:
-        if getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True:
+        if self._not_paper():
             raise _NotPaper  # before anything else: a failing account list ends the watch
         state = self.conn.state
         if state is ConnState.CLOSED:
@@ -1450,7 +1457,8 @@ def run_watch(
         say(f"Unexpected {type(exc).__name__}: {exc}")
         code = EXIT_STOPPED
     finally:
-        if verified and conn is not None and conn.paper_verified is not True:
+        if (verified and conn is not None and conn.paper_verified is not True
+                and not closed_without_rejection(conn)):
             # the account list failed after READY: whatever the watch saw, this is the result
             say(NOT_PAPER_LINE)
             code = EXIT_NOT_PAPER

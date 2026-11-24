@@ -547,6 +547,20 @@ class IbConnection:
                 and att.accounts_bad is None
             )
 
+    @property
+    def paper_rejected(self) -> bool:
+        """True only when an account list was received on the current attempt and failed the rule.
+
+        Read-only, and it is the existing sticky `accounts_bad` state: it stays True after
+        `close()` and after the connection is closed by the peer. It is False when no list
+        arrived, when the list passed, and when `require_paper` is off. `paper_verified` is
+        unchanged: it is also False once the connection is closed, which this property tells
+        apart from a rejected account.
+        """
+        with self._lock:
+            att = self._att
+            return self._require_paper and att is not None and att.accounts_bad is not None
+
     def __enter__(self) -> IbConnection:
         if self.state is ConnState.NEW:
             self.open()

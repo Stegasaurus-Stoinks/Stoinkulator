@@ -718,3 +718,66 @@ def test_failing_list_delivered_inside_the_client_call_does_not_deadlock(
     assert conn.paper_verified is False
     with pytest.raises(NotConnected):
         conn.request("reqCurrentTime")
+
+
+# -- `paper_rejected`: why the connection is not verified -----------------------------------------
+
+
+def test_paper_rejected_is_false_before_open_and_for_a_passing_list(build: Callable[..., Rig]) -> None:
+    rig = build(paper())
+    assert rig.conn.paper_rejected is False and rig.conn.paper_verified is False
+    rig.conn.open()
+    assert rig.conn.paper_verified is True and rig.conn.paper_rejected is False
+    rig.conn.close()
+    assert rig.conn.paper_verified is False and rig.conn.paper_rejected is False
+
+
+def test_paper_rejected_is_true_for_a_refused_open_and_stays_after_close(build: Callable[..., Rig]) -> None:
+    rig = build("U" + OTHER_DIGITS)
+    with pytest.raises(NotPaperSession):
+        rig.conn.open()
+    assert rig.conn.paper_rejected is True and rig.conn.paper_verified is False
+    rig.conn.close()
+    assert rig.conn.paper_rejected is True
+
+
+def test_paper_rejected_is_false_without_require_paper(build: Callable[..., Rig]) -> None:
+    rig = build("U" + OTHER_DIGITS, require_paper=False)
+    rig.conn.open()
+    assert rig.conn.paper_rejected is False
+    rig.fake.push("managedAccounts", "U" + OTHER_DIGITS)
+    rig.conn.request("reqCurrentTime")
+    rig.conn.close()
+    assert rig.conn.paper_rejected is False
+
+
+def test_a_connection_closed_by_the_peer_is_not_a_rejected_account(build: Callable[..., Rig]) -> None:
+    rig = build(paper())
+    rig.conn.open()
+    rig.fake.drop("connectionClosed")
+    assert wait_until(lambda: rig.conn.state is ConnState.CLOSED)
+    assert rig.conn.paper_verified is False
+    assert rig.conn.paper_rejected is False
+    rig.conn.close()
+    assert rig.conn.state is ConnState.CLOSED
+    assert rig.conn.paper_verified is False and rig.conn.paper_rejected is False
+
+
+def test_a_failing_list_while_ready_is_rejected_and_stays_so_after_close(build: Callable[..., Rig]) -> None:
+    rig = build(paper())
+    rig.conn.open()
+    assert rig.conn.paper_rejected is False
+    rig.fake.push("managedAccounts", "U" + OTHER_DIGITS)
+    assert wait_until(lambda: rig.conn.state is ConnState.CLOSED)
+    assert rig.conn.paper_rejected is True and rig.conn.paper_verified is False
+    rig.conn.close()
+    assert rig.conn.paper_rejected is True
+
+
+def test_paper_rejected_is_sticky_against_a_later_passing_list(build: Callable[..., Rig]) -> None:
+    rig = build(paper())
+    rig.conn.open()
+    rig.fake.push("managedAccounts", "U" + OTHER_DIGITS)
+    rig.fake.push("managedAccounts", paper())
+    assert wait_until(lambda: rig.conn.state is ConnState.CLOSED)
+    assert rig.conn.paper_rejected is True and rig.conn.paper_verified is False

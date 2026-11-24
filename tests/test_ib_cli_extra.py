@@ -1034,3 +1034,41 @@ def test_an_unknown_subcommand_still_gets_the_old_error_and_loads_no_ib_code() -
 
 def test_the_repository_path_the_command_refuses_is_this_repository() -> None:
     assert cli.REPO_ROOT == REPO
+
+
+# -- a stopped run: days it never asked for are "not fetched", not "no data" ----------------------
+
+
+def test_a_stopped_run_does_not_call_unrequested_days_no_data_and_a_resume_fetches_them(
+        sess: Session, tmp_path: Path) -> None:
+    lose_connection(sess, day=13)  # 12th requested and fine, 13th requested and lost, 14th never asked for
+    assert sess.fetch(symbols="AAPL") == cli.EXIT_STOPPED
+    line = next(ln for ln in sess.text.splitlines() if ln.startswith("  AAPL: gaps:"))
+    assert "1 not fetched" in line and "1 complete" in line, line
+    assert "1 no data" not in line and "2 no data" not in line, line
+    folder = sess.tmp / "bars" / "AAPL"
+    csv_lines = (folder / "gaps.csv").read_text(encoding="utf-8").splitlines()[1:]
+    rows = {ln.split(",")[1]: ln.split(",")[2] for ln in csv_lines}
+    assert rows["2024-08-14"] == "not_fetched" and rows["2024-08-12"] == "complete"
+    assert rows["2024-08-13"] == "no_data"  # asked for, lost: unchanged (the printed line counts it failed)
+    summary = (folder / "gaps_summary.txt").read_text(encoding="utf-8")
+    assert "not_fetched: 1" in summary and "2024-08-14 not_fetched" in summary
+    assert "missing minutes in days with data: 0" in summary
+    manifest_days = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))["days"]
+    assert "2024-08-14" not in manifest_days  # nothing recorded: the same fact the gap files state
+
+    again = Session(tmp_path)  # the same folder, no loss this time
+    try:
+        assert again.fetch(symbols="AAPL") == cli.EXIT_OK
+        assert "3 complete" in again.text and "not fetched" not in again.text
+        requested = [req[1] for req in again.rig.requests]
+        assert date(2024, 8, 14) in requested and date(2024, 8, 12) not in requested
+        csv = (folder / "gaps.csv").read_text(encoding="utf-8")
+        assert "not_fetched" not in csv and "no_data" not in csv
+    finally:
+        for conn in again.connections:
+            conn.close()
+        for recorder in again.recorders:
+            recorder.close()
+        for fake in again.fakes:
+            fake.close()

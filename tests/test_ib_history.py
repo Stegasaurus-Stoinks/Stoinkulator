@@ -15,6 +15,7 @@ from MainStoinker.ib import history
 from MainStoinker.ib.history import (
     GAP_COMPLETE,
     GAP_NO_DATA,
+    GAP_NOT_FETCHED,
     GAP_PARTIAL,
     GAP_SHORT,
     Manifest,
@@ -337,6 +338,25 @@ def test_gap_report_missing_day(tmp_path: Path) -> None:
     summary = text_path.read_text(encoding="utf-8")
     assert "no_data: 1" in summary and "complete: 1" in summary and "2024-03-12 no_data" in summary
     assert write_gap_files(tmp_path, rows, "AAPL") == (csv_path, text_path)  # rewrite is fine
+
+
+def test_gap_report_not_requested_days_are_not_fetched_not_no_data(tmp_path: Path) -> None:
+    days = [date(2024, 3, 11), date(2024, 3, 12), date(2024, 3, 13)]
+    rows = gap_report(days, bars_for(days[0]), not_requested={days[1], days[0]})
+    # the first has bars, so it keeps its bar-based status; the second was never asked for; the
+    # third has no bars and was asked for (or is unknown): still no_data
+    assert [r.status for r in rows] == [GAP_COMPLETE, GAP_NOT_FETCHED, GAP_NO_DATA]
+    csv_path, text_path = write_gap_files(tmp_path, rows, "AAPL")
+    assert "AAPL,2024-03-12,not_fetched,390,0,390,09:30-15:59" in csv_path.read_text(encoding="utf-8")
+    summary = text_path.read_text(encoding="utf-8")
+    assert "not_fetched: 1" in summary and "no_data: 1" in summary and "2024-03-12 not_fetched" in summary
+    assert "missing minutes in days with data: 0" in summary
+    # without a not-requested day the summary has no such line and the old default is unchanged
+    plain = gap_report(days, bars_for(days[0]))
+    assert [r.status for r in plain] == [GAP_COMPLETE, GAP_NO_DATA, GAP_NO_DATA]
+    (tmp_path / "plain").mkdir()
+    _, plain_text = write_gap_files(tmp_path / "plain", plain, "AAPL")
+    assert "not_fetched" not in plain_text.read_text(encoding="utf-8")
 
 
 def test_gap_report_converts_to_other_data_zone() -> None:

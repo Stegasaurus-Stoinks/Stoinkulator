@@ -291,6 +291,9 @@ class SymbolResult:
     # (day, bars on disk, gap status "short" or "partial") for every day of the range with
     # bars that is not a full session; the days stay `ok` (missing minutes are data)
     short_days: list[tuple[date, int, str]] = field(default_factory=list)
+    # days of the range this run was to fetch and has not asked IB for (yet): the gap report
+    # calls such a day without bars `not_fetched`, never `no_data`; a resumed run fetches them
+    not_requested: set[date] = field(default_factory=set)
 
     @property
     def remaining(self) -> int:
@@ -629,6 +632,7 @@ class _Run:
         mfile = manifest_path(self.out_dir, symbol)
         manifest, reason = load_manifest(mfile, expected)
         if reason is not None:
+            res.not_requested = set(self.days)  # nothing was asked for
             res.state = "manifest"
             res.message = (f"{reason}. The file was set aside as {mfile.name}.unusable (never deleted); "
                            f"nothing was fetched for {symbol}. Look at it, then run again to fetch "
@@ -639,6 +643,7 @@ class _Run:
         self.current = sym
         pending = manifest.pending(self.days)
         res.planned = len(pending)
+        res.not_requested = set(pending)
         res.already_done = len(self.days) - len(pending)
         self.emit("symbol_start", f"{symbol}: conId {info.con_id}, {len(pending)} day(s) to fetch, "
                   f"{res.already_done} already done", symbol, con_id=info.con_id,
@@ -735,6 +740,7 @@ class _Run:
     def _day(self, sym: _Symbol, day: date) -> bool:
         """Fetch and store one day; False when this symbol must not go on (damaged month file)."""
         res = sym.result
+        res.not_requested.discard(day)  # from here on the day counts as asked for
         damage = self._month_damage(sym, day)  # before any request is spent on this month
         answer = (self._answer(sym, day) if damage is None
                   else _Answer("failed", "damaged_file", None, damage))
@@ -906,7 +912,8 @@ class _Run:
                     bars = read_symbol_bars(self.out_dir, symbol)
                 except FileNotFoundError:
                     bars = _minute_frame([])
-                rows = gap_report(self.days, bars, data_zone=self.zone)
+                rows = gap_report(self.days, bars, data_zone=self.zone,
+                                  not_requested=res.not_requested)
                 res.gaps = rows
                 res.short_days = [(r.day, r.present, r.status) for r in rows
                                   if r.status in (GAP_SHORT, GAP_PARTIAL)]

@@ -2127,6 +2127,51 @@ def test_a_failing_list_in_the_middle_of_a_watch_ends_it_with_the_not_paper_code
     assert "Summary" in rig.text and f"(exit {code})" in rig.text
 
 
+def test_a_connection_closed_after_the_account_check_is_the_ordinary_stop_not_not_paper(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 34, (34, 2.0), (100.3, 100.3, 100.3, 100.3, 5))
+    rig.drop((34, 20.0), "connectionClosed")
+    rig.at(rig.tt(34, 40.0), lambda: None)
+    code = rig.watch(symbols="AAPL", minutes=5, paper=True)
+    assert code == watch_bars.EXIT_STOPPED == 4, rig.text
+    assert "STOPPED: the connection to TWS closed" in rig.text
+    assert watch_bars.NOT_PAPER_LINE not in rig.text and watch_bars.NOT_PAPER_LABEL not in rig.text
+    assert "Nothing was requested" not in rig.text
+    assert rig.connections[0].paper_verified is False and rig.connections[0].paper_rejected is False
+    assert rig.connections[0].state is ConnState.CLOSED
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:33"]
+    assert "Summary" in rig.text and "exit 4" in rig.text
+
+
+def test_a_lost_then_closed_connection_in_paper_mode_is_the_ordinary_stop(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.3, 1800))
+    rig.drop((33, 40.0), 1100)
+    rig.drop((34, 20.0), "connectionClosed", ready=lambda: "connectivity LOST" in rig.text)
+    rig.at(rig.tt(34, 40.0), lambda: None)
+    code = rig.watch(symbols="AAPL", minutes=5, paper=True)
+    assert code == watch_bars.EXIT_STOPPED, rig.text
+    assert "connectivity LOST" in rig.text
+    assert watch_bars.NOT_PAPER_LINE not in rig.text and watch_bars.NOT_PAPER_LABEL not in rig.text
+    assert rig.connections[0].paper_rejected is False
+    assert "Summary" in rig.text and f"(exit {code})" in rig.text
+
+
+def test_a_failing_list_after_a_loss_in_paper_mode_is_still_not_paper(rig: Rig) -> None:
+    """Fail-safe: the connection was lost, then a failing list arrived: the account is rejected."""
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.3, 1800))
+    rig.drop((33, 40.0), 1100)
+    rig.at(rig.tt(34, 10.0), lambda: rig.fakes[-1].push("managedAccounts", LIVE_LOOKING),
+           ready=lambda: "connectivity LOST" in rig.text)
+    rig.at(rig.tt(34, 40.0), lambda: None)
+    code = rig.watch(symbols="AAPL", minutes=5, paper=True)
+    assert code == watch_bars.EXIT_NOT_PAPER, rig.text
+    assert rig.connections[0].paper_rejected is True
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+
+
 def test_the_real_connection_is_built_with_require_paper_only_in_paper_mode(
         rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[dict[str, Any]] = []
