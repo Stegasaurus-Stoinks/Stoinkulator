@@ -593,7 +593,12 @@ def test_claude_md_states_the_paper_rules() -> None:
         "never from a task branch or worktree and never with uncommitted changes",
         "code that connects must have been reviewed and merged before it talks to TWS",
         "The hook cannot check this; the rule does.",
-        "the owner confirms it in one attended `--paper` session before the first `--no-prompt` run",
+        "(`D[UFI][A-Z]?[0-9]+`): it was confirmed against the owner's paper account in an attended "
+        "`--paper` session on 2026-11-23, and it still rests on \"no live Interactive Brokers "
+        "account id begins with D\"",
+        "`D[UFI][A-Z]?[0-9]+`, confirmed against the owner's paper account on 2026-11-23",
+        "The watcher (`python -m MainStoinker.ib.watch_bars`) is owner-run only: the hook allowance "
+        "does not cover it.",
         "The hook does not check which code is checked out or which interpreter file it is.",
     ):
         assert phrase in text, phrase
