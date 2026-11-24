@@ -114,8 +114,8 @@ exit codes:
   3    could not connect to TWS or IB Gateway
   4    stopped early: connection lost, pacing violation twice, or a fatal fault;
        what was finished is on disk, run the same command again to resume
-  5    --paper only: the account TWS is signed into is not a paper account; nothing was
-       requested; never retry
+  5    --paper only: the account TWS is signed into is not a paper account (at the start:
+       nothing was requested; later: the session was stopped); never retry
   130  interrupted with Ctrl-C (the connection and the recording were closed)
 """
 
@@ -126,8 +126,8 @@ exit codes:
   2    refused: console gate, port guard, bad arguments, unusable path,
        or --paper conditions not met (port, host, STOINK_ALLOW_LIVE_PORT set)
   3    could not connect to TWS or IB Gateway
-  4    --paper only: the account TWS is signed into is not a paper account; nothing was
-       requested; never retry
+  4    --paper only: the account TWS is signed into is not a paper account (at the start:
+       nothing was requested; later: the session was stopped); never retry
   130  interrupted with Ctrl-C (the connection and the recording were closed)
 """
 PAPER_PORT = 7497
@@ -141,6 +141,8 @@ NOT_PAPER_MID_LINE = ("The account list TWS reported during the session is not a
 NOT_PAPER_DOUBT_LINE = ("The account could not be confirmed after the connection closed. "
                         "Treated as not a paper account. Not retried.")
 NOT_PAPER_LABEL = "not a paper account, nothing was requested"
+NOT_PAPER_MID_LABEL = "not a paper account: the session was stopped"
+NOT_PAPER_DOUBT_LABEL = "account could not be confirmed after the connection closed"
 OWNER_LINE = "This command connects to TWS or IB Gateway. Only the owner runs it."
 UNATTENDED_LINE = "Unattended paper run: data only, paper account only."
 
@@ -157,6 +159,11 @@ def mid_run_not_paper_line(conn: IbConnection) -> str:
     """The line for an account that was verified at the start and is not any more: a failing list
     (`paper_rejected`) says so; anything else is a doubt (the list could not be confirmed)."""
     return NOT_PAPER_MID_LINE if conn.paper_rejected else NOT_PAPER_DOUBT_LINE
+
+
+def mid_run_not_paper_label(line: str) -> str:
+    """The Result label that goes with a mid-run line (never "nothing was requested")."""
+    return NOT_PAPER_DOUBT_LABEL if line == NOT_PAPER_DOUBT_LINE else NOT_PAPER_MID_LABEL
 FETCH_BARS = "fetch-bars"
 PROBE_DATA = "probe-data"
 PROBE_MAX_SYMBOLS = 5
@@ -575,7 +582,7 @@ def describe_session(args: argparse.Namespace) -> str:
         f"  Connects to:      {args.host}:{args.port}",
         f"  Client id:        {args.client_id}",
         f"  Symbols:          {', '.join(args.symbols)}",
-        f"  Dates:           {args.start} to {args.end}",
+        f"  Dates:            {args.start} to {args.end}",
         f"  Output folder:    {args.out}",
         f"  Recording file:   {record}",
         "  Estimate:         " + describe_estimate(estimate.requests, estimate.symbols, estimate.days,
@@ -593,7 +600,7 @@ def describe_probe(args: argparse.Namespace) -> str:
         f"  Connects to:      {args.host}:{args.port}",
         f"  Client id:        {args.client_id}",
         f"  Symbols:          {', '.join(args.symbols)}",
-        f"  Quotes:          about {args.quote_seconds:g} s per symbol (delayed data is tried "
+        f"  Quotes:           about {args.quote_seconds:g} s per symbol (delayed data is tried "
         "if no live price comes)",
         f"  History:          {history}",
         f"  Recording file:   {record}",
@@ -996,7 +1003,9 @@ def run_session(
                 verified_at_start = True
             else:
                 # the account list failed after READY: whatever the body saw, this is the result
-                say(mid_run_not_paper_line(conn))
+                mid_line = mid_run_not_paper_line(conn)
+                say(mid_line)
+                labels[not_paper_exit] = mid_run_not_paper_label(mid_line)
                 code = not_paper_exit
                 advice.clear()
         if conn is not None:
@@ -1008,6 +1017,7 @@ def run_session(
                 # a failing list delivered while close() joined the reader: whatever was decided
                 # before, this is the result
                 say(NOT_PAPER_MID_LINE)
+                labels[not_paper_exit] = NOT_PAPER_MID_LABEL
                 code = not_paper_exit
                 verified = verified_at_start = False
                 advice.clear()

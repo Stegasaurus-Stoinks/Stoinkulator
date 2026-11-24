@@ -133,6 +133,7 @@ from MainStoinker.ib.bars import BadBar, bar_from_ib, data_time
 from MainStoinker.ib.cli import (
     NOT_PAPER_LABEL,
     NOT_PAPER_LINE,
+    NOT_PAPER_MID_LABEL,
     NOT_PAPER_MID_LINE,
     PAPER_HOST,
     PAPER_MODE_LINE,
@@ -145,6 +146,7 @@ from MainStoinker.ib.cli import (
     first_banner_line,
     home_folder,
     make_folders,
+    mid_run_not_paper_label,
     mid_run_not_paper_line,
     paper_refusal,
     paper_session_ok,
@@ -197,7 +199,8 @@ exit codes:
   3    could not connect to TWS or IB Gateway
   4    stopped by a lost or closed connection, or by an unexpected error
   5    --paper only: the account TWS is signed into is not a paper account (checked before
-       the first request and all along); nothing more was requested; never retried
+       the first request and all along); at the start nothing was requested, later the watch was
+       stopped; never retried
   6    finished, every symbol streaming or closed, but at least one symbol received no data: no
        bar of today's session and no live update for 120 s of the regular session (09:30 to 16:00
        New York, weekday) after its backfill ended: check the account's market data subscription
@@ -230,7 +233,8 @@ CONNECTION_NOTICES = frozenset({1100, 1101, 1102})  # connectivity lost, restore
 DELAY_THRESHOLD = 120.0 # newest bar more than this behind server time in session: delayed data
 NO_DATA_AFTER = 120.0  # session seconds without any bar of today or update before "no data received"
 NO_DATA_HINT = ("check the market data subscription of this account (quotes answering IB 354 / 10167 "
-                "mean none); a paper account needs the live account's data shared with it")
+                "mean none; a paper account needs the live account's data shared with it); on a "
+                "market holiday or with delayed data this is expected")
 SESSION_OPEN_MINUTE = 9 * 60 + 30
 SESSION_CLOSE_MINUTE = 16 * 60
 BACKFILL_TIMEOUT = 90.0
@@ -600,7 +604,7 @@ class _Sym:
     close_delays: list[float] = field(default_factory=list)
     last_forming_line: float = -math.inf
     live_since: float | None = None  # server time when the first backfill ended
-    updates_seen: int = 0  # live updates received, whatever their date
+    last_update_at: float | None = None  # server time of the last live update, whatever its date
     no_data_noted: bool = False  # the "no data received" line was printed
 
     @property
@@ -650,15 +654,26 @@ def _session_start(day: date) -> int:
     return int(datetime(day.year, day.month, day.day, 9, 30, tzinfo=NY).timestamp())
 
 
-def _session_exposure(since: float, now: float) -> float:
+def _session_exposure(since: float, now: float, outages: Sequence[Sequence[Any]] = ()) -> float:
     """Seconds of the regular session (weekday, 09:30 to 16:00 New York, server time) that lie
-    between `since` and `now` on the New York date of `now`."""
+    between `since` and `now` on the New York date of `now`, less the time of any outage
+    (`[start, end, kind]`, end `inf` while open) inside that window."""
     day = _ny(now).date()
     if day.weekday() >= 5:
         return 0.0
     start = max(since, _session_start(day))
     end = min(now, _session_end(day))
-    return max(0.0, end - start)
+    if end <= start:
+        return 0.0
+    spans = sorted((max(o[0], start), min(o[1], end)) for o in outages if o[0] < end and o[1] > start)
+    down = 0.0
+    reached = start
+    for begin, finish in spans:
+        begin = max(begin, reached)
+        if finish > begin:
+            down += finish - begin
+            reached = finish
+    return (end - start) - down
 
 
 def _header_only(path: Path) -> bool:
@@ -1026,10 +1041,19 @@ class _Watcher:
     def _no_data(self, sym: _Sym) -> bool:
         """True when `sym` is streaming but has received no bar of today's session and no live update
         for at least `NO_DATA_AFTER` s of the regular session since its backfill ended (the clock
-        starts at 09:30 for a pre-open start). It is the state now: data arriving later clears it."""
-        if sym.phase != "live" or sym.live_since is None or sym.newest is not None or sym.updates_seen:
+        starts at 09:30 for a pre-open start). It is the state now: data arriving later clears it.
+
+        The clock does not run while the connection is lost or a data farm is broken, and nothing is
+        declared while such an outage is open: an outage is not a missing subscription. Updates of
+        an earlier date are not data of today, but while any update keeps arriving the stream is alive
+        and the symbol is not declared: the 120 s run from the last update (of any date), so a stream
+        that goes silent without ever showing a bar of today is declared after 120 s."""
+        if sym.phase != "live" or sym.live_since is None or sym.newest is not None:
             return False
-        return _session_exposure(sym.live_since, self.server_now()) >= NO_DATA_AFTER
+        if self._down():
+            return False
+        since = max(sym.live_since, sym.last_update_at or 0.0)
+        return _session_exposure(since, self.server_now(), self.outages) >= NO_DATA_AFTER
 
     def _check_no_data(self, sym: _Sym) -> None:
         """Say once, as soon as it is established, that `sym` has received no data."""
@@ -1150,7 +1174,7 @@ class _Watcher:
 
     def _update(self, sym: _Sym, raw: events.HistoricalBar) -> None:
         now = self.server_now()
-        sym.updates_seen += 1
+        sym.last_update_at = now
         bar = self._convert(sym, raw)
         if bar is None:
             return
@@ -1488,11 +1512,12 @@ def run_watch(
     Returns the exit code.
     """
     say = _Say(out)
+    labels = dict(_LABELS)  # a mid-run not-paper rejection replaces the not-paper label
     try:
         recorder = recorder_factory(args)
     except (OSError, PathRefused) as exc:
         say(f"Cannot start the session recording: {type(exc).__name__}: {exc}")
-        say(f"Result: {_LABELS[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
+        say(f"Result: {labels[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
         return EXIT_REFUSED
     files = LiveFiles(args.out, say)
     conn: IbConnection | None = None
@@ -1529,7 +1554,9 @@ def run_watch(
                 verified_at_start = True  # closed or lost, no failing list: the watch's own outcome stands
             else:
                 # the account list failed after READY: whatever the watch saw, this is the result
-                say(mid_run_not_paper_line(conn))
+                mid_line = mid_run_not_paper_line(conn)
+                say(mid_line)
+                labels[EXIT_NOT_PAPER] = mid_run_not_paper_label(mid_line)
                 code = EXIT_NOT_PAPER
                 advice.clear()
                 said_not_paper = True
@@ -1542,6 +1569,7 @@ def run_watch(
             if verified and not said_not_paper and conn.paper_rejected:
                 # a failing list delivered while close() joined the reader: this is the result
                 say(NOT_PAPER_MID_LINE)
+                labels[EXIT_NOT_PAPER] = NOT_PAPER_MID_LABEL
                 code = EXIT_NOT_PAPER
                 advice.clear()
                 verified_at_start = False
@@ -1567,7 +1595,7 @@ def run_watch(
                 say(f"  line {finding.line}: {finding.reason}")
             if len(findings) > SHOWN_FINDINGS:
                 say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
-    say(f"Result: {_LABELS[code]} (exit {code})"
+    say(f"Result: {labels[code]} (exit {code})"
         + ("; paper account verified at start" if verified_at_start else ""))
     say(PATHS_NOTE)
     return code
