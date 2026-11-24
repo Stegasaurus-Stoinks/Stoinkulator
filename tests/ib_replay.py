@@ -19,9 +19,9 @@ answer left raises `ReplayExhausted` on the calling thread, so an unexpected ext
 request fails the test that made it. Callbacks before the first request are the
 handshake (`handshake_kwargs`); later callbacks that belong to no request (1100,
 1102, `currentTime` without a request, errors with id -1) are `Recording.unsolicited`
-and are pushed by the test when it wants them (`push_unsolicited`); data farm messages
-(codes 2100 to 2199, id -1) are the exception, they are taken from anywhere in the file by
-`handshake_kwargs` and never pushed.
+and are pushed by the test when it wants them (`push_unsolicited`); data farm OK and
+inactive notices (codes 2104, 2106, 2107, 2108, 2158, id -1) are the exception, they are
+taken from anywhere in the file by `handshake_kwargs` and never pushed.
 
 Unreplayable requests. A redaction marker line, a torn last line or a value that was
 redacted inside a number or a bar (a conId, a price, a volume) does not make the
@@ -363,13 +363,24 @@ def is_farm_message(ev: RecordedEvent) -> bool:
     )
 
 
+FARM_OK_CODES = frozenset({2104, 2106, 2107, 2108, 2158})  # farm up, or inactive but available
+
+
+def is_late_farm_message(ev: RecordedEvent) -> bool:
+    """A farm-OK or farm-inactive notice (see `FARM_OK_CODES`), wherever it stands in the file.
+    Farm-BROKEN notices (2103, 2105, 2110, 2157, any other 21xx) are not: they are events of
+    the session, replayed in their recorded order by `push_unsolicited`."""
+    return is_farm_message(ev) and ev.args[2] in FARM_OK_CODES
+
+
 def handshake_kwargs(rec: Recording) -> dict[str, Any]:
     """`FakeIbClient` constructor arguments that reproduce the recorded handshake.
 
-    Farm messages are taken from anywhere in the file, in file order: in a real session
-    one that arrives after the first request is filed as unsolicited, not as handshake,
-    and the replayed connection would otherwise only see it after `push_unsolicited`
-    (which skips them, so none is delivered twice)."""
+    Every farm message of the handshake is kept. Farm-OK and farm-inactive notices are also
+    taken from after the first request, in file order: in a real session one that arrives
+    late is filed as unsolicited, and the replayed connection would otherwise only see it
+    after `push_unsolicited` (which skips them, so none is delivered twice). Farm-broken
+    notices after the first request stay unsolicited, so a replay never starts in an outage."""
     kwargs: dict[str, Any] = {}
     for ev in rec.handshake:
         if ev.name == "nextValidId" and ev.args:
@@ -378,7 +389,8 @@ def handshake_kwargs(rec: Recording) -> dict[str, Any]:
             kwargs["managed_accounts"] = ev.args[0]
     farm = [
         (ev.args[2], ev.args[3]) for ev in sorted(
-            (e for e in (*rec.handshake, *rec.unsolicited) if is_farm_message(e)),
+            [*(e for e in rec.handshake if is_farm_message(e)),
+             *(e for e in rec.unsolicited if is_late_farm_message(e))],
             key=lambda e: e.line,
         )
     ]
@@ -449,8 +461,9 @@ def install(fake: FakeIbClient, rec: Recording) -> Replay:
 def push_unsolicited(fake: FakeIbClient, rec: Recording) -> int:
     """Queue the callbacks that belonged to no request (1100, 1102...); returns how many.
 
-    Farm messages are not queued: `handshake_kwargs` already hands them to the fake."""
-    pushed = [ev for ev in rec.unsolicited if not is_farm_message(ev)]
+    Farm-OK and farm-inactive notices are not queued: `handshake_kwargs` already hands them
+    to the fake. Farm-broken notices are, in their recorded order."""
+    pushed = [ev for ev in rec.unsolicited if not is_late_farm_message(ev)]
     for ev in pushed:
         fake.push(ev.name, *decode_callback(ev))
     return len(pushed)

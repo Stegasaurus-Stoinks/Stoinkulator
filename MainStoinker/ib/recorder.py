@@ -87,8 +87,10 @@ then, in order:
    IB's id shapes (`U`, `DU`, `F`, `DF`, `I`, `DI` plus seven digits, longer for
    some institutional ids; `DU`, one more upper-case letter and six digits, the
    three-letter form of some paper accounts; a sub-account suffix after a dot goes with
-   the digits when it is a number). The three letters are taken whole, so no letter of
-   an id is left beside its placeholder. It over-redacts on purpose: any token of one to
+   the digits when it is a number). The three letters are taken whole; once an id is
+   known (learned from `managedAccounts`, or from a pattern hit), its letters are also
+   removed when up to three separator characters stand between them and the digits, so
+   no letter of an id is left beside its placeholder. It over-redacts on purpose: any token of one to
    three letters and five or more digits (an ISIN, a version string such as a letter, a
    space and a dotted number, a time such as `at 14:30:00`). There are three exemptions, all
    narrow. (a) An option symbol in OCC shape, `_OCC`: an optional root of up to six
@@ -98,10 +100,10 @@ then, in order:
    take the last two letters of CLOSED, the semicolon and the next date for an id,
    learn the date, and remove it from every later string, so a normal session would
    no longer replay. A hit is therefore left alone, and never learned, when its letters
-   are immediately preceded by another ASCII letter (the tail of a longer word; a letter
-   outside ASCII, and the end of a placeholder such as `IP-REDACTED`, are not a word), or
-   are three (the pattern's longest prefix, which then begins at the word's third letter from
-   the end), its first
+   are immediately preceded by another ASCII letter (the tail of a longer word of four or
+   more letters; a letter outside ASCII, and the end of a placeholder such as
+   `IP-REDACTED`, are not a word; the pattern takes up to three letters, so a word of three
+   letters or fewer before a date is never exempt), its first
    run of digits is exactly eight and a valid calendar date `YYYYMMDD` (year 1990 to
    2100), and the hit goes on with nothing or with a colon and digits only. What this
    loosens: cold only, an id of eight digits that happen to form a valid date AND is
@@ -266,6 +268,9 @@ _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]++(?:@[\w.+-]*+)+")
 _EXCHANGE_TOKEN = re.compile(r"[A-Z0-9]{1,6}@[A-Z]+")  # AAPL@SMART in IB's error texts, not an address
 _ISO_TIME = re.compile(r"T\d\d:\d\d:\d\d(?:\.\d+)?(?:[+-]\d\d(?::?\d\d)?)?")
 _GAP = r"[^A-Za-z0-9]{0,2}"  # what a learned digit run tolerates between its digits
+# what a learned id tolerates between its letters and its digits (as `ACCOUNT_PATTERN` does)
+_LETTER_GAP = r"(?:\\[\"']|[^A-Za-z0-9]){0,3}"
+_LETTERS_DIGITS = re.compile(r"([A-Za-z]{1,3})(\d{5,})(.*)", re.DOTALL)
 _IPV4 = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.]*\d)")
 _IPV4_MAPPED = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}\d{1,3}(?:\.\d{1,3}){3}(?!\d)")
 _IPV6 = re.compile(
@@ -354,20 +359,19 @@ def _glued_date(text: str, m: re.Match[str]) -> bool:
     followed by a date, as in `CLOSED;<date>:0400-...` of IB's trading hours.
 
     All of: the hit's letters are the tail of a longer word (they are immediately preceded by
-    another ASCII letter, which is not the end of a placeholder such as `IP-REDACTED`, or
-    they are three letters, the pattern's longest prefix: it then starts a letter earlier than
-    the two-letter tail did); its first run of digits is exactly eight and a valid date; what
-    follows that run inside the hit is nothing or a colon and more digits (a time)."""
+    another ASCII letter, which is not the end of a placeholder such as `IP-REDACTED`;
+    the pattern takes up to three letters, so only a word of four or more qualifies); its
+    first run of digits is exactly eight and a valid date; what follows that run inside the
+    hit is nothing or a colon and more digits (a time)."""
     start = m.start()
     hit = m.group(0)
     count = len(re.match(r"[A-Za-z]*", hit).group(0))  # type: ignore[union-attr]
     # an id glued to a placeholder (`IP-REDACTED<id>`): the placeholder's last letters are no word
     if any(text.startswith("REDACTED", p - 8) for p in range(max(start, 8), start + count + 1)):
         return False
-    if count < 3:
-        before = text[start - 1] if start > 0 else ""
-        if not (before.isascii() and before.isalpha()):
-            return False
+    before = text[start - 1] if start > 0 else ""
+    if not (before.isascii() and before.isalpha()):
+        return False
     lead = re.search(r"\d+", hit)
     if lead is None or not _is_date(lead.group(0)):
         return False
@@ -464,6 +468,9 @@ def _id_regex(token: str) -> str:
     of any kind between its digits; an id with letters is matched as written."""
     if len(token) >= 5 and token.isascii() and token.isdigit():
         return _GAP.join(re.escape(c) for c in token)
+    head = _LETTERS_DIGITS.match(token)
+    if head is not None:  # letters then a digit run: up to three separators may stand between them
+        return re.escape(head.group(1)) + _LETTER_GAP + _id_regex(head.group(2)) + re.escape(head.group(3))
     return re.escape(token)
 
 
@@ -1299,7 +1306,9 @@ def scan_recording(path: str | Path, words: Iterable[str] = ()) -> list[Finding]
     held against the name of an `EWrapper` / `EClient` method); any line that is not
     valid JSON. The value of a `tickString` of type 45 (an epoch in seconds) or 48 (real-time
     volume, `price;size;time;volume;vwap;flag`, numbers only) is a known numeric shape and is
-    held against `words` only, so market data does not drown the findings; any other
+    held against `words` only, so market data does not drown the findings (a bare digit run
+    inside such a value, as a size or a volume, is therefore NOT flagged; a letter-prefixed
+    id shape makes the value an unknown shape, which is scanned); any other
     shape of those, and every other tick type, is scanned as text. It fails closed: a file
     that cannot be read, is not UTF-8, is empty or
     has no session header is itself a finding.

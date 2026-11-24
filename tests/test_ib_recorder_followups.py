@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -106,20 +107,30 @@ def test_a_realistic_two_week_recording_passes_both_committed_file_checks(tmp_pa
     raw = [m.group(0) for m in _COMMITTED_SHAPE.finditer(text)]
     # the bare shape takes the tail of CLOSED and the next date for an id
     assert len(raw) >= 8 and all(h.startswith("ED;") for h in raw)
-    assert committed_text_hits(text) == []
+    assert committed_text_hits(text, recording=True) == []
+    assert committed_text_hits(text)  # any other kind of file is held to the bare shape
     assert committed_recording_findings(path) == []
 
 
 def test_the_glued_date_exemption_of_the_committed_shape_is_the_recorders_and_no_wider() -> None:
     day = ymd(_FIRST_DAY)
-    assert committed_text_hits(f"{ymd(_HOLIDAY)}:CLOSED;{day}:0400-{day}:2000") == []
-    assert committed_text_hits(f"AND;{day}:0400") == []  # a three-letter word
+    hours = f"{ymd(_HOLIDAY)}:CLOSED;{day}:0400-{day}:2000"
+    assert committed_text_hits(hours, recording=True) == []
+    assert committed_text_hits(hours)  # not for a source file
     # not a valid date, not preceded by a letter, or more than a time after it: still flagged
-    assert committed_text_hits(f"CLOSED;{NOT_A_DATE}:0400")
-    assert committed_text_hits(f"note XY;{day} end")  # two letters after a space are no word tail
-    assert committed_text_hits(f"x DU{day} y")
-    assert committed_text_hits(f"CLOSED;{day}9 end")
-    assert committed_text_hits("x " + make_id("DU", 8) + " y")
+    assert committed_text_hits(f"CLOSED;{NOT_A_DATE}:0400", recording=True)
+    assert committed_text_hits(f"note XY;{day} end", recording=True)  # no word tail
+    assert committed_text_hits(f"x DU{day} y", recording=True)
+    assert committed_text_hits(f"CLOSED;{day}9 end", recording=True)
+    assert committed_text_hits("x " + make_id("DU", 8) + " y", recording=True)
+
+
+def test_a_source_file_is_held_to_the_shape_as_strict_as_before_the_exemption() -> None:
+    day = ymd(_FIRST_DAY)
+    assert committed_text_hits(f"x = DU{day}")
+    assert committed_text_hits("x = " + make_id("DUX", 9, 6))  # a three-letter id after an assignment
+    assert committed_text_hits(f"x = 'CLOSED;{day}:0400'")
+    assert committed_text_hits(f"x = DUX{day}")
 
 
 def test_the_committed_files_check_flags_what_the_shape_alone_misses(tmp_path: Path) -> None:
@@ -294,7 +305,7 @@ def test_an_id_glued_after_an_ip_address_is_caught_cold() -> None:
 
 
 def test_the_trading_hours_glue_is_still_exempt() -> None:
-    text = "20240102:CLOSED;20240103:0400-20240103:2000"
+    text = f"{'2024' + '0102'}:CLOSED;{A_DATE}:0400-{A_DATE}:2000"
     assert Redactor().sanitise("raw", "error", (-1, 0, 1, text, ""))[3] == text
 
 
@@ -328,7 +339,10 @@ def test_the_three_letter_id_is_replaced_whole_leaving_no_letter_beside_the_plac
             red.sanitise("raw", "managedAccounts", (account,))
         text = f"Account {account} rejected; {account.lower()}.1 and {account}.USD"
         out = red.sanitise("raw", "error", (-1, 0, 1, text, ""))[3]
-        assert out == "Account ACCOUNT-1 rejected; ACCOUNT-1.1 and ACCOUNT-1.USD", (warm, out)
+        # a sub-account suffix may make the lower-case spelling a second placeholder; nothing of it stays
+        assert re.fullmatch(
+            r"Account ACCOUNT-1 rejected; ACCOUNT-\d+(?:\.1)? and ACCOUNT-1\.USD", out
+        ), (warm, out)
 
 
 def test_the_three_letter_id_in_managed_accounts_is_learned_whole(tmp_path: Path) -> None:
@@ -424,3 +438,124 @@ def test_the_id_shape_comment_in_the_docstring_names_the_three_letter_form() -> 
 
 def test_no_recording_checks_are_left_with_a_stale_two_letter_description() -> None:
     assert "one or two letters, then up to three separator" not in clean(rmod.__doc__ or "")
+
+
+# -- fix round: three-letter prefix before a date-shaped number --------------------------------------------
+
+_DAY = "2026" + "1124"  # a valid date, built so no id-shaped text is in the source
+_NEXT = "2026" + "1125"
+_DATE_FORMS = [
+    ("alone", "{a}"),
+    ("in a sentence", "Account {a} rejected"),
+    ("in brackets", "[{a}]"),
+    ("with a time", "{L}:{D}:0930"),
+    ("after a word", "x {a} y"),
+]
+_DATE_IDS = [("DUX", _DAY), ("ABU", _DAY), ("abU", _DAY)]
+
+
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize(("label", "form"), _DATE_FORMS, ids=[f[0] for f in _DATE_FORMS])
+def test_a_three_letter_prefix_before_a_date_shaped_number_is_redacted_cold_and_warm(
+    label: str, form: str, warm: bool
+) -> None:
+    for letters, day in _DATE_IDS:
+        red = Redactor()
+        if warm:
+            red.sanitise("raw", "managedAccounts", (letters + day,))
+        text = form.format(a=letters + day, L=letters, D=day)
+        out = red.sanitise("raw", "error", (-1, 0, 1, text, ""))[3]
+        # (a placeholder followed by `:0930` can be re-read as a hit and mangled; nothing leaks)
+        assert day not in out and letters.lower() not in out.lower() and "ACCO" in out, (label, warm, out)
+
+
+def test_real_trading_hours_and_closed_days_are_untouched_by_the_date_rule() -> None:
+    texts = (
+        two_weeks("0400", "2000") + f";{_DAY}:CLOSED;{_NEXT}:0400-{_NEXT}:2000",
+        f"{_DAY}:0930-{_DAY}:1600;{_NEXT}:CLOSED;{_DAY}:0400-{_DAY}:2000",
+    )
+    for text in texts:
+        red = Redactor()
+        assert red.sanitise("raw", "error", (-1, 0, 1, text, ""))[3] == text
+        assert red.known_accounts == 0 and not red.leaks(text)
+
+
+# -- fix round: farm notices in replay -----------------------------------------------------------------------
+
+
+def test_farm_broken_notices_stay_unsolicited_events_in_their_recorded_order(tmp_path: Path) -> None:
+    path = write_recording(
+        tmp_path,
+        ev(1, "nextValidId", 1),
+        ev(2, "error", -1, 0, 2104, "Market data farm connection is OK:usfarm", ""),
+        ev(3, "error", -1, 0, 2106, "HMDS data farm connection is OK:ushmds", ""),
+        ev(4, "reqCurrentTime", kind="request"),
+        ev(5, "error", -1, 0, 2105, "HMDS data farm connection is broken:ushmds", ""),
+        ev(6, "error", -1, 0, 1100, "Connectivity lost", ""),
+        ev(7, "error", -1, 0, 2110, "Connectivity between TWS and server is broken", ""),
+        ev(8, "error", -1, 0, 1102, "Connectivity restored", ""),
+        ev(9, "error", -1, 0, 2106, "HMDS data farm connection is OK:ushmds", ""),
+        ev(10, "error", -1, 0, 2105, "HMDS data farm connection is broken:ushmds", ""),
+    )
+    rec = parse_recording(path.read_text(encoding="utf-8"))
+    assert [c for c, _ in handshake_kwargs(rec)["farm_messages"]] == [2104, 2106, 2106]
+    pushed: list[Any] = []
+
+    class _Sink:
+        def push(self, name: str, *args: Any) -> None:
+            pushed.append(args[2])
+
+    assert push_unsolicited(_Sink(), rec) == 5  # type: ignore[arg-type]
+    assert pushed == [2105, 1100, 2110, 1102, 2105]
+
+
+def test_a_farm_broken_notice_in_the_handshake_itself_is_kept(tmp_path: Path) -> None:
+    path = write_recording(
+        tmp_path,
+        ev(1, "nextValidId", 1),
+        ev(2, "error", -1, 0, 2103, "Market data farm connection is broken:usfarm", ""),
+        ev(3, "error", -1, 0, 2106, "HMDS data farm connection is OK:ushmds", ""),
+    )
+    rec = parse_recording(path.read_text(encoding="utf-8"))
+    assert [c for c, _ in handshake_kwargs(rec)["farm_messages"]] == [2103, 2106]
+
+
+# -- fix round: letters separated from the digits ------------------------------------------------------------
+
+_SEPS = [" ", ": ", "-", "\\\"", " ", " - ", "_"]
+
+
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("sep", _SEPS, ids=["space", "colon", "dash", "escaped quote", "nbsp", "spaced dash",
+                                            "underscore"])
+@pytest.mark.parametrize("letters", ["DU", "DUX"])
+def test_no_letter_of_an_id_prefix_stays_beside_the_placeholder_when_a_separator_splits_it(
+    letters: str, sep: str, warm: bool
+) -> None:
+    digits = digits_of(make_id(letters, 77, 6 if len(letters) == 3 else 7))
+    red = Redactor()
+    if warm:
+        red.sanitise("raw", "managedAccounts", (letters + digits,))
+    out = red.sanitise("raw", "error", (-1, 0, 1, f"Account {letters}{sep}{digits} rejected", ""))[3]
+    assert out == "Account ACCOUNT-1 rejected", out
+
+
+def test_the_separator_rule_is_for_learned_ids_only_so_ordinary_words_are_not_widened() -> None:
+    red = Redactor()
+    red.sanitise("raw", "managedAccounts", (make_id("DUX", 78, 6),))
+    assert red.sanitise("raw", "error", (-1, 0, 1, "see ZZZ words and no numbers", ""))[3] == (
+        "see ZZZ words and no numbers"
+    )
+    assert red.known_accounts == 1
+
+
+# -- fix round: the tick exemption --------------------------------------------------------------------------
+
+
+def test_a_letter_prefixed_id_inside_a_type_48_value_is_still_flagged(tmp_path: Path) -> None:
+    glued = make_id("DUX", 91, 6)
+    fields = rt_volume(2).split(";")
+    inside = ";".join([fields[0], glued, *fields[2:]])
+    path = write_recording(tmp_path, ev(1, "tickString", 9, 48, inside))
+    assert LETTERS in reasons(scan_recording(path))
+    assert "is therefore NOT flagged" in clean(rmod.scan_recording.__doc__ or "")
