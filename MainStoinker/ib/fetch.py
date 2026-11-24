@@ -37,6 +37,18 @@ then `Manifest.record(day, "ok", ...)` and `save_manifest`. A crash between the 
 leaves bars on disk and the day pending; the next run fetches it again and the merge
 gives the same file.
 
+Provisional days (issue 174)
+----------------------------
+IB's history of a day is not final for hours after the close (`history.DAY_FINAL_AT`
+has the evidence). A day fetched before `day_final_utc(day)` is written and recorded
+`ok` as usual, and counts as provisional (`Manifest.is_provisional`, derived from the
+recorded fetch time, so old manifests need no migration). A later run whose server
+time is at or after that moment fetches it again and replaces its rows; one before
+that moment does not (it could not get a better answer). The refetch reports how many
+minutes changed. A refetch that returns fewer bars than are stored keeps the stored day
+(never loses data), records `refetch_fewer` and reports it; a refetch that fails keeps
+the stored day and its record, so it is tried again next run.
+
 Outcomes of one day
 -------------------
 ==================================================== ===========================================
@@ -45,9 +57,10 @@ what IB did                                          what is recorded
 end marker, bars of the day                          `ok` (also with fewer than 390 bars: listed in
                                                      `SymbolResult.short_days`, never fails the run)
 end marker, no bar of the requested day (holiday:    `no_data` (complete answer), but only when the
-IB returns the previous session)                     session closed at least `settle_seconds` before
-                                                     the server time; sooner: `failed` ("no data
-                                                     yet"), so the next run asks again
+IB returns the previous session)                     server time is at or after the day's final time
+                                                     (`day_final_utc`, 06:00 New York next day);
+                                                     sooner: `failed` ("no data yet"), so the next
+                                                     run asks again
 error 162 with "no data" text (`NO_DATA_PHRASES`),   as the line above
 no bars
 error 162 with "pacing violation" text               wait `pacing_backoff` seconds (sliced),
@@ -113,6 +126,7 @@ from MainStoinker.ib.bars import BadBar, bar_from_ib
 from MainStoinker.ib.connection import ConnState, IbConnection, NotConnected
 from MainStoinker.ib.history import (
     DATA_ZONE,
+    DAY_FINAL_AT,
     DEFAULT_BAR_SIZE,
     DEFAULT_WHAT_TO_SHOW,
     GAP_PARTIAL,
@@ -124,6 +138,7 @@ from MainStoinker.ib.history import (
     Manifest,
     Pacer,
     SentTooEarly,
+    day_final_utc,
     day_request,
     filter_day,
     format_end_date_time,
@@ -168,7 +183,6 @@ DEFAULT_SERVER_TIME_TIMEOUT = 10.0
 DEFAULT_FARM_TIMEOUT = 30.0
 DEFAULT_PACING_BACKOFF = 600.0
 DEFAULT_PAUSE_SLICE = 5.0
-DEFAULT_SETTLE_SECONDS = 3 * 3600.0
 MAX_RECORDED_ERRORS = 1000
 
 
@@ -234,7 +248,7 @@ class DayFailure:
     code: int | None
     text: str
     # reason: error, timeout, pacing, data_lost, bad_bar, invalid_data, lost, closed, disk,
-    # no_data_yet (closed less than `settle_seconds` ago), damaged_file (month file refused or
+    # no_data_yet (no bars, and the day is not final yet), damaged_file (month file refused or
     # not mergeable; the symbol stops), no_data_but_bars_on_disk (IB empty, bars already stored)
     reason: str
 
@@ -294,6 +308,14 @@ class SymbolResult:
     # days of the range this run was to fetch and has not asked IB for (yet): the gap report
     # calls such a day without bars `not_fetched`, never `no_data`; a resumed run fetches them
     not_requested: set[date] = field(default_factory=set)
+    # days of the range that are stored but provisional (fetched before the day is final),
+    # after this run; a later run at or after the day's final time fetches them again
+    provisional_days: list[date] = field(default_factory=list)
+    # days of this run that were fetched again (stored before, provisional): day -> rows changed
+    refetched: dict[date, int] = field(default_factory=dict)
+    # refetched days whose new answer had fewer bars than the stored day: day -> (stored, new);
+    # the stored day was kept
+    refetch_kept: dict[date, tuple[int, int]] = field(default_factory=dict)
 
     @property
     def remaining(self) -> int:
@@ -455,6 +477,17 @@ def merge_day(path: Path, day: date, new: pd.DataFrame) -> tuple[pd.DataFrame, b
     return merged, not _same_rows(existing, merged)
 
 
+def _changed_rows(old: pd.DataFrame, new: pd.DataFrame) -> int:
+    """How many minutes differ between two frames of one day: changed values, added or dropped rows."""
+    def rows(frame: pd.DataFrame) -> dict[object, tuple[object, ...]]:
+        return {t: tuple(v) for t, v in zip(
+            frame["date"].tolist(), frame[["open", "high", "low", "close", "volume"]].itertuples(
+                index=False, name=None), strict=True)}
+
+    a, b = rows(old), rows(new)
+    return sum(1 for key in a.keys() | b.keys() if a.get(key) != b.get(key))
+
+
 def _with_ib_text(ib_text: str, explanation: str) -> str:
     """IB's own text (if any) followed by our explanation."""
     return f"{ib_text}; {explanation}" if ib_text else explanation
@@ -470,9 +503,8 @@ class _Run:
         self, md: IbMarketData, connection: IbConnection, out_dir: Path, zone: str,
         clock: Callable[[], float], sleep: Callable[[float], None], on_progress: Progress | None,
         pacer: Pacer, request_timeout: float, resolve_timeout: float, pacing_backoff: float,
-        pause_slice: float, settle_seconds: float = DEFAULT_SETTLE_SECONDS,
+        pause_slice: float,
     ) -> None:
-        self.settle_seconds = settle_seconds
         self.md = md
         self.conn = connection
         self.out_dir = out_dir
@@ -492,6 +524,8 @@ class _Run:
         self.days: list[date] = []
         self.current: _Symbol | None = None
         self.checked_months: set[Path] = set()  # month files read and found usable in this run
+        self.manifests: dict[str, Manifest] = {}  # per symbol that got as far as its manifest
+        self.extra: dict[str, object] = {}  # what the day just settled adds to its progress line
 
     # -- helpers ----------------------------------------------------------------
 
@@ -641,7 +675,12 @@ class _Run:
             return
         sym = _Symbol(res, manifest, mfile, info)
         self.current = sym
-        pending = manifest.pending(self.days)
+        self.manifests[symbol] = manifest
+        assert self.server_now is not None
+        # unknown and failed days, plus provisional days that are final by now (refetched);
+        # a provisional day that is not final yet is left alone
+        wanted = set(manifest.pending(self.days)) | set(manifest.refetch_due(self.days, self.server_now))
+        pending = [d for d in self.days if d in wanted]
         res.planned = len(pending)
         res.not_requested = set(pending)
         res.already_done = len(self.days) - len(pending)
@@ -752,9 +791,14 @@ class _Run:
         else:
             res.failed += 1
             res.failures.append(DayFailure(res.symbol, day, code, text, reason))
-        self.emit("day", f"{res.symbol} {day}: {status}" + (f" ({bars} bars)" if bars else "")
+        notes = [f"{bars} bars"] if bars else []
+        notes += [str(n) for n in self.extra.get("notes", [])]  # type: ignore[attr-defined]
+        self.emit("day", f"{res.symbol} {day}: {status}" + (f" ({', '.join(notes)})" if notes else "")
                   + (f", {code}: {text}" if status == STATUS_FAILED else ""),
-                  res.symbol, day, status=status, bars=bars, code=code, text=text, reason=reason)
+                  res.symbol, day, status=status, bars=bars, code=code, text=text, reason=reason,
+                  provisional=bool(self.extra.get("provisional")),
+                  refetch_changed=self.extra.get("changed"))
+        self.extra = {}
         if answer.stop is not None:
             raise answer.stop
         if reason == "damaged_file":
@@ -787,16 +831,31 @@ class _Run:
             return 0
 
     def _too_soon(self, day: date) -> str | None:
-        """The failure text when `day`'s session closed less than `settle_seconds` ago, else None."""
-        closed_for = (self.fetched_utc() - session_close_utc(day)).total_seconds()
-        if closed_for >= self.settle_seconds:
+        """The failure text when `day` is not final yet (so "no bars" proves nothing), else None."""
+        if self.fetched_utc() >= day_final_utc(day):
             return None
-        return (f"no data yet (session closed less than {self.settle_seconds / 60:g} minutes ago)")
+        return (f"no data yet (the day's bars are not final until {DAY_FINAL_AT:%H:%M} New York "
+                "time on the next day)")
+
+    def _day_rows(self, path: Path, day: date) -> pd.DataFrame | None:
+        """The stored rows of `day` in the month file at `path` (None: none, or unreadable)."""
+        if not path.is_file():
+            return None
+        try:
+            frame = read_offline_bars(path)
+            rows = frame.loc[frame["date"].dt.date == day]
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        return None if rows.empty else rows.reset_index(drop=True)
 
     def _record(self, sym: _Symbol, day: date, status: str, *, bars: int = 0,
-                code: int | None = None, text: str = "") -> None:
+                code: int | None = None, text: str = "", refetch_fewer: int = 0) -> None:
+        prior = sym.manifest.days.get(day.isoformat())
+        if status == STATUS_FAILED and prior is not None and prior.status == STATUS_OK:
+            return  # a refetch that failed: the stored day and its record stay (it is retried next run)
         sym.manifest.record(day, status, bars=bars, error_code=code, error_text=text,
-                            fetched_utc=self.fetched_utc(), complete_answer=status == STATUS_NO_DATA)
+                            fetched_utc=self.fetched_utc(), complete_answer=status == STATUS_NO_DATA,
+                            refetch_fewer=refetch_fewer)
         save_manifest(sym.manifest_file, sym.manifest, sleep=self.sleep, clock=self.clock)
 
     def _settle(self, sym: _Symbol, day: date, answer: _Answer) -> tuple[str, int, int | None, str, str]:
@@ -853,6 +912,16 @@ class _Run:
             self._record(sym, day, STATUS_NO_DATA, text=text)
             self._first(sym, day, STATUS_NO_DATA, raw, kept, first)
             return STATUS_NO_DATA, 0, None, text, ""
+        prior = sym.manifest.days.get(day.isoformat())
+        old = self._day_rows(path, day) if prior is not None and prior.status == STATUS_OK else None
+        if old is not None and len(kept) < len(old):
+            # a refetch with fewer bars than are stored: never lose data, keep the stored day
+            self._record(sym, day, STATUS_OK, bars=len(old), refetch_fewer=len(kept))
+            sym.result.refetch_kept[day] = (len(old), len(kept))
+            self.extra = {"notes": [f"stored day kept: the refetch returned only {len(kept)} of "
+                                    f"the {len(old)} stored bars"]}
+            self._first(sym, day, STATUS_OK, raw, kept, first)
+            return STATUS_OK, len(old), None, "", ""
         try:
             merged, changed = merge_day(path, day, kept)
         except (OSError, ValueError, TypeError) as exc:  # second line behind `_month_damage`
@@ -865,6 +934,17 @@ class _Run:
                 return self._fail(sym, day, f"month file {path.name} is damaged: {exc}",
                                   "damaged_file", first, raw)
         self._record(sym, day, STATUS_OK, bars=len(kept))
+        notes: list[str] = []
+        if old is not None:
+            rows_changed = _changed_rows(old, kept)
+            sym.result.refetched[day] = rows_changed
+            notes.append(f"refetched: {rows_changed} row(s) changed")
+            self.extra["changed"] = rows_changed
+        if sym.manifest.is_provisional(day):
+            notes.append("provisional: fetched before the day's bars are final; a run after "
+                         f"{DAY_FINAL_AT:%H:%M} New York next day will refetch")
+            self.extra["provisional"] = True
+        self.extra["notes"] = notes
         self._first(sym, day, STATUS_OK, raw, kept, first)
         return STATUS_OK, len(kept), None, "", ""
 
@@ -912,8 +992,11 @@ class _Run:
                     bars = read_symbol_bars(self.out_dir, symbol)
                 except FileNotFoundError:
                     bars = _minute_frame([])
+                manifest = self.manifests.get(symbol)
+                res.provisional_days = [] if manifest is None else manifest.provisional(self.days)
                 rows = gap_report(self.days, bars, data_zone=self.zone,
-                                  not_requested=res.not_requested)
+                                  not_requested=res.not_requested,
+                                  provisional=set(res.provisional_days))
                 res.gaps = rows
                 res.short_days = [(r.day, r.present, r.status) for r in rows
                                   if r.status in (GAP_SHORT, GAP_PARTIAL)]
@@ -968,7 +1051,6 @@ def fetch(
     farm_timeout: float = DEFAULT_FARM_TIMEOUT,
     pacing_backoff: float = DEFAULT_PACING_BACKOFF,
     pause_slice: float = DEFAULT_PAUSE_SLICE,
-    settle_seconds: float = DEFAULT_SETTLE_SECONDS,
 ) -> FetchResult:
     """Download the 1-minute regular-hours bars of `symbols` for `start` to `end` into `out_dir`.
 
@@ -978,9 +1060,11 @@ def fetch(
     the data time zone (default New York). `pacer` defaults to one `Pacer(clock)` with
     IB's limits; it is the only pacer of the run. `pacing_backoff` is the wait after a
     first pacing violation, `pause_slice` the longest single sleep inside any wait, so
-    a lost connection is noticed. `settle_seconds` (default 3 hours): a day without bars
-    counts as `no_data` only when its session closed at least that long before the
-    server time, else it is `failed` and retried by the next run. Returns the `FetchResult`; it raises only
+    a lost connection is noticed. A day fetched before `day_final_utc(day)` (06:00 New York
+    on the next calendar day, `DAY_FINAL_AT`) is stored but provisional and fetched again by
+    a later run that is at or after that time; a day without bars counts as `no_data` only
+    when the server time is at or after that time, else it is `failed` and retried by the
+    next run. Returns the `FetchResult`; it raises only
     `FetchSetupError` (bad arguments or layout, before anything is sent) and whatever a
     broken `on_progress` raises. Never raises for what IB does.
     """
@@ -1001,12 +1085,9 @@ def fetch(
                          ("pacing_backoff", pacing_backoff), ("pause_slice", pause_slice)):
         if isinstance(value, bool) or not isinstance(value, int | float) or not 0 < value < float("inf"):
             raise FetchSetupError(f"{label} must be a finite number above 0, got {value!r}")
-    if (isinstance(settle_seconds, bool) or not isinstance(settle_seconds, int | float)
-            or not 0 <= settle_seconds < float("inf")):
-        raise FetchSetupError(f"settle_seconds must be a finite number, at least 0, got {settle_seconds!r}")
     out = Path(out_dir)
     check_layouts(out, names)
     run = _Run(market_data, connection, out, zone, clock, sleep, on_progress,
                pacer if pacer is not None else Pacer(clock), request_timeout, resolve_timeout,
-               pacing_backoff, pause_slice, settle_seconds)
+               pacing_backoff, pause_slice)
     return run.run(names, start, end, server_time_timeout, farm_timeout)
