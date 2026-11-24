@@ -2596,7 +2596,8 @@ def test_a_lost_connection_that_is_restored_is_not_no_data(rig: Rig) -> None:
     rig.server_epoch = PRE_OPEN
     rig.backfills = {"AAPL": [earlier_session()]}
     at_epoch(rig, epd(16, 9, 29), lambda: rig.fakes[-1].drop(1100))
-    at_epoch(rig, epd(16, 9, 34), lambda: rig.fakes[-1].drop(1102), ready=lambda: "connectivity LOST" in rig.text)
+    at_epoch(rig, epd(16, 9, 34), lambda: rig.fakes[-1].drop(1102),
+             ready=lambda: "connectivity LOST" in rig.text)
     passes(rig, epd(16, 9, 29, 30), epd(16, 9, 33, 30), 30)  # 09:30 to 09:34 is an outage: no clock
     for secs in (10, 15, 20, 25, 30):
         update_of(rig, "AAPL", epd(16, 9, 34), epd(16, 9, 34, secs))
