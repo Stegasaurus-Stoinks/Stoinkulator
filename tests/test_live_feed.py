@@ -1,6 +1,7 @@
 """LiveBarAligner: minute batches from per-symbol closed bars (pure, time passed in)."""
 from __future__ import annotations
 
+import copy
 import random
 from pathlib import Path
 
@@ -11,7 +12,9 @@ from MainStoinker.engine.feed import COLUMNS, Bar, CsvBarFeed, read_symbol_bars
 from MainStoinker.engine.live_feed import (
     ACCEPTED,
     DEFAULT_ALIGN_WAIT,
+    DEFAULT_MAX_CLOCK_AHEAD,
     LATE,
+    MAX_PLAUSIBLE_EPOCH,
     REFUSED,
     LiveBarAligner,
 )
@@ -82,9 +85,17 @@ def test_late_bar_counted_not_fed() -> None:
 
 def test_late_when_time_passed_even_without_any_bar_for_the_minute() -> None:
     al = LiveBarAligner(["A", "B"])
-    assert al.poll(end(0) + 100) == []  # nothing pending, but minute 0 is now released
-    assert al.bar("A", mk(0)) == LATE
-    assert al.poll(end(0) + 200) == []
+    al.bar("A", mk(5))
+    assert len(al.poll(end(5) + 100)) == 1  # minutes 0 to 4 have no bar at all, and are released too
+    assert al.bar("B", mk(0)) == LATE
+    assert al.poll(end(5) + 200) == []
+
+
+def test_poll_before_the_first_bar_releases_nothing_by_time() -> None:
+    # was: a poll before any bar released minutes by time, so the first bar was late (#205 fix round)
+    al = LiveBarAligner(["A", "B"])
+    assert al.poll(end(0) + 100) == []
+    assert al.bar("A", mk(0)) == ACCEPTED
 
 
 def test_duplicate_and_backwards_bars_refused() -> None:
@@ -94,8 +105,8 @@ def test_duplicate_and_backwards_bars_refused() -> None:
     assert al.bar("A", mk(3, 99)) == REFUSED  # duplicate
     assert al.bar("A", mk(2)) == REFUSED  # backwards
     al.decided("B", minute(5))
-    assert al.bar("B", mk(4)) == REFUSED  # at or before its decided point
-    assert al.refused_counts() == {"A": 2, "B": 1}
+    assert al.bar("B", mk(4)) == ACCEPTED  # before its decided point: no longer refused (#205)
+    assert al.refused_counts() == {"A": 2, "B": 0}
     out = al.poll(end(3))
     assert out == [(first.date, {"A": first})]  # the original bar, not the duplicate
 
@@ -299,3 +310,609 @@ def test_random_interleavings_hold_the_invariants() -> None:
         # every bar given is fed or counted late: nothing vanishes
         assert sum(fed.values()) + sum(late.values()) == len(accepted)
         assert al.pending_minutes() == 0
+
+
+# ---------------------------------------------------------------------------
+# #205: call order, clock guard, date/time agreement
+# ---------------------------------------------------------------------------
+
+def counters_sum(al: LiveBarAligner, symbol: str) -> int:
+    return (
+        al.fed_counts()[symbol]
+        + al.late_counts()[symbol]
+        + al.late_after_decided_counts()[symbol]
+        + al.refused_counts()[symbol]
+    )
+
+
+@pytest.mark.parametrize("decided_first", [True, False], ids=["decided_then_bar", "bar_then_decided"])
+def test_bar_and_decided_for_the_same_minute_in_either_order(decided_first: bool) -> None:
+    al = LiveBarAligner(["A", "B"])
+    a0, b0 = mk(0), mk(0, 20)
+    for symbol, bar in (("A", a0), ("B", b0)):
+        if decided_first:
+            al.decided(symbol, minute(0))
+            assert al.bar(symbol, bar) == ACCEPTED
+        else:
+            assert al.bar(symbol, bar) == ACCEPTED
+            al.decided(symbol, minute(0))
+    assert al.poll(end(0)) == [(a0.date, {"A": a0, "B": b0})]
+    assert al.refused_counts() == {"A": 0, "B": 0}
+    assert al.fed_counts() == {"A": 1, "B": 1}
+
+
+def test_decided_with_the_minute_end_does_not_lose_the_next_bar() -> None:
+    al = LiveBarAligner(["A"])
+    a0, a1 = mk(0), mk(1)
+    assert al.bar("A", a0) == ACCEPTED
+    al.decided("A", end(0))  # the end of minute 0 is the start of minute 1
+    assert al.bar("A", a1) == ACCEPTED  # was refused before #205
+    assert al.poll(end(1)) == [(a0.date, {"A": a0}), (a1.date, {"A": a1})]
+    assert al.refused_counts() == {"A": 0}
+
+
+def test_bar_behind_decided_point_is_late_with_its_own_counter_once_released() -> None:
+    al = LiveBarAligner(["A", "B"])
+    a2 = mk(2)
+    al.bar("A", a2)
+    al.decided("B", minute(2))
+    assert al.poll(end(2)) == [(a2.date, {"A": a2})]  # minutes 0 to 2 are released
+    assert al.bar("B", mk(1)) == LATE  # released, and at or before B's decided point
+    assert al.late_after_decided_counts() == {"A": 0, "B": 1}
+    assert al.late_counts() == {"A": 0, "B": 0}
+    assert al.bar("B", mk(1)) == REFUSED  # now a duplicate
+    assert al.bar("B", mk(3)) == ACCEPTED
+    assert al.fed_counts() == {"A": 1, "B": 0}
+    assert counters_sum(al, "B") == 2  # given 3 bars: late, refused, and one still pending
+    assert al.pending_minutes() == 1
+
+
+def test_bar_behind_decided_point_but_pending_is_fed() -> None:
+    al = LiveBarAligner(["A", "B"])
+    b1 = mk(1, 20)
+    assert al.bar("B", b1) == ACCEPTED
+    al.decided("A", minute(1))
+    a0 = mk(0)
+    assert al.bar("A", a0) == ACCEPTED  # at or before decided, minute 0 not released yet
+    out = al.poll(0)
+    assert out == [(a0.date, {"A": a0}), (b1.date, {"B": b1})]
+
+
+def test_duplicate_and_backwards_still_refused_after_decided() -> None:
+    al = LiveBarAligner(["A"])
+    assert al.bar("A", mk(3)) == ACCEPTED
+    al.decided("A", minute(9))
+    assert al.bar("A", mk(3, 99)) == REFUSED
+    assert al.bar("A", mk(2)) == REFUSED
+    assert al.refused_counts() == {"A": 2}
+    assert al.late_after_decided_counts() == {"A": 0}
+
+
+# --- clock guard -----------------------------------------------------------
+
+def test_default_clock_bound_is_60_plus_wait_plus_20() -> None:
+    assert DEFAULT_MAX_CLOCK_AHEAD == 180
+    assert DEFAULT_MAX_CLOCK_AHEAD == 60 + DEFAULT_ALIGN_WAIT + 20
+    assert MAX_PLAUSIBLE_EPOCH == 1e11
+
+
+IMPOSSIBLE_NOWS = [
+    (BASE + 60) * 1000.0,  # milliseconds
+    BASE * 1_000_000.0,  # microseconds
+    MAX_PLAUSIBLE_EPOCH * 1.5,
+    -1.0,
+    -float(BASE),
+    float("nan"),
+    float("inf"),
+    -float("inf"),
+]
+IMPOSSIBLE_IDS = ["ms", "us", "too_big", "minus_one", "minus_epoch", "nan", "inf", "minus_inf"]
+
+
+@pytest.mark.parametrize("bad_now", IMPOSSIBLE_NOWS, ids=IMPOSSIBLE_IDS)
+def test_first_poll_with_an_impossible_clock_raises_and_leaves_no_trace(bad_now: float) -> None:
+    al = LiveBarAligner(["A"])
+    with pytest.raises(ValueError, match="poll time"):
+        al.poll(bad_now)
+    a0 = mk(0)
+    assert al.bar("A", a0) == ACCEPTED
+    assert al.poll(end(0) + 5) == [(a0.date, {"A": a0})]
+    assert al.clock_clamped_count() == 0
+
+
+@pytest.mark.parametrize("bad_now", IMPOSSIBLE_NOWS, ids=IMPOSSIBLE_IDS)
+def test_poll_refuses_an_impossible_clock_and_changes_nothing(bad_now: float) -> None:
+    al, twin = LiveBarAligner(["A", "B"]), LiveBarAligner(["A", "B"])
+    for each in (al, twin):
+        each.bar("A", mk(0))
+        each.bar("B", mk(0, 20))
+        each.bar("A", mk(1))
+    with pytest.raises(ValueError, match="poll time"):
+        al.poll(bad_now)
+    # the refused call left no trace: the same calls from here give the twin's results
+    assert al.pending_minutes() == twin.pending_minutes()
+    for step in (end(0), end(1), end(1) + 100, end(1) + 200):
+        assert al.poll(step) == twin.poll(step)
+    assert al.bar("B", mk(1, 20)) == twin.bar("B", mk(1, 20)) == LATE
+    assert al.bar("B", mk(5, 20)) == twin.bar("B", mk(5, 20)) == ACCEPTED
+    for name in (
+        "fed_counts",
+        "late_counts",
+        "refused_counts",
+        "released_without_counts",
+        "late_after_decided_counts",
+        "clock_clamped_count",
+        "max_clock_excess",
+    ):
+        assert getattr(al, name)() == getattr(twin, name)()
+
+
+def test_poll_after_a_refused_clock_behaves_as_if_it_never_happened() -> None:
+    al = LiveBarAligner(["A", "B"])
+    a0 = mk(0)
+    al.bar("A", a0)
+    with pytest.raises(ValueError):
+        al.poll((BASE + 60) * 1000)  # the mistake that used to make every later bar late
+    assert al.poll(end(0) + 99) == []
+    b0 = mk(0, 20)
+    assert al.bar("B", b0) == ACCEPTED  # not late
+    assert al.poll(end(0)) == [(a0.date, {"A": a0, "B": b0})]
+
+
+def test_clock_is_clamped_to_the_newest_bar_plus_the_bound() -> None:
+    al = LiveBarAligner(["A", "B"], max_clock_ahead=160)  # the smallest allowed: 60 + align_wait
+    al.bar("A", mk(2))
+    assert al.poll(minute(2) + 159) == []
+    assert len(al.poll(minute(2) + 160)) == 1  # at the clamp: not clamped, released by time
+    assert al.clock_clamped_count() == 0
+    al.bar("A", mk(3))
+    assert len(al.poll(minute(3) + 160.5)) == 1  # 0.5 s over: clamped to +160, minute 3 released
+    assert al.clock_clamped_count() == 1
+    assert al.max_clock_excess() == 0.5
+    al.poll(minute(3) - 500)  # a clock behind the data is neither clamped nor refused
+    assert al.clock_clamped_count() == 1
+
+
+def test_clock_bound_covers_every_legitimate_poll() -> None:
+    # a bar of minute M is closed by time up to 90 s after M + 60; the aligner waits 100 s
+    assert 60 + 90 + 1 < DEFAULT_MAX_CLOCK_AHEAD
+    assert 60 + DEFAULT_ALIGN_WAIT < DEFAULT_MAX_CLOCK_AHEAD
+    al = LiveBarAligner(["A", "B"])
+    a0 = mk(0)
+    al.bar("A", a0)
+    assert al.poll(end(0) + 99) == []
+    assert al.poll(end(0) + 100) == [(a0.date, {"A": a0})]  # released at the exact deadline, not clamped
+    assert al.clock_clamped_count() == 0
+
+
+def test_the_clock_is_not_used_when_all_stopped() -> None:
+    al = LiveBarAligner(["A"])
+    a0 = mk(0)
+    al.bar("A", a0)
+    al.stopped("A")
+    assert al.poll(BASE + 10**6) == [(a0.date, {"A": a0})]
+    assert al.clock_clamped_count() == 0
+
+
+def test_clock_bound_validation() -> None:
+    for bad in (-1, 0, 159.9, float("nan")):
+        with pytest.raises(ValueError):
+            LiveBarAligner(["A"], max_clock_ahead=bad)
+    LiveBarAligner(["A"], max_clock_ahead=160)  # exactly 60 + align_wait
+    with pytest.raises(ValueError):
+        LiveBarAligner(["A"], align_wait=100, max_clock_ahead=159)
+    assert LiveBarAligner(["A"], align_wait=300).poll(0) == []  # the default grows with the wait
+    LiveBarAligner(["A"], align_wait=0, max_clock_ahead=60)
+
+
+# --- the clamp: outages, the close, the morning after, a wrong clock ----------
+
+def test_quiet_stretch_of_15_minutes_never_raises_and_loses_nothing() -> None:
+    symbols = ["A", "B", "C"]
+    al = LiveBarAligner(symbols)
+    got: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for i in range(3):
+        for s in symbols:
+            al.bar(s, mk(i))
+    t = end(2) + 4
+    while t < end(2) + 15 * 60:  # polls every 5 s through the outage
+        got += al.poll(t)
+        t += 5
+    assert [stamp for stamp, _ in got] == [mk(i).date for i in range(3)]
+    assert al.pending_minutes() == 0
+    assert al.clock_clamped_count() > 0  # the driver can see the stretch
+    # the feed comes back with minutes 18 to 20: all accepted and fed, none late
+    for i in (18, 19, 20):
+        for s in symbols:
+            assert al.bar(s, mk(i)) == ACCEPTED
+        got += al.poll(end(i) + 5)
+    assert [stamp for stamp, _ in got][3:] == [mk(i).date for i in (18, 19, 20)]
+    assert al.fed_counts() == dict.fromkeys(symbols, 6)
+    assert al.late_counts() == dict.fromkeys(symbols, 0)
+
+
+def test_quiet_stretch_releases_a_pending_minute_by_time() -> None:
+    al = LiveBarAligner(["A", "B"])
+    a0 = mk(0)
+    al.bar("A", a0)
+    out: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for t in range(end(0) + 5, end(0) + 1200, 5):
+        out += al.poll(t)
+    assert out == [(a0.date, {"A": a0})]
+    assert al.released_without_counts() == {"A": 0, "B": 1}
+
+
+def test_polling_for_30_minutes_after_the_last_bar_of_the_day_never_raises() -> None:
+    al = LiveBarAligner(["A"])
+    al.bar("A", mk(389))  # 15:59
+    out: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for t in range(end(389), end(389) + 30 * 60, 5):
+        out += al.poll(t)
+    assert [stamp for stamp, _ in out] == [mk(389).date]
+    assert al.pending_minutes() == 0
+
+
+def test_backfill_of_yesterday_then_polls_the_next_morning() -> None:
+    symbols = ["A", "B"]
+    al = LiveBarAligner(symbols)
+    day = 86_400
+    for i in range(390):
+        for s in symbols:
+            assert al.bar(s, mk(i)) == ACCEPTED
+    assert len(al.poll(end(389) + 5)) == 390
+    for t in range(BASE + day - 600, BASE + day, 5):  # polls from 09:20 the next morning
+        assert al.poll(t) == []
+    today = Bar(START + pd.Timedelta(days=1), BASE + day, 1, 1, 1, 1, 1)
+    assert al.bar("A", today) == ACCEPTED
+    assert al.bar("B", today) == ACCEPTED
+    assert len(al.poll(BASE + day + 65)) == 1
+    assert al.late_counts() == dict.fromkeys(symbols, 0)
+
+
+def test_wrong_clock_five_hours_fast_before_any_bar_does_nothing_harmful() -> None:
+    al = LiveBarAligner(["A", "B"])
+    now = BASE + 5 * 3600.0
+    assert al.poll(now) == []
+    assert al.poll(now + 5) == []
+    a0, b0 = mk(0), mk(0, 20)
+    assert al.bar("A", a0) == ACCEPTED
+    assert al.bar("B", b0) == ACCEPTED
+    assert al.poll(BASE + 65) == [(a0.date, {"A": a0, "B": b0})]  # fed, in order, once
+    assert al.clock_clamped_count() == 0  # no reference, no clamp
+
+
+def test_wrong_clock_five_hours_fast_throughout_follows_the_documented_rule() -> None:
+    """Clock = newest bar + 180 s: only the newest minute is released by time (180-60-100 = 20 s)."""
+    symbols = ["A", "B"]
+    al = LiveBarAligner(symbols)
+    fast = 5 * 3600.0
+    got: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    a = [mk(i) for i in range(4)]
+    b = [mk(i, 20) for i in range(4)]
+    for i in range(4):
+        assert al.bar("A", a[i]) == ACCEPTED  # A's bar for minute i is first
+        got += al.poll(end(i) + 4 + fast)  # a poll with the wrong clock: releases minute i at once
+        assert al.bar("B", b[i]) == LATE  # so B's is late
+    assert [batch for _, batch in got] == [{"A": a[i]} for i in range(4)]
+    assert [stamp for stamp, _ in got] == sorted({stamp for stamp, _ in got})
+    assert al.late_counts() == {"A": 0, "B": 4}
+    assert al.fed_counts() == {"A": 4, "B": 0}
+    assert al.clock_clamped_count() == 4
+    assert al.max_clock_excess() == pytest.approx(end(3) + 4 + fast - (minute(3) + DEFAULT_MAX_CLOCK_AHEAD))
+    # a bar after the clamped clock's watermark is still accepted
+    assert al.bar("A", mk(5)) == ACCEPTED
+
+
+def test_a_huge_decided_value_does_not_move_the_clamp() -> None:
+    al = LiveBarAligner(["A", "B"])
+    al.bar("A", mk(0))
+    al.decided("B", BASE * 1000)  # bogus
+    out = al.poll(end(0) + 5)
+    assert [list(b) for _, b in out] == [["A"]]  # B decided through "forever": released at once, as before
+    assert al.clock_clamped_count() == 0
+    al.poll(BASE + 10**6)  # a late clock is clamped to the newest BAR, not to the decided value
+    assert al.clock_clamped_count() == 1
+    assert al.max_clock_excess() == pytest.approx(BASE + 10**6 - (minute(0) + DEFAULT_MAX_CLOCK_AHEAD))
+    c = LiveBarAligner(["A", "B"])
+    c.decided("A", BASE * 1000)
+    assert c.poll(BASE + 10**6) == []  # no bar yet: nothing happens, however large decided is
+    assert c.bar("B", mk(0)) == ACCEPTED
+
+
+# --- date and time must agree ----------------------------------------------
+
+def test_bar_whose_date_and_time_disagree_is_refused_without_effect() -> None:
+    al = LiveBarAligner(["A", "B"])
+    good = mk(0)
+    wrong_minute = Bar(good.date + pd.Timedelta(minutes=1), good.time, 1, 1, 1, 1, 1)
+    utc_naive = Bar(good.date + pd.Timedelta(hours=4), good.time, 1, 1, 1, 1, 1)  # UTC, not New York
+    aware = Bar(good.date.tz_localize("America/New_York"), good.time, 1, 1, 1, 1, 1)
+    nat = Bar(pd.NaT, good.time, 1, 1, 1, 1, 1)
+    for bad in (wrong_minute, utc_naive, aware, nat):
+        assert al.bar("A", bad) == REFUSED
+    assert al.refused_counts() == {"A": 4, "B": 0}
+    assert al.pending_minutes() == 0
+    # nothing was recorded: the symbol's last bar is unchanged, so the right bar is not a duplicate
+    assert al.bar("A", good) == ACCEPTED
+    assert al.poll(end(0) + 100) == [(good.date, {"A": good})]
+    assert counters_sum(al, "A") == 5
+
+
+def test_date_time_agreement_holds_across_daylight_saving_time() -> None:
+    winter = pd.Timestamp("2024-01-16 09:30:00")
+    epoch = int(winter.tz_localize("America/New_York").timestamp())
+    al = LiveBarAligner(["A"])
+    assert al.bar("A", Bar(winter, epoch, 1, 1, 1, 1, 1)) == ACCEPTED
+    assert al.bar("A", Bar(winter + pd.Timedelta(minutes=1), epoch + 60, 1, 1, 1, 1, 1)) == ACCEPTED
+    summer_epoch = int(pd.Timestamp("2024-07-16 09:30:00").tz_localize("America/New_York").timestamp())
+    assert al.bar("A", Bar(pd.Timestamp("2024-07-16 08:30:00"), summer_epoch, 1, 1, 1, 1, 1)) == REFUSED
+
+
+# --- model-based property tests, both call orders ---------------------------
+
+class Model:
+    """Wraps an aligner with an independent model and checks every call and poll."""
+
+    def __init__(self, symbols: list[str], wait: float) -> None:
+        self.symbols = symbols
+        self.wait = wait
+        self.al = LiveBarAligner(symbols, wait)
+        self.active = set(symbols)
+        self.last_bar = dict.fromkeys(symbols, float("-inf"))
+        self.dec = dict.fromkeys(symbols, float("-inf"))
+        self.newest = float("-inf")
+        self.released = float("-inf")  # everything at or before this minute is released
+        self.pending: dict[int, set[str]] = {}
+        self.given = dict.fromkeys(symbols, 0)
+        self.bars: dict[int, tuple[str, str, Bar]] = {}  # id(bar) -> (symbol, status, bar)
+        self.fed: set[int] = set()
+        self.batches: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+        self.max_ahead = 60.0 + wait + 20.0  # the default bound for this align wait
+        self.clamped = 0
+        self.excess = 0.0
+        self.impossible_polls = 0
+
+    def bar(self, symbol: str, i: int, price: float = 10.0) -> str:
+        bar = mk(i, price)
+        self.given[symbol] += 1
+        got = self.al.bar(symbol, bar)
+        m = minute(i)
+        if symbol not in self.active or m <= self.last_bar[symbol]:
+            expected = REFUSED
+        else:
+            self.last_bar[symbol] = m
+            self.dec[symbol] = max(self.dec[symbol], m)
+            self.newest = max(self.newest, m)
+            if m <= self.released:
+                expected = LATE
+            else:
+                expected = ACCEPTED
+                self.pending.setdefault(m, set()).add(symbol)
+        assert got == expected, (symbol, i, got, expected)
+        self.bars[id(bar)] = (symbol, got, bar)
+        return got
+
+    def decided(self, symbol: str, through: int) -> None:
+        self.al.decided(symbol, through)
+        if symbol in self.active and through > self.dec[symbol]:
+            self.dec[symbol] = through  # a decided point never moves the clamp reference
+
+    def stopped(self, symbol: str) -> None:
+        self.al.stopped(symbol)
+        self.active.discard(symbol)
+
+    def poll_impossible(self, now: float) -> None:
+        before = copy.deepcopy(vars(self.al))
+        with pytest.raises(ValueError):
+            self.al.poll(now)
+        assert vars(self.al) == before, "state changed by a refused poll"
+        self.impossible_polls += 1
+
+    def poll(self, now: float) -> None:
+        if self.newest == float("-inf"):  # no bar yet: nothing happens at all
+            before = copy.deepcopy(vars(self.al))
+            assert self.al.poll(now) == []
+            assert vars(self.al) == before
+            return
+        clock = now
+        if self.active:
+            cap = self.newest + self.max_ahead
+            if clock > cap:
+                self.clamped += 1
+                self.excess = max(self.excess, clock - cap)
+                clock = cap
+            through = max(min(self.dec[s] for s in self.active), clock - 60 - self.wait)
+        else:
+            through = float("inf")
+        expected = sorted(m for m in self.pending if m <= through)
+        before = self.released
+        out = self.al.poll(now)  # never raises for a plausible now
+        assert self.al.clock_clamped_count() == self.clamped
+        assert self.al.max_clock_excess() == pytest.approx(self.excess)
+        stamps = [stamp for stamp, _ in out]
+        assert stamps == sorted(set(stamps)), "batches not strictly increasing"
+        assert [int(next(iter(b.values())).time) for _, b in out] == expected, (now, through)
+        for stamp, batch in out:
+            assert batch, "empty batch"
+            assert list(batch) == [s for s in self.symbols if s in batch]
+            minutes = {int(b.time) for b in batch.values()}
+            assert len(minutes) == 1, "mixed minutes"
+            (m,) = minutes
+            assert all(b.date == stamp for b in batch.values())
+            if self.active:
+                assert m > before, "fed for a released minute"
+            assert set(batch) == self.pending.pop(m)
+            for symbol, bar in batch.items():
+                owner, status, _ = self.bars[id(bar)]
+                assert owner == symbol and status == ACCEPTED, "fed a bar that was not accepted"
+                assert id(bar) not in self.fed, "fed twice"
+                self.fed.add(id(bar))
+        if self.active:
+            self.released = max(self.released, through)
+        elif out:
+            self.released = max(self.released, int(next(iter(out[-1][1].values())).time))
+        self.batches += out
+
+    def finish(self) -> None:
+        """Liveness: with the clock past every deadline, everything accepted is fed."""
+        if self.active:
+            self.poll(max(self.newest, BASE) + 60 + self.wait)
+            self.poll(max(self.newest, BASE) + 60 + self.wait + 1)
+        else:
+            self.poll(0)
+        assert self.al.pending_minutes() == 0
+        assert not self.pending
+        accepted = {i for i, (_, status, _) in self.bars.items() if status == ACCEPTED}
+        assert accepted == self.fed, "an accepted bar was never fed"
+        al = self.al
+        for symbol in self.symbols:
+            counted = {
+                status: sum(1 for s, st, _ in self.bars.values() if s == symbol and st == status)
+                for status in (ACCEPTED, LATE, REFUSED)
+            }
+            assert al.fed_counts()[symbol] == counted[ACCEPTED]
+            assert al.late_counts()[symbol] + al.late_after_decided_counts()[symbol] == counted[LATE]
+            assert al.refused_counts()[symbol] == counted[REFUSED]
+            assert counters_sum(al, symbol) == self.given[symbol]
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_adversarial_calls_in_both_orders_hold_the_invariants(seed: int) -> None:
+    rng = random.Random(seed)
+    symbols = [f"S{k}" for k in range(rng.randint(1, 4))]
+    model = Model(symbols, rng.choice([100.0, 100.0, 0.0, 30.0]))
+    n_minutes = 40
+    nxt = dict.fromkeys(symbols, 0)
+    now = float(BASE)
+    for _ in range(rng.randint(50, 300)):
+        roll = rng.random()
+        symbol = rng.choice(symbols)
+        if roll < 0.45:
+            i = nxt[symbol] + (rng.randint(0, 3) if rng.random() < 0.3 else 0)
+            if rng.random() < 0.05:
+                i = max(0, i - rng.randint(1, 3))  # backwards or duplicate
+            if i >= n_minutes:
+                continue
+            # the call order under test: decided before the bar, after it, or not at all;
+            # the decided point is the minute's start, its end, or something older
+            through = minute(i) + rng.choice([0, 0, 60, -60, 600])
+            order = rng.choice(["decided_first", "bar_first", "bar_only"])
+            if order == "decided_first":
+                model.decided(symbol, through)
+            model.bar(symbol, i, rng.random() * 100)
+            if order == "bar_first":
+                model.decided(symbol, through)
+            nxt[symbol] = i + 1
+        elif roll < 0.6:
+            j = nxt[symbol] + rng.choice([0, 0, 1, 5, 30])  # decided, sometimes far ahead
+            model.decided(symbol, minute(j))
+            if rng.random() < 0.5:
+                nxt[symbol] = j + 1
+        elif roll < 0.63:
+            model.stopped(symbol)
+        else:
+            now += rng.choice([0, 1, 5, 5, 60, 100, 161, 600, 1200, 5 * 3600, -3, -60])  # jumps and skew
+            if rng.random() < 0.6:
+                model.poll(now)
+            if rng.random() < 0.03:
+                model.poll_impossible(rng.choice([now * 1000, -1.0, float("nan"), float("inf"), 1e12]))
+    model.finish()
+
+
+def test_the_property_test_exercises_the_clamp_and_late_bars() -> None:
+    clamped = late = 0
+    for seed in range(300):
+        rng = random.Random(seed)
+        symbols = ["A", "B"]
+        model = Model(symbols, 100.0)
+        for _ in range(100):
+            symbol = rng.choice(symbols)
+            if rng.random() < 0.5:
+                model.bar(symbol, rng.randint(0, 20), 1.0)
+            else:
+                model.poll(BASE + rng.choice([0, 100, 300, 1000, 5000, 100000]))
+        clamped += model.al.clock_clamped_count()
+        late += sum(model.al.late_counts().values()) + sum(model.al.late_after_decided_counts().values())
+    assert clamped > 100
+    assert late > 100
+
+
+@pytest.mark.parametrize("order", ["decided_first", "bar_first", "bar_only"])
+def test_realistic_arrival_never_late_and_always_fed(order: str) -> None:
+    """Bars close 4 to 5 s after their minute, some by time up to 90 s after; clock off by 1 s."""
+    for seed in range(60):
+        rng = random.Random(seed)
+        symbols = ["AAPL", "MSFT", "TSLA"][: rng.randint(1, 3)]
+        model = Model(symbols, 100.0)
+        events = []
+        for symbol in symbols:
+            previous = 0.0
+            for i in range(60):
+                if rng.random() < 0.1:
+                    continue  # a dropped minute
+                delay = rng.uniform(4, 5) if rng.random() < 0.9 else rng.uniform(5, 90)
+                arrival = max(previous, end(i) + delay)  # per symbol, bars stay in order
+                previous = arrival
+                events.append((arrival, symbol, i))
+        events.sort()
+        for arrival, symbol, i in events:
+            model.poll(int(arrival) + rng.choice([-1, 0, 1]))
+            if order == "decided_first":
+                model.decided(symbol, minute(i))
+            assert model.bar(symbol, i) == ACCEPTED
+            if order == "bar_first":
+                model.decided(symbol, minute(i))
+            model.poll(int(arrival) + rng.choice([-1, 0, 1]))
+        model.finish()
+        assert sum(model.al.late_counts().values()) + sum(model.al.late_after_decided_counts().values()) == 0
+        assert sum(model.al.refused_counts().values()) == 0
+
+
+@pytest.mark.parametrize("delay,expected", [(98, ACCEPTED), (99, ACCEPTED), (100, LATE)])
+def test_release_by_time_is_exactly_at_the_deadline(delay: int, expected: str) -> None:
+    al = LiveBarAligner(["A", "B"])
+    al.bar("B", mk(0))
+    al.poll(end(0) + delay)
+    assert al.bar("A", mk(0)) == expected
+
+
+def test_startup_backfill_before_the_first_poll_is_all_fed() -> None:
+    symbols = ["A", "B", "C"]
+    al = LiveBarAligner(symbols)
+    for symbol in symbols:
+        for i in range(20):
+            assert al.bar(symbol, mk(i)) == ACCEPTED
+    out = al.poll(end(19) + 5)
+    assert [int(next(iter(b.values())).time) for _, b in out] == [minute(i) for i in range(20)]
+    assert all(list(b) == symbols for _, b in out)
+
+
+def test_last_minute_dropped_by_one_symbol() -> None:
+    al = LiveBarAligner(["A", "B"])
+    al.bar("A", mk(389))
+    al.bar("B", mk(388))
+    assert len(al.poll(end(389) + 99)) == 1  # minute 388, decided by both
+    assert al.poll(end(389) + 99) == []
+    out = al.poll(end(389) + 100)
+    assert len(out) == 1 and list(out[0][1]) == ["A"]
+
+
+@pytest.mark.parametrize("decided_first", [True, False], ids=["decided_then_bar", "bar_then_decided"])
+def test_equivalent_to_csv_feed_minute_wise_in_either_call_order(decided_first: bool) -> None:
+    symbols = ["AAPL", "MSFT", "TSLA"]
+    feed = CsvBarFeed(DATA_DIR, symbols)
+    al = LiveBarAligner(symbols)
+    got: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for _stamp, batch in feed:
+        epoch = int(next(iter(batch.values())).time)
+        for symbol in symbols:
+            if decided_first:
+                al.decided(symbol, epoch)
+            if symbol in batch:
+                assert al.bar(symbol, batch[symbol]) == ACCEPTED
+            if not decided_first:
+                al.decided(symbol, epoch)
+        got += al.poll(epoch + 65)
+    assert got == list(feed)
+    assert al.released_without_counts() == feed.missing_counts()
+    assert al.refused_counts() == dict.fromkeys(symbols, 0)
