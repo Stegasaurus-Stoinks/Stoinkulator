@@ -65,9 +65,14 @@ Common options of `fetch-bars` and `probe-data` (the watcher has its own list): 
 Downloads 1-minute regular-hours bars (09:30 to 16:00 New York, 390 bars a full day, stamped 09:30
 to 15:59), one request ("1 D", `useRTH=1`) per symbol per trading day, into one CSV file per symbol
 per month. Options: `--symbols` (comma or space separated, at most 20), `--start` and `--end`
-(`YYYY-MM-DD`), `--out DIR` (default `%USERPROFILE%\Stoinkulator\bars`), `--settle-hours` (0 to 24,
-default 3: a day with no bars counts as a holiday only when its session closed at least this long
-ago; sooner it is retried next run).
+(`YYYY-MM-DD`), `--out DIR` (default `%USERPROFILE%\Stoinkulator\bars`). There is no settle option: IB's history
+of a day is final from 06:00 New York on the next calendar day (`history.DAY_FINAL_AT`). A day
+fetched earlier is stored as usual but is provisional; a later run whose server time is past that
+moment fetches it again and replaces its rows (reporting how many minutes changed; a refetch with
+fewer bars keeps the stored day, a failed refetch keeps it and tries again). A day with no bars
+counts as a holiday (`no_data`) only once that moment has passed; sooner it is `failed` ("no data
+yet") and asked again. The summary shows a provisional count and the days, and the gap files carry
+a `provisional` status for such days.
 
 Order of events: arguments, paths, dates, port guard, folder layout, the console gate; connect;
 IB's server time (the run's clock: the machine's clock is never used for the plan); the closed
@@ -201,8 +206,8 @@ machine's idea of "home"); a command with neither set refuses to start.
 - `%USERPROFILE%\Stoinkulator\bars` (`fetch-bars --out`): `SYMBOL/SYMBOL_YYYY-MM.csv`, the layout
   `engine.feed` reads, plus in each symbol folder `manifest.json` (per day: ok, no_data or failed
   with the IB text, the contract id), `gaps.csv` (`symbol,day,status,expected,present,missing,
-  ranges`) and `gaps_summary.txt`. A gap status is complete, short (a half day), partial, no_data or
-  not_fetched. Files are written atomically and merged day by day; the manifest is set aside, never
+  ranges`) and `gaps_summary.txt`. A gap status is complete, provisional (all 390 minutes, fetched before the day is
+  final), short (a half day), partial, no_data or not_fetched. Files are written atomically and merged day by day; the manifest is set aside, never
   deleted, if it cannot be used.
 - `%USERPROFILE%\Stoinkulator\live` (watcher `--out`): `SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`, kept out
   of the bars folder so fetched history and live observation never mix.
@@ -210,10 +215,12 @@ machine's idea of "home"); a command with neither set refuses to start.
   `probe-data-DATE-NNN.jsonl` or `watch-bars-DATE-NNN.jsonl`; an existing file is never overwritten.
 
 These folders are the owner's. Agents write there only through the commands' own defaults, in a
-session the owner asked for. Tests never do: `tests/home_guard.py` wraps the calls that write or
-change the file system for the length of a test and raises at once, and records, when a path inside
-the real `Stoinkulator` folder is touched; the test then fails at teardown even if the code
-swallowed the error.
+session the owner asked for. Tests never do. The command test files (`test_ib_cli.py`,
+`test_ib_cli_paper.py`, `test_ib_probe.py`, `test_ib_watch_bars.py`) enforce it with
+`tests/home_guard.py` (shown by `test_home_guard.py`): for the length of a test it wraps the calls
+that write or change the file system, raises at once and records when a path inside the real
+`Stoinkulator` folder is touched, so the test fails at teardown even if the code swallowed the
+error. It is not applied to other test files, and it watches only its own process.
 
 Volumes are stored exactly as IB sends them: shares only if the TWS API setting for US stock sizes
 in lots is unticked. The data time zone is fixed in code.
@@ -266,11 +273,12 @@ never connect; none runs a connecting command in a subprocess (a subprocess test
 ## Known limits and open follow-ups
 
 - Issue 174: same-evening history is not final (the opening-minute volume of one day grew from
-  about 127,000 to about 1,030,000 shares between 22:19 and the next morning), so the 3-hour settle
-  window of `fetch-bars` is too short; a watcher run that receives nothing for a symbol still says
-  "streaming" with exit 0 (a "no data received" outcome with its own code, and provisional days
-  that are refetched, are being worked on and are not in the code described above); a pre-open
-  start is unverified; the banner says "Only the owner runs it" in unattended runs.
+  about 127,000 to about 1,030,000 shares between 22:19 and the next morning). `fetch-bars` now
+  treats a day as provisional until 06:00 New York next day (PR 176, above); the exact moment IB's
+  bars become final is not known, 06:00 is a margin. Still open: a watcher run that receives
+  nothing for a symbol says "streaming" with exit 0 (a "no data received" outcome with its own
+  code is in an unmerged PR and is not in the code described above); a pre-open start is
+  unverified; the banner says "Only the owner runs it" in unattended runs.
 - Issue 177: the exit code 4 clash of `probe-data`; console masking of the exact ids TWS reports;
   data-farm breaks timed from when the notice is read; the lag bound is a running minimum; holidays
   are unknown to the watcher; whether the last update of a minute equals the final bar is still to

@@ -116,15 +116,17 @@ refuses a path inside either): `%USERPROFILE%\Stoinkulator\bars` (`fetch-bars`),
 `DIR/SYMBOL/SYMBOL_YYYY-MM.csv` (naive New York times, regular hours) with
 `manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them; live files are
 `DIR/SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`. Agents write there only through a
-command's own defaults, in a session the owner asked for; tests never (see
-`tests/home_guard.py`).
+command's own defaults, in a session the owner asked for; tests never (the
+command test files enforce it with `tests/home_guard.py`).
 
 Seen in real sessions (2026-11-23/24, owner's TWS):
 - Keep-up-to-date bars update about every 5 s; a bar is known closed 4 to 5 s after its minute.
 - Same-day history is not final until the next morning (the opening minute grew from 127k to
-  1.03M shares): issue 174.
+  1.03M shares), so `fetch-bars` stores a day fetched before 06:00 New York next day as provisional
+  and a later run refetches it (`history.DAY_FINAL_AT`).
 - Volumes are shares only with the TWS "US stock sizes in lots" API setting unticked.
-- The paper account gets market data only if the live account's data is shared with it.
+- The paper account got market data only once the live account's data was shared with it
+  (an observation of the owner's sessions of 2026-11-24, not checked in code).
 
 ## Layout
 
@@ -182,8 +184,9 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
   `EClient` with no socket and no order method) and, through `tests/ib_replay.py`, against
   recordings under `tests/recordings/`. A pytest run marks its environment so a child process
   cannot open a real client either; no test runs a connecting command in a subprocess.
-- `tests/home_guard.py` fails any test that writes into the real `%USERPROFILE%\Stoinkulator`;
-  IB tests point `USERPROFILE`/`HOME` at `tmp_path`. Nothing real is committed under
+- `tests/home_guard.py` fails a test that writes into the real `%USERPROFILE%\Stoinkulator`; only
+  `test_ib_cli.py`, `test_ib_cli_paper.py`, `test_ib_probe.py` and `test_ib_watch_bars.py` use it
+  (plus `test_home_guard.py`), and those tests point `USERPROFILE`/`HOME` at `tmp_path`. Nothing real is committed under
   `tests/recordings/` before the owner has read it (`docs/live-data.md`, "The recorder").
 - The suite runs in parallel (pytest-xdist). Nothing may use a fixed path or a
   fixed port or depend on what else is running on the machine (the dashboard

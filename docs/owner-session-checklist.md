@@ -7,25 +7,29 @@ server time); the client cannot send an order.
 
 ## Before a session
 
-TWS (or IB Gateway), logged in. Global Configuration, API, Settings:
+TWS (or IB Gateway), logged in. Items marked "(TWS itself)" are TWS's own settings and menu names,
+written from general knowledge of TWS and not verified by this project: check them in your TWS.
+Global Configuration, API, Settings:
 
-- Enable ActiveX and Socket Clients: ON.
-- Read-Only API: ON. TWS then refuses every API order, on top of the data-only client.
-- Socket port: 7497 for the paper login, 7496 for the live login (TWS defaults; the commands use
-  whatever you type, but `--paper` accepts only 7497).
-- Trusted IPs include 127.0.0.1, and "Allow connections from localhost only" is ON. The commands
-  connect to 127.0.0.1 only.
-- Master API client id: empty. The commands use client id 21 (`fetch-bars`, `probe-data`) and 22
-  (the watcher). If another program uses one, pass another `--client-id`; 0 and 123 are refused.
-- The setting that sends US stock sizes in lots: UNTICKED. Ticked, volumes come in lots and cannot
-  be converted back.
+- Enable ActiveX and Socket Clients: ON. Read-Only API: ON (TWS then refuses every API order, on
+  top of the data-only client). Both are named in `docs/specs/live-side.md`.
+- The setting that sends US stock sizes in lots: UNTICKED (named in the commands' own output).
+  Ticked, volumes come in lots and cannot be converted back.
+- Socket port (TWS itself): the paper login has been used on 7497; 7496 is the usual live port.
+  The commands use whatever you type, but `--paper` accepts only 7497.
+- Trusted IPs and "Allow connections from localhost only" (TWS itself): the commands connect to
+  127.0.0.1 only, so 127.0.0.1 must be allowed.
+- Master API client id (TWS itself): leave it empty. The commands use client id 21 (`fetch-bars`,
+  `probe-data`) and 22 (the watcher). If another program uses one, pass another `--client-id`; 0 and
+  123 are refused.
 - Which login: the paper login for `--paper` runs; the live login for a live-account data session.
-  The paper account gets market data only if the live account's market data is shared with it
-  (Account Management). No other session of the same user may be using the market data (a second
-  TWS, a phone app, the web portal), or IB answers with code 10197.
-- Auto-restart time (Global Configuration, Lock and Exit): set it outside the hours you will run. A
-  restart closes the connection mid-run: the command stops (see the exit codes) and `fetch-bars`
-  resumes when run again.
+  In the owner's sessions of 2026-11-24 the paper account got market data only once the live
+  account's market data was shared with it (an observation, not checked in code; where that is
+  set is in IB's Account Management, TWS itself). No other session of the same user may be using
+  the market data (a second TWS, a phone app, the web portal), or IB answers with code 10197.
+- Auto-restart time (TWS itself, under Global Configuration, Lock and Exit): set it outside the
+  hours you will run. A restart closes the connection mid-run: the command stops (see the exit
+  codes) and `fetch-bars` resumes when run again.
 - The `.venv` is installed (`uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt`
   and `-e .`) and the checkout is the one you intend to run.
 
@@ -55,25 +59,28 @@ script or the system settings. A value with anything after it (a trailing space)
 the session is over, close that window.
 
     .venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols AAPL,MSFT,TSLA --port 7496
-    .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols AAPL,MSFT,TSLA --start 2024-08-01 --end 2024-08-30 --port 7496 --out %USERPROFILE%\Stoinkulator\bars-stage1
+    .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols AAPL,MSFT,TSLA --start 2024-08-01 --end 2024-08-30 --port 7496 --out "$env:USERPROFILE\Stoinkulator\bars-stage1"
     .venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols AAPL,MSFT,TSLA --minutes 30 --port 7496
 
-Type `7496` when asked. `--paper` is refused on 7496. Run `probe-data` during the regular session
+These are PowerShell lines, run from the project folder; PowerShell does not expand `%USERPROFILE%`,
+so write `$env:USERPROFILE` in any path you pass. Type `7496` when asked. `--paper` is refused on 7496. Run `probe-data` during the regular session
 (09:30 to 16:00 New York) to see live data; the watcher is only useful then. `fetch-bars` can run
 at any time: about 10 s per symbol-day (the three symbols above for August 2024: 66 requests, about
 11 minutes; the printed estimate comes from IB's own clock).
 
 ## What good output looks like
 
-- Every command prints what it will do (host, port, client id, files) before asking for the port.
-  With `--paper` the first line after the gate is `paper mode: port 7497, account check on`.
+- With `--paper` the first line printed is `paper mode: port 7497, account check on` (with
+  `--no-prompt`, `..., no prompt`), before anything else. Then the command prints what it will do
+  (host, port, client id, files) and asks for the port.
 - `probe-data`: steps 1 to 7, each OK; per symbol a verdict `LIVE data`, `DELAYED data (15 min)` or
   `NO data`; a first bar with hundreds of thousands to millions of shares for a large stock; the last
   line `Result: all steps completed`. Delayed data is a success (exit 0).
 - `fetch-bars`: a `Summary` with, per symbol, `N ok, N no data, 0 failed, ... [done]` (22 `ok`
   days for 2024-08-01 to 2024-08-30; weekends are not requested); the first fetched day
   of each symbol with 390 bars (09:30 to 15:59) or fewer on a half day; a gaps line per symbol that
-  names no `partial` day; `Result: complete (exit 0)`. Running the same command again fetches
+  names no `partial` day; `Result: complete (exit 0)`. A day fetched before 06:00 New York next day
+  is listed as provisional: run the command again after that time and it is fetched again. Running the same command again fetches
   nothing and also ends with exit 0.
 - Watcher: one line per closed bar, the offsets, then a summary with every symbol `streaming`. A
   symbol that shows no bars at all is not a success even if the exit code is 0 (issue 174).
@@ -87,9 +94,9 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
 | 1 | finished with problems (`fetch-bars`: a day failed or a symbol was not fetched; `probe-data`: a step failed or a symbol has NO data; watcher: a symbol stopped or delivered no bars) | read the lines above the result; run `fetch-bars` again to retry failed days; for NO data check the market data subscriptions and code 10197 |
 | 2 | refused, nothing started (gate, port guard, arguments, path, `--paper` conditions) | read the message; it says which check |
 | 3 | could not connect | TWS running and logged in, API enabled, the right port, 127.0.0.1 trusted, no dialog waiting in TWS |
-| 4 | `fetch-bars` and watcher: stopped early (connection lost, pacing violation twice, a fault). `probe-data`: not a paper account | `fetch-bars`: what was finished is on disk; run the same command again (after a pacing stop wait at least 10 minutes). `probe-data` with `--paper`: stop and read the next row |
+| 4 | `fetch-bars`: stopped early (connection lost, pacing violation twice, a fault). Watcher: connection lost or closed, or an unexpected error. `probe-data`: not a paper account (`--paper` only) | `fetch-bars`: what was finished is on disk; check TWS is running and logged in, run the same command again to resume; after a pacing stop wait at least 10 minutes first. Watcher: check TWS, start a new watch (files of the day are appended, only later bars). `probe-data`: log TWS into the paper account, do not retry in a loop |
 | 5 | `--paper` only, `fetch-bars` and watcher: the account TWS is signed into is not a paper account; nothing was requested | log TWS into the paper account; do not retry in a loop |
-| 130 | Ctrl-C | the connection and the recording were closed; run again to resume |
+| 130 | Ctrl-C | the connection and the recording were closed. `fetch-bars`: run the same command to resume. `probe-data` and watcher: nothing to resume, start again if needed |
 
 ## Recordings
 
