@@ -569,8 +569,9 @@ def test_the_commands_shown_in_claude_md_are_the_allowed_shape() -> None:
     text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     block = text.split("## Commands", 1)[1].split("```")[1]
     paper = [ln.split("   #")[0].strip() for ln in block.splitlines() if "--no-prompt" in ln]
-    assert len(paper) == 2
+    assert len(paper) == 3
     assert any(" fetch-bars " in c for c in paper) and any(" probe-data " in c for c in paper)
+    assert any(" -m MainStoinker.ib.watch_bars " in c and " --minutes " in c for c in paper)
     for command in paper:
         assert hook.allowed_paper_data_command(command), command
 
@@ -597,8 +598,10 @@ def test_claude_md_states_the_paper_rules() -> None:
         "`--paper` session on 2026-11-23, and it still rests on \"no live Interactive Brokers "
         "account id begins with D\"",
         "`D[UFI][A-Z]?[0-9]+`, confirmed against the owner's paper account on 2026-11-23",
-        "The watcher (`python -m MainStoinker.ib.watch_bars`) is owner-run only: the hook allowance "
-        "does not cover it.",
+        "Agents may also run the live bar watcher, `python -m MainStoinker.ib.watch_bars`, with "
+        "`--paper --no-prompt --minutes N` (N from 1 to 420: a bounded run, data only), under the "
+        "same rules (main session only, clean `origin/revival` checkout, one broker session at a "
+        "time, exit code 5 means not a paper account: stop, tell the owner)",
         "The hook does not check which code is checked out or which interpreter file it is.",
     ):
         assert phrase in text, phrase
@@ -698,3 +701,404 @@ def test_every_allowed_spelling_survives_each_character_at_each_place_only_as_re
             assert hook.allowed_paper_data_command(mutated) is False, mutated
             count += 1
     assert count > 300
+
+
+# =============================================================================================
+# The second module form: `<venv python> -P -m MainStoinker.ib.watch_bars <args>` with
+# `--paper --no-prompt` and `--minutes N` (the unattended, bounded live bar watcher).
+# =============================================================================================
+
+REVIVAL = (REPO_ROOT / "tests" / "fixtures" / "hook_baseline"
+           / "block_live_launch_before_watcher_allowance.py.txt")
+# sha256 of the frozen copy of the hook as it was on `revival` before the watcher form (LF endings)
+REVIVAL_SHA256 = "ba355197dc400960d6f5ac9b0ea1049a4baf48ae822784c3776cd949039d5319"
+WATCHER_MODULE = "MainStoinker.ib.watch_bars"
+WATCH_ARGS = '--symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt'
+
+
+@functools.cache
+def _revival() -> types.ModuleType:
+    """The hook as it was on `revival` before the watcher form."""
+    data = REVIVAL.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(data).hexdigest() == REVIVAL_SHA256, "the frozen revival hook was edited"
+    module = types.ModuleType("block_live_launch_revival")
+    module.__file__ = str(REVIVAL)
+    exec(compile(data.decode("utf-8"), module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def watch(py: str = UP, args: str = WATCH_ARGS, mid: str = " -P", module: str = WATCHER_MODULE) -> str:
+    return f"{py}{mid} -m {module} {args}"
+
+
+def is_watcher_shape(command: str) -> bool:
+    m = hook._paper_match(command)
+    return m is not None and m.group("mod") is not None
+
+
+def only_the_watcher_shape_got_looser(command: str) -> bool:
+    """Blocked now, or blocked on `revival` too, or exactly the new shape (and allowed by the rule)."""
+    if hook.decide(command)[0] or _revival().decide(command)[0]:
+        return True
+    return is_watcher_shape(command) and hook.allowed_paper_data_command(command)
+
+
+ALLOWED_WATCH = [
+    watch(),
+    watch(UPF),
+    watch(QP),
+    watch(QPF),
+    watch("& " + QP),
+    watch("& " + UP),
+    watch("&  " + UPF),
+    watch('".venv\\Scripts\\python.exe"'),
+    watch("C:/Stonks/.venv/Scripts/python.exe"),
+    watch('"D:\\work dir\\Stonks\\.venv\\Scripts\\python.exe"'),
+    watch(args="--paper --no-prompt --minutes 30 --symbols AAPL"),
+    watch(args="--minutes 30 --no-prompt --paper --symbols AAPL"),
+    watch(args="--no-prompt --minutes 30 --paper"),
+    watch(args="--symbols AAPL,MSFT,TSLA --minutes=390 --paper --no-prompt"),
+    watch(args="--paper --no-prompt --minutes=1"),
+    watch(args="--paper --no-prompt --minutes 420"),
+    watch(args="--paper --no-prompt --minutes 1"),
+    watch(args="--paper --no-prompt --minutes 007"),  # the hook takes 1-3 digits: the watcher judges it
+    watch(args="--paper --no-prompt --minutes 999"),  # ... and refuses it itself (usage error)
+    watch(args="--symbols AAPL MSFT TSLA --minutes 30 --paper --no-prompt"),
+    watch(args=f'{WATCH_ARGS} --out "{PROJECT}\\live dir"'),
+    watch(args=f'{WATCH_ARGS} --out "C:/Users/x y/Stoinkulator/live"'),
+    watch(args=f"{WATCH_ARGS} --out C:\\Users\\x\\live --no-record"),
+    watch(args=f'{WATCH_ARGS} --record "C:\\Users\\x y\\rec.jsonl"'),
+    watch(args=f"{WATCH_ARGS} --quiet"),
+    watch(args=f"{WATCH_ARGS} --port 7497"),
+    watch(args=f"{WATCH_ARGS} --port=7497 --host=127.0.0.1"),
+    watch(args=f"{WATCH_ARGS} --host 127.0.0.1 --port 7497"),
+    watch(args=f"{WATCH_ARGS} --client-id 22 --connect-timeout 30 --backfill-minutes 10"),
+    watch(args=f"{WATCH_ARGS} --backfill-minutes=10 --quiet --no-record"),
+    watch(args=f'--quiet --minutes 5 --symbols "AAPL" --paper --no-prompt --out "{PROJECT}\\x y"'),
+    "  " + watch() + "  ",
+    watch() + "\n",
+    "\t" + watch(QP) + "\r\n",
+]
+
+
+def refused_watch_table() -> list[str]:
+    out: list[str] = []
+
+    def add(*items: str) -> None:
+        out.extend(items)
+
+    ok = "--symbols AAPL"
+    plain = ".venv\\Scripts\\python.exe"
+    UP = f"{plain} -P"  # noqa: N806 - here every literal command carries the mandatory -P
+    # -P is mandatory
+    for py in (plain, UPF, QP, "& " + QP, QPF):
+        add(watch(py, mid=""))
+    add(watch(mid=" -p"), watch(mid=" -PP"), watch(mid=" -P -P"), watch(mid=" -u"), watch(mid=' "-P"'),
+        watch(mid=" -Ｐ"), f"{plain} -u -m {WATCHER_MODULE} {WATCH_ARGS}",
+        f"{plain} -m {WATCHER_MODULE} -P {WATCH_ARGS}", f"{plain} -m {WATCHER_MODULE} {WATCH_ARGS}")
+    # the required options
+    add(watch(args=f"{ok} --minutes 30 --no-prompt"), watch(args=f"{ok} --minutes 30 --paper"),
+        watch(args=f"{ok} --minutes 30"), watch(args=f"{ok} --paper --no-prompt"),
+        watch(args="--paper --no-prompt"), watch(args="--minutes 30 --paper"),
+        watch(args=f"{ok} --minutes 30 --pape --no-prompt"),
+        watch(args=f"{ok} --minutes 30 --paper --no-promp"),
+        watch(args=f"{ok} --minutes 30 --paper=1 --no-prompt"),
+        watch(args=f"{ok} --minutes 30 --paper --no-prompt=1"),
+        watch(args=f'{ok} --minutes 30 "--paper" --no-prompt'),
+        watch(args=f'{ok} --minutes 30 --paper "--no-prompt"'),
+        watch(args=f"{ok} --minutes 30 --PAPER --no-prompt"))
+    # --minutes: absent, malformed, too long, abbreviated, repeated
+    for bad in ("1000", "1234", "0000", "abc", "3a", "a3", "-5", "+5", '"30"', '""', "3.5", "0x1F", "30,",
+                "3,0", "30;", "--paper", "x", "\\30", "30\\", "٣٠", "３０"):
+        add(watch(args=f"{ok} --paper --no-prompt --minutes {bad}"),
+            watch(args=f"{ok} --paper --no-prompt --minutes={bad}"))
+    add(watch(args=f"{ok} --paper --no-prompt --minutes"),
+        watch(args=f"{ok} --paper --no-prompt --minutes="),
+        watch(args=f"--minutes {ok} --paper --no-prompt"),
+        watch(args=f"{ok} --paper --no-prompt --minutes 30 --minutes 30"),
+        watch(args=f"{ok} --paper --no-prompt --minutes 30 --minutes 5000"),
+        watch(args=f"{ok} --paper --no-prompt --minutes 5000 --minutes 30"),
+        watch(args=f"{ok} --paper --no-prompt --minutes=30 --minutes 30"),
+        watch(args=f'{ok} --paper --no-prompt "--minutes" 30'),
+        watch(args=f'{ok} --paper --no-prompt "--minutes=30"'),
+        watch(args=f"{ok} --paper --no-prompt --minute 30"),
+        watch(args=f"{ok} --paper --no-prompt --minut 30"),
+        watch(args=f"{ok} --paper --no-prompt --min 30"),
+        watch(args=f"{ok} --paper --no-prompt --mi 30"),
+        watch(args=f"{ok} --paper --no-prompt --m 30"),
+        watch(args=f"{ok} --paper --no-prompt --MINUTES 30"),
+        watch(args=f"{ok} --paper --no-prompt --Minutes=30"),
+        watch(args=f"{ok} --paper --no-prompt --minutes,5"),
+        watch(args=f"{ok} --paper --no-prompt --minutes:5"),
+        watch(args=f"{ok} --paper --no-prompt --minutes.5"),
+        watch(args=f"{ok} --paper --no-prompt --minutes30"),
+        watch(args=f"{ok} --paper --no-prompt --minutesx 30"),
+        watch(args=f"{ok} --paper --no-prompt --minutes\\ 30"),
+        watch(args=f"{ok} --paper --no-prompt --min\\utes 30"),
+        watch(args=f"{ok} --paper --no-prompt \\--minutes 30"),
+        watch(args=f"{ok} --paper --no-prompt -minutes 30"),
+        watch(args=f"{ok} --paper --no-prompt --backfill-minutes 10"),
+        watch(args=f"{ok} --paper --no-prompt --backfill-minutes=30"),
+        watch(args=f"{ok} --paper --no-prompt --minutes 30 --minutes,5"))
+    # every other module of the package (and spellings of this one); a module that is not the
+    # package at all is not for this rule to judge: see `test_other_modules_keep_their_verdict`
+    # every other module (and spellings of this one)
+    for module in ("MainStoinker.ib.cli", "MainStoinker.ib.probe", "MainStoinker.ib", "MainStoinker.ib.",
+                   "MainStoinker.ib.watch_bars.x", "MainStoinker.ib.watch_bars.",
+                   "MainStoinker.ib.watch_bars..", "MainStoinker.IB.watch_bars",
+                   "MainStoinker.ib.Watch_Bars", "MainStoinker.ib.WATCH_BARS",
+                   "mainstoinker.ib.watch_bars", "MAINSTOINKER.IB.WATCH_BARS", "MainStoinker.ib.watch-bars",
+                   "MainStoinker.ib.watch_bar", "MainStoinker.ib.watch_bars2", "MainStoinker.ib.watch_barsx",
+                   "MainStoinker.ib.recorder", "MainStoinker.ib.connection", "MainStoinker.ib.client",
+                   "MainStoinker.ib.history", "MainStoinker.ib.market_data", "MainStoinker.engine.cli",
+                   "MainStoinker.__main__", "MainStoinker.testy", "MainStoinker..ib.watch_bars",
+                   "MainStoinker.ib..watch_bars", "MainStoinker.ib/watch_bars", "MainStoinker/ib/watch_bars",
+                   "MainStoinker.ib.watch_bars.watch_bars", "MainStoinker .ib.watch_bars"):
+        add(watch(module=module))
+    add(f"{UP} -mMainStoinker.ib.watch_bars {WATCH_ARGS}",
+        f"{UP} --module {WATCHER_MODULE} {WATCH_ARGS}",
+        f"{UP} --module={WATCHER_MODULE} {WATCH_ARGS}",
+        f"{UP} -m {WATCHER_MODULE} -m {WATCHER_MODULE} {WATCH_ARGS}",
+        f"{UP} -m MainStoinker -m {WATCHER_MODULE} {WATCH_ARGS}",
+        f"{UP} -m {WATCHER_MODULE} -m MainStoinker.ib.cli {WATCH_ARGS}",
+        f"{UP} {WATCH_ARGS} -m {WATCHER_MODULE}",
+        f"{UP} -m {WATCHER_MODULE}",
+        f"{UP} -m {WATCHER_MODULE} ",
+        f"{UP} MainStoinker/ib/watch_bars.py {WATCH_ARGS}",
+        f"{UP} MainStoinker\\ib\\watch_bars.py {WATCH_ARGS}",
+        f"{UP} ./MainStoinker/ib/watch_bars.py {WATCH_ARGS}",
+        f'{UP} -c "import MainStoinker.ib.watch_bars" {WATCH_ARGS}',
+        f'{UP} -c "from MainStoinker.ib import watch_bars; watch_bars.main()" {WATCH_ARGS}',
+        f"{UP} -c x -m {WATCHER_MODULE} {WATCH_ARGS}",
+        f"{UP} -m {WATCHER_MODULE} -c x {WATCH_ARGS}",
+        f"{UP} -m runpy {WATCHER_MODULE} {WATCH_ARGS}")
+    # the subcommand shapes mixed with the module form
+    add(f"{UP} -m MainStoinker watch_bars {WATCH_ARGS}",
+        f"{UP} -m MainStoinker watch-bars {WATCH_ARGS}",
+        f"{UP} -m MainStoinker watch {WATCH_ARGS}",
+        f"{UP} -m MainStoinker.ib.watch_bars.fetch-bars {WATCH_ARGS}",
+        f"{UP} -m MainStoinker fetch-bars.ib.watch_bars {WATCH_ARGS}",
+        f"{UP} -m MainStoinker fetch-bars -m {WATCHER_MODULE} {WATCH_ARGS}",
+        f"{UP} -m MainStoinker.ib.watch_bars -m MainStoinker fetch-bars {WATCH_ARGS}")
+    # ports and hosts
+    for bad in ("7496", "4001", "4002", "74970", "07497", "0", "", "7498"):
+        add(watch(args=f"{WATCH_ARGS} --port {bad}"))
+    add(watch(args=f"{WATCH_ARGS} --port=7496"), watch(args=f"{WATCH_ARGS} --port=4002"),
+        watch(args=f"{WATCH_ARGS} --port=4001"),
+        watch(args=f"{WATCH_ARGS} --port 7497 --port 7496"),
+        watch(args=f"{WATCH_ARGS} --port 7496 --port 7497"),
+        watch(args=f"{WATCH_ARGS} --por 7497"), watch(args=f"{WATCH_ARGS} --po 7496"),
+        watch(args=f"{WATCH_ARGS} --host localhost"), watch(args=f"{WATCH_ARGS} --host 127.0.0.2"),
+        watch(args=f"{WATCH_ARGS} --host 8.8.8.8"), watch(args=f"{WATCH_ARGS} --host=localhost"),
+        watch(args=f"{WATCH_ARGS} --host 0.0.0.0"), watch(args=f"{WATCH_ARGS} --host"),
+        watch(args=f"{WATCH_ARGS} --hos 127.0.0.1"), watch(args=f"{WATCH_ARGS} --port,7496"),
+        watch(args=f"{WATCH_ARGS} --host:8.8.8.8"), watch(args=f"{WATCH_ARGS} --port\\=7496"),
+        watch(args=f"{WATCH_ARGS} --help"), watch(args=f"{WATCH_ARGS} -h"),
+        watch(args=f"{WATCH_ARGS} --HELP"),
+        watch(args=f"{WATCH_ARGS} -x"), watch(args=f"{WATCH_ARGS} --"))
+    # other interpreters
+    for py in ("python", "python.exe", "py", "uv run python", "pythonw", ".venv\\Scripts\\pythonw.exe",
+               "venv\\Scripts\\python.exe", "'.venv/Scripts/python.exe'",
+               "\\\\evil\\share\\.venv\\Scripts\\python.exe", "../.venv/Scripts/python.exe",
+               "X=1 .venv/Scripts/python.exe", "C:\\a\\..\\.venv\\Scripts\\python.exe",
+               "call .venv\\Scripts\\python.exe", "start .venv\\Scripts\\python.exe"):
+        add(watch(py))
+    # other reasons to block, hidden in a value the shape tolerates
+    add(watch(args=f'{WATCH_ARGS} --out "{ENTRY}"'),
+        watch(args=f'{WATCH_ARGS} --out "C:\\x\\Stonks data collect.bat"'),
+        watch(args=f'{WATCH_ARGS} --out "C:\\x\\MainStoinker\\ib\\live"'),
+        watch(args=f'{WATCH_ARGS} --out "C:\\x -m MainStoinker.ib.cli"'),
+        watch(args=f'{WATCH_ARGS} --out "C:\\x -c y"'),
+        watch(args=f'{WATCH_ARGS} --out "C:\\x\\"'),
+        watch(args=f'{WATCH_ARGS} "MainStoinker/testy/testy.py"'),
+        f"{UP} -m MainStoinker.testy.x {WATCH_ARGS}")
+    # the live opt-in name anywhere
+    base = watch()
+    for name in (ENV_NAME, ENV_NAME.lower(), "ALLOW_LIVE_PORT"):
+        add(f"{name}=1 {base}", f"$env:{name}='1'; {base}", f"set {name}=1 && {base}",
+            f"export {name}=1; {base}", f"env {name}=1 {base}", f"{base} --out {name}",
+            f'{base} --out "x {name}"', f"{base} {name}=1", f"{base} --symbols AAPL,{name}",
+            f"{UP} -m {WATCHER_MODULE} {WATCH_ARGS} --record C:\\{name}\\r.jsonl")
+    # separators, wrappers, prefixes
+    for suffix in ("; echo x", " && echo x", " || echo x", " | more", " & echo x", " > out.txt", " 2>&1",
+                   " < in.txt", " `", " $x", " $(x)", " %X%", " ^", " (x)", " {x}", " 'x'", " [x]", " *",
+                   " ?", " #c", " @x", "\necho x", "\r\necho x", " \\\n", " --out\\\n", " \\", ";", "&"):
+        add(watch() + suffix)
+    for prefix in ("cd x; ", "cd x && ", "cd x\n", "Set-Location x; ", "VAR=x ", "$env:A=1; ", "env ",
+                   "start ", "cmd /c ", "powershell -c ", "bash -c ", "sh -c ", "call ", "time ", "nohup ",
+                   "timeout 5 ", "xargs ", "sudo ", "echo hi | ", "echo hi; ", "Start-Process ", "iex ",
+                   "wsl ", "exec ", "command ", "& & ", ". ", "source ", "(", "{ ", "@(", "$(",
+                   "`", "!", "echo x &&"):
+        add(prefix + watch())
+    for wrapper in ('cmd /c "{c}"', "cmd /c '{c}'", 'powershell -c "{c}"', 'bash -c "{c}"',
+                    'echo "{c}" | bash', '"{c}"', "'{c}'", "$({c})", "`{c}`", "({c})", "{{ {c} }}",
+                    "& {{ {c} }}", "start '{c}'", "eval '{c}'", "<<EOF\n{c}\nEOF", "bash <<< '{c}'"):
+        add(wrapper.format(c=watch()))
+    # a second command next to it, and the older shapes with the watcher module as an argument
+    add(watch() + f'\n{UP} "{ENTRY}"', watch() + "\n" + watch(), watch() + "\n" + fetch(),
+        fetch() + "\n" + watch(), f'{watch()}; "Stonks data collect.bat"',
+        watch() + ' & python "MainStoinker/testy/testy.py"',
+        fetch(args=f"{FETCH_ARGS} -m {WATCHER_MODULE}"), probe(args=f"{PROBE_ARGS} -m {WATCHER_MODULE}"))
+    # look-alikes and continuation lines
+    add(watch().replace("watch_bars", "watch\u2011bars"), watch().replace("watch_bars", "w\u0430tch_bars"),
+        watch().replace("MainStoinker", "Main\u200bStoinker"),
+        watch().replace("--minutes", "--min\u2011utes"),
+        watch().replace("--minutes", "\uff0d\uff0dminutes"), watch().replace("30", "\uff13\uff10"),
+        watch().replace("--paper", "\uff0d\uff0dpaper"), watch().replace(" ", "\u00a0", 1),
+        watch() + " \\\n", watch() + " `\necho x", watch(args=WATCH_ARGS + " \\\n--port 7496"),
+        watch(args="--paper \\\n--no-prompt --minutes 30"),
+        watch(args="--paper --no-prompt --minutes \\\n30"))
+    return [c for c in dict.fromkeys(out) if c not in ALLOWED_WATCH]
+
+
+REFUSED_WATCH = refused_watch_table()
+
+
+def test_the_watcher_tables_are_big_enough() -> None:
+    assert len(set(ALLOWED_WATCH)) >= 20
+    assert len(set(REFUSED_WATCH)) >= 60
+    assert not set(ALLOWED_WATCH) & set(REFUSED_WATCH)
+    assert not set(ALLOWED_WATCH) & set(ALLOWED) and not set(REFUSED_WATCH) & set(ALLOWED)
+
+
+@pytest.mark.parametrize("command", ALLOWED_WATCH)
+def test_allowed_watcher_spellings(command: str) -> None:
+    assert hook.allowed_paper_data_command(command) is True
+    assert hook.decide(command) == (False, "")
+    assert hook.main(json.dumps({"tool_name": "PowerShell", "tool_input": {"command": command}})) == 0
+    assert is_watcher_shape(command)
+    assert _revival().decide(command)[0] is True  # blocked before: the new shape is the only change
+
+
+@pytest.mark.parametrize("command", REFUSED_WATCH)
+def test_refused_watcher_variants(command: str) -> None:
+    assert hook.decide(command)[0] is True, command
+    assert hook.main(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})) == 2
+    assert hook.allowed_paper_data_command(command) is False, command
+    assert only_the_watcher_shape_got_looser(command)
+
+
+@pytest.mark.parametrize("command", REFUSED + REFUSED_WATCH + ALLOWED + ALLOWED_WATCH)
+def test_only_the_new_shape_is_looser_than_revival(command: str) -> None:
+    now, before = hook.decide(command)[0], _revival().decide(command)[0]
+    if before is False:
+        assert now is False  # the old verdicts stay as they were
+    if now is False and before is True:
+        assert is_watcher_shape(command) and hook.allowed_paper_data_command(command)
+
+
+@pytest.mark.parametrize("module", ["Other.ib.watch_bars", "xMainStoinker.ib.watch_bars", ".ib.watch_bars",
+                                    "ib.watch_bars"])
+def test_other_modules_are_not_the_rule_and_keep_their_verdict(module: str) -> None:
+    command = watch(module=module)
+    assert hook.allowed_paper_data_command(command) is False
+    assert hook.decide(command) == _revival().decide(command)
+
+
+def test_the_module_without_minutes_stays_refused_and_with_it_is_allowed() -> None:
+    row = f"{UP} -P -m {WATCHER_MODULE} --paper --no-prompt"  # the row of REFUSED, unchanged
+    assert row in REFUSED and hook.decide(row)[0] is True
+    assert hook.decide(row + " --minutes 30") == (False, "")
+    assert hook.decide(row + " --minutes 30 --minutes 31")[0] is True
+
+
+def test_the_watcher_module_with_a_subcommand_word_is_plain_arguments() -> None:
+    # `-m MainStoinker.ib.watch_bars fetch-bars ...`: `fetch-bars` is one more plain argument. The
+    # hook allows it (the shape is exact and the neutral text is harmless); the watcher has no
+    # positional argument, so it ends as a usage error (exit 2) before anything is built.
+    command = watch(args=f"fetch-bars {WATCH_ARGS}")
+    assert hook.decide(command) == (False, "")
+    match = hook._paper_match(command)
+    assert match is not None and match.group("mod") == ".ib.watch_bars" and match.group("sub") is None
+    # and `-m MainStoinker watch_bars ...` is no shape at all
+    assert hook.decide(f"{UP} -P -m MainStoinker watch_bars {WATCH_ARGS}")[0] is True
+
+
+def test_the_module_name_is_exact_and_case_sensitive() -> None:
+    for module in ("MainStoinker.ib.cli", "MainStoinker.ib.probe", "MainStoinker.ib",
+                   "mainstoinker.ib.watch_bars", "MainStoinker.IB.watch_bars",
+                   "MainStoinker.ib.watch_bars.x", "MainStoinker.ib.watch_bars."):
+        assert hook._paper_match(watch(module=module)) is None, module
+        assert hook._paper_neutral(watch(module=module)) is None, module
+
+
+def test_the_neutral_text_of_the_module_form_is_the_offline_subcommand() -> None:
+    for command in (ALLOWED_WATCH[0], ALLOWED_WATCH[4], ALLOWED_WATCH[9], "  " + ALLOWED_WATCH[2] + "\n"):
+        neutral = hook._paper_neutral(command)
+        assert neutral == command.replace(f"-m {WATCHER_MODULE} ", "-m MainStoinker backtest ", 1)
+        assert hook._decide(neutral, 1) == (False, "")
+        # harmless only for that reason: the same text with the module kept is blocked
+        assert hook._decide(command, 1)[0] is True
+    assert hook._paper_neutral(REFUSED_WATCH[0]) is None
+
+
+def test_other_blocks_still_apply_to_the_allowed_watcher_shape() -> None:
+    for tail in (f' --out "{ENTRY}"', ' --out "C:\\x\\Stonks data collect.bat"',
+                 ' --out "C:\\x\\MainStoinker\\ib\\bars"', ' "MainStoinker/testy/testy.py"',
+                 ' --out "C:\\x -m MainStoinker.ib.cli"'):
+        command = ALLOWED_WATCH[0] + tail
+        assert hook.decide(command)[0] is True
+        assert hook.allowed_paper_data_command(command) is False
+
+
+def test_the_allowance_is_still_off_for_decoded_and_folded_watcher_text() -> None:
+    import base64
+
+    encoded = base64.b64encode(ALLOWED_WATCH[0].encode("utf-16-le")).decode()
+    assert hook.decide(f"powershell -EncodedCommand {encoded}")[0] is True
+    assert hook.decide(ALLOWED_WATCH[0].replace("--paper", "\uff0d\uff0dpaper"))[0] is True
+
+
+def test_the_function_is_still_called_in_one_place_and_the_message_names_the_watcher() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert len(re.findall(r"allowed_paper_data_command\(", text)) == 2
+    assert text.count("_paper_neutral(") == 2
+    reason = hook.decide(f"{UP} -P -m {WATCHER_MODULE} --port 7497")[1]
+    for word in ("-P -m MainStoinker.ib.watch_bars", "--minutes", "--paper", "--no-prompt", "7497"):
+        assert word in reason
+    assert ENV_NAME not in reason
+    assert ".venv\\Scripts\\python.exe -P -m MainStoinker fetch-bars|probe-data" in reason
+
+
+WATCH_PROPERTY_BASES = [ALLOWED_WATCH[0], ALLOWED_WATCH[4], ALLOWED_WATCH[13], ALLOWED_WATCH[20]]
+
+
+@pytest.mark.parametrize("original", WATCH_PROPERTY_BASES)
+def test_any_forbidden_character_or_wrapper_anywhere_is_refused_for_the_watcher(original: str) -> None:
+    variants = _variants(original)
+    assert len(variants) > 500
+    for label, mutated in variants:
+        if _benign(label, mutated, original):
+            assert hook.allowed_paper_data_command(mutated), label
+            continue
+        assert hook.allowed_paper_data_command(mutated) is False, (label, mutated)
+        # not looser than `revival`: blocked now, or `revival` let it through too (a split such as
+        # `-m ; MainStoinker.ib.watch_bars` runs no module at all)
+        assert hook.decide(mutated)[0] or not _revival().decide(mutated)[0], (label, mutated)
+
+
+@pytest.mark.parametrize("original", WATCH_PROPERTY_BASES)
+def test_a_backslash_inside_any_option_token_is_refused_for_the_watcher(original: str) -> None:
+    tokens = SPLIT.findall(original.strip())
+    count = 0
+    for i, tok in enumerate(tokens):
+        if not tok.startswith("--"):
+            continue
+        for k in range(1, len(tok)):
+            mutated = " ".join([*tokens[:i], tok[:k] + "\\" + tok[k:], *tokens[i + 1 :]])
+            assert hook.allowed_paper_data_command(mutated) is False, mutated
+            assert hook.decide(mutated)[0] or not _revival().decide(mutated)[0], mutated
+            count += 1
+    assert count > 30
+
+
+def test_every_prefix_of_a_guarded_option_name_is_refused_for_the_watcher() -> None:
+    # no abbreviation of a guarded option (the watcher turns abbreviations off too)
+    count = 0
+    for name in ("--paper", "--no-prompt", "--minutes", "--port", "--host"):
+        for k in range(3, len(name)):
+            short = name[:k]
+            for command in (watch(args=f"{WATCH_ARGS} {short} 7497"), watch(args=f"{WATCH_ARGS} {short}=1")):
+                assert hook.allowed_paper_data_command(command) is False, command
+                count += 1
+    assert count > 15

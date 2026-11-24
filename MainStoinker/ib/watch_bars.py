@@ -11,7 +11,12 @@ sets it.
 Only the owner runs it, in a real terminal, with TWS or IB Gateway open. It runs no algo and
 places no trade: it is built on `IbConnection` and `IbMarketData` (a data-only client that
 cannot send anything but data requests) and is the first observation step before paper
-trading on live bars. Agents never run it.
+trading on live bars. Agents run it only as `--paper --no-prompt --minutes N` (see below).
+
+`--paper --no-prompt` (unattended, bounded): the same, minus the console gate (no terminal, no
+port typed, nothing read from stdin); the first output line says `no prompt`. Every other check
+of paper mode still runs. `--no-prompt` without `--paper` is a usage error, and with it
+`--minutes` is required (1 to 420), so the run is bounded.
 
 How IB's live bars arrive. One `reqHistoricalData` per symbol with `keepUpToDate=True` (empty
 end time, `formatDate=2`, 1-minute regular-hours bars): IB sends the backfill bars for the
@@ -123,6 +128,7 @@ from MainStoinker.ib.cli import (
     NOT_PAPER_LINE,
     PAPER_HOST,
     PAPER_MODE_LINE,
+    PAPER_NO_PROMPT_LINE,
     PAPER_PORT,
     PathRefused,
     check_folder_usable,
@@ -280,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=EXIT_CODES_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,  # `--paper`, `--no-prompt` and `--minutes` are matched exactly
     )
     parser.add_argument("--port", type=int, default=None,
                         help=f"TWS or Gateway API port (no default; with --paper: {PAPER_PORT})")
@@ -289,12 +296,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "must not be set in the environment, and the account list IB sends "
                              "must show a paper account before anything is requested and all along "
                              "(else exit code 5, never retried)")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="only with --paper (and then --minutes is required): skip the console "
+                             "gate (no terminal needed, no port to type); every other check of "
+                             "paper mode still runs")
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID,
                         help=f"default {DEFAULT_CLIENT_ID} (the probe and fetch-bars use 21)")
     parser.add_argument("--symbols", nargs="+", default=["AAPL"], metavar="SYMBOL",
                         help=f"tickers, comma or space separated, at most {MAX_SYMBOLS} (default AAPL)")
-    parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES,
-                        help=f"how long to watch, 1 to {MAX_MINUTES} (default {DEFAULT_MINUTES})")
+    parser.add_argument("--minutes", type=int, default=None,
+                        help=f"how long to watch, 1 to {MAX_MINUTES} (default {DEFAULT_MINUTES}; "
+                             "required with --no-prompt)")
     parser.add_argument("--backfill-minutes", type=int, default=DEFAULT_BACKFILL_MINUTES,
                         help=f"minutes of bars IB sends before the live ones, 1 to "
                              f"{MAX_BACKFILL_MINUTES} (default {DEFAULT_BACKFILL_MINUTES})")
@@ -316,6 +328,12 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.no_prompt and not args.paper:
+        parser.error("--no-prompt is valid only together with --paper")
+    if args.minutes is None:
+        if args.no_prompt:
+            parser.error(f"--minutes is required with --no-prompt (1 to {MAX_MINUTES})")
+        args.minutes = DEFAULT_MINUTES
     names: list[str] = []
     for chunk in args.symbols:
         for raw in chunk.split(","):
@@ -1502,7 +1520,7 @@ def main(
         if refusal is not None:
             say(refusal)
             return EXIT_REFUSED
-        say(PAPER_MODE_LINE)
+        say(PAPER_NO_PROMPT_LINE if args.no_prompt else PAPER_MODE_LINE)
     try:
         resolve_paths(args, variables, today or datetime.now(NY).date(), Path.cwd())
     except PathRefused as exc:
@@ -1520,10 +1538,13 @@ def main(
         say(f"Refused: {exc}")
         return EXIT_REFUSED
     try:
-        tty = sys.stdin if stdin is None else stdin
-        ask = input if input_fn is None else input_fn
-        if not gate(args, tty, ask, say):
-            return EXIT_REFUSED
+        if args.no_prompt:  # `parse_args` accepted it only with --paper; nothing is read from stdin
+            say(describe_session(args))
+        else:
+            tty = sys.stdin if stdin is None else stdin
+            ask = input if input_fn is None else input_fn
+            if not gate(args, tty, ask, say):
+                return EXIT_REFUSED
         logging.getLogger("ibapi").setLevel(logging.WARNING)
         now = clock or time.monotonic
 
