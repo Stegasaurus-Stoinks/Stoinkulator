@@ -73,6 +73,23 @@ non-paper account (see ``MainStoinker/ib/cli.py``). The hook does NOT check whic
 is checked out: a paper session must be run from an unmodified, merged ``origin/revival``
 checkout (a rule in CLAUDE.md, not enforced here). Order placement, the live account and
 the live ports remain the owner's alone.
+The same allowance has a SECOND module form (owner decision 2026-11-23, unattended live bar
+watcher on the paper account): ``<venv python> -P -m MainStoinker.ib.watch_bars <args>``, with
+the same interpreter rule, token rules and guarded options, and in addition ``--minutes``
+exactly once, followed by an unquoted token of 1 to 3 digits (or ``--minutes=NNN``): a bounded
+run (the watcher itself refuses 0 and over 420). ``--minutes`` joins the guarded names for this
+form (no abbreviation, no other spelling). The module name is matched exactly and case-
+sensitively: ``MainStoinker.ib.cli``, ``.ib.probe``, ``.ib``, ``.ib.watch_bars.x``, a trailing
+dot, the script path and ``-c`` are not it. Words after the module are plain arguments: the
+watcher has no positional argument, so ``-m MainStoinker.ib.watch_bars fetch-bars ...`` is
+allowed by the hook and ends as a usage error of the watcher (exit 2, nothing built).
+How the neutral re-judgement works for the module form: ``_paper_neutral`` replaces exactly
+the module suffix ``.ib.watch_bars`` by `` backtest``, giving ``-m MainStoinker backtest
+<args>`` with every argument unchanged. The rest of the hook judges that text, and finds it
+harmless ONLY because ``backtest`` is an offline subcommand of the package: that is the same
+neutral text as for the two subcommands, so a path under ``MainStoinker/ib`` in a value, a
+second module, ``-c`` code, a wrapper, the entry script and the like still block it, and
+every rule that runs before the allowance has already judged the ORIGINAL text.
 Not seen: a script or file that itself imports and runs the package (written
 in one call, run in another), ``bash script.sh``, aliases/functions, a module
 name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
@@ -581,7 +598,9 @@ _CONNECT_MESSAGE = (
     "the PAPER account, written as ONE plain command and nothing else: "
     ".venv\\Scripts\\python.exe -P -m MainStoinker fetch-bars|probe-data "
     "<args> with --paper and --no-prompt among the args (--port only 7497, --host only "
-    "127.0.0.1; quote a symbol list: --symbols \"AAPL,MSFT\"; no --help). A "
+    "127.0.0.1; quote a symbol list: --symbols \"AAPL,MSFT\"; no --help); the live bar "
+    "watcher is the same with -P -m MainStoinker.ib.watch_bars <args> and --minutes N "
+    "(1 to 3 digits) as well. A "
     "drive-absolute path ending in .venv\\Scripts\\python.exe also works, in double "
     "quotes if it has spaces. No ; && || | & ` $ % < > ( ) quotes other than \", newline, cd, "
     "variable assignment or wrapper (start, cmd /c, powershell -c, bash -c) may appear, "
@@ -1211,10 +1230,16 @@ def _decode_encoded(value: str) -> str | None:
 # may also hold spaces (the project path has some). Nothing else is ever matched.
 _PAPER_CHARS = r"A-Za-z0-9_,.:=\\/-"
 _PAPER_TOKEN = rf'(?:"[ {_PAPER_CHARS}]*"|[{_PAPER_CHARS}]+)'
+# ``MainStoinker`` is followed by ONE of: a subcommand word (``sub``), or exactly the
+# watcher module suffix (``mod``). Case-sensitive; a trailing ``.x`` or ``.`` cannot match
+# because the arguments must start after a space.
 _PAPER_COMMAND = re.compile(
-    rf"(?:& +)?(?P<py>{_PAPER_TOKEN}) +-P +-m +MainStoinker +"
-    rf"(?P<sub>fetch-bars|probe-data)(?P<args>(?: +{_PAPER_TOKEN})+)"
+    rf"(?:& +)?(?P<py>{_PAPER_TOKEN}) +-P +-m +MainStoinker"
+    rf"(?: +(?P<sub>fetch-bars|probe-data)|(?P<mod>\.ib\.watch_bars))"
+    rf"(?P<args>(?: +{_PAPER_TOKEN})+)"
 )
+_PAPER_MINUTES_VALUE = re.compile(r"[0-9]{1,3}")
+_PAPER_WATCHER_GUARDED = ("--minutes",)
 _PAPER_TOKEN_RE = re.compile(_PAPER_TOKEN)
 # The interpreter: the project venv, written relative (``.venv\Scripts\python.exe``) or as
 # a drive-absolute path (``X:\...\.venv\Scripts\python.exe``, no other colon). Never a UNC
@@ -1276,6 +1301,9 @@ def _paper_match(command: str) -> re.Match[str] | None:
         return None
     if "--paper" not in tokens or "--no-prompt" not in tokens:  # exact, standalone, unquoted
         return None
+    watcher = m.group("mod") is not None
+    guarded = _PAPER_GUARDED + (_PAPER_WATCHER_GUARDED if watcher else ())
+    minutes: list[str | None] = []  # the value of each ``--minutes`` (watcher form only)
     for i, tok in enumerate(tokens):
         if tok.startswith('"') or not tok.startswith("--"):
             continue
@@ -1283,12 +1311,15 @@ def _paper_match(command: str) -> re.Match[str] | None:
         if name.lower() == "--help":  # keeps the rule to real runs
             return None
         # an abbreviation or a differently cased spelling of a guarded option
-        if any(g.startswith(name.lower()) and name != g for g in _PAPER_GUARDED):
+        if any(g.startswith(name.lower()) and name != g for g in guarded):
             return None
         # a guarded name followed by anything but ``=`` (``--port,7496``, ``--port:7496``,
         # ``--paperx``); the ``=`` forms of the flags and of port and host are checked below
-        if any(tok.startswith(g) and tok != g and tok[len(g)] != "=" for g in _PAPER_GUARDED):
+        if any(tok.startswith(g) and tok != g and tok[len(g)] != "=" for g in guarded):
             return None
+        if watcher and name == "--minutes":
+            minutes.append(tok[len("--minutes=") :] if "=" in tok else
+                           (tokens[i + 1] if i + 1 < len(tokens) else None))
         if tok.startswith(("--paper=", "--no-prompt=")):
             return None
         following = tokens[i + 1] if i + 1 < len(tokens) else None
@@ -1300,29 +1331,40 @@ def _paper_match(command: str) -> re.Match[str] | None:
             return None
         if name == "--host" and tok != "--host" and tok != f"--host={_PAPER_HOST}":
             return None
+    if watcher:
+        # a bounded run: ``--minutes`` exactly once, with 1 to 3 plain digits (the watcher
+        # itself refuses 0 and anything over 420)
+        if len(minutes) != 1 or minutes[0] is None or not _PAPER_MINUTES_VALUE.fullmatch(minutes[0]):
+            return None
     return m
 
 
 def allowed_paper_data_command(command: str) -> bool:
     """True only for the one allowed shape (see the header): a whole plain command that runs
-    ``fetch-bars`` or ``probe-data`` of the project package with ``--paper --no-prompt``,
-    and that the rest of this hook would not block once its subcommand is neutral."""
+    ``fetch-bars`` or ``probe-data`` of the project package, or the module
+    ``MainStoinker.ib.watch_bars`` with ``--minutes N``, with ``--paper --no-prompt``, and
+    that the rest of this hook would not block once its connecting part is neutral."""
     neutral = _paper_neutral(command)
     # depth 1: the allowance itself is off in this judgement, so it cannot recurse
     return neutral is not None and not _decide(neutral, 1)[0]
 
 
 def _paper_neutral(command: str) -> str | None:
-    """The allowed command with only the subcommand word replaced by ``backtest``, else None.
+    """The allowed command with only the connecting part replaced by ``backtest``, else None.
 
-    The whole hook judges this text (``allowed_paper_data_command``), so every OTHER reason
-    to block the command still applies: only "connecting subcommand of ``-m MainStoinker``"
-    is suppressed.
+    ``-m MainStoinker fetch-bars|probe-data`` becomes ``-m MainStoinker backtest``, and the
+    watcher form ``-m MainStoinker.ib.watch_bars`` becomes ``-m MainStoinker backtest``: the
+    same offline command, with every argument unchanged. The whole hook judges this text
+    (``allowed_paper_data_command``), so every OTHER reason to block the command still
+    applies: only "connecting subcommand of ``-m MainStoinker``" or "``-m`` of the module
+    ``MainStoinker.ib.watch_bars``" is suppressed, and the module is matched exactly.
     """
     m = _paper_match(command)
     if m is None:
         return None
     lead = len(command) - len(command.lstrip(" \t\r\n"))
+    if m.group("mod") is not None:
+        return command[: lead + m.start("mod")] + " backtest" + command[lead + m.end("mod") :]
     return command[: lead + m.start("sub")] + "backtest" + command[lead + m.end("sub") :]
 
 

@@ -390,7 +390,7 @@ class Rig:
         return self.typed
 
     def main(self, *argv: str, tty: bool = True, with_factories: bool = True,
-             recorder: bool = True) -> int:
+             recorder: bool = True, stdin: Any = None) -> int:
         if "--symbols" in argv:
             self.run_symbols = argv[argv.index("--symbols") + 1].split(",")
         extra: dict[str, Any] = {}
@@ -400,7 +400,8 @@ class Rig:
             if recorder:
                 extra["recorder_factory"] = self.recorder_factory
         return watch_bars.main(
-            list(argv), env=self.env, stdin=Tty(tty), input_fn=self.input_fn, out=self.out,
+            list(argv), env=self.env, stdin=Tty(tty) if stdin is None else stdin,
+            input_fn=self.input_fn, out=self.out,
             clock=self, sleep=self.sleep, wall=self.wall, today=date(2024, 8, 16), **extra)
 
     def watch(self, *extra: str, symbols: str | None = None, minutes: int = 5, record: bool = False,
@@ -2145,6 +2146,163 @@ def test_the_real_connection_is_built_with_require_paper_only_in_paper_mode(
         rig.behavior = ConnectBehavior.ACCEPT if paper else ConnectBehavior.REFUSE
         rig.watch(symbols="AAPL", minutes=1, paper=paper, with_factories=False)
     assert [s["require_paper"] for s in seen] == [True, False]
+
+
+# -- --paper --no-prompt (unattended, bounded) ---------------------------------------------------
+
+NO_PROMPT_LINE = "paper mode: port 7497, account check on, no prompt"
+
+
+class NoStdin:
+    """A stdin that fails the test on any access: the unattended run never touches it."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"stdin was touched: {name}")
+
+
+def unattended(rig: Rig, *extra: str, symbols: str = "AAPL", minutes: int = 2, **kw: Any) -> int:
+    """A `--paper --no-prompt` run whose stdin raises on any access and whose prompt must stay unused."""
+    return rig.watch(*extra, "--no-prompt", symbols=symbols, minutes=minutes, paper=True,
+                     stdin=NoStdin(), **kw)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--no-prompt", "--port", "7497", "--symbols", "AAPL", "--minutes", "2"],  # no --paper
+    ["--no-prompt", "--symbols", "AAPL", "--minutes", "2"],  # no --paper, no port
+    ["--paper", "--no-prompt", "--symbols", "AAPL"],  # no --minutes
+    ["--paper", "--no-prompt"],  # no --minutes
+    ["--paper", "--no-prompt", "--minutes", "0"],
+    ["--paper", "--no-prompt", "--minutes", "421"],
+    ["--paper", "--no-prompt", "--minutes", "-1"],
+    ["--paper", "--no-prompt", "--minutes", "x"],
+    ["--paper", "--no-prompt", "--minutes="],
+    ["--paper", "--no-prompt", "--minutes", "1000"],
+    ["--paper", "--no-prom", "--minutes", "5"],  # no abbreviations
+    ["--paper", "--no-prompt", "--minute", "5"],
+    ["--paper", "--no-prompt", "--min", "5"],
+    ["--pape", "--no-prompt", "--minutes", "5"],
+    ["--paper", "--no-prompt=1", "--minutes", "5"],
+])
+def test_no_prompt_usage_errors_exit_2_before_anything_is_built(rig: Rig, argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        rig.main(*argv, "--out", str(rig.live), "--no-record", stdin=NoStdin())
+    assert raised.value.code == 2
+    assert not rig.prompts
+    nothing_built(rig)
+    assert not rig.live.exists()
+
+
+def test_the_minutes_bounds_with_no_prompt_are_1_to_420() -> None:
+    for good in ("1", "30", "420"):
+        assert watch_bars.parse_args(["--paper", "--no-prompt", "--minutes", good]).minutes == int(good)
+    assert watch_bars.parse_args(["--paper", "--no-prompt", "--minutes=390"]).minutes == 390
+    assert watch_bars.parse_args(["--paper"]).minutes == watch_bars.DEFAULT_MINUTES == 30  # the default stays
+    assert watch_bars.parse_args(["--port", "7497"]).minutes == 30
+
+
+def test_no_prompt_skips_the_console_gate_and_never_reads_stdin(rig: Rig) -> None:
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.end_at(2, symbols=1)
+    assert unattended(rig) == watch_bars.EXIT_OK, rig.text
+    assert rig.text.splitlines()[0] == NO_PROMPT_LINE
+    assert not rig.prompts  # nothing typed, nothing asked
+    assert len(rig.fakes) == 1 and len(rig.rows("AAPL")) >= 2
+
+
+def test_without_no_prompt_a_missing_terminal_still_refuses(rig: Rig) -> None:
+    assert rig.watch(symbols="AAPL", minutes=2, paper=True, tty=False) == watch_bars.EXIT_REFUSED
+    assert "stdin is not one" in rig.text
+    nothing_built(rig)
+
+
+@pytest.mark.parametrize("extra,env", [
+    (["--port", "7496"], {}), (["--port", "4002"], {}), (["--port", "7497", "--host", "127.0.0.2"], {}),
+    (["--host", "localhost"], {}), ([], {"STOINK_ALLOW_LIVE_PORT": "1"}),
+    ([], {"STOINK_ALLOW_LIVE_PORT": ""}),
+    (["--port", "7496"], {"STOINK_ALLOW_LIVE_PORT": "1"})])
+def test_each_paper_refusal_still_applies_with_no_prompt(
+        rig: Rig, extra: list[str], env: dict[str, str]) -> None:
+    rig.env.update(env)
+    assert rig.main(*paper_argv(rig, *extra), "--no-prompt", stdin=NoStdin()) == watch_bars.EXIT_REFUSED
+    assert "Refused (--paper)" in rig.text and "Nothing was started." in rig.text
+    assert "no prompt" not in rig.text  # the paper line comes only after the refusals pass
+    assert not rig.prompts
+    nothing_built(rig)
+    assert not rig.live.exists()
+
+
+@pytest.mark.parametrize("accounts", [LIVE_LOOKING, "", f"DU1234567,{LIVE_LOOKING}", "D1234567"])
+def test_a_live_looking_account_list_with_no_prompt_ends_with_5_and_requests_nothing(
+        rig: Rig, accounts: str) -> None:
+    rig.accounts = accounts
+    code = unattended(rig, record=True)
+    assert code == watch_bars.EXIT_NOT_PAPER == 5
+    assert len(rig.fakes) == 1  # not retried
+    no_data_request(rig)
+    assert "reqCurrentTime" not in {c.name for c in rig.fakes[0].calls}
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and rig.text.splitlines()[0] == NO_PROMPT_LINE
+    assert "U7654321" not in rig.text and "1234567" not in rig.text
+    assert not rig.prompts
+    assert not rig.live.exists() or not list(rig.live.rglob("*.csv"))
+
+
+def test_a_connection_that_cannot_vouch_for_the_account_sends_nothing_with_no_prompt(rig: Rig) -> None:
+    rig.require_paper_override = False
+    rig.accounts = LIVE_LOOKING
+    assert unattended(rig) == watch_bars.EXIT_NOT_PAPER
+    assert rig.connections[0].paper_verified is False
+    no_data_request(rig)
+
+
+def test_a_failing_list_in_the_middle_of_a_no_prompt_watch_ends_it_with_5(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.at(rig.tt(34, 10.0), lambda: rig.fakes[-1].push("managedAccounts", LIVE_LOOKING))
+    rig.upd("AAPL", 35, (35, 2.0), (100.3, 100.3, 100.3, 100.3, 5))  # never read
+    rig.expected = 0
+    rig.end_at(4, symbols=1)
+    code = unattended(rig, minutes=4)
+    assert code == watch_bars.EXIT_NOT_PAPER, rig.text
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+    assert rig.rows("AAPL")[-1][0][11:16] == "09:33"
+    assert not rig.prompts
+
+
+def test_the_real_connection_is_still_built_with_require_paper_with_no_prompt(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    original = watch_bars.IbConnection
+
+    def spy(*args: Any, **kw: Any) -> IbConnection:
+        seen.append(dict(kw))
+        kw.update(client_factory=rig.client_factory, clock=rig.plumb, sleep=rig.plumb.sleep,
+                  poll_interval=0.002)
+        conn = original(*args, **kw)
+        rig.connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(watch_bars, "IbConnection", spy)
+    rig.accounts = LIVE_LOOKING  # stops at the account check
+    rig.behavior = ConnectBehavior.ACCEPT
+    assert unattended(rig, minutes=1, with_factories=False) == watch_bars.EXIT_NOT_PAPER
+    assert [s["require_paper"] for s in seen] == [True]
+    assert not rig.prompts
+
+
+def test_the_parser_turns_abbreviations_off_and_documents_no_prompt() -> None:
+    parser = watch_bars.build_parser()
+    assert parser.allow_abbrev is False
+    shown = " ".join(parser.format_help().split())
+    assert "--no-prompt" in shown and "required with --no-prompt" in shown
+
+
+def test_the_no_prompt_line_is_the_one_of_cli() -> None:
+    from MainStoinker.ib import cli
+
+    assert watch_bars.PAPER_NO_PROMPT_LINE is cli.PAPER_NO_PROMPT_LINE
+    assert cli.PAPER_NO_PROMPT_LINE == NO_PROMPT_LINE
 
 
 def test_the_not_paper_code_is_new_documented_and_distinct() -> None:

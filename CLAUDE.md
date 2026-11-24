@@ -12,9 +12,13 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   `python -m MainStoinker fetch-bars` or `probe-data` with `--paper --no-prompt`,
   which only work against the paper account (port 7497, account check). Data
   only. No other way of connecting (no script, no `-c` code, no other module,
-  no test). The watcher (`python -m MainStoinker.ib.watch_bars`) is owner-run
-  only: the hook allowance does not cover it. Everything else works only against
-  offline data and the test harness.
+  no test). Agents may also run the live bar watcher,
+  `python -m MainStoinker.ib.watch_bars`, with `--paper --no-prompt --minutes N`
+  (N from 1 to 420: a bounded run, data only), under the same rules (main
+  session only, clean `origin/revival` checkout, one broker session at a time,
+  exit code 5 means not a paper account: stop, tell the owner); any other way of
+  running it is owner-run only. Everything else works only against offline data
+  and the test harness.
 - The live account, the live ports and `STOINK_ALLOW_LIVE_PORT` are the owner's
   alone: an agent never uses them, sets them or asks for them.
 - One broker session at a time, started by the main session, never by parallel
@@ -56,7 +60,10 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   MainStoinker fetch-bars|probe-data <args>` (or a drive-absolute path ending in
   `.venv\Scripts\python.exe`) with `--paper` and `--no-prompt`, `--port` only 7497,
   `--host` only `127.0.0.1`, no `--help`, and no shell syntax, wrapper, `cd` or
-  variable assignment; the live opt-in name may not appear at all. The hook does
+  variable assignment; the live opt-in name may not appear at all. The same
+  shape with the module `.venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars <args>`
+  is allowed too, and needs `--minutes` once with 1 to 3 digits besides
+  (`--no-prompt` makes the watcher itself require it, 1 to 420). The hook does
   not check which code is checked out or which interpreter file it is. It is a
   tripwire against accidents, not a security boundary.
 - Never set that variable, and never weaken, disable, bypass or work around
@@ -81,6 +88,7 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m MainStoinker serve --db DB [--port 8750] [--allow-remote]   # read-only API + dashboard on 127.0.0.1 (needs requirements-web.txt)
 .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols "AAPL,MSFT" --start 2024-08-16 --end 2024-08-26 --paper --no-prompt   # DATA only, PAPER account only (TWS on 7497): bars to CSV; one session at a time, main session only
 .venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols "AAPL" --paper --no-prompt   # DATA only, PAPER account only: what market data the account gets
+.venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt   # DATA only, PAPER account only: watch live 1-minute bars for N minutes (1-420); one session at a time, main session only
 ```
 
 ## Layout
