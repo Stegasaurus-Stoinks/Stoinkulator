@@ -324,7 +324,7 @@ def _broker_blocked_here(env: Mapping[str, str]) -> bool:
     return "STOINK_BROKER_BLOCKED" in os.environ or "STOINK_BROKER_BLOCKED" in env
 
 
-_PAPER_ID = re.compile(r"D[UFI][0-9]+")
+_PAPER_ID = re.compile(r"D[UFI][A-Z]?[0-9]+")
 PAPER_PORTS: frozenset[int] = frozenset({7497, 4002})
 """TWS paper and IB Gateway paper: the only ports `require_paper=True` accepts."""
 
@@ -333,7 +333,7 @@ def _all_paper_accounts(text: str) -> tuple[bool, int, int]:
     """(ok, listed, failed) for a comma-separated `managedAccounts` list.
 
     Items are stripped and empty items ignored. `ok` needs at least one id and every id
-    to match `D[UFI][0-9]+` (case-sensitive, whole item). The rule and its source are in
+    to match `D[UFI][A-Z]?[0-9]+` (case-sensitive ASCII, whole item). The rule and its source are in
     the `IbConnection` docstring.
     """
     ids = [item.strip() for item in text.split(",") if item.strip()]
@@ -402,10 +402,11 @@ class IbConnection:
     else `open()` raises `NotPaperSession` before any client is built; the ordinary port guard
     still runs as well. (2) READY needs both `nextValidId` and `managedAccounts` of the
     attempt, in either order, and a list that is non-empty with EVERY id matching
-    `^D[UFI][0-9]+$` (case-sensitive; items stripped, empty items ignored). The rule rests on
-    "no live Interactive Brokers account id begins with D, and paper ids begin with DU, DF or
-    DI"; to be confirmed in the owner's first paper session. (Live ids begin with `U`, `F` or
-    `I`.) (3) A
+    `^D[UFI][A-Z]?[0-9]+$` (case-sensitive ASCII; items stripped, empty items ignored). The
+    form `DU` + one letter + digits was seen in the owner's paper session on 2026-11-23 (the
+    first form of this rule, `D[UFI][0-9]+`, rejected it). The rule still rests on "no live
+    Interactive Brokers account id begins with D"; paper ids begin with DU, DF or DI. (Live ids
+    begin with `U`, `F` or `I`.) (3) A
     failing or empty list disconnects at once and `open()` raises `NotPaperSession` (fatal,
     never retried, state CLOSED, no request possible). A failing list is sticky (a later
     passing list does not clear it) and wins over every other failure of the same attempt

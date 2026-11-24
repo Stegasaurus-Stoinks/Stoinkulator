@@ -163,8 +163,19 @@ def not_paper_ids() -> dict[str, str]:
         "DX": "DX" + DIGITS,
         "DU without digits": "DU",
         "suffix": paper() + "x",
-        "two letters after D": "DUU" + DIGITS,
+        "two letters after DU": "DUXY" + DIGITS,
         "inner space": "D U" + DIGITS,
+        "lower case letter": "DUx" + DIGITS,
+        "letter after digits": "DU123A",
+        "letter only": "DUX",
+        "non-ASCII letter": "DUÄ123",
+        "Greek capital alpha": "DUΑ123",
+        "live U, seven digits": "U1234567",
+        "DA short": "DA123",
+        "DX short": "DX1",
+        "D and three digits": "D123",
+        "UX": "UX123456",
+        "space inside": " DUX 123",
     }
 
 
@@ -181,6 +192,19 @@ def test_pattern_accepts_and_counts() -> None:
     assert _all_paper_accounts(f"{paper()},U{DIGITS}") == (False, 2, 1)
     assert _all_paper_accounts("") == (False, 0, 0)
     assert _all_paper_accounts(" , ,") == (False, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "ident",
+    ["DUX123456", "DUA1", "DFB123", "DIZ9", "DU123456", "DF1", "DI22"],
+)
+def test_pattern_accepts_each_paper_form(ident: str) -> None:
+    assert _all_paper_accounts(ident) == (True, 1, 0)
+
+
+def test_pattern_refuses_a_list_mixing_paper_and_live() -> None:
+    assert _all_paper_accounts("DUX123456,U1234567") == (False, 2, 1)
+    assert _all_paper_accounts("DUX123456, DU123456") == (True, 2, 0)
 
 
 # -- default behaviour -----------------------------------------------------------------------
@@ -217,6 +241,8 @@ def test_require_paper_must_be_a_bool() -> None:
         f"{paper()},{paper(OTHER_DIGITS, 'F')}",
         f" {paper()} , {paper(OTHER_DIGITS)} ,",
         paper(letters="I"),
+        "DUX123456",
+        "DUX123456,DU123456",
     ],
 )
 def test_paper_accounts_become_ready(build: Callable[..., Rig], accounts: str, order: str) -> None:
