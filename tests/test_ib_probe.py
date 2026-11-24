@@ -40,6 +40,7 @@ from MainStoinker.ib.recorder import (
     scan_recording,
 )
 from tests.fake_ib import FARM_MESSAGES, ConnectBehavior, FakeIbClient, make_bar
+from tests.home_guard import no_writes_to_real_home
 
 SERVER = datetime(2024, 11, 22, 22, 0, tzinfo=UTC)  # Friday 17:00 New York, session closed
 OPEN_EPOCH = int(datetime(2024, 11, 22, 14, 30, tzinfo=UTC).timestamp())  # 09:30 New York
@@ -60,43 +61,19 @@ def _real_home() -> Path | None:
     return None
 
 
-def _listing(home: Path | None) -> dict[str, tuple[bool, int]]:
-    """Name and modification time of every entry of the real `Stoinkulator/bars` and `recordings`."""
-    seen: dict[str, tuple[bool, int]] = {}
-    if home is None:
-        return seen
-    for name in ("bars", "recordings"):
-        folder = home / "Stoinkulator" / name
-        try:
-            seen[name] = (folder.is_dir(), folder.stat().st_mtime_ns)
-        except OSError:
-            seen[name] = (False, 0)
-        if folder.is_dir():
-            for entry in folder.rglob("*"):
-                try:
-                    seen[str(entry)] = (entry.is_dir(), entry.stat().st_mtime_ns)
-                except OSError:
-                    seen[str(entry)] = (False, 0)
-    return seen
-
-
 REAL_HOME = _real_home()
-REAL_LISTING_AT_START = _listing(REAL_HOME)
 
 
 @pytest.fixture(autouse=True)
 def real_home_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """The process environment is pointed at `tmp_path` for the test, and afterwards the real
-    `Stoinkulator` folders must be as at the start."""
+    """The process environment is pointed at `tmp_path` for the test, and any write inside the real
+    `Stoinkulator` folder by this process fails the test (tests/home_guard.py)."""
     fake_home = tmp_path / "process-home"
     fake_home.mkdir()
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
-    yield
-    after = _listing(REAL_HOME)
-    assert after == REAL_LISTING_AT_START, (
-        "A TEST WROTE INTO THE REAL HOME FOLDER: "
-        f"changed {sorted(set(after.items()) ^ set(REAL_LISTING_AT_START.items()))}")
+    with no_writes_to_real_home(REAL_HOME):
+        yield
 
 
 # -- the rig -------------------------------------------------------------------------------------

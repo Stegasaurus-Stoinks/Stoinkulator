@@ -26,6 +26,8 @@ from MainStoinker.ib.connection import DATA_REQUESTS, ConnState, IbConnection
 from MainStoinker.ib.market_data import IbMarketData
 from MainStoinker.ib.recorder import SessionRecorder
 from tests.fake_ib import FARM_MESSAGES, ConnectBehavior, FakeIbClient
+from tests.home_guard import no_writes_to_real_home
+from tests.no_build import forbid_building
 from tests.test_ib_fetch import (
     SERVER_NOW,
     Rig,
@@ -51,43 +53,21 @@ def _real_home() -> Path | None:
     return None
 
 
-def _listing(home: Path | None) -> dict[str, tuple[bool, int]]:
-    """Name and modification time of every entry of the real `Stoinkulator/bars` and `recordings`."""
-    seen: dict[str, tuple[bool, int]] = {}
-    if home is None:
-        return seen
-    for name in ("bars", "recordings"):
-        folder = home / "Stoinkulator" / name
-        try:
-            seen[name] = (folder.is_dir(), folder.stat().st_mtime_ns)
-        except OSError:
-            seen[name] = (False, 0)
-        if folder.is_dir():
-            for entry in folder.rglob("*"):
-                try:
-                    seen[str(entry)] = (entry.is_dir(), entry.stat().st_mtime_ns)
-                except OSError:
-                    seen[str(entry)] = (False, 0)
-    return seen
-
-
 REAL_HOME = _real_home()
-REAL_LISTING_AT_START = _listing(REAL_HOME)
 
 
 @pytest.fixture(autouse=True)
 def real_home_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     """No test of this command may reach the real profile: the process environment is pointed at
-    `tmp_path` for the test, and afterwards the real `Stoinkulator` folders must be as at the start."""
+    `tmp_path` for the test, and any write inside the real `Stoinkulator` folder by this process
+    fails the test (tests/home_guard.py). The real folder is not looked at, so a real session that
+    the owner runs meanwhile cannot make a test fail."""
     fake_home = tmp_path / "process-home"
     fake_home.mkdir()
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
-    yield
-    after = _listing(REAL_HOME)
-    assert after == REAL_LISTING_AT_START, (
-        "A TEST WROTE INTO THE REAL HOME FOLDER: "
-        f"changed {sorted(set(after.items()) ^ set(REAL_LISTING_AT_START.items()))}")
+    with no_writes_to_real_home(REAL_HOME):
+        yield
 
 
 class Tty(io.StringIO):
@@ -225,6 +205,7 @@ def test_help_exits_zero_before_any_client_lists_exit_codes(session: Session,
 ])
 def test_bad_arguments_exit_2_before_any_client(session: Session, argv: list[str],
                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    forbid_building(session)
     with pytest.raises(SystemExit) as info:
         session.main(*argv)
     assert info.value.code == 2
@@ -365,11 +346,12 @@ def test_the_process_environment_is_pointed_into_tmp_for_every_test(tmp_path: Pa
     assert Path.home().is_relative_to(tmp_path)
 
 
-def test_the_guard_compares_the_real_folder_with_its_state_at_the_start() -> None:
-    """The listing helper sees a change (so the autouse check after each test would fail loudly)."""
+def test_the_process_home_is_not_the_real_home_and_the_write_guard_is_in_force() -> None:
+    """The guard itself is tested on a FAKE home in tests/test_home_guard.py; here only that it is
+    armed for this module's tests and the environment no longer names the real profile."""
     assert REAL_HOME is not None
     assert not Path(os.environ["USERPROFILE"]).samefile(REAL_HOME)
-    assert _listing(REAL_HOME) == REAL_LISTING_AT_START
+    assert getattr(open, "__name__", "") == "guarded"
 
 
 def test_an_existing_recording_file_is_never_overwritten(session: Session) -> None:
