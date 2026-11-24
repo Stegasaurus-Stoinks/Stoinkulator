@@ -96,6 +96,52 @@ and flushed per bar. A second run on the same day appends only bars later than t
 last row. These files are deliberately not in the month-file layout and not in the bars
 folder, so fetched history and live observation never mix.
 
+Seams for a driver (an engine that runs on the closed bars). All are optional and change nothing
+when absent: the command line, its limits, its output and its exit codes are the ones above. A
+driver calls `run_watch` with a `WatchSeams`; this module sends no request it did not send before.
+
+- Output: a `ClosedBars` sink (`write(symbol, bar, how) -> bool`, `close()`, `written`). `LiveFiles` is
+  one; `TeeBars` feeds several in sequence and returns the answer of the first (the files). Every row
+  the watcher appends to a file (a `write` call, whatever the file answers) reaches every sink.
+- Notifications: a `BarListener` is told `decided(symbol, through_epoch)` and `stopped(symbol)`.
+- Pass hook: `on_pass(server_now)` once at the end of every pass of the reading loop, with IB's
+  server time in seconds, the clock this watcher decides with. An exception from it ends the watch
+  like any unexpected error (exit 4); it must not block for long.
+- Limits: `minutes` (the run deadline, up to `MAX_DRIVER_MINUTES`) and `backfill_minutes` (up to
+  `MAX_SINCE_OPEN_MINUTES`, 390 = the whole session) or `backfill_since_open` (the duration asks for
+  today's bars from 09:30, see `since_open_duration`; each re-request asks again the same way).
+  `parse_args` keeps its limits.
+- `Watcher` is the public name of the class; `Watcher.drop_counts()` and
+  `Watcher.first_backfills_over()` are read-only.
+
+What `decided(symbol, M)` promises. `M` is the START epoch of a minute. After it, no row of `symbol`
+is written, and no `write` call is made, for any minute at or before `M`; a late `decided` only
+delays a driver, an early one would lose a bar. The watcher tells `decided(symbol, last_emitted)`
+and nothing else, where `last_emitted` is the newest minute of the symbol that was written or
+reported "not written", and only right after that happened (in `_emit`, after every sink has the
+row, so a driver sees `bar` before `decided`; and in `_not_written`). Why it is never early: the one
+place a row is written is `_emit`; it is reached from `_backfill` (a snapshot) and from
+`_close_forming` (from `_update`, `_settle` and `_finish`). Both reach it only for a minute strictly
+after `last_emitted`: `_backfill` skips (compares only) every snapshot bar at or before it, and
+the forming bar is always later than it, because `last_emitted` is raised only by writing or
+dropping a bar the forming bar is not (it is cleared first, or it is the bar itself) and a forming
+bar is only created for a minute after it. `last_emitted` never falls. Case by case, then:
+- initial and re-requested backfill snapshot (also a late one, also one that holds minutes the
+  stream never showed): writes only minutes after the point, the last snapshot bar stays forming
+  unless the snapshot rule closes it, and nothing is told before the snapshot is processed;
+- lag bound, closing by time, the 16:20 rule, the stale-update guard: they decide whether and when
+  the forming bar (later than the point) is written or dropped, never which minute;
+- a drop ("snapshot only", spanned a loss or a farm break, stalled, re-request gap): the minute is
+  never written afterwards, so the point may include it, and does;
+- connection loss, data farm break, a re-request outstanding: nothing is closed and nothing is
+  told; a minute skipped by an update for a LATER minute is NOT decided (a re-requested backfill
+  may still write it), which is why this is not "an update for a later minute arrived";
+- late revisions and bars of an earlier date: never written;
+- a symbol that stopped (file error, IB error, cap on re-requests): `_emit` writes nothing after
+  it; `stopped` is told once, and again nothing else;
+- the end of the watch: the last closing by time in `_finish` is a write like any other and is told
+  before `stopped(symbol)` is sent for every symbol still running.
+
 Checks, in this sequence, before any client or connection is built: arguments; default paths
 (from `USERPROFILE`, else `HOME`, in the environment mapping given to `main`, never the
 machine's idea of "home"); output and recording paths (not in the repository or a OneDrive
@@ -124,7 +170,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO
 from zoneinfo import ZoneInfo
 
 from MainStoinker.engine.feed import Bar
@@ -215,6 +261,8 @@ DEFAULT_MINUTES = 30
 MAX_MINUTES = 420
 DEFAULT_BACKFILL_MINUTES = 10
 MAX_BACKFILL_MINUTES = 120
+MAX_SINCE_OPEN_MINUTES = 390  # a driver (not the command line) may ask for the whole session
+MAX_DRIVER_MINUTES = 600  # the longest run deadline a driver may ask for (the command line: MAX_MINUTES)
 REQUEST_SPACING = 1.0  # seconds between two history requests
 IDENTICAL_REQUEST_SPACING = 15.0  # IB refuses an identical history request within 15 s
 MAX_REREQUESTS = 10  # per symbol; more means something is wrong, not a passing outage
@@ -461,6 +509,145 @@ def gate(args: argparse.Namespace, stdin: TextIO, input_fn: Callable[[str], str]
     return True
 
 
+# -- where closed bars go and who is told about them ---------------------------------------------
+
+
+class ClosedBars(Protocol):
+    """Where the watcher puts a closed bar. `LiveFiles` is the default; `TeeBars` feeds several.
+
+    `write(symbol, bar, how)` returns True if a row was appended to a file, False if the sink already
+    had that minute or a later one; `how` is "backfill", "backfilled", "later" or "time". It may raise
+    `LiveFileError`, which stops that symbol (the bar is then no row anywhere after it). `written`
+    maps a symbol to the files this sink wrote (empty for a sink with no file)."""
+
+    @property
+    def written(self) -> Mapping[str, list[Path]]: ...
+
+    def write(self, symbol: str, bar: Bar, how: str) -> bool: ...
+
+    def close(self) -> None: ...
+
+
+class BarListener(Protocol):
+    """Told what the watcher knows about each symbol (see "What `decided` promises", above).
+
+    `decided(symbol, through_epoch)`: no row of `symbol` is or will be written for a minute starting
+    at or before `through_epoch`. `stopped(symbol)`: nothing more will come for `symbol`."""
+
+    def decided(self, symbol: str, through_epoch: int) -> None: ...
+
+    def stopped(self, symbol: str) -> None: ...
+
+
+def _append(sink: ClosedBars, symbol: str, bar: Bar, how: str) -> bool:
+    """One `write` call. `LiveFiles` ignores `how` and is called with the two arguments it always
+    had (so what wraps or replaces its `write` keeps working); every other sink gets all three."""
+    if type(sink) is LiveFiles:
+        return sink.write(symbol, bar)
+    return sink.write(symbol, bar, how)
+
+
+class TeeBars:
+    """Feeds the same bar to several sinks, in the sequence given, and answers as the first one.
+
+    The first sink is the files: its answer is the watcher's "a row was appended", and when it raises
+    (`LiveFileError`) no later sink gets the bar. Every later sink gets every bar the first one was
+    asked to write, also one the file already had (False): a later run of the day still hands the
+    whole backfill on. A later sink must not raise. `close` closes every sink; the first error is
+    raised after all were tried."""
+
+    def __init__(self, first: ClosedBars, *more: ClosedBars) -> None:
+        self._sinks: tuple[ClosedBars, ...] = (first, *more)
+
+    @property
+    def written(self) -> dict[str, list[Path]]:
+        merged: dict[str, list[Path]] = {}
+        for sink in self._sinks:
+            for symbol, paths in sink.written.items():
+                into = merged.get(symbol, [])
+                into.extend(p for p in paths if p not in into)
+                merged[symbol] = into
+        return merged
+
+    def write(self, symbol: str, bar: Bar, how: str) -> bool:
+        answer = _append(self._sinks[0], symbol, bar, how)
+        for sink in self._sinks[1:]:
+            _append(sink, symbol, bar, how)
+        return answer
+
+    def close(self) -> None:
+        failure: Exception | None = None
+        for sink in self._sinks:
+            try:
+                sink.close()
+            except Exception as exc:  # noqa: BLE001 - every sink gets its close
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+
+def _check_limits(minutes: int | None, backfill_minutes: int | None, since_open: bool) -> None:
+    """The limits a driver may ask for (the command line keeps `MAX_MINUTES` and `MAX_BACKFILL_MINUTES`)."""
+    if minutes is not None and not 1 <= minutes <= MAX_DRIVER_MINUTES:
+        raise ValueError(f"minutes must be 1 to {MAX_DRIVER_MINUTES}, not {minutes!r}")
+    if backfill_minutes is not None and not 1 <= backfill_minutes <= MAX_SINCE_OPEN_MINUTES:
+        raise ValueError(f"backfill_minutes must be 1 to {MAX_SINCE_OPEN_MINUTES}, not {backfill_minutes!r}")
+    if since_open and backfill_minutes is not None:
+        raise ValueError("backfill_since_open and backfill_minutes exclude each other")
+
+
+def since_open_minutes(server_now: float) -> int:
+    """Minutes of backfill that reach back to 09:30 New York of the date of `server_now`: the whole
+    minutes since the open rounded up, plus one for the bar still forming; 1 before the open and at
+    most `MAX_SINCE_OPEN_MINUTES` (a whole session, also after the close)."""
+    elapsed = server_now - _session_start(_ny(server_now).date())
+    if elapsed <= 0:
+        return 1
+    return min(MAX_SINCE_OPEN_MINUTES, math.ceil(elapsed / 60) + 1)
+
+
+def since_open_duration(server_now: float) -> str:
+    """The IB duration string of a backfill since the open, as `"<seconds> S"` like the usual one."""
+    return f"{since_open_minutes(server_now) * 60} S"
+
+
+@dataclass(frozen=True)
+class WatchSeams:
+    """What a driver adds to `run_watch`; the default changes nothing.
+
+    `extra_sinks` come after the live files in a `TeeBars` (and are closed with it); `listener` and
+    `on_pass` are described in the module docstring; `minutes` replaces `args.minutes` and
+    `backfill_minutes` replaces `args.backfill_minutes` (or `backfill_since_open` asks for today's
+    bars from 09:30 at every request), each within the driver limits; `on_watcher` is called with
+    the `Watcher` right after it is built (to read `drop_counts()` later)."""
+
+    extra_sinks: tuple[ClosedBars, ...] = ()
+    listener: BarListener | None = None
+    on_pass: Callable[[float], None] | None = None
+    minutes: int | None = None
+    backfill_minutes: int | None = None
+    backfill_since_open: bool = False
+    on_watcher: Callable[[Watcher], None] | None = None
+
+    def __post_init__(self) -> None:
+        _check_limits(self.minutes, self.backfill_minutes, self.backfill_since_open)
+
+
+@dataclass(frozen=True)
+class DropCounts:
+    """What one symbol did not write or revised, as the summary counts it (read-only)."""
+
+    snapshot_only: int
+    connection_loss: int
+    farm_break: int
+    stalled_stream: int
+    rerequest_gap: int
+    late_revisions: int
+    stale_rows: int
+    bad_bars: int
+    rerequests: int
+
+
 # -- the live files -------------------------------------------------------------------------
 
 
@@ -477,8 +664,9 @@ class LiveFiles:
     def path_for(self, symbol: str, bar: Bar) -> Path:
         return self._root / symbol / f"{symbol}_live_{bar.date:%Y-%m-%d}.csv"
 
-    def write(self, symbol: str, bar: Bar) -> bool:
-        """Append `bar`; False (nothing written) if the file already has this minute or a later one."""
+    def write(self, symbol: str, bar: Bar, how: str = "") -> bool:
+        """Append `bar`; False (nothing written) if the file already has this minute or a later one.
+        `how` (why the bar is closed) is not used here."""
         path = self.path_for(symbol, bar)
         try:
             handle = self._handles.get(path) or self._open(symbol, path)
@@ -685,12 +873,20 @@ def _header_only(path: Path) -> bool:
     return len([line for line in text.split("\n") if line.strip()]) <= 1
 
 
-class _Watcher:
-    """The session: requests, the reading loop, the closed-bar logic and the summary."""
+class Watcher:
+    """The session: requests, the reading loop, the closed-bar logic and the summary.
+
+    `files` is where closed bars go (`LiveFiles`, or a `TeeBars` that also feeds a driver). The rest
+    after `wall` is for a driver and changes nothing when absent: `listener` (told `decided` and
+    `stopped`), `on_pass` (called with IB's server time at the end of every pass of the loop),
+    `minutes` and `backfill_minutes` (instead of those of `args`) and `backfill_since_open`."""
 
     def __init__(self, args: argparse.Namespace, conn: IbConnection, md: IbMarketData, say: _Say,
-                 files: LiveFiles, clock: Callable[[], float], sleep: Callable[[float], None],
-                 wall: Callable[[], datetime]) -> None:
+                 files: ClosedBars, clock: Callable[[], float], sleep: Callable[[float], None],
+                 wall: Callable[[], datetime], *, listener: BarListener | None = None,
+                 on_pass: Callable[[float], None] | None = None, minutes: int | None = None,
+                 backfill_minutes: int | None = None, backfill_since_open: bool = False) -> None:
+        _check_limits(minutes, backfill_minutes, backfill_since_open)
         self.args = args
         self.conn = conn
         self.md = md
@@ -699,6 +895,13 @@ class _Watcher:
         self.clock = clock
         self.sleep = sleep
         self.wall = wall
+        self.listener = listener
+        self.on_pass = on_pass
+        self.minutes: int = args.minutes if minutes is None else minutes
+        self.since_open = backfill_since_open
+        self.backfill_minutes: int | None = (
+            None if backfill_since_open
+            else args.backfill_minutes if backfill_minutes is None else backfill_minutes)
         self.syms = [_Sym(name) for name in args.symbols]
         self.server0: int | None = None
         self.clock0 = 0.0
@@ -728,6 +931,19 @@ class _Watcher:
     def _down(self) -> bool:
         """True while the connection is lost or a data farm is reported broken."""
         return self._lost() or any(o[1] == math.inf for o in self.outages)
+
+    def first_backfills_over(self) -> bool:
+        """True once every symbol's first backfill has been handled (its bars are in the sinks) or
+        the symbol has stopped: a driver that polls an aligner starts after this."""
+        return all(not s.first_backfill or s.phase == "stopped" for s in self.syms)
+
+    def drop_counts(self) -> dict[str, DropCounts]:
+        """Per symbol, the counts the summary prints (a snapshot; read at any time)."""
+        return {s.name: DropCounts(
+            snapshot_only=s.snapshot_only, connection_loss=s.lost_not_written,
+            farm_break=s.farm_not_written, stalled_stream=s.stale_not_written,
+            rerequest_gap=s.gap_not_written, late_revisions=s.late, stale_rows=s.stale,
+            bad_bars=s.bad, rerequests=s.rerequests) for s in self.syms}
 
     # -- the session ----------------------------------------------------------------------
 
@@ -794,35 +1010,45 @@ class _Watcher:
         self.say(f"{sym.name}: conId {info.con_id}, primary exchange {info.primary_exchange}, "
                  f"time zone {info.time_zone_id}")
 
-    def _request(self, sym: _Sym) -> None:
-        """Send one history request, at least `REQUEST_SPACING` after the previous one (any symbol)."""
-        duration = f"{self.args.backfill_minutes * 60} S"
+    def _request(self, sym: _Sym) -> str:
+        """Send one history request, at least `REQUEST_SPACING` after the previous one (any symbol).
+        Returns the duration asked for."""
         if self.last_request is not None:
             wait = REQUEST_SPACING - (self.clock() - self.last_request)
             if wait > 0:
                 self.sleep(wait)
         # IB's backfill is its snapshot at the time the request was sent: note that time now
         sym.requested_server = self.server_now()
+        if self.since_open:
+            duration = since_open_duration(sym.requested_server)
+        else:
+            assert self.backfill_minutes is not None
+            duration = f"{self.backfill_minutes * 60} S"
         sent = self.clock()
         sym.req_id = self.md.request_history(sym.info.contract(), None, duration, use_rth=True,
                                              keep_up_to_date=True)
         sym.cancelled = False
         sym.requested_at = self.last_request = sent
         sym.phase = "backfill"
+        return duration
 
     def _request_all(self) -> None:
         for sym in self.syms:
             if sym.info is None:
                 continue
             try:
-                self._request(sym)
+                duration = self._request(sym)
             except NotConnected as exc:
                 raise _Closed from exc
-            self.say(f"{sym.name}: requested live bars with {self.args.backfill_minutes} minutes "
-                     "of backfill")
+            if self.since_open:
+                self.say(f"{sym.name}: requested live bars with the backfill since the open "
+                         f"({duration})")
+            else:
+                self.say(f"{sym.name}: requested live bars with {self.backfill_minutes} minutes "
+                         "of backfill")
 
     def _loop(self) -> int:
-        deadline = self.clock() + self.args.minutes * 60
+        deadline = self.clock() + self.minutes * 60
         while self.clock() < deadline:
             active = [s for s in self.syms if s.phase in ("backfill", "live")]
             if not active:
@@ -838,11 +1064,13 @@ class _Watcher:
                     self._assess(sym)
                     self._check_no_data(sym)
                     self._settle(sym)
+            if self.on_pass is not None:
+                self.on_pass(self.server_now())  # after this pass's bars and notifications
             if not progressed:
                 self.sleep(IDLE_SLEEP)
         self.lost_at_end = self.conn.state is ConnState.LOST
         self.say()
-        self.say(f"Watch time over ({self.args.minutes} minutes)." if self.clock() >= deadline
+        self.say(f"Watch time over ({self.minutes} minutes)." if self.clock() >= deadline
                  else "No symbol is streaming any more.")
         if self.lost_at_end:
             self.say("The connection to IB is still lost (code 1100).")
@@ -1000,6 +1228,8 @@ class _Watcher:
         sym.phase = "stopped"
         sym.stop_reason = reason
         self.say(line or f"{sym.name}: stopped watching ({reason}); the other symbols continue")
+        if self.listener is not None:
+            self.listener.stopped(sym.name)
 
     # -- bars -------------------------------------------------------------------------------
 
@@ -1091,6 +1321,15 @@ class _Watcher:
         if sym.last_emitted is None or bar.time > sym.last_emitted:
             sym.last_emitted = bar.time
         self.say(f"{sym.name} {_hm(bar.time)} not written: {why}")
+        self._tell_decided(sym)
+
+    def _tell_decided(self, sym: _Sym) -> None:
+        """Tell the listener `decided(symbol, last_emitted)`: the newest minute of `sym` that was
+        written or dropped. Nothing else is ever told, and only right after `last_emitted` moved;
+        see "What `decided` promises" in the module docstring for why no row can follow for a
+        minute at or before it."""
+        if self.listener is not None and sym.last_emitted is not None and sym.phase != "stopped":
+            self.listener.decided(sym.name, sym.last_emitted)
 
     def _backfill(self, sym: _Sym, raw: Sequence[events.HistoricalBar]) -> None:
         sent = sym.requested_server  # IB's snapshot is at least this old, not as old as `now`
@@ -1293,7 +1532,7 @@ class _Watcher:
                                                 "ended (stream stalled?)")
                     return False
         try:
-            written = self.files.write(sym.name, bar)
+            written = _append(self.files, sym.name, bar, how)
         except LiveFileError as exc:
             advice = ("close it in other programs (for example Excel) and run again" if exc.locked
                       else "check or move the file, then run again")
@@ -1304,6 +1543,7 @@ class _Watcher:
         sym.emitted_bars[bar.time] = (bar, written)
         sym.last_emitted = bar.time
         sym.last_bar = bar
+        self._tell_decided(sym)  # after every sink has the row
         head = f"{_hm(bar.time)}  {sym.name}  {_ohlc(bar)}  volume {bar.volume}"
         tag = sym.tag
         if how == "backfill":
@@ -1360,6 +1600,14 @@ class _Watcher:
                 self._cancel(sym)
             except Exception as exc:  # noqa: BLE001
                 self.say(f"Cancelling {sym.name} raised {type(exc).__name__}: {exc}")
+        if self.listener is not None:
+            for sym in self.syms:  # nothing more will come for any symbol still running
+                if sym.phase != "stopped":
+                    try:
+                        self.listener.stopped(sym.name)
+                    except Exception as exc:  # noqa: BLE001
+                        self.say(f"Telling the listener that {sym.name} ended raised "
+                                 f"{type(exc).__name__}: {exc}")
 
     def _summary(self) -> None:
         say = self.say
@@ -1428,6 +1676,9 @@ class _Watcher:
                 "closed by time after it.")
         say(OFFSET_NOTE)
         say(COMPARE_NOTE)
+
+
+_Watcher = Watcher  # the name it had before it was public
 
 
 def _ohlc(bar: Bar) -> str:
@@ -1503,23 +1754,28 @@ def run_watch(
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     wall: Callable[[], datetime],
+    seams: WatchSeams | None = None,
 ) -> int:
     """Connect, watch, summarise; always cancels every request and closes the connection and recorder.
 
     `args` carries `symbols`, `minutes`, `backfill_minutes`, `quiet`, `out` (Path), `record` (Path or
     None), `private`, `host`, `port`, `client_id` and `connect_timeout`. `clock` is monotonic
     seconds, `sleep` an interruptible sleep, `wall` this computer's clock as an aware datetime.
-    Returns the exit code.
+    `seams` is for a driver (module docstring); without it the run is the command's. Returns the
+    exit code. The sinks of `seams` are closed with the live files, in every case.
     """
     say = _Say(out)
+    seam = seams or WatchSeams()
     labels = dict(_LABELS)  # a mid-run not-paper rejection replaces the not-paper label
+    files = LiveFiles(args.out, say)
+    sink: ClosedBars = TeeBars(files, *seam.extra_sinks) if seam.extra_sinks else files
     try:
         recorder = recorder_factory(args)
     except (OSError, PathRefused) as exc:
         say(f"Cannot start the session recording: {type(exc).__name__}: {exc}")
         say(f"Result: {labels[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
+        sink.close()
         return EXIT_REFUSED
-    files = LiveFiles(args.out, say)
     conn: IbConnection | None = None
     code = EXIT_STOPPED
     advice: list[str] = []
@@ -1539,7 +1795,13 @@ def run_watch(
         else:
             verified = paper
             md = market_data_factory(conn)
-            code = _Watcher(args, conn, md, say, files, clock, sleep, wall).run()
+            watcher = Watcher(args, conn, md, say, sink, clock, sleep, wall, listener=seam.listener,
+                              on_pass=seam.on_pass, minutes=seam.minutes,
+                              backfill_minutes=seam.backfill_minutes,
+                              backfill_since_open=seam.backfill_since_open)
+            if seam.on_watcher is not None:
+                seam.on_watcher(watcher)
+            code = watcher.run()
     except KeyboardInterrupt:
         say()
         say("Interrupted (Ctrl-C).")
@@ -1560,7 +1822,10 @@ def run_watch(
                 code = EXIT_NOT_PAPER
                 advice.clear()
                 said_not_paper = True
-        files.close()
+        try:
+            sink.close()
+        except Exception as exc:  # noqa: BLE001 - the live files never raise; a driver's sink might
+            say(f"Closing the bar sinks raised {type(exc).__name__}: {exc}")
         if conn is not None:
             try:
                 conn.close()
