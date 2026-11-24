@@ -37,6 +37,7 @@ from MainStoinker.Util.broker_guard import BrokerPortRefused
 from tests.fake_ib import _WAKE, FARM_MESSAGES, ConnectBehavior, FakeIbClient, make_bar
 from tests.home_guard import no_writes_to_real_home
 from tests.no_build import forbid_building
+from tests.not_paper_text import assert_one_not_paper_line
 
 REPO = Path(__file__).resolve().parent.parent
 SOURCE = REPO / "MainStoinker" / "ib" / "watch_bars.py"
@@ -1065,6 +1066,7 @@ def upd_at(rig: Rig, symbol: str, bar_epoch: int, when: int, ohlcv: Bar6) -> Non
     def push() -> None:
         rig.expected += 1
         rig.fakes[-1].push("historicalDataUpdate", rig.req_ids[symbol], make_bar(bar_epoch, o, h, lo, c, v))
+        rig.await_delivery(symbol)
 
     rig.at(when - rig.server_epoch, push)
 
@@ -2104,7 +2106,8 @@ def test_a_failing_list_with_the_first_clock_answer_requests_nothing_more(rig: R
     code = rig.watch(symbols="AAPL", minutes=2, paper=True)
     assert code == watch_bars.EXIT_NOT_PAPER, rig.text
     no_data_request(rig)
-    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+    assert_one_not_paper_line(rig.text, "mid")
+    assert "U7654321" not in rig.text
 
 
 def test_a_failing_list_in_the_middle_of_a_watch_ends_it_with_the_not_paper_code(rig: Rig) -> None:
@@ -2117,7 +2120,8 @@ def test_a_failing_list_in_the_middle_of_a_watch_ends_it_with_the_not_paper_code
     rig.end_at(4, symbols=1)
     code = rig.watch(symbols="AAPL", minutes=4, paper=True)
     assert code == watch_bars.EXIT_NOT_PAPER, rig.text
-    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+    assert_one_not_paper_line(rig.text, "mid")
+    assert "U7654321" not in rig.text and "Nothing was requested." not in rig.text
     assert "STOPPED: the connection to TWS closed" not in rig.text
     assert rig.rows("AAPL")[-1][0][11:16] == "09:33"  # what was written before stays
     assert "Summary" in rig.text and f"(exit {code})" in rig.text
@@ -2165,7 +2169,8 @@ def test_a_failing_list_after_a_loss_in_paper_mode_is_still_not_paper(rig: Rig) 
     code = rig.watch(symbols="AAPL", minutes=5, paper=True)
     assert code == watch_bars.EXIT_NOT_PAPER, rig.text
     assert rig.connections[0].paper_rejected is True
-    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+    assert_one_not_paper_line(rig.text, "mid")
+    assert "U7654321" not in rig.text
 
 
 @pytest.mark.parametrize("rep", range(4))
@@ -2184,8 +2189,8 @@ def test_a_failing_list_behind_connection_closed_in_a_watch_is_still_not_paper(r
     code = rig.watch(symbols="AAPL", minutes=5, paper=True)
     assert code == watch_bars.EXIT_NOT_PAPER, rig.text
     assert rig.connections[0].paper_rejected is True
-    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
-    assert "verified at start" not in rig.text
+    assert_one_not_paper_line(rig.text, "mid")
+    assert "U7654321" not in rig.text and "verified at start" not in rig.text
 
 
 def test_a_failing_list_delivered_just_before_close_in_a_watch_is_not_paper(
@@ -2206,7 +2211,8 @@ def test_a_failing_list_delivered_just_before_close_in_a_watch_is_not_paper(
     code = rig.watch(symbols="AAPL", minutes=5, paper=True)
     assert code == watch_bars.EXIT_NOT_PAPER, rig.text
     assert rig.connections[0].paper_rejected is True
-    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "verified at start" not in rig.text
+    assert_one_not_paper_line(rig.text, "mid")
+    assert "verified at start" not in rig.text
 
 
 def test_the_watcher_result_line_says_the_account_was_verified_at_start_after_a_loss(rig: Rig) -> None:
@@ -2387,7 +2393,8 @@ def test_a_failing_list_in_the_middle_of_a_no_prompt_watch_ends_it_with_5(rig: R
     rig.end_at(4, symbols=1)
     code = unattended(rig, minutes=4)
     assert code == watch_bars.EXIT_NOT_PAPER, rig.text
-    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+    assert_one_not_paper_line(rig.text, "mid")
+    assert "U7654321" not in rig.text
     assert rig.rows("AAPL")[-1][0][11:16] == "09:33"
     assert not rig.prompts
 
@@ -2432,6 +2439,306 @@ def test_the_not_paper_code_is_new_documented_and_distinct() -> None:
              watch_bars.EXIT_NO_CONNECTION, watch_bars.EXIT_STOPPED, watch_bars.EXIT_INTERRUPTED]
     assert watch_bars.EXIT_NOT_PAPER not in codes
     assert "  5    --paper only" in watch_bars.EXIT_CODES_TEXT
+
+
+# -- "no data received": a stream that answers nothing in the session -----------------------------
+
+NO_DATA_HINT = ("check the market data subscription of this account (quotes answering IB 354 / 10167 "
+                "mean none; a paper account needs the live account's data shared with it); on a "
+                "market holiday or with delayed data this is expected")
+
+
+def epd(day: int, hh: int, mm: int, ss: int = 0) -> int:
+    """Epoch seconds of 2024-08-<day> hh:mm:ss New York (the 16th is a Friday)."""
+    return int(datetime(2024, 8, day, hh, mm, ss, tzinfo=NY).timestamp())
+
+
+def earlier_session() -> list[tuple[Any, ...]]:
+    """What a start outside the session gets from IB: bars of the previous session only."""
+    return [(epd(15, 15, 58), 99.0, 99.5, 98.8, 99.2, 5000), (epd(15, 15, 59), 99.2, 99.9, 99.1, 99.8, 4000)]
+
+
+def probe_text(rig: Rig, when: float, seen: dict[str, bool]) -> None:
+    """At script time `when`, record whether the no-data line is out yet (the step runs before the pass)."""
+    rig.at(when, lambda: seen.__setitem__(str(when), "no data received" in rig.text))
+
+
+def no_data_lines(rig: Rig, symbol: str) -> list[str]:
+    return [ln for ln in rig.text.splitlines() if ln.startswith(f"{symbol}: no data received")]
+
+
+def test_no_data_is_said_after_two_minutes_of_the_session_and_ends_with_the_new_code(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [[]]}
+    seen: dict[str, bool] = {}
+    probe_text(rig, rig.tt(34, 50.0), seen)  # 85 s after the backfill: not yet
+    probe_text(rig, rig.tt(35, 40.0), seen)  # the pass at 09:34:50 has run: still nothing said
+    probe_text(rig, rig.tt(36, 30.0), seen)  # the pass at 09:35:40 (135 s) has run: said
+    rig.end_at(4, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=4)
+    assert code == watch_bars.EXIT_NO_DATA == 6, rig.text
+    assert list(seen.values()) == [False, False, True]
+    lines = no_data_lines(rig, "AAPL")
+    assert len(lines) == 1 and NO_DATA_HINT in lines[0]  # once, with the hint
+    assert "  AAPL: no data received" in rig.text and "  AAPL: streaming" not in rig.text
+    assert "every symbol streaming" not in rig.text
+    assert f"Result: {watch_bars._LABELS[6]} (exit 6)" in rig.text
+    assert "no data received for at least one symbol" in rig.text
+
+
+def test_no_data_with_only_the_end_of_the_watch_as_the_first_look(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [[]]}
+    rig.end_at(3, symbols=1)  # nothing happens until 181 s: the end of the watch decides
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_NO_DATA, rig.text
+    assert len(no_data_lines(rig, "AAPL")) == 1
+
+
+def test_no_data_less_than_two_minutes_into_the_session_is_not_declared(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [[]]}
+    rig.end_at(1, symbols=1)  # a one-minute watch: 61 s
+    code = rig.watch(symbols="AAPL", minutes=1)
+    assert "no data received" not in rig.text
+    assert code != watch_bars.EXIT_NO_DATA
+
+
+def test_one_symbol_without_data_is_named_and_the_other_keeps_streaming(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL], "MSFT": [[]]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.end_at(4)
+    code = rig.watch(minutes=4)
+    assert code == watch_bars.EXIT_NO_DATA, rig.text
+    assert len(no_data_lines(rig, "MSFT")) == 1 and no_data_lines(rig, "AAPL") == []
+    assert "  AAPL: streaming" in rig.text and "  MSFT: no data received" in rig.text
+    assert "every symbol streaming" not in rig.text
+
+
+def test_data_that_starts_later_makes_the_symbol_streaming_and_the_result_follows(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [[]]}
+    rig.at(rig.tt(35, 40.0), lambda: None)  # a look at 135 s: nothing yet
+    rig.upd("AAPL", 36, (36, 2.0), (100.0, 100.5, 99.9, 100.2, 1000))  # 155 s after the backfill
+    rig.upd("AAPL", 36, (36, 20.0), (100.0, 100.6, 99.9, 100.3, 1200))
+    rig.end_at(4, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=4)
+    assert code == watch_bars.EXIT_OK, rig.text
+    assert len(no_data_lines(rig, "AAPL")) == 1  # said once, when it was established
+    assert "  AAPL: streaming" in rig.text and "  AAPL: no data received" not in rig.text
+    assert f"Result: {watch_bars._LABELS[0]} (exit 0)" in rig.text
+
+
+@pytest.mark.parametrize("server,minutes", [
+    (epd(16, 16, 30), 4),  # after the close
+    (epd(17, 10, 0), 4),   # a Saturday
+    (epd(18, 11, 0), 4),   # a Sunday
+    (epd(16, 9, 0), 4),    # before the open, and the watch ends before 09:30
+])
+def test_outside_the_session_nothing_changes(rig: Rig, server: int, minutes: int) -> None:
+    rig.server_epoch = server
+    rig.wall_offset = -0.4
+    rig.backfills = {"AAPL": [earlier_session()]}
+    rig.end_at(minutes, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=minutes)
+    assert code == watch_bars.EXIT_OK, rig.text
+    assert "no data received" not in rig.text
+    assert "market closed: no new bars expected" in rig.text
+    assert "  AAPL: streaming" in rig.text
+
+
+def test_a_start_before_the_open_starts_the_clock_at_0930(rig: Rig) -> None:
+    rig.server_epoch = epd(16, 9, 28)
+    rig.backfills = {"AAPL": [earlier_session()]}
+    seen: dict[str, bool] = {}
+    probe_text(rig, rig.tt(31, 40.0), seen)  # 100 s after 09:30
+    probe_text(rig, rig.tt(32, 20.0), seen)  # the pass at 09:31:40 has run: nothing said
+    probe_text(rig, rig.tt(33, 5.0), seen)   # the pass at 09:32:20 (140 s) has run: said
+    rig.end_at(6, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=6)
+    assert code == watch_bars.EXIT_NO_DATA, rig.text
+    assert list(seen.values()) == [False, False, True]
+    assert len(no_data_lines(rig, "AAPL")) == 1
+
+
+def test_the_no_data_code_is_new_documented_and_distinct() -> None:
+    codes = [watch_bars.EXIT_OK, watch_bars.EXIT_FAILED, watch_bars.EXIT_REFUSED,
+             watch_bars.EXIT_NO_CONNECTION, watch_bars.EXIT_STOPPED, watch_bars.EXIT_NOT_PAPER,
+             watch_bars.EXIT_INTERRUPTED]
+    assert watch_bars.EXIT_NO_DATA == 6 and watch_bars.EXIT_NO_DATA not in codes
+    assert "  6    " in watch_bars.EXIT_CODES_TEXT and "no data" in watch_bars.EXIT_CODES_TEXT
+    assert "exit code 6" in (watch_bars.__doc__ or "")
+    shown = " ".join(watch_bars.build_parser().format_help().split())
+    assert "6 finished" in shown and "market data subscription" in shown
+
+
+def at_epoch(rig: Rig, when: int, fn: Callable[[], None], ready: Callable[[], bool] | None = None) -> None:
+    rig.at(when - rig.server_epoch, fn, ready)
+
+
+def passes(rig: Rig, first: int, last: int, every: int) -> None:
+    """No-op steps, so that the watcher takes a look at these server times."""
+    for when in range(first, last + 1, every):
+        at_epoch(rig, when, lambda: None)
+
+
+def update_of(rig: Rig, symbol: str, bar_epoch: int, when: int, volume: int = 10) -> None:
+    def push() -> None:
+        rig.expected += 1
+        rig.fakes[-1].push("historicalDataUpdate", rig.req_ids[symbol],
+                           make_bar(bar_epoch, 99.0, 99.5, 98.8, 99.2, volume))
+        rig.await_delivery(symbol)
+
+    at_epoch(rig, when, push)
+
+
+PRE_OPEN = epd(16, 9, 28)
+SUBSCRIPTION_WORDS = "check the market data subscription"
+
+
+def test_a_lost_connection_that_is_restored_is_not_no_data(rig: Rig) -> None:
+    rig.server_epoch = PRE_OPEN
+    rig.backfills = {"AAPL": [earlier_session()]}
+    at_epoch(rig, epd(16, 9, 29), lambda: rig.fakes[-1].drop(1100))
+    at_epoch(rig, epd(16, 9, 34), lambda: rig.fakes[-1].drop(1102),
+             ready=lambda: "connectivity LOST" in rig.text)
+    passes(rig, epd(16, 9, 29, 30), epd(16, 9, 33, 30), 30)  # 09:30 to 09:34 is an outage: no clock
+    for secs in (10, 15, 20, 25, 30):
+        update_of(rig, "AAPL", epd(16, 9, 34), epd(16, 9, 34, secs))
+    update_of(rig, "AAPL", epd(16, 9, 35), epd(16, 9, 35, 4))
+    rig.end_at(8, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=8)
+    assert code == watch_bars.EXIT_OK, rig.text
+    assert "no data received" not in rig.text and SUBSCRIPTION_WORDS not in rig.text
+    assert "connectivity LOST" in rig.text and "connectivity restored" in rig.text
+
+
+def test_the_clock_resumes_after_an_outage_where_it_stopped(rig: Rig) -> None:
+    rig.server_epoch = PRE_OPEN
+    rig.backfills = {"AAPL": [earlier_session()]}
+    at_epoch(rig, epd(16, 9, 29), lambda: rig.fakes[-1].drop(1100))
+    at_epoch(rig, epd(16, 9, 31, 30), lambda: rig.fakes[-1].drop(1102),
+             ready=lambda: "connectivity LOST" in rig.text)
+    passes(rig, epd(16, 9, 29, 30), epd(16, 9, 31, 0), 30)
+    at_epoch(rig, epd(16, 9, 31, 31), lambda: None, ready=lambda: "connectivity restored" in rig.text)
+    passes(rig, epd(16, 9, 31, 40), epd(16, 9, 32, 30), 30)
+    seen: dict[str, bool] = {}
+    when = epd(16, 9, 33, 0)  # 90 s after the restore: not yet (the 09:30 to 09:31:30 outage is not counted)
+    at_epoch(rig, when, lambda: seen.__setitem__("early", "no data received" in rig.text))
+    at_epoch(rig, epd(16, 9, 34, 0), lambda: None)
+    at_epoch(rig, epd(16, 9, 34, 30), lambda: seen.__setitem__("late", "no data received" in rig.text))
+    rig.end_at(8, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=8)
+    assert seen == {"early": False, "late": True}, rig.text
+    assert code == watch_bars.EXIT_NO_DATA
+
+
+def test_a_connection_lost_until_the_end_is_the_outage_not_no_data(rig: Rig) -> None:
+    rig.server_epoch = PRE_OPEN
+    rig.backfills = {"AAPL": [earlier_session()]}
+    at_epoch(rig, epd(16, 9, 29), lambda: rig.fakes[-1].drop(1100))
+    at_epoch(rig, epd(16, 9, 29, 10), lambda: None, ready=lambda: "connectivity LOST" in rig.text)
+    passes(rig, epd(16, 9, 29, 30), epd(16, 9, 35, 0), 30)
+    rig.end_at(8, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=8)
+    assert code == watch_bars.EXIT_STOPPED, rig.text
+    assert "no data received" not in rig.text and SUBSCRIPTION_WORDS not in rig.text
+    assert "The connection to IB is still lost" in rig.text
+
+
+def test_a_data_farm_break_that_is_never_restored_is_not_no_data(rig: Rig) -> None:
+    rig.server_epoch = PRE_OPEN
+    rig.backfills = {"AAPL": [earlier_session()]}
+    at_epoch(rig, epd(16, 9, 29),
+             lambda: rig.fakes[-1].drop(2103, "Market data farm connection is broken:usfarm"))
+    at_epoch(rig, epd(16, 9, 29, 10), lambda: None, ready=lambda: "data farm break (2103)" in rig.text)
+    passes(rig, epd(16, 9, 29, 30), epd(16, 9, 35, 0), 30)
+    rig.end_at(8, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=8)
+    assert code == watch_bars.EXIT_OK, rig.text  # what the watcher answered before "no data" existed
+    assert "no data received" not in rig.text and SUBSCRIPTION_WORDS not in rig.text
+    assert "never reported OK again" in rig.text
+
+
+def test_exit_1_wins_over_no_data(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_write = watch_bars.LiveFiles.write
+
+    def failing(self: Any, symbol: str, bar: Any) -> bool:
+        if symbol == "MSFT":
+            raise watch_bars.LiveFileError("cannot open the file: PermissionError", locked=True)
+        return real_write(self, symbol, bar)
+
+    monkeypatch.setattr(watch_bars.LiveFiles, "write", failing)
+    rig.backfills = {"AAPL": [[]], "MSFT": [[(ep(9, m), 1.0, 2.0, 0.5, 1.5, 10) for m in (30, 31, 32)]]}
+    rig.end_at(4)
+    code = rig.watch(minutes=4)
+    assert len(no_data_lines(rig, "AAPL")) == 1 and "MSFT stopped, the other symbols continue" in rig.text
+    assert code == watch_bars.EXIT_FAILED == 1, rig.text
+
+
+def test_updates_of_the_previous_session_keep_the_symbol_alive_but_not_forever(rig: Rig) -> None:
+    """Updates of an earlier date are no data of today, but while any update arrives the stream is alive;
+    the 120 s run from the last one."""
+    rig.server_epoch = PRE_OPEN
+    rig.backfills = {"AAPL": [earlier_session()]}
+    passes(rig, epd(16, 9, 29), epd(16, 9, 36, 30), 30)
+    for secs in range(0, 8 * 60, 30):  # an update every 30 s from 09:30 to 09:37:30
+        update_of(rig, "AAPL", epd(15, 15, 59), PRE_OPEN + 120 + secs)
+    seen: dict[str, bool] = {}
+    at_epoch(rig, epd(16, 9, 36), lambda: seen.__setitem__("while", "no data received" in rig.text))
+    rig.end_at(9, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=9)
+    assert seen["while"] is False
+    assert code == watch_bars.EXIT_OK, rig.text  # updates keep arriving until the end of the watch
+    assert "no data received" not in rig.text
+
+
+def test_a_stream_that_goes_silent_without_a_bar_of_today_is_no_data_after_120_s(rig: Rig) -> None:
+    rig.server_epoch = PRE_OPEN
+    rig.backfills = {"AAPL": [earlier_session()]}
+    update_of(rig, "AAPL", epd(15, 15, 59), epd(16, 9, 30, 30))  # the last sign of life
+    passes(rig, epd(16, 9, 31), epd(16, 9, 35, 0), 30)
+    rig.end_at(8, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=8) == watch_bars.EXIT_NO_DATA, rig.text
+    assert len(no_data_lines(rig, "AAPL")) == 1
+
+
+def test_the_watcher_doubt_line_is_exactly_one_line_with_the_same_code(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    from MainStoinker.ib import cli
+    from MainStoinker.ib.connection import IbConnection as Connection
+
+    monkeypatch.setattr(cli, "READER_WAIT", 0.01)
+    monkeypatch.setattr(Connection, "reader_finished", lambda self, timeout=0.0: False)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.at(rig.tt(34, 10.0), lambda: rig.fakes[-1].drop("connectionClosed"))
+    rig.end_at(4, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=4, paper=True)
+    assert code == watch_bars.EXIT_NOT_PAPER, rig.text
+    assert_one_not_paper_line(rig.text, "doubt")
+
+
+# -- the first banner line --------------------------------------------------------------------
+
+
+def test_an_unattended_paper_watch_does_not_say_only_the_owner_runs_it(rig: Rig) -> None:
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.end_at(2, symbols=1)
+    unattended(rig)
+    assert "Unattended paper run: data only, paper account only." in rig.text
+    assert "Only the owner runs it" not in rig.text
+    assert "places no trade" in rig.text
+
+
+def test_an_attended_watch_keeps_the_owner_line(rig: Rig) -> None:
+    rig.typed = "nope"
+    rig.watch(symbols="AAPL", minutes=2, paper=True)
+    assert "Only the owner runs it" in rig.text and "Unattended paper run" not in rig.text
+
+
+def test_the_mid_run_line_is_not_the_at_open_line(rig: Rig) -> None:
+    from MainStoinker.ib import cli
+
+    assert watch_bars.NOT_PAPER_MID_LINE is cli.NOT_PAPER_MID_LINE
+    assert "Nothing was requested" not in watch_bars.NOT_PAPER_MID_LINE
 
 
 def test_the_paper_helpers_are_the_ones_of_cli() -> None:
