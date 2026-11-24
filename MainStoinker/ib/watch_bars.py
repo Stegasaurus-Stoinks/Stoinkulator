@@ -53,6 +53,13 @@ acceptable, a partial row is not. Hence:
   A start after the open with no bar of today yet says so; after 16:00 the output says "market
   closed: no new bars expected", or for a delayed stream "regular session ended; delayed bars
   continue for about N minutes".
+- No data (exit code 6): a symbol that, in the regular session by IB's server clock (weekday, 09:30
+  to 16:00 New York), has received no bar of today's session and no live update for at least 120 s
+  after its backfill ended (a start before 09:30 starts the clock at 09:30; the end of the watch
+  counts too) is `no data received`: one line says so as soon as it is established, with a hint
+  about the account's market data subscription, the summary says so instead of `streaming`, and
+  the result says no data was received. Data that arrives later makes the symbol `streaming` and
+  the result follows the final state. Outside the session nothing changes (market closed, exit 0).
 - While the connection is reported lost (code 1100) nothing is closed by time, and a bar whose
   minute overlapped the outage is never written ("not written: spanned a connection loss"). While
   a re-requested backfill is outstanding nothing is closed for that symbol; when it arrives its
@@ -126,6 +133,7 @@ from MainStoinker.ib.bars import BadBar, bar_from_ib, data_time
 from MainStoinker.ib.cli import (
     NOT_PAPER_LABEL,
     NOT_PAPER_LINE,
+    NOT_PAPER_MID_LINE,
     PAPER_HOST,
     PAPER_MODE_LINE,
     PAPER_NO_PROMPT_LINE,
@@ -134,8 +142,10 @@ from MainStoinker.ib.cli import (
     check_folder_usable,
     check_path,
     closed_without_rejection,
+    first_banner_line,
     home_folder,
     make_folders,
+    mid_run_not_paper_line,
     paper_refusal,
     paper_session_ok,
     port_refusal_text,
@@ -175,11 +185,12 @@ EXIT_REFUSED = 2
 EXIT_NO_CONNECTION = 3
 EXIT_STOPPED = 4
 EXIT_NOT_PAPER = 5
+EXIT_NO_DATA = 6
 EXIT_INTERRUPTED = 130
 
 EXIT_CODES_TEXT = """\
 exit codes:
-  0    watched to the end and every symbol was streaming
+  0    watched to the end and every symbol was streaming (or the market was closed)
   1    finished, but a symbol stopped (IB error, unknown symbol, unusable live file), had no
        stream at the end (a re-request still outstanding) or delivered no bars
   2    refused: console gate, port guard, --paper conditions, bad arguments, unusable path
@@ -187,6 +198,9 @@ exit codes:
   4    stopped by a lost or closed connection, or by an unexpected error
   5    --paper only: the account TWS is signed into is not a paper account (checked before
        the first request and all along); nothing more was requested; never retried
+  6    finished, every symbol streaming or closed, but at least one symbol received no data: no
+       bar of today's session and no live update for 120 s of the regular session (09:30 to 16:00
+       New York, weekday) after its backfill ended: check the account's market data subscription
   130  interrupted with Ctrl-C (requests cancelled, connection and recording closed)
 """
 
@@ -214,6 +228,9 @@ FARM_OK = {2104: "market", 2106: "historical"}  # ... and that farm is OK again
 STALE_UPDATE = 15.0  # a bar closed by time needs a live update at most this long before its minute ended
 CONNECTION_NOTICES = frozenset({1100, 1101, 1102})  # connectivity lost, restored with data lost, restored
 DELAY_THRESHOLD = 120.0 # newest bar more than this behind server time in session: delayed data
+NO_DATA_AFTER = 120.0  # session seconds without any bar of today or update before "no data received"
+NO_DATA_HINT = ("check the market data subscription of this account (quotes answering IB 354 / 10167 "
+                "mean none); a paper account needs the live account's data shared with it")
 SESSION_OPEN_MINUTE = 9 * 60 + 30
 SESSION_CLOSE_MINUTE = 16 * 60
 BACKFILL_TIMEOUT = 90.0
@@ -277,7 +294,8 @@ def build_parser() -> argparse.ArgumentParser:
             "print each bar as it closes and save the closed bars to one CSV file per symbol and "
             "day. It connects to TWS or IB Gateway and sends DATA REQUESTS ONLY: it runs no algo "
             "and places no trade. Only the owner runs it, from a real terminal; you type the "
-            "port number to confirm.\n\n"
+            "port number to confirm. (With --paper --no-prompt it runs unattended: no prompt, "
+            "data only, paper account only.)\n\n"
             "A bar is closed when an update with a later minute arrives. The session recording "
             "(on by default) grows with every update and may slow a long watch: use --no-record "
             "to avoid that.\n\n"
@@ -410,7 +428,7 @@ def resolve_paths(args: argparse.Namespace, env: Mapping[str, str], today: date,
 def describe_session(args: argparse.Namespace) -> str:
     record = f"{args.record}" if args.record else "none (--no-record)"
     return "\n".join([
-        "This command connects to TWS or IB Gateway. Only the owner runs it.",
+        first_banner_line(args),
         f"  Connects to:      {args.host}:{args.port}",
         f"  Client id:        {args.client_id}",
         f"  Symbols:          {', '.join(args.symbols)}",
@@ -581,6 +599,9 @@ class _Sym:
     first_delays: list[float] = field(default_factory=list)
     close_delays: list[float] = field(default_factory=list)
     last_forming_line: float = -math.inf
+    live_since: float | None = None  # server time when the first backfill ended
+    updates_seen: int = 0  # live updates received, whatever their date
+    no_data_noted: bool = False  # the "no data received" line was printed
 
     @property
     def had_bars(self) -> bool:
@@ -623,6 +644,21 @@ def _in_session(epoch: float) -> bool:
 
 def _session_end(day: date) -> int:
     return int(datetime(day.year, day.month, day.day, 16, tzinfo=NY).timestamp())
+
+
+def _session_start(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, 9, 30, tzinfo=NY).timestamp())
+
+
+def _session_exposure(since: float, now: float) -> float:
+    """Seconds of the regular session (weekday, 09:30 to 16:00 New York, server time) that lie
+    between `since` and `now` on the New York date of `now`."""
+    day = _ny(now).date()
+    if day.weekday() >= 5:
+        return 0.0
+    start = max(since, _session_start(day))
+    end = min(now, _session_end(day))
+    return max(0.0, end - start)
 
 
 def _header_only(path: Path) -> bool:
@@ -785,6 +821,7 @@ class _Watcher:
                     progressed |= self._service(sym, slice_)
                 if sym.phase in ("backfill", "live"):
                     self._assess(sym)
+                    self._check_no_data(sym)
                     self._settle(sym)
             if not progressed:
                 self.sleep(IDLE_SLEEP)
@@ -795,8 +832,14 @@ class _Watcher:
         if self.lost_at_end:
             self.say("The connection to IB is still lost (code 1100).")
             return EXIT_STOPPED
-        failed = any(s.phase in ("stopped", "backfill") or not s.had_bars for s in self.syms)
-        return EXIT_FAILED if failed else EXIT_OK
+        for sym in self.syms:  # the end of the watch may be what completes the 120 s
+            self._check_no_data(sym)
+        no_data = [s for s in self.syms if self._no_data(s)]
+        failed = any(s.phase in ("stopped", "backfill") or (not s.had_bars and s not in no_data)
+                     for s in self.syms)
+        if failed:
+            return EXIT_FAILED
+        return EXIT_NO_DATA if no_data else EXIT_OK
 
     # -- reading ----------------------------------------------------------------------------
 
@@ -890,6 +933,8 @@ class _Watcher:
         outcome = result.outcome
         if outcome is END:
             self._backfill(sym, result.bars)
+            if sym.live_since is None:
+                sym.live_since = self.server_now()
             if sym.phase == "backfill":  # not "stopped" (an unwritable file stops it inside)
                 sym.phase = "live"
             return True
@@ -977,6 +1022,22 @@ class _Watcher:
                          f"{max(1, round(sym.lag / 60))} minutes")
             else:
                 self.say(f"{sym.name}: market closed: no new bars expected")
+
+    def _no_data(self, sym: _Sym) -> bool:
+        """True when `sym` is streaming but has received no bar of today's session and no live update
+        for at least `NO_DATA_AFTER` s of the regular session since its backfill ended (the clock
+        starts at 09:30 for a pre-open start). It is the state now: data arriving later clears it."""
+        if sym.phase != "live" or sym.live_since is None or sym.newest is not None or sym.updates_seen:
+            return False
+        return _session_exposure(sym.live_since, self.server_now()) >= NO_DATA_AFTER
+
+    def _check_no_data(self, sym: _Sym) -> None:
+        """Say once, as soon as it is established, that `sym` has received no data."""
+        if sym.no_data_noted or not self._no_data(sym):
+            return
+        sym.no_data_noted = True
+        self.say(f"{sym.name}: no data received: no bar of today's session and no live update for "
+                 f"{NO_DATA_AFTER:g} s of the session; {NO_DATA_HINT}")
 
     def _label(self, sym: _Sym, observed: float | None, now: float) -> None:
         """The DELAYED label (it never changes how bars are judged; the lag bound does that): declared
@@ -1089,6 +1150,7 @@ class _Watcher:
 
     def _update(self, sym: _Sym, raw: events.HistoricalBar) -> None:
         now = self.server_now()
+        sym.updates_seen += 1
         bar = self._convert(sym, raw)
         if bar is None:
             return
@@ -1280,7 +1342,9 @@ class _Watcher:
         say()
         say("Summary")
         for sym in self.syms:
-            if sym.phase == "live":
+            if self._no_data(sym):
+                state = f"no data received ({NO_DATA_HINT})"
+            elif sym.phase == "live":
                 state = "streaming"
             elif sym.phase == "backfill":
                 state = ("NOT streaming at the end: a request was outstanding (a backfill was still "
@@ -1368,6 +1432,7 @@ _LABELS = {
     EXIT_STOPPED: "stopped early (lost or closed connection, or an unexpected error)",
     EXIT_INTERRUPTED: "interrupted with Ctrl-C",
     EXIT_NOT_PAPER: NOT_PAPER_LABEL,
+    EXIT_NO_DATA: "watched to the end, but no data received for at least one symbol",
 }
 ADVICE_CLIENT_ID = ("Client id in use: another API client is connected with this id. Close it or pass "
                     "another --client-id.")
@@ -1464,7 +1529,7 @@ def run_watch(
                 verified_at_start = True  # closed or lost, no failing list: the watch's own outcome stands
             else:
                 # the account list failed after READY: whatever the watch saw, this is the result
-                say(NOT_PAPER_LINE)
+                say(mid_run_not_paper_line(conn))
                 code = EXIT_NOT_PAPER
                 advice.clear()
                 said_not_paper = True
@@ -1476,7 +1541,7 @@ def run_watch(
                 say(f"Closing the connection raised {type(exc).__name__}: {exc}")
             if verified and not said_not_paper and conn.paper_rejected:
                 # a failing list delivered while close() joined the reader: this is the result
-                say(NOT_PAPER_LINE)
+                say(NOT_PAPER_MID_LINE)
                 code = EXIT_NOT_PAPER
                 advice.clear()
                 verified_at_start = False

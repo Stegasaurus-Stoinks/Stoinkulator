@@ -299,7 +299,8 @@ def test_a_failing_list_after_ready_stops_the_run(ps: PaperSession, caplog: pyte
     assert ps.connections[0].state is ConnState.CLOSED
     assert code == NEW_CODE[command]  # not "stopped, run again" and not "a step failed"
     assert ps.connections[0].paper_verified is False
-    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert ps.text.count(cli.NOT_PAPER_MID_LINE) == 1 and cli.NOT_PAPER_LINE not in ps.text
+    assert "Nothing was requested." not in ps.text
     assert "paper account verified" not in ps.text
     assert "run the same command again" not in ps.text and "What to do" not in ps.text
     assert f"(exit {code})" in ps.text and cli.NOT_PAPER_LABEL in ps.text
@@ -698,7 +699,7 @@ def test_a_failing_list_after_the_connection_was_lost_is_still_not_paper(
     lose_mid_run(ps, command, "lost_then_closed")
     code = ps.run(command, "--paper")
     assert code == NEW_CODE[command]
-    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert ps.text.count(cli.NOT_PAPER_MID_LINE) == 1
     assert "paper account verified" not in ps.text
 
 
@@ -715,7 +716,8 @@ def test_a_connection_that_is_neither_verified_nor_cleanly_closed_stays_not_pape
     monkeypatch.setattr(IbConnection, "paper_verified", property(once))
     code = ps.run(command, "--paper")
     assert code == NEW_CODE[command]
-    assert ps.text.count(cli.NOT_PAPER_LINE) >= 1
+    assert ps.text.count(cli.NOT_PAPER_DOUBT_LINE) >= 1
+    assert cli.NOT_PAPER_LINE not in ps.text
     assert "paper account verified" not in ps.text
 
 
@@ -752,7 +754,7 @@ def test_a_failing_list_behind_connection_closed_is_still_not_paper(
     code = ps.run(command, "--paper")
     assert code == NEW_CODE[command], ps.text
     assert ps.connections[0].paper_rejected is True
-    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert ps.text.count(cli.NOT_PAPER_MID_LINE) == 1
     assert "verified at start" not in ps.text and "What to do" not in ps.text
     no_account_text(ps, caplog)
 
@@ -773,7 +775,7 @@ def test_a_failing_list_delivered_after_the_check_but_before_close_is_not_paper(
     code = ps.run(command, "--paper")
     assert code == NEW_CODE[command], ps.text
     assert ps.connections[0].paper_rejected is True
-    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert ps.text.count(cli.NOT_PAPER_MID_LINE) == 1
     assert "verified at start" not in ps.text and "What to do" not in ps.text
 
 
@@ -783,4 +785,31 @@ def test_a_reader_that_has_not_finished_after_a_peer_close_is_in_doubt(
     monkeypatch.setattr(IbConnection, "reader_finished", lambda self, timeout=0.0: False)
     on_first_request(ps, FETCH, lambda fake: fake.drop("connectionClosed"))
     code = ps.run(FETCH, "--paper")
-    assert code == cli.EXIT_NOT_PAPER_FETCH and ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert code == cli.EXIT_NOT_PAPER_FETCH and ps.text.count(cli.NOT_PAPER_DOUBT_LINE) == 1
+    assert cli.NOT_PAPER_LINE not in ps.text
+
+
+def test_the_mid_run_and_doubt_lines_do_not_claim_nothing_was_requested() -> None:
+    assert cli.NOT_PAPER_MID_LINE == ("The account list TWS reported during the session is not a paper "
+                                      "account. The session was stopped. Not retried.")
+    assert cli.NOT_PAPER_DOUBT_LINE == ("The account could not be confirmed after the connection closed. "
+                                        "Treated as not a paper account. Not retried.")
+    assert "Nothing was requested" in cli.NOT_PAPER_LINE
+    assert "Nothing was requested" not in cli.NOT_PAPER_MID_LINE + cli.NOT_PAPER_DOUBT_LINE
+
+
+# -- the first banner line: no owner is at the terminal of an unattended paper run -----------------
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_an_unattended_paper_run_does_not_say_only_the_owner_runs_it(ps: PaperSession, command: str) -> None:
+    run_no_prompt(ps, command, "--paper", "--no-prompt")
+    assert cli.UNATTENDED_LINE == "Unattended paper run: data only, paper account only."
+    assert cli.UNATTENDED_LINE in ps.text
+    assert "Only the owner runs it" not in ps.text
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_an_attended_run_keeps_the_owner_line(ps: PaperSession, command: str) -> None:
+    ps.run(command, "--paper")
+    assert cli.OWNER_LINE in ps.text and cli.UNATTENDED_LINE not in ps.text
