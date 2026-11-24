@@ -71,6 +71,12 @@ def run_header(run: RunData, *, data_directory: str) -> dict[str, Any]:
         "first_bar": None if s.data.first_bar is None else s.data.first_bar.isoformat(),
         "last_bar": None if s.data.last_bar is None else s.data.last_bar.isoformat(),
         "data_directory": data_directory,
+        # None for a run stored before gaps were recorded
+        "replayed_minutes": s.data.replayed_minutes,
+        "missing_minutes": (None if s.data.missing_minutes is None
+                            else {symbol: n for symbol, n in s.data.missing_minutes}),
+        "uncovered_minutes": s.data.uncovered_minutes,
+        "data_warnings": list(s.data.warnings),
         "capital": config.get("capital") if s.fills == "realistic" else None,
         "costs": costs if isinstance(costs, Mapping) else None,
     }

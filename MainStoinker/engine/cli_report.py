@@ -254,6 +254,14 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
     first, last = s.data.first_bar, s.data.last_bar
     lines.append(f"bars: {first if first else '-'} to {last if last else '-'}")
     lines.append(f"data directory: {header['data_directory']}")
+    missing = header["missing_minutes"]
+    if missing and any(missing.values()):
+        lines.append("missing bars: " + ", ".join(
+            f"{symbol} {count} of {header['replayed_minutes']} minutes"
+            for symbol, count in missing.items() if count))
+    if header["uncovered_minutes"]:
+        lines.append(f"minutes with no bar for any symbol: {header['uncovered_minutes']}")
+    lines.extend(f"data warning: {text}" for text in header["data_warnings"])
     if s.fills == "realistic":
         capital = header["capital"]
         lines.append("capital per algo: " + (_opt_str_money(capital) or "-"))

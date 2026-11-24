@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from .bars import BarStore
 from .broker import Broker
@@ -148,7 +149,9 @@ class Engine:
         last two rows are more than a minute apart; nothing is invented. A
         batch with no known symbol at all is ignored. `on_end` gets the last
         bar of each symbol that had any, in feed symbol order, and
-        `ledger.finish` runs at the last timestamp with those closes.
+        `ledger.finish` runs at the last timestamp with those closes; a symbol
+        whose last bar is earlier than that has its synthetic close stamped at
+        its own last bar (`symbol_times`), at its own last close.
         """
         if self._ran:
             raise RuntimeError("run_backtest() can only be called once per Engine")
@@ -157,6 +160,7 @@ class Engine:
         wants_algo_data = self._sink.wants_algo_data
         last_time = None
         last_bars: dict[str, Bar] = {}
+        last_times: dict[str, Any] = {}
         for timestamp, bars in self._feed:
             present = [symbol for symbol in self._symbols if symbol in bars]
             if not present:
@@ -165,6 +169,7 @@ class Engine:
             for symbol in present:
                 stores[symbol].append(bars[symbol])
                 last_bars[symbol] = bars[symbol]
+                last_times[symbol] = timestamp
             for broker in self._bar_brokers:
                 for symbol in present:
                     broker.on_bar(symbol, bars[symbol])
@@ -183,8 +188,13 @@ class Engine:
         for broker in self._bar_brokers:
             broker.on_end(dict(final))
         if self._ledger is not None:
-            self._ledger.finish(
-                last_time,
-                {s: b.close for s, b in final.items()},
-                self._end_commission,
-            )
+            closes = {s: b.close for s, b in final.items()}
+            # A symbol whose data ended before the run's last timestamp is closed at
+            # its own last bar's time. When every symbol ended at the last timestamp
+            # (aligned data) the call is the same as it always was.
+            early = {s: t for s, t in last_times.items() if t != last_time}
+            if early:
+                self._ledger.finish(last_time, closes, self._end_commission,
+                                    symbol_times=early)
+            else:
+                self._ledger.finish(last_time, closes, self._end_commission)

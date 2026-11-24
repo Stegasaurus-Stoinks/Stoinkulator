@@ -302,6 +302,17 @@ class BarFeed(Protocol):
         ...
 
 
+def _uncovered_minutes(stamps: Sequence[pd.Timestamp]) -> int:
+    """Whole minutes absent between consecutive distinct timestamps of the same day."""
+    total = 0
+    previous: pd.Timestamp | None = None
+    for stamp in stamps:
+        if previous is not None and stamp != previous and stamp.date() == previous.date():
+            total += max(int((stamp - previous).total_seconds() // 60) - 1, 0)
+        previous = stamp
+    return total
+
+
 class CsvBarFeed:
     """Feed backed by `<data_dir>/_<SYMBOL>_offlinedata_` files or month files.
 
@@ -327,8 +338,9 @@ class CsvBarFeed:
     timestamp, in `symbols()` order, and is never empty. A symbol with no bar
     at a timestamp is skipped there; `missing_counts()` reports how often. Only
     timestamps that some symbol has are replayed: a minute missing from EVERY
-    symbol is not in the union, so it is neither replayed, counted nor
-    reported.
+    symbol is not in the union, so it is neither replayed nor in
+    `missing_counts()`; `uncovered_minutes()` counts those inside a day, and
+    `coverage_warnings()` words them with stale or non-overlapping symbols.
 
     A timestamp may repeat within a symbol (consecutive rows with the same
     date). The repeats are replayed in file order, one batch each: the k-th
@@ -363,6 +375,12 @@ class CsvBarFeed:
         self._missing: dict[str, int] = {
             symbol: len(self._batches) - self._replayed[symbol] for symbol in self._symbols
         }
+        self._shared = sum(1 for _, bars in self._batches if len(bars) == len(self._symbols))
+        self._spans: dict[str, tuple[pd.Timestamp, pd.Timestamp] | None] = {
+            s: (per_symbol[s][0].date, per_symbol[s][-1].date) if per_symbol[s] else None
+            for s in self._symbols
+        }
+        self._uncovered = _uncovered_minutes([stamp for stamp, _ in self._batches])
 
     @staticmethod
     def _read(data_dir: Path, symbol: str) -> pd.DataFrame:
@@ -424,6 +442,49 @@ class CsvBarFeed:
         symbol with no replay bars at all misses every timestamp.
         """
         return dict(self._missing)
+
+    def shared_count(self) -> int:
+        """How many replay batches hold a bar for EVERY symbol (0 when none do)."""
+        return self._shared
+
+    def uncovered_minutes(self) -> int:
+        """Minutes with no bar for any symbol, inside the days that have bars.
+
+        Counted between consecutive replayed timestamps of the same calendar
+        day: every whole minute between them that no symbol has. Such a minute
+        is not in the union of timestamps, so `missing_counts()` cannot see it.
+        The start and end of a day are not judged (half days and late opens
+        are normal), so a missing first or last minute of a day is not counted.
+        """
+        return self._uncovered
+
+    def coverage_warnings(self) -> list[str]:
+        """Plain-text warnings about how well the symbols' replay data line up.
+
+        Empty for data that covers the same days. Lines name: a symbol whose
+        replay data starts or ends on a different day than the others (stale
+        or shifted file), a feed where no minute has a bar for every symbol,
+        and minutes missing from every symbol (`uncovered_minutes()`).
+        """
+        warnings: list[str] = []
+        spans = {s: span for s, span in self._spans.items() if span is not None}
+        if spans:
+            first = min(a for a, _ in spans.values())
+            last = max(b for _, b in spans.values())
+            for symbol, (a, b) in spans.items():
+                if a.date() > first.date():
+                    warnings.append(f"{symbol}: replay data starts {a}, but other symbols "
+                                    f"start {first}")
+                if b.date() < last.date():
+                    warnings.append(f"{symbol}: replay data ends {b}, but other symbols "
+                                    f"run to {last}")
+        if len(spans) > 1 and self._shared == 0:
+            warnings.append("no minute has a bar for every symbol: the symbols' data "
+                            "do not overlap")
+        if self._uncovered:
+            warnings.append(f"{self._uncovered} minutes inside replayed days have no bar "
+                            f"for any symbol")
+        return warnings
 
     def symbols(self) -> list[str]:
         """Symbols in caller order, de-duplicated (a fresh list each call)."""

@@ -93,6 +93,21 @@ export function buildRows(doc) {
 export function runNotes(doc) {
   const total = doc && doc.total && typeof doc.total === "object" ? doc.total : {};
   const notes = [];
+  // Gaps in the replayed bars (a run stored before they were recorded has none of these fields).
+  const run = doc && doc.run && typeof doc.run === "object" ? doc.run : {};
+  const missing = run.missing_minutes && typeof run.missing_minutes === "object" ? run.missing_minutes : {};
+  const gapped = Object.entries(missing).filter(([, n]) => numberOrNull(n) > 0);
+  if (gapped.length > 0) {
+    notes.push("Missing bars (skipped for those minutes): "
+      + gapped.map(([symbol, n]) => symbol + " " + n + " of " + run.replayed_minutes + " minutes").join(", ") + ".");
+  }
+  const uncovered = numberOrNull(run.uncovered_minutes) || 0;
+  if (uncovered > 0) {
+    notes.push(uncovered + (uncovered === 1 ? " minute" : " minutes") + " with no bar for any symbol.");
+  }
+  if (Array.isArray(run.data_warnings)) {
+    for (const warning of run.data_warnings) notes.push("Data warning: " + String(warning) + ".");
+  }
   const synthetic = numberOrNull(total.synthetic_closes) || 0;
   if (synthetic > 0) {
     notes.push(synthetic + (synthetic === 1 ? " synthetic end-of-data close" : " synthetic end-of-data closes")
