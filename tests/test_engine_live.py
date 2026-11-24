@@ -440,3 +440,73 @@ def test_end_live_after_a_failure_calls_on_end_on_the_brokers() -> None:
     opened = engine.end_live()
     assert [(p.symbol, p.quantity) for p in opened] == [("AAA", Decimal(10))]
     assert [f.reason for f in ledger.fills] == ["entry"]
+
+
+# ------------------------------------------------- warm-up, re-entrancy, extras
+
+
+def test_first_step_must_be_after_the_warmup() -> None:
+    engine, algos, _, _ = make()
+    engine.start_live(warm("AAA"))  # the warm-up ends at 09:29
+    for stale in (-1, -3):  # the warm-up's own minute, an earlier one
+        with pytest.raises(ValueError, match="last stored bar"):
+            engine.step(bar(stale).date, {"AAA": bar(stale)})
+    assert algos[0].updates == 0
+    engine.step(bar(0).date, {"AAA": bar(0)})  # still usable
+    assert algos[0].updates == 1
+
+
+def test_the_warmup_check_is_per_symbol() -> None:
+    engine, algos, _, _ = make(symbols=("AAA", "BBB"))
+    frames = {"AAA": pd.DataFrame.from_records([bar(-1).as_record()]),
+              "BBB": pd.DataFrame.from_records([bar(-3).as_record(), bar(-2).as_record()])}
+    engine.start_live(frames)
+    with pytest.raises(ValueError, match="AAA"):
+        engine.step(bar(-1).date, {"AAA": bar(-1)})
+    engine.step(bar(-1).date, {"BBB": bar(-1)})  # fine for BBB, whose warm-up ends at 09:28
+    assert [a.updates for a in algos] == [0, 1]
+    engine.step(bar(0).date, {"AAA": bar(0), "BBB": bar(0)})
+    assert [a.updates for a in algos] == [1, 2]
+
+
+def test_warmup_must_be_strictly_increasing() -> None:
+    engine, algos, _, brokers = make()
+    for rows in ([bar(-1), bar(-2)], [bar(-2), bar(-2)]):
+        with pytest.raises(ValueError, match="not sorted"):
+            engine.start_live({"AAA": pd.DataFrame.from_records([b.as_record() for b in rows])})
+    assert algos[0].broker is brokers["a-AAA"]
+    engine.start_live(warm("AAA"))  # nothing was consumed
+
+
+def test_start_live_refuses_warmups_of_unknown_symbols() -> None:
+    engine, algos, _, brokers = make()
+    with pytest.raises(ValueError, match="ZZZ"):
+        engine.start_live({**warm("AAA"), "ZZZ": warm("ZZZ")["ZZZ"]})
+    assert algos[0].broker is brokers["a-AAA"]
+    engine.start_live(warm("AAA"))
+
+
+def test_step_and_start_live_from_on_step_are_refused_but_end_live_is_allowed() -> None:
+    engine, algos, _, _ = make()
+    caught: list = []
+
+    def observer(timestamp, present) -> None:
+        for call in (lambda: engine.step(bar(1).date, {"AAA": bar(1)}),
+                     lambda: engine.start_live(warm("AAA"))):
+            with pytest.raises(RuntimeError, match="inside a step"):
+                call()
+        caught.append(timestamp)
+
+    engine.start_live(warm("AAA"), on_step=observer)
+    engine.step(bar(0).date, {"AAA": bar(0)})
+    assert caught == [bar(0).date]
+    engine.step(bar(1).date, {"AAA": bar(1)})  # the refusals did not fail the engine
+    assert algos[0].updates == 2
+
+    engine, algos, _, brokers = make()
+    ended: list = []
+    engine.start_live(warm("AAA"), on_step=lambda t, p: ended.append(engine.end_live()))
+    engine.step(bar(0).date, {"AAA": bar(0)})
+    assert ended == [()] and algos[0].broker is brokers["a-AAA"]
+    with pytest.raises(RuntimeError, match="ended"):
+        engine.step(bar(1).date, {"AAA": bar(1)})

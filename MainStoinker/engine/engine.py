@@ -156,6 +156,8 @@ class Engine:
         self._live_state: Literal["running", "failed", "ended"] | None = None
         self._live_failure: BaseException | None = None
         self._live_last_time: Any = None
+        self._live_last_bar: dict[str, Any] = {}
+        self._in_live_step = False
         self._on_step: Callable[[Any, tuple[str, ...]], None] | None = None
 
     @property
@@ -246,6 +248,8 @@ class Engine:
         One mode, once: raises `RuntimeError` after `run_backtest` or after an
         earlier `start_live` (also an ended session).
         """
+        if self._in_live_step:
+            raise RuntimeError("start_live() called from inside a step (from on_step)")
         if self._mode is not None:
             raise RuntimeError(f"this Engine already ran in {self._mode} mode: "
                                "an Engine serves one mode, once")
@@ -253,10 +257,22 @@ class Engine:
         if missing:
             raise ValueError(f"start_live: no warm-up frame for {missing} "
                              f"(every feed symbol needs one: {self._symbols})")
+        extra = [s for s in warmup if s not in self._by_symbol]
+        if extra:
+            raise ValueError(f"start_live: warm-up frame(s) for {extra}, which are not in the "
+                             f"feed (symbols: {self._symbols})")
         bad = [s for s in self._symbols if "date" not in warmup[s].columns]
         if bad:
             raise ValueError(f"start_live: the warm-up frame of {bad} has no 'date' column")
+        unordered = [s for s in self._symbols
+                     if not warmup[s]["date"].is_monotonic_increasing
+                     or warmup[s]["date"].duplicated().any()]
+        if unordered:
+            raise ValueError(f"start_live: the warm-up frame of {unordered} is not sorted by "
+                             "strictly increasing date (unsorted or duplicated rows)")
         self._begin(warmup)
+        self._live_last_bar = {s: (warmup[s]["date"].max() if len(warmup[s]) else None)
+                               for s in self._symbols}
         try:
             self._guard_algos()
         except BaseException:
@@ -282,7 +298,10 @@ class Engine:
 
         Refused with nothing applied, as a `ValueError` (the engine stays
         usable): a timestamp not strictly after the previous step's, a symbol
-        not in the feed, a bar whose `date` differs from `timestamp`. An empty
+        not in the feed, a bar whose `date` differs from `timestamp`, a bar not
+        strictly after its symbol's last stored bar (the warm-up's latest date
+        until the symbol has stepped). Calling `step` from `on_step` raises
+        `RuntimeError`. An empty
         batch is a no-op (not even its timestamp is recorded). `RuntimeError`
         if the session is not running.
 
@@ -294,6 +313,9 @@ class Engine:
         original exception propagates from this call. `on_step` runs after the
         step completed; its exception also fails the engine.
         """
+        if self._in_live_step:
+            raise RuntimeError("step() called from inside a step (from on_step): "
+                               "not allowed, steps do not nest")
         self._require_live("step")
         if self._live_state == "failed":
             raise RuntimeError("the live session failed in an earlier step and cannot "
@@ -310,15 +332,26 @@ class Engine:
         if self._live_last_time is not None and not timestamp > self._live_last_time:
             raise ValueError(f"step: timestamp {timestamp} is not after the previous step's "
                              f"{self._live_last_time}")
+        stale = [s for s, b in bars.items()
+                 if self._live_last_bar.get(s) is not None and not b.date > self._live_last_bar[s]]
+        if stale:
+            raise ValueError(f"step: bar of {stale} is not after that symbol's last stored bar "
+                             f"(warm-up or an earlier step): {[self._live_last_bar[s] for s in stale]}")
+        self._in_live_step = True
         try:
             self._live_last_time = timestamp
+            for symbol in bars:
+                self._live_last_bar[symbol] = bars[symbol].date
             present = self._step(timestamp, bars)
             if self._on_step is not None:
                 self._on_step(timestamp, tuple(present))
         except BaseException as exc:
-            self._live_state = "failed"
+            if self._live_state == "running":  # an end_live from on_step stays ended
+                self._live_state = "failed"
             self._live_failure = exc
             raise
+        finally:
+            self._in_live_step = False
 
     def end_live(self) -> tuple[LivePosition, ...]:
         """End the live session; return the positions still open.
@@ -331,7 +364,11 @@ class Engine:
         and nothing synthetic is closed. The ledger's last equity point is the
         mark of the last step; it does not include fills made by `on_end`
         (`ledger.equity()` does). The result is read from the ledger after
-        `on_end`, in account order; empty without a ledger.
+        `on_end`, in account order; empty without a ledger. The brokers are put
+        back before `on_end`, which is equivalent to a backtest ending after a
+        completed step. The ledger's last equity point does not include fills
+        made by `on_end`. Allowed from inside `on_step` (the step then
+        finishes normally and the session is over).
 
         A second call raises `RuntimeError` (the session is over, and a second
         `on_end` must never happen); so does a call before `start_live`.
