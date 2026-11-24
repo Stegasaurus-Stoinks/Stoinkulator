@@ -45,7 +45,13 @@ def warmup_digest(frame: pd.DataFrame) -> str:
     matter (`100` and `100.0` hash alike). Then `to_csv(index=False,
     lineterminator="\\n", date_format="%Y-%m-%d %H:%M:%S")` encoded as UTF-8
     (header line included); floats use pandas' shortest round-trip repr.
+    A `time` or `volume` value with a fractional part raises `ValueError`
+    rather than being truncated.
     """
+    for column in ("time", "volume"):
+        values = frame[column]
+        if (values.astype("float64") % 1 != 0).any():
+            raise ValueError(f"warm-up column {column} has a value with a fractional part")
     fixed = frame[list(COLUMNS)].astype(
         {
             "date": "datetime64[ns]",
@@ -79,18 +85,19 @@ def _read_month(path: Path, symbol: str) -> pd.DataFrame:
         raise ValueError(
             f"month file {path} has a row outside {year:04d}-{month:02d}: {dates[outside].iloc[0]}"
         )
-    _check_increasing(symbol, frame)
+    _check_increasing(symbol, frame, path)
     return frame
 
 
-def _check_increasing(symbol: str, data: pd.DataFrame) -> None:
+def _check_increasing(symbol: str, data: pd.DataFrame, source: Path | None = None) -> None:
     dates = data["date"]
     bad = (dates <= dates.shift()).to_numpy().nonzero()[0]
     # The first row compares with NaT, which is never `<=`, so it cannot be flagged.
     if len(bad):
         row = int(bad[0])
+        where = f" in {source}" if source is not None else ""
         raise ValueError(
-            f"symbol {symbol}: dates are not strictly increasing: data row {row + 1} "
+            f"symbol {symbol}: dates are not strictly increasing{where}: data row {row + 1} "
             f"({dates.iloc[row]}) is not after the row above ({dates.iloc[row - 1]})"
         )
 

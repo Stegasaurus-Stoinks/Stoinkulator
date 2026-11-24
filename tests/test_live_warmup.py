@@ -217,6 +217,58 @@ def test_legacy_file_must_be_strictly_increasing(tmp_path: Path) -> None:
         live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 2)
 
 
+def write_raw_month(root: Path, rows: list[dict[str, object]], year: int, month: int) -> Path:
+    path = month_file_path(root, "AAPL", year, month)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)[list(COLUMNS)]
+    frame["date"] = frame["date"].astype(str)
+    frame.to_csv(path, index=False)
+    return path
+
+
+def test_month_file_row_in_another_month_is_an_error(tmp_path: Path) -> None:
+    rows = day_rows("2024-10-08") + day_rows("2024-09-30")[:1]
+    path = write_raw_month(tmp_path, rows, 2024, 10)
+    with pytest.raises(ValueError, match="outside 2024-10") as info:
+        live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 1)
+    assert path.name in str(info.value)
+
+
+def test_month_file_duplicate_row_is_an_error_naming_the_file(tmp_path: Path) -> None:
+    rows = day_rows("2024-10-08")
+    path = write_raw_month(tmp_path, rows + rows[-1:], 2024, 10)
+    with pytest.raises(ValueError, match=r"strictly increasing") as info:
+        live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 1)
+    assert path.name in str(info.value)
+
+
+def test_month_file_out_of_order_rows_is_an_error_naming_the_file(tmp_path: Path) -> None:
+    rows = day_rows("2024-10-08")
+    path = write_raw_month(tmp_path, [rows[1], rows[0], rows[2]], 2024, 10)
+    with pytest.raises(ValueError, match=r"strictly increasing") as info:
+        live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 1)
+    assert path.name in str(info.value)
+
+
+def test_month_file_with_tz_aware_dates_is_an_error(tmp_path: Path) -> None:
+    rows = day_rows("2024-10-08")
+    for row in rows:
+        row["date"] = f"{row['date']}+00:00"
+    path = write_raw_month(tmp_path, rows, 2024, 10)
+    with pytest.raises(ValueError, match="time-zone aware") as info:
+        live_warmup(tmp_path, ["AAPL"], date(2024, 10, 9), 1)
+    assert path.name in str(info.value)
+
+
+@pytest.mark.parametrize("column", ["volume", "time"])
+def test_warmup_digest_refuses_fractional_integers(column: str) -> None:
+    frame = pd.DataFrame(day_rows("2024-10-08"))[list(COLUMNS)]
+    frame[column] = frame[column].astype("float64")
+    frame.loc[1, column] += 0.5
+    with pytest.raises(ValueError, match="fractional"):
+        warmup.warmup_digest(frame)
+
+
 def test_legacy_file_is_read_whole(tmp_path: Path) -> None:
     rows = day_rows("2024-10-07") + day_rows("2024-10-08") + day_rows("2024-10-09")
     pd.DataFrame(rows)[list(COLUMNS)].to_csv(offline_data_path(tmp_path, "AAPL"))
