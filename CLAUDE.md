@@ -91,6 +91,41 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt   # DATA only, PAPER account only: watch live 1-minute bars for N minutes (1-420); one session at a time, main session only
 ```
 
+Owner forms of the same three (the owner's terminal, prompted: you type the port;
+`--paper` means 7497, a live port needs the owner's own opt-in, see
+`docs/owner-session-checklist.md`): `fetch-bars --symbols A,B --start D --end D --port P`,
+`probe-data --symbols A,B --port P`, `watch_bars --symbols A,B --minutes N --port P`
+(with `--paper` instead of `--port` for 7497). Options and outcomes: `docs/live-data.md`.
+
+Exit codes (`--help` shows them; the not-paper code is 5 for `fetch-bars` and the
+watcher but 4 for `probe-data`, where 4 is otherwise unused: issue 177):
+
+| code | `fetch-bars` | `probe-data` | `watch_bars` |
+|------|--------------|--------------|--------------|
+| 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming |
+| 1 | a day failed or a symbol not fetched | a step failed (incl. NO data) | a symbol stopped or delivered no bars |
+| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same |
+| 3 | could not connect | same | same |
+| 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault |
+| 5 | not a paper account | (unused) | not a paper account |
+| 130 | Ctrl-C | same | same |
+
+Where data lands (the owner's folders, outside the repo and OneDrive; a command
+refuses a path inside either): `%USERPROFILE%\Stoinkulator\bars` (`fetch-bars`),
+`...\live` (watcher), `...\recordings` (session recordings). Bars are month files
+`DIR/SYMBOL/SYMBOL_YYYY-MM.csv` (naive New York times, regular hours) with
+`manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them; live files are
+`DIR/SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`. Agents write there only through a
+command's own defaults, in a session the owner asked for; tests never (see
+`tests/home_guard.py`).
+
+Seen in real sessions (2026-11-23/24, owner's TWS):
+- Keep-up-to-date bars update about every 5 s; a bar is known closed 4 to 5 s after its minute.
+- Same-day history is not final until the next morning (the opening minute grew from 127k to
+  1.03M shares): issue 174.
+- Volumes are shares only with the TWS "US stock sizes in lots" API setting unticked.
+- The paper account gets market data only if the live account's data is shared with it.
+
 ## Layout
 
 - `MainStoinker/MainStuff/` entry script, `Globals.py` (frozen `Config` plus
@@ -106,6 +141,15 @@ uv pip install --python .venv\Scripts\python.exe -e .
 - `MainStoinker/api/` read-only web API (FastAPI, GET only) and static dashboard, started by `serve`;
   may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy
   (enforced by `tests/test_api_boundary.py`); the engine never imports it.
+- `MainStoinker/ib/` the only new-code package that imports `ibapi` (apart from three frozen legacy
+  files; the list only shrinks); imports only `ib`, `engine` and `Util.broker_guard`, no socket
+  modules; the engine and the API never import it (enforced by `tests/test_ib_import_boundary.py`).
+  The client is data-only: an allowlist of ten outgoing message ids, so it can never send an order.
+  `client.py` that client; `connection.py` open, readiness, retry, paper check, close; `market_data.py`
+  history, quotes, server time, contract lookup; `bars.py` IB bar to engine `Bar`; `history.py`
+  day planning, pacing, manifest, gap report; `fetch.py` the fetch driver; `recorder.py` session
+  recording with account/path redaction; `cli.py` `fetch-bars` and `probe-data` (gate, paper mode,
+  paths); `probe.py` the probe steps; `watch_bars.py` the live bar watcher; `contracts.py`, `events.py`.
 - `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests. Data time is naive
   `America/New_York` wall-clock time (session 09:30 to 16:00); algos' hard-coded times use it too.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.
@@ -134,6 +178,13 @@ uv pip install --python .venv\Scripts\python.exe -e .
 - The runtime writes `loggy.log`, `tradey.txt` and `algo.csv` to the current
   directory. Tests run in a temp directory (autouse fixture); keep it that way.
 - New behaviour needs a test that fails without the change.
+- IB code is tested only against `tests/fake_ib.py` (`FakeIbClient`, a scripted stand-in for
+  `EClient` with no socket and no order method) and, through `tests/ib_replay.py`, against
+  recordings under `tests/recordings/`. A pytest run marks its environment so a child process
+  cannot open a real client either; no test runs a connecting command in a subprocess.
+- `tests/home_guard.py` fails any test that writes into the real `%USERPROFILE%\Stoinkulator`;
+  IB tests point `USERPROFILE`/`HOME` at `tmp_path`. Nothing real is committed under
+  `tests/recordings/` before the owner has read it (`docs/live-data.md`, "The recorder").
 - The suite runs in parallel (pytest-xdist). Nothing may use a fixed path or a
   fixed port or depend on what else is running on the machine (the dashboard
   listens on 8750: use port 0 or stub the check). Expensive runs shared by
