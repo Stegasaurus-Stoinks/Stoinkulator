@@ -1039,6 +1039,18 @@ def test_the_repository_path_the_command_refuses_is_this_repository() -> None:
 # -- a stopped run: days it never asked for are "not fetched", not "no data" ----------------------
 
 
+def test_a_refused_manifest_leaves_every_day_not_fetched_in_the_gap_files(sess: Session) -> None:
+    folder = sess.tmp / "bars" / "AAPL"
+    folder.mkdir(parents=True)
+    (folder / "manifest.json").write_text("{ not json", encoding="utf-8")
+    assert sess.fetch(symbols="AAPL") == cli.EXIT_FAILED
+    csv_lines = (folder / "gaps.csv").read_text(encoding="utf-8").splitlines()[1:]
+    assert [ln.split(",")[2] for ln in csv_lines] == ["not_fetched"] * 3
+    assert "not_fetched: 3" in (folder / "gaps_summary.txt").read_text(encoding="utf-8")
+    line = next(ln for ln in sess.text.splitlines() if ln.startswith("  AAPL: gaps:"))
+    assert "3 not fetched" in line, line
+
+
 def test_a_stopped_run_does_not_call_unrequested_days_no_data_and_a_resume_fetches_them(
         sess: Session, tmp_path: Path) -> None:
     lose_connection(sess, day=13)  # 12th requested and fine, 13th requested and lost, 14th never asked for

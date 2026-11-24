@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from MainStoinker.ib import cli
+from MainStoinker.ib import cli, events
 from MainStoinker.ib.client import DataOnlyClient
 from MainStoinker.ib.connection import ConnState, IbConnection, NotPaperSession
 from MainStoinker.Util.broker_guard import ALLOW_LIVE_ENV
@@ -713,3 +713,70 @@ def test_a_connection_that_is_neither_verified_nor_cleanly_closed_stays_not_pape
     assert code == NEW_CODE[command]
     assert ps.text.count(cli.NOT_PAPER_LINE) >= 1
     assert "paper account verified" not in ps.text
+
+
+# -- a failing list that is processed after the close ------------------------------------------------
+
+
+def on_first_request(s: PaperSession, command: str, act: Any) -> None:
+    """Run `act(fake)` on the command's first request that can be hooked (fetch: the 13th's request)."""
+    if command == FETCH:
+        s.rig.script(date(2024, 8, 13), lambda req_id, day, symbol: (act(s.fakes[-1]), [])[1])
+        return
+    original = s.client_factory
+
+    def factory(**kw: Any) -> FakeIbClient:
+        fake = original(**kw)
+        fake.respond("reqCurrentTime", lambda: (act(fake), [])[1])
+        return fake
+
+    s.client_factory = factory  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("rep", range(4))
+def test_a_failing_list_behind_connection_closed_is_still_not_paper(
+        ps: PaperSession, caplog: pytest.LogCaptureFixture, command: str, rep: int) -> None:
+    """The EReader order of real ibapi: connectionClosed first, the queued failing list after it."""
+    def act(fake: FakeIbClient) -> None:
+        fake._deliver("connectionClosed", ())
+        fake.push("managedAccounts", LIVE_ID)
+        fake._peer_close()
+
+    caplog.set_level(logging.DEBUG)
+    on_first_request(ps, command, act)
+    code = ps.run(command, "--paper")
+    assert code == NEW_CODE[command], ps.text
+    assert ps.connections[0].paper_rejected is True
+    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert "verified at start" not in ps.text and "What to do" not in ps.text
+    no_account_text(ps, caplog)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_a_failing_list_delivered_after_the_check_but_before_close_is_not_paper(
+        ps: PaperSession, monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    real_close = IbConnection.close
+
+    def close(self: IbConnection) -> None:
+        att = self._att
+        if att is not None and not att.dead and not self._close_started:
+            self._on_event(att, events.ManagedAccounts(LIVE_ID))  # the decoder delivers it late
+        real_close(self)
+
+    monkeypatch.setattr(IbConnection, "close", close)
+    on_first_request(ps, command, lambda fake: fake.drop("connectionClosed"))
+    code = ps.run(command, "--paper")
+    assert code == NEW_CODE[command], ps.text
+    assert ps.connections[0].paper_rejected is True
+    assert ps.text.count(cli.NOT_PAPER_LINE) == 1
+    assert "verified at start" not in ps.text and "What to do" not in ps.text
+
+
+def test_a_reader_that_has_not_finished_after_a_peer_close_is_in_doubt(
+        ps: PaperSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "READER_WAIT", 0.01)
+    monkeypatch.setattr(IbConnection, "reader_finished", lambda self, timeout=0.0: False)
+    on_first_request(ps, FETCH, lambda fake: fake.drop("connectionClosed"))
+    code = ps.run(FETCH, "--paper")
+    assert code == cli.EXIT_NOT_PAPER_FETCH and ps.text.count(cli.NOT_PAPER_LINE) == 1

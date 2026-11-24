@@ -1436,6 +1436,7 @@ def run_watch(
     not_connected = False
     paper = getattr(args, "paper", False) is True
     verified = False
+    verified_at_start = False  # verified, then closed or lost without a failing list
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
         refused = _connect(say, conn, args, advice, paper)
@@ -1457,18 +1458,28 @@ def run_watch(
         say(f"Unexpected {type(exc).__name__}: {exc}")
         code = EXIT_STOPPED
     finally:
-        if (verified and conn is not None and conn.paper_verified is not True
-                and not closed_without_rejection(conn)):
-            # the account list failed after READY: whatever the watch saw, this is the result
-            say(NOT_PAPER_LINE)
-            code = EXIT_NOT_PAPER
-            advice.clear()
+        said_not_paper = False
+        if verified and conn is not None and conn.paper_verified is not True:
+            if closed_without_rejection(conn):
+                verified_at_start = True  # closed or lost, no failing list: the watch's own outcome stands
+            else:
+                # the account list failed after READY: whatever the watch saw, this is the result
+                say(NOT_PAPER_LINE)
+                code = EXIT_NOT_PAPER
+                advice.clear()
+                said_not_paper = True
         files.close()
         if conn is not None:
             try:
                 conn.close()
             except Exception as exc:  # noqa: BLE001
                 say(f"Closing the connection raised {type(exc).__name__}: {exc}")
+            if verified and not said_not_paper and conn.paper_rejected:
+                # a failing list delivered while close() joined the reader: this is the result
+                say(NOT_PAPER_LINE)
+                code = EXIT_NOT_PAPER
+                advice.clear()
+                verified_at_start = False
         if recorder is not None:
             recorder.close()
     for line in advice:
@@ -1491,7 +1502,8 @@ def run_watch(
                 say(f"  line {finding.line}: {finding.reason}")
             if len(findings) > SHOWN_FINDINGS:
                 say(f"  ... and {len(findings) - SHOWN_FINDINGS} more")
-    say(f"Result: {_LABELS[code]} (exit {code})")
+    say(f"Result: {_LABELS[code]} (exit {code})"
+        + ("; paper account verified at start" if verified_at_start else ""))
     say(PATHS_NOTE)
     return code
 

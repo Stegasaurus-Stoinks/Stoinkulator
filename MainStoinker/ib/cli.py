@@ -622,27 +622,39 @@ def paper_session_ok(conn: IbConnection, say: _Say) -> bool:
     return False
 
 
-def closed_without_rejection(conn: IbConnection) -> bool:
+READER_WAIT = 5.0  # seconds a closed connection's reader may take to deliver what it had already read
+
+
+def closed_without_rejection(conn: IbConnection, reader_wait: float = READER_WAIT) -> bool:
     """After a session that passed `paper_session_ok`: True when `paper_verified` is no longer
     True only because the connection was closed or lost, not because an account list failed.
 
     Decision table (the account was verified at the start of the run):
 
-    | `paper_verified` | `paper_rejected` | `state`      | outcome                              |
-    |------------------|------------------|--------------|--------------------------------------|
-    | True             | False            | READY / LOST | ordinary result of the command       |
-    | False            | True             | any          | not-paper line and exit code         |
-    | False            | False            | CLOSED       | ordinary lost-connection result      |
-    | False            | False            | any other    | not-paper line and exit code (doubt) |
+    | `paper_verified` | `paper_rejected` | `state` | reader      | outcome                       |
+    |------------------|------------------|---------|-------------|-------------------------------|
+    | True             | False            | READY / LOST | any    | ordinary result of the command |
+    | False            | True             | any     | any         | not-paper line and exit code  |
+    | False            | False            | CLOSED  | ended       | ordinary lost-connection result |
+    | False            | False            | CLOSED  | still alive after `reader_wait` | not-paper (doubt) |
+    | False            | False            | other   | any         | not-paper line and exit code (doubt) |
 
-    Only the third row returns True. Anything else, including a state that cannot be
-    explained, keeps the not-paper outcome (fail-safe). `paper_rejected` is read first and is
-    sticky, and a failing list closes the connection in the same step that records it, so a
-    closed connection without a rejected list never hides a failing one.
+    Only the third row returns True. Anything else keeps the not-paper outcome (fail-safe).
+    The reader of the attempt is given `reader_wait` seconds to deliver what it had already
+    read from the socket (a failing list can sit behind `connectionClosed`), and
+    `paper_rejected` is read again after that. The callers read `paper_rejected` once more
+    AFTER `conn.close()` (which joins the reader) and switch to not-paper if it is True then.
+
+    What is guaranteed: a failing list that is delivered before the reader ends, or while
+    `close()` joins it, is reported as not-paper. What is not: a list that the client never
+    delivers (dropped by the client, or still in the socket when the peer closed) cannot be
+    seen; that case is indistinguishable from a plain close.
     """
     if conn.paper_verified is True or conn.paper_rejected is not False:
         return False
-    return conn.state is ConnState.CLOSED
+    if conn.state is not ConnState.CLOSED:
+        return False
+    return conn.reader_finished(reader_wait) and conn.paper_rejected is False
 
 
 def port_refusal_text(exc: Exception) -> str:
@@ -959,6 +971,13 @@ def run_session(
                 conn.close()
             except Exception as exc:  # noqa: BLE001
                 say(f"Closing the connection raised {type(exc).__name__}: {exc}")
+            if (verified or verified_at_start) and conn.paper_rejected:
+                # a failing list delivered while close() joined the reader: whatever was decided
+                # before, this is the result
+                say(NOT_PAPER_LINE)
+                code = not_paper_exit
+                verified = verified_at_start = False
+                advice.clear()
         if recorder is not None:
             recorder.close()
     for line in advice:  # each cause is added once, so each line is distinct
