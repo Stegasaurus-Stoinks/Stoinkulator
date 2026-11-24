@@ -23,6 +23,7 @@ from MainStoinker.ib.connection import ConnState, IbConnection
 from MainStoinker.ib.recorder import SessionRecorder, scan_recording
 from tests.fake_ib import ConnectBehavior, FakeIbClient
 from tests.ib_replay import handshake_kwargs, install, load_recording
+from tests.no_build import forbid_building
 from tests.test_ib_cli import DAYS, LOADED, REPO, Session, Tty, child
 from tests.test_ib_cli import real_home_untouched as real_home_untouched  # noqa: F401  (autouse here too)
 from tests.test_ib_fetch import SERVER_NOW, SimClock, details, error_behaviour
@@ -603,6 +604,7 @@ def test_at_most_twenty_symbols(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_too_many_symbols_never_reach_the_gate(sess: Session, capsys: pytest.CaptureFixture[str]) -> None:
     many = ",".join(f"S{n:02d}" for n in range(21))
+    forbid_building(sess)
     with pytest.raises(SystemExit) as info:
         sess.main("--symbols", many, *DAYS, "--port", "7497")
     assert info.value.code == 2 and not sess.prompts

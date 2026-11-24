@@ -535,14 +535,31 @@ def test_code_version_is_stored_and_computed_once_per_run(env, db, monkeypatch):
     assert stored(db, 2).summary.code_version == "injected" and calls == [1]
 
 
+# Only a git command fails the check. Something else may legitimately start a process during an
+# import: on Windows `platform` falls back to the `ver` shell command when its WMI query fails
+# (seen on a machine under heavy load), and numpy/pandas import `platform`.
+GIT_GUARD = ("import subprocess\n"
+             "def guard(real):\n"
+             "    def wrapper(*a, **k):\n"
+             "        args = a[0] if a else k.get('args')\n"
+             "        if 'git' in str(args).lower():\n"
+             "            raise SystemExit('git was run at import time: %r' % (args,))\n"
+             "        return real(*a, **k)\n"
+             "    return wrapper\n"
+             "subprocess.run = guard(subprocess.run)\n"
+             "subprocess.Popen = guard(subprocess.Popen)\n")
+
+
 def test_importing_cli_does_not_run_git():
-    code = ("import subprocess\n"
-            "def no(*a, **k):\n    raise SystemExit('git was run at import time')\n"
-            "subprocess.run = no\nsubprocess.Popen = no\n"
-            "import MainStoinker.engine.cli\n")
-    done = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True,
-                          text=True, timeout=120)
+    done = subprocess.run([sys.executable, "-c", GIT_GUARD + "import MainStoinker.engine.cli\n"],
+                          cwd=REPO, capture_output=True, text=True, timeout=300)
     assert done.returncode == 0, done.stderr
+
+
+def test_the_git_guard_of_that_check_still_catches_git():
+    done = subprocess.run([sys.executable, "-c", GIT_GUARD + "subprocess.run(['git', '--version'])\n"],
+                          cwd=REPO, capture_output=True, text=True, timeout=300)
+    assert done.returncode != 0 and "git was run at import time" in done.stderr
 
 
 # ---- verification additions: goldens through the store, processes, output failures ----

@@ -16,7 +16,8 @@ import os
 import re
 import statistics
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,9 @@ from MainStoinker.ib.connection import ConnState, IbConnection
 from MainStoinker.ib.market_data import IbMarketData, Outcome
 from MainStoinker.ib.recorder import SessionRecorder, scan_recording
 from MainStoinker.Util.broker_guard import BrokerPortRefused
-from tests.fake_ib import FARM_MESSAGES, ConnectBehavior, FakeIbClient, make_bar
+from tests.fake_ib import _WAKE, FARM_MESSAGES, ConnectBehavior, FakeIbClient, make_bar
+from tests.home_guard import no_writes_to_real_home
+from tests.no_build import forbid_building
 
 REPO = Path(__file__).resolve().parent.parent
 SOURCE = REPO / "MainStoinker" / "ib" / "watch_bars.py"
@@ -55,43 +58,21 @@ def _real_home() -> Path | None:
     return None
 
 
-def _listing(home: Path | None) -> dict[str, tuple[bool, int]]:
-    """Name and modification time of every entry of the real `Stoinkulator/live`, `bars`, `recordings`."""
-    seen: dict[str, tuple[bool, int]] = {}
-    if home is None:
-        return seen
-    for name in ("live", "bars", "recordings"):
-        folder = home / "Stoinkulator" / name
-        try:
-            seen[name] = (folder.is_dir(), folder.stat().st_mtime_ns)
-        except OSError:
-            seen[name] = (False, 0)
-        if folder.is_dir():
-            for entry in folder.rglob("*"):
-                try:
-                    seen[str(entry)] = (entry.is_dir(), entry.stat().st_mtime_ns)
-                except OSError:
-                    seen[str(entry)] = (False, 0)
-    return seen
-
-
 REAL_HOME = _real_home()
-REAL_LISTING_AT_START = _listing(REAL_HOME)
 
 
 @pytest.fixture(autouse=True)
-def real_home_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def real_home_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """No test of this command may reach the real profile: the process environment is pointed at
-    `tmp_path` for the test, and afterwards the real `Stoinkulator` folders must be as at the start."""
+    `tmp_path` for the test, and any write inside the real `Stoinkulator` folder, by this process,
+    fails the test (tests/home_guard.py; the real folder is not looked at, so what else writes it,
+    such as an owner's real session, cannot matter)."""
     fake_home = tmp_path / "process-home"
     fake_home.mkdir()
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
-    yield
-    after = _listing(REAL_HOME)
-    assert after == REAL_LISTING_AT_START, (
-        "A TEST WROTE INTO THE REAL HOME FOLDER: "
-        f"changed {sorted(set(after.items()) ^ set(REAL_LISTING_AT_START.items()))}")
+    with no_writes_to_real_home(REAL_HOME):
+        yield
 
 
 # -- scripted time and stream ---------------------------------------------------------------
@@ -270,13 +251,27 @@ class Rig:
             self.expected += 1
             self.fakes[-1].push("historicalDataUpdate", self.req_ids[symbol],
                                 make_bar(ep(hh, bar_mm), o, h, lo, c, v))
+            self.await_delivery(symbol)
 
         self.at(self.tt(when[0], when[1], hh), push)
+
+    def await_delivery(self, symbol: str) -> None:
+        """Return only when what was just pushed has been delivered by the fake's reader thread.
+        The watcher's next poll runs on a ticking clock, so a slow thread made that poll time out
+        first; the watcher then slept (moving script time on) and read the update later than
+        scripted. A wake item queued behind the push is taken only after the push was delivered
+        (one reader, in order). Real time, bounded; a miss is reported by the feeder's own check."""
+        fake = self.fakes[-1]
+        fake._q.put((_WAKE, ()))
+        end = time.monotonic() + 5.0
+        while not fake._q.empty() and time.monotonic() < end:
+            time.sleep(0.0005)
 
     def raw_update(self, symbol: str, when: tuple[int, float], bar: BarData) -> None:
         def push() -> None:
             self.expected += 1
             self.fakes[-1].push("historicalDataUpdate", self.req_ids[symbol], bar)
+            self.await_delivery(symbol)
 
         self.at(self.tt(when[0], when[1]), push)
 
@@ -493,6 +488,7 @@ def test_help_exits_zero_before_any_client_and_says_what_it_is(rig: Rig,
 ])
 def test_bad_arguments_exit_2_before_any_client(rig: Rig, argv: list[str],
                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    forbid_building(rig)  # a wrongly accepted argument must fail here, not start a watch that waits
     with pytest.raises(SystemExit) as info:
         rig.main(*argv)
     assert info.value.code == 2
@@ -2184,12 +2180,27 @@ def unattended(rig: Rig, *extra: str, symbols: str = "AAPL", minutes: int = 2, *
     ["--paper", "--no-prompt=1", "--minutes", "5"],
 ])
 def test_no_prompt_usage_errors_exit_2_before_anything_is_built(rig: Rig, argv: list[str]) -> None:
+    forbid_building(rig)  # a wrongly accepted argument must fail here, not start a watch that waits
     with pytest.raises(SystemExit) as raised:
         rig.main(*argv, "--out", str(rig.live), "--no-record", stdin=NoStdin())
     assert raised.value.code == 2
     assert not rig.prompts
     nothing_built(rig)
     assert not rig.live.exists()
+
+
+def test_accepted_arguments_with_forbidden_factories_fail_at_once_instead_of_waiting(rig: Rig) -> None:
+    """What the usage-error tests rely on: if the parser let a run through, building stops it
+    immediately (the run would otherwise wait for scripted time that nobody feeds)."""
+    forbid_building(rig)
+    began = time.monotonic()
+    try:
+        code = rig.main("--paper", "--no-prompt", "--minutes", "2", "--symbols", "AAPL",
+                        "--out", str(rig.live), "--no-record", stdin=NoStdin())
+    except AssertionError:
+        code = None  # the factory's own error
+    assert code != watch_bars.EXIT_OK
+    assert time.monotonic() - began < 20
 
 
 @pytest.mark.parametrize("argv,message", [

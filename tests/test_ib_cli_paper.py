@@ -22,7 +22,9 @@ from MainStoinker.ib.client import DataOnlyClient
 from MainStoinker.ib.connection import ConnState, IbConnection, NotPaperSession
 from MainStoinker.Util.broker_guard import ALLOW_LIVE_ENV
 from tests.fake_ib import FARM_MESSAGES, REQUEST_ARGS, FakeIbClient
-from tests.test_ib_cli import DAYS, REAL_HOME, REAL_LISTING_AT_START, Session, Tty, _listing
+from tests.home_guard import no_writes_to_real_home
+from tests.no_build import forbid_building
+from tests.test_ib_cli import DAYS, REAL_HOME, Session, Tty
 from tests.test_ib_fetch import SERVER_NOW
 from tests.test_ib_probe import SERVER, Script, TickClock
 
@@ -41,9 +43,8 @@ def real_home_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv(ALLOW_LIVE_ENV, raising=False)
-    yield
-    after = _listing(REAL_HOME)
-    assert after == REAL_LISTING_AT_START, "A TEST WROTE INTO THE REAL HOME FOLDER"
+    with no_writes_to_real_home(REAL_HOME):  # any write by this process inside the real folder fails
+        yield
 
 
 class PaperSession(Session):
@@ -324,6 +325,7 @@ def test_check_broker_port_still_runs_in_paper_mode(ps: PaperSession, monkeypatc
 @pytest.mark.parametrize("flag", [["--pape"], ["--pap", "--port", "7497"], ["--por", "7497"]])
 def test_abbreviated_options_are_usage_errors(ps: PaperSession, capsys: pytest.CaptureFixture[str],
                                               command: str, flag: list[str]) -> None:
+    forbid_building(ps)
     with pytest.raises(SystemExit) as info:
         ps.run(command, *flag)
     assert info.value.code == 2
@@ -470,6 +472,7 @@ def run_no_prompt(s: PaperSession, command: str, *argv: str, env: dict[str, str]
                                   ["--port", "7497", "--no-prompt"], ["--no-prompt", "--port", "7496"]])
 def test_no_prompt_without_paper_is_a_usage_error(ps: PaperSession, capsys: pytest.CaptureFixture[str],
                                                   command: str, argv: list[str]) -> None:
+    forbid_building(ps)
     with pytest.raises(SystemExit) as info:
         run_no_prompt(ps, command, *argv)
     assert info.value.code == 2
@@ -481,6 +484,7 @@ def test_no_prompt_without_paper_is_a_usage_error(ps: PaperSession, capsys: pyte
 @pytest.mark.parametrize("command", [FETCH, PROBE])
 def test_no_prompt_without_paper_names_the_flag(ps: PaperSession, capsys: pytest.CaptureFixture[str],
                                                 command: str) -> None:
+    forbid_building(ps)
     with pytest.raises(SystemExit):
         run_no_prompt(ps, command, "--port", "7497", "--no-prompt")
     assert "--no-prompt is valid only together with --paper" in capsys.readouterr().err
