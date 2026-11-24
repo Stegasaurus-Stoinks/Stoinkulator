@@ -1,7 +1,10 @@
 """`GET /api/runs/{run_id}/bars`: the 1-minute bars of one run's symbol, for the price chart.
 
-The bars are read from the run's recorded data directory, never stored in the
-database. The symbol must be one of the run's own symbols, so nothing outside
+The bars of a backtest are read from the run's recorded data directory, never
+stored in the database. The bars of a live run (kind in `LIVE_KINDS`) are the
+ones its engine consumed, read from the database (`run_bars`) with the same
+window rules, limits and JSON shape; a live run with no bars yet has an empty
+series. The symbol must be one of the run's own symbols, so nothing outside
 the run's data files can be named. The window rules are `MainStoinker.api.windows`'
 (default: the calendar day of the run's last bar); times are naive "data time",
 formatted by `format_time` (`YYYY-MM-DD HH:MM:SS`); prices are JSON numbers
@@ -28,6 +31,7 @@ from MainStoinker.engine.feed import (
     read_symbol_bars,
     symbol_fingerprint,
 )
+from MainStoinker.engine.run_documents import LIVE_KINDS
 from MainStoinker.engine.store import DataMeta, Store
 
 router = APIRouter()
@@ -67,6 +71,33 @@ def _servable(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[keep.to_numpy()]
 
 
+def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
+                 start: str | None, end: str | None) -> dict[str, Any]:
+    """A live run's bars come from the database (`run_bars`), under the same window rules.
+
+    With no window the default day is the day of the run's last bar, else of the
+    latest stored bar; a run with no bars yet has an empty series, not an error.
+    """
+    default_day = data.last_bar
+    if default_day is None:
+        default_day = max((b.time for b in store.load_last_bars(run_id)), default=None)
+    try:
+        if start is None and end is None and default_day is None:
+            first = last = None
+        else:
+            first, last = parse_window(start, end, default_day=default_day)
+    except WindowError as error:
+        raise HTTPException(422, str(error)) from None
+    if first is None or last is None:
+        return {"symbol": symbol, "available": True, "reason": None, "bars": []}
+    stored = store.load_bars(run_id, symbol, first, last)
+    frame = pd.DataFrame(
+        [(b.time, b.open, b.high, b.low, b.close, b.volume) for b in stored],
+        columns=["date", *_PRICES, "volume"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    return _served(symbol, _servable(frame).reset_index(drop=True), None)
+
+
 def _bars(store: Store, run_id: int, symbol: str,
           start: str | None, end: str | None) -> dict[str, Any]:
     run = next((r for r in store.list_runs() if r.run_id == run_id), None)
@@ -75,6 +106,8 @@ def _bars(store: Store, run_id: int, symbol: str,
     data: DataMeta = run.data
     if symbol not in data.symbols:
         raise NotFound("no such symbol in this run")
+    if run.kind in LIVE_KINDS:
+        return _stored_bars(store, run_id, symbol, data, start, end)
     try:
         first, last = parse_window(start, end, default_day=data.last_bar)
     except WindowError as error:
@@ -99,6 +132,11 @@ def _bars(store: Store, run_id: int, symbol: str,
         window = bars_between(_servable(frame), first, last)
     except TypeError:  # dates that cannot be compared with a naive window
         return _empty(symbol, "missing")
+    return _served(symbol, window, reason)
+
+
+def _served(symbol: str, window: pd.DataFrame, reason: str | None) -> dict[str, Any]:
+    """The response of a window of bars (already servable); shared by files and the store."""
     if len(window) > MAX_BARS:
         raise HTTPException(422, f"window too wide: more than {MAX_BARS} bars")
     bars = [
