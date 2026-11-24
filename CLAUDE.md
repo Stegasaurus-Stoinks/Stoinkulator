@@ -7,10 +7,31 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
 
 ## Safety rules (non-negotiable)
 
-- Never connect to TWS / IB Gateway, and never run
-  `MainStoinker/MainStuff/this is how we do it dum dum.py` or
-  `Stonks data collect.bat`. Agents work only against offline data and the
-  test harness.
+- Never run `MainStoinker/MainStuff/this is how we do it dum dum.py` or
+  `Stonks data collect.bat`. Never connect to TWS / IB Gateway except through
+  `python -m MainStoinker fetch-bars` or `probe-data` with `--paper --no-prompt`,
+  which only work against the paper account (port 7497, account check). Data
+  only. No other way of connecting (no script, no `-c` code, no other module,
+  no test). The watcher (`python -m MainStoinker.ib.watch_bars`) is owner-run
+  only: the hook allowance does not cover it. Everything else works only against
+  offline data and the test harness.
+- The live account, the live ports and `STOINK_ALLOW_LIVE_PORT` are the owner's
+  alone: an agent never uses them, sets them or asks for them.
+- One broker session at a time, started by the main session, never by parallel
+  subagents. Exit code 5 (`fetch-bars`) or 4 (`probe-data`) means TWS is not
+  signed into a paper account: stop, do not retry, tell the owner.
+- A paper session is run only by the main session, from the main checkout at an
+  unmodified `origin/revival` commit (clean `git status` for tracked files, `HEAD`
+  equal to or contained in `origin/revival`, and no untracked `.py` files in the
+  repo root or under `MainStoinker/`), never from a task branch or worktree
+  and never with uncommitted changes: code that connects must have been reviewed
+  and merged before it talks to TWS. The hook cannot check this; the rule does.
+- Everything rests on the paper-id rule (`D[UFI][A-Z]?[0-9]+`): it was confirmed
+  against the owner's paper account in an attended `--paper` session on 2026-11-23,
+  and it still rests on "no live Interactive Brokers account id begins with D".
+- Order placement on the paper account is NOT allowed yet: it is a separate
+  owner decision.
+- Tests never connect.
 - Never change the defaults of `LiveTrading`, `LiveData`, `TWS_HOST` or
   `TWS_PORT` in `MainStoinker/MainStuff/Globals.py`. `tests/test_safe_defaults.py`
   enforces the trading flag, host and port; do not weaken it.
@@ -19,12 +40,25 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   successors) must be flagged `needs-human-review` in the PR. A reviewer
   agent's approval is not sufficient for these.
 - Never commit credentials, account numbers or machine addresses.
-- Three mechanical guards back these rules. `IBapi.connect` refuses any port
+- Mechanical guards back these rules. `IBapi.connect` refuses any port
   other than the paper ports 7497 / 4002 unless `STOINK_ALLOW_LIVE_PORT=1`,
   which only a human sets, on the trading machine. Any broker connection
-  during a pytest run raises (`tests/conftest.py`). A `PreToolUse` hook
+  during a pytest run raises (`tests/conftest.py`). `--paper` makes the command
+  itself refuse any port but 7497, any host but `127.0.0.1`, and the live
+  opt-in variable in the environment; the connection is built with
+  `require_paper=True`, so it is never ready, and nothing is requested, unless
+  every account id TWS reports looks like a paper id (`D[UFI][A-Z]?[0-9]+`,
+  confirmed against the owner's paper account on 2026-11-23). A `PreToolUse` hook
   (`.claude/settings.json`, `.claude/hooks/block_live_launch.py`) blocks shell
-  commands that would run the entry script or the launcher.
+  commands that would run the entry script or the launcher, and every
+  `python -m MainStoinker` subcommand except `backtest`, `runs`, `report`,
+  `serve` and ONE whole-command shape: `.venv\Scripts\python.exe -P -m
+  MainStoinker fetch-bars|probe-data <args>` (or a drive-absolute path ending in
+  `.venv\Scripts\python.exe`) with `--paper` and `--no-prompt`, `--port` only 7497,
+  `--host` only `127.0.0.1`, no `--help`, and no shell syntax, wrapper, `cd` or
+  variable assignment; the live opt-in name may not appear at all. The hook does
+  not check which code is checked out or which interpreter file it is. It is a
+  tripwire against accidents, not a security boundary.
 - Never set that variable, and never weaken, disable, bypass or work around
   any of the guards or their tests. Changing them is only allowed as an
   approved task with `needs-human-review`.
@@ -45,6 +79,8 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m MainStoinker runs --db DB [--json]              # list the runs stored by `backtest --db` (read-only)
 .venv\Scripts\python.exe -m MainStoinker report RUN --db DB [--json]        # per-algo and total statistics of one stored run
 .venv\Scripts\python.exe -m MainStoinker serve --db DB [--port 8750] [--allow-remote]   # read-only API + dashboard on 127.0.0.1 (needs requirements-web.txt)
+.venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols "AAPL,MSFT" --start 2024-08-16 --end 2024-08-26 --paper --no-prompt   # DATA only, PAPER account only (TWS on 7497): bars to CSV; one session at a time, main session only
+.venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols "AAPL" --paper --no-prompt   # DATA only, PAPER account only: what market data the account gets
 ```
 
 ## Layout

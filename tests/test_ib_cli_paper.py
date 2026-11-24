@@ -422,3 +422,194 @@ def test_the_helpers_take_their_inputs_as_parameters() -> None:
     Stub.paper_verified = False
     assert cli.paper_session_ok(Stub(), cli._Say(out)) is False  # type: ignore[arg-type]
     assert out.getvalue().strip() == cli.NOT_PAPER_LINE
+
+
+# -- 4. --no-prompt: the console gate is skipped, and only together with --paper ----------------
+
+
+class NoStdin(io.StringIO):
+    """A stdin that fails the test on any access: no tty check, no read."""
+
+    def isatty(self) -> bool:
+        raise AssertionError("stdin was asked whether it is a terminal")
+
+    def read(self, *args: Any) -> str:
+        raise AssertionError("stdin was read")
+
+    def readline(self, *args: Any) -> str:
+        raise AssertionError("stdin was read")
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("stdin was read")
+
+
+def run_no_prompt(s: PaperSession, command: str, *argv: str, env: dict[str, str] | None = None,
+                  stdin: Any = None) -> int:
+    """`PaperSession.run`/`PaperProbeSession.run`, but with a stdin that must never be touched."""
+    if env is not None:
+        s.env.update(env)
+
+    def no_input(prompt: str) -> str:
+        raise AssertionError("the prompt was shown")
+
+    kwargs: dict[str, Any] = {
+        "env": s.env, "stdin": NoStdin() if stdin is None else stdin, "input_fn": no_input, "out": s.out,
+        "clock": s.clock, "sleep": s.sleep, "connection_factory": s.connection_factory,
+        "market_data_factory": s.market_data_factory, "recorder_factory": s.recorder_factory,
+    }
+    if command == PROBE:
+        return cli.probe_data_main(
+            ["--symbols", "AAPL", "--no-history", "--quote-seconds", "10", *argv], today=date(2024, 11, 22),
+            wall=lambda: SERVER - timedelta(seconds=2), **kwargs)
+    return cli.main(["--symbols", "AAPL", *DAYS, "--out", str(s.tmp / "bars"), *argv],
+                    today=date(2024, 8, 21), **kwargs)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("argv", [["--no-prompt"], ["--no-prompt", "--port", "7497"],
+                                  ["--port", "7497", "--no-prompt"], ["--no-prompt", "--port", "7496"]])
+def test_no_prompt_without_paper_is_a_usage_error(ps: PaperSession, capsys: pytest.CaptureFixture[str],
+                                                  command: str, argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as info:
+        run_no_prompt(ps, command, *argv)
+    assert info.value.code == 2
+    capsys.readouterr()
+    nothing_built(ps)
+    assert ps.text == ""  # not even the paper line
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_no_prompt_without_paper_names_the_flag(ps: PaperSession, capsys: pytest.CaptureFixture[str],
+                                                command: str) -> None:
+    with pytest.raises(SystemExit):
+        run_no_prompt(ps, command, "--port", "7497", "--no-prompt")
+    assert "--no-prompt is valid only together with --paper" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_paper_and_no_prompt_need_no_terminal_and_read_nothing(ps: PaperSession,
+                                                               caplog: pytest.LogCaptureFixture,
+                                                               command: str) -> None:
+    caplog.set_level(logging.DEBUG)
+    code = run_no_prompt(ps, command, "--paper", "--no-prompt")  # NoStdin raises on any access
+    lines = ps.text.splitlines()
+    assert lines[0] == "paper mode: port 7497, account check on, no prompt"
+    assert code in (cli.EXIT_OK, cli.EXIT_FAILED) if command == PROBE else code == cli.EXIT_OK
+    assert ps.prompts == []
+    assert ps.connections[0].port == 7497 and ps.connections[0].host == "127.0.0.1"
+    assert "reqCurrentTime" in ps.requests()
+    result = [line for line in lines if line.startswith("Result:")]
+    assert len(result) == 1 and result[0].endswith("; paper account verified")
+    no_account_text(ps, caplog)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_a_stdin_that_is_no_terminal_does_not_matter_with_no_prompt(ps: PaperSession, command: str) -> None:
+    assert run_no_prompt(ps, command, "--paper", "--no-prompt", stdin=Tty(False)) in (
+        cli.EXIT_OK, cli.EXIT_FAILED)
+    assert "Refusing to run" not in ps.text and ps.requests()
+
+
+def test_without_no_prompt_the_gate_still_needs_a_terminal(ps: PaperSession) -> None:
+    code = cli.main(["--symbols", "AAPL", *DAYS, "--out", str(ps.tmp / "bars"), "--paper"], env=ps.env,
+                    stdin=Tty(False), input_fn=ps.input_fn, out=ps.out, clock=ps.clock, sleep=ps.sleep,
+                    today=date(2024, 8, 21), connection_factory=ps.connection_factory,
+                    market_data_factory=ps.market_data_factory, recorder_factory=ps.recorder_factory)
+    assert code == cli.EXIT_REFUSED and "Refusing to run" in ps.text
+    assert ps.requests() == [] and ps.prompts == []
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("port", ["7496", "4002", "4001", "7498", "1"])
+@pytest.mark.parametrize("opt_in", [None, "1", ""])
+def test_no_prompt_keeps_the_port_refusal(ps: PaperSession, command: str, port: str,
+                                          opt_in: str | None) -> None:
+    env = {} if opt_in is None else {ALLOW_LIVE_ENV: opt_in}
+    assert run_no_prompt(ps, command, "--paper", "--no-prompt", "--port", port, env=env) == cli.EXIT_REFUSED
+    assert "Refused (--paper)" in ps.text and "paper mode:" not in ps.text
+    nothing_built(ps)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.2", "0.0.0.0", "::1", " 127.0.0.1"])
+def test_no_prompt_keeps_the_host_refusal(ps: PaperSession, command: str, host: str) -> None:
+    code = run_no_prompt(ps, command, "--paper", "--no-prompt", "--port", "7497", "--host", host)
+    assert code == cli.EXIT_REFUSED and "Refused (--paper)" in ps.text
+    nothing_built(ps)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("value", ["", "0", "1"])
+def test_no_prompt_keeps_the_live_opt_in_refusal(ps: PaperSession, command: str, value: str) -> None:
+    code = run_no_prompt(ps, command, "--paper", "--no-prompt", env={ALLOW_LIVE_ENV: value})
+    assert code == cli.EXIT_REFUSED
+    assert "unset it" in ps.text
+    nothing_built(ps)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+@pytest.mark.parametrize("accounts", [LIVE_ID, "", f"{PAPER_ID},{LIVE_ID}"])
+def test_no_prompt_still_stops_a_non_paper_account_with_zero_requests(
+        ps: PaperSession, caplog: pytest.LogCaptureFixture, command: str, accounts: str) -> None:
+    caplog.set_level(logging.DEBUG)
+    ps.accounts = accounts
+    code = run_no_prompt(ps, command, "--paper", "--no-prompt")
+    assert code == NEW_CODE[command]
+    assert ps.requests() == [] and len(ps.fakes) == 1
+    assert ps.text.count(cli.NOT_PAPER_LINE) == 1 and "paper account verified" not in ps.text
+    assert ps.prompts == []
+    no_account_text(ps, caplog)
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_no_prompt_still_stops_when_the_list_fails_after_ready(ps: PaperSession, command: str) -> None:
+    ps.mid_list = LIVE_ID
+    code = run_no_prompt(ps, command, "--paper", "--no-prompt")
+    assert code == NEW_CODE[command] and ps.requests() == ["reqCurrentTime"]
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_no_prompt_still_runs_the_ordinary_port_guard(ps: PaperSession, monkeypatch: pytest.MonkeyPatch,
+                                                      command: str) -> None:
+    calls: list[int] = []
+    real = cli.check_broker_port
+
+    def spy(port: int, env: Any) -> None:
+        calls.append(port)
+        real(port, env)
+
+    monkeypatch.setattr(cli, "check_broker_port", spy)
+    run_no_prompt(ps, command, "--paper", "--no-prompt")
+    assert calls == [7497]
+
+
+@pytest.mark.parametrize("command", [FETCH, PROBE])
+def test_no_prompt_with_the_port_and_host_given_is_fine(ps: PaperSession, command: str) -> None:
+    code = run_no_prompt(ps, command, "--no-prompt", "--paper", "--port", "7497", "--host", "127.0.0.1")
+    assert code in (cli.EXIT_OK, cli.EXIT_FAILED)
+
+
+def test_the_real_wiring_passes_require_paper_with_no_prompt(ps: PaperSession,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def spy(*args: Any, **kw: Any) -> IbConnection:
+        seen.append(dict(kw))
+        kw.update(client_factory=ps.client_factory, clock=ps.clock, sleep=ps.clock.sleep, poll_interval=0.002)
+        conn = IbConnection(*args, **kw)
+        ps.connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(cli, "IbConnection", spy)
+    ps.accounts = LIVE_ID  # stops at the account check: nothing is requested
+    code = cli.main(["--symbols", "AAPL", *DAYS, "--out", str(ps.tmp / "bars"), "--no-record", "--paper",
+                     "--no-prompt"], env=ps.env, stdin=NoStdin(), input_fn=ps.input_fn, out=ps.out,
+                    clock=ps.clock, sleep=ps.sleep, today=date(2024, 8, 21))
+    assert seen[0]["require_paper"] is True
+    assert code == cli.EXIT_NOT_PAPER_FETCH and ps.requests() == [] and ps.prompts == []
+
+
+@pytest.mark.parametrize("parser", [cli.build_parser, cli.build_probe_parser])
+def test_help_documents_no_prompt(parser: Any) -> None:
+    shown = " ".join(parser().format_help().split())
+    assert "--no-prompt" in shown and "only with --paper" in shown
