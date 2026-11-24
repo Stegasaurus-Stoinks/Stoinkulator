@@ -202,10 +202,12 @@ def test_every_failed_condition_is_named(ps: PaperSession, command: str) -> None
 # -- 2. a paper list passes --------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("accounts", [PAPER_ID, "DUX123456"])
 @pytest.mark.parametrize("command", [FETCH, PROBE])
 def test_paper_list_passes_and_the_command_runs(ps: PaperSession, caplog: pytest.LogCaptureFixture,
-                                                command: str) -> None:
+                                                command: str, accounts: str) -> None:
     caplog.set_level(logging.DEBUG)
+    ps.accounts = accounts
     code = ps.run(command, "--paper")  # no --port: the paper port is the default
     lines = ps.text.splitlines()
     assert lines[0] == "paper mode: port 7497, account check on"
