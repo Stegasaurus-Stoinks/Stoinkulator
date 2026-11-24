@@ -15,6 +15,7 @@ from typing import Any
 from .bars import BarStore
 from .broker import Broker
 from .feed import Bar, BarFeed
+from .gaprule import GapGuardBroker, GapRule, GapRuleReport
 from .ledger import Ledger
 from .router import BarAwareBroker, BrokerRouter, SingleBrokerRouter
 from .sink import EventSink
@@ -112,16 +113,27 @@ class Engine:
         self._symbols = symbols
         self._by_symbol = by_symbol
         self._ran = False
+        self._gap_rule = GapRule({symbol: None for symbol in symbols})
+        self._routed: tuple[tuple[object, Broker], ...] = tuple(routed)
 
     @property
     def algos(self) -> tuple[object, ...]:
         """The algos in registration order (read-only)."""
         return self._algos
 
+    @property
+    def gap_report(self) -> GapRuleReport:
+        """What the gap rule counted and refused so far (see `gaprule`)."""
+        return self._gap_rule.report()
+
     def run_backtest(self) -> None:
         """Replay the whole feed once. A second call raises `RuntimeError`.
 
         Algos are stateful, so a re-run would double their trades.
+
+        The gap rule (see `gaprule`) applies throughout: on a bar that follows a
+        gap for its symbol an algo's entry orders are refused, everything else
+        works. The refusals are in `gap_report` afterwards.
 
         Per batch: every symbol's bar is appended to its store first (feed
         symbol order); then, per symbol in feed order, each algo on that
@@ -156,7 +168,23 @@ class Engine:
         if self._ran:
             raise RuntimeError("run_backtest() can only be called once per Engine")
         self._ran = True
-        stores = {symbol: BarStore(self._feed.warmup(symbol)) for symbol in self._symbols}
+        # The gap rule (gaprule.py): while the replay runs, each algo talks to its
+        # broker through a guard that refuses entries on a bar that follows a gap.
+        # The algo's own broker is put back afterwards.
+        for algo, routed_broker in self._routed:
+            algo.broker = GapGuardBroker(  # type: ignore[attr-defined]
+                routed_broker, str(getattr(algo, "name", algo)), self._gap_rule)
+        try:
+            self._replay()
+        finally:
+            for algo, routed_broker in self._routed:
+                algo.broker = routed_broker  # type: ignore[attr-defined]
+
+    def _replay(self) -> None:
+        warmups = {symbol: self._feed.warmup(symbol) for symbol in self._symbols}
+        self._gap_rule.start({s: (w["date"].iloc[-1] if len(w) else None)
+                              for s, w in warmups.items()})
+        stores = {symbol: BarStore(warmups[symbol]) for symbol in self._symbols}
         wants_algo_data = self._sink.wants_algo_data
         last_time = None
         last_bars: dict[str, Bar] = {}
@@ -170,15 +198,19 @@ class Engine:
                 stores[symbol].append(bars[symbol])
                 last_bars[symbol] = bars[symbol]
                 last_times[symbol] = timestamp
+                self._gap_rule.on_bar(symbol, bars[symbol].date)
             for broker in self._bar_brokers:
                 for symbol in present:
                     broker.on_bar(symbol, bars[symbol])
             for symbol in present:
                 algo_data: list | None = [] if wants_algo_data else None
-                for algo in self._by_symbol[symbol]:
-                    algo.update(stores[symbol].view())  # type: ignore[attr-defined]
-                    if algo_data is not None:
-                        algo_data.append(algo.update_frontend())  # type: ignore[attr-defined]
+                try:
+                    for algo in self._by_symbol[symbol]:
+                        algo.update(stores[symbol].view())  # type: ignore[attr-defined]
+                        if algo_data is not None:
+                            algo_data.append(algo.update_frontend())  # type: ignore[attr-defined]
+                finally:
+                    self._gap_rule.end_bar(symbol)
                 self._sink.on_bar(symbol, bars[symbol], algo_data)
             if self._ledger is not None:
                 self._ledger.mark(timestamp, {s: bars[s].close for s in present})

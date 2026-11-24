@@ -122,10 +122,11 @@ from pathlib import Path
 from typing import Any
 
 from .algos import close_algo_logs, load_algo
-from .cli_report import ReportError, run_report_command, run_runs_command
+from .cli_report import ReportError, gap_rule_lines, run_report_command, run_runs_command
 from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
 from .feed import _SYMBOL, CsvBarFeed, file_fingerprint, symbol_fingerprint
+from .gaprule import GapRuleReport
 from .ledger import Ledger
 from .modes import DEFAULT_MODE, ModeError, build_router, parse_mode
 from .paper_broker import CostModel
@@ -743,6 +744,7 @@ def run_backtest_command(
                     for entry in entries for cfg in entry["data"]
                 ])
             algos: list = []
+            gap_report = GapRuleReport()
             engine_started = True
             try:
                 with _working_directory(out_dir), _maybe_quiet(args.quiet):
@@ -751,6 +753,7 @@ def run_backtest_command(
                                     ledger=ledger, end_commission=router.end_commission)
                     engine.run_backtest()
                     engine_done = True
+                    gap_report = engine.gap_report
                     if realistic:
                         assert ledger is not None
                         result = {i: ledger_trade_records(ledger, i) for i in idnames}
@@ -783,6 +786,7 @@ def run_backtest_command(
             # failure cannot take a finished run's files away.
             if store is not None:
                 assert run_id is not None and ledger is not None
+                store.write_gap_rule(run_id, gap_report)
                 store.write_results(
                     run_id,
                     order_events=ledger.orders,
@@ -835,6 +839,8 @@ def run_backtest_command(
     for idname, records in result.items():
         extra = f" ({summary[idname]})" if idname in summary else ""
         print(f"{idname}: {len(records)} trades{extra}")
+    for line in gap_rule_lines(gap_report):  # only when the gap rule counted something
+        print(line)
     print(f"wrote {trades_path}")
     if realistic:
         print(f"wrote {ledger_path}")

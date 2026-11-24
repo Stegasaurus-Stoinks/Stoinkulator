@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
+from .gaprule import GapRuleReport, SuppressedEntries
 from .ledger import (
     AccountInfo,
     EquityPoint,
@@ -121,6 +122,41 @@ class DataMeta:
     missing_minutes: tuple[tuple[str, int], ...] | None = None
     uncovered_minutes: int | None = None
     warnings: tuple[str, ...] = ()
+    # What the gap rule counted and refused (issue 175), also kept in `data_json`
+    # (key "gap_rule"). None for a run stored before it existed, or one that has
+    # not yet recorded it; `write_gap_rule` sets it when the replay is done.
+    gap_rule: GapRuleReport | None = None
+
+
+def gap_rule_to_json(report: GapRuleReport) -> dict[str, Any]:
+    """The `data_json` / API form of a gap-rule report (times as ISO text)."""
+    return {
+        "bars_after_gap": {s: n for s, n in report.bars_after_gap},
+        "suppressed_entries": {
+            "count": report.total_suppressed,
+            "by_algo": [
+                {"algo": e.algo, "symbol": e.symbol, "count": e.count,
+                 "times": [t.isoformat() for t in e.times],
+                 "times_truncated": e.count > len(e.times)}
+                for e in report.suppressed
+            ],
+        },
+    }
+
+
+def gap_rule_from_json(value: Any) -> GapRuleReport | None:
+    """Inverse of `gap_rule_to_json`; None for a missing or unreadable value."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        bars = tuple((str(s), int(n)) for s, n in value["bars_after_gap"].items())
+        suppressed = tuple(
+            SuppressedEntries(str(e["algo"]), str(e["symbol"]), int(e["count"]),
+                              tuple(datetime.fromisoformat(t) for t in e["times"]))
+            for e in value["suppressed_entries"]["by_algo"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    return GapRuleReport(bars, suppressed)
 
 
 @dataclass(frozen=True)
@@ -247,6 +283,8 @@ class Store(Protocol):
     def write_series(self, run_id: int, infos: Sequence[SeriesInfo],
                      points: Iterable[SeriesPoint] = ()) -> None: ...
 
+    def write_gap_rule(self, run_id: int, report: GapRuleReport) -> None: ...
+
     def end_run(self, run_id: int, status: RunStatus) -> None: ...
 
     def list_runs(self) -> tuple[RunSummary, ...]: ...
@@ -291,6 +329,9 @@ class NullStore:
 
     def write_series(self, run_id: int, infos: Sequence[SeriesInfo],
                      points: Iterable[SeriesPoint] = ()) -> None:
+        return None
+
+    def write_gap_rule(self, run_id: int, report: GapRuleReport) -> None:
         return None
 
     def end_run(self, run_id: int, status: RunStatus) -> None:
@@ -816,6 +857,7 @@ class SqliteStore:
                                 else {s: n for s, n in data.missing_minutes}),
             "uncovered_minutes": data.uncovered_minutes,
             "warnings": list(data.warnings),
+            "gap_rule": None if data.gap_rule is None else gap_rule_to_json(data.gap_rule),
         }, "data")
         config_json = _dumps(dict(meta.config), "config")
         with self._tx() as conn:
@@ -928,6 +970,19 @@ class SqliteStore:
             conn.executemany(
                 "INSERT INTO equity (run_id, algo, time, cash_e4, position_value_e4, realised_e4,"
                 " unrealised_e4, equity_e4) VALUES (?,?,?,?,?,?,?,?)", rows)
+
+    def write_gap_rule(self, run_id: int, report: GapRuleReport) -> None:
+        """Record what the gap rule counted and refused, in the run's `data_json`.
+
+        For a running run; no schema change (the key is added to the JSON text).
+        """
+        with self._tx() as conn:
+            self._require_run(conn, run_id, running=True)
+            row = conn.execute("SELECT data_json FROM runs WHERE id=?", (run_id,)).fetchone()
+            data = json.loads(row[0])
+            data["gap_rule"] = gap_rule_to_json(report)
+            conn.execute("UPDATE runs SET data_json=? WHERE id=?",
+                         (_dumps(data, "data"), run_id))
 
     def end_run(self, run_id: int, status: RunStatus) -> None:
         """Flush the last equity point of every series and close the run."""
@@ -1045,7 +1100,8 @@ class SqliteStore:
                         None if d.get("missing_minutes") is None
                         else tuple((s, int(n)) for s, n in d["missing_minutes"].items()),
                         d.get("uncovered_minutes"),
-                        tuple(d.get("warnings") or ()))
+                        tuple(d.get("warnings") or ()),
+                        gap_rule_from_json(d.get("gap_rule")))
         return RunSummary(r[0], _dt(r[1]), _opt_dt(r[2]), r[3], r[4], r[5], r[6], data)
 
     def load_run(self, run_id: int) -> RunData:

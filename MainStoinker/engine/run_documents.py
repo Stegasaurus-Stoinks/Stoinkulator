@@ -23,7 +23,7 @@ from typing import Any
 
 from .ledger import IGNORED_KINDS
 from .stats import fmt4, run_statistics, statistics_record
-from .store import RunData, RunSummary
+from .store import RunData, RunSummary, gap_rule_to_json
 
 
 def run_net(run: RunData) -> Decimal:
@@ -76,6 +76,8 @@ def run_header(run: RunData, *, data_directory: str) -> dict[str, Any]:
         "missing_minutes": (None if s.data.missing_minutes is None
                             else {symbol: n for symbol, n in s.data.missing_minutes}),
         "uncovered_minutes": s.data.uncovered_minutes,
+        # None for a run stored before the gap rule (issue 175)
+        "gap_rule": None if s.data.gap_rule is None else gap_rule_to_json(s.data.gap_rule),
         "data_warnings": list(s.data.warnings),
         "capital": config.get("capital") if s.fills == "realistic" else None,
         "costs": costs if isinstance(costs, Mapping) else None,

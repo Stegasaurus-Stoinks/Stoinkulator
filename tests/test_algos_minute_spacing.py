@@ -10,6 +10,12 @@ decision (the asserted outcome is the least surprising one, not a decision).
 Each defect has a control test (not xfail) that runs the same algo on
 contiguous bars and shows the behaviour the defect departs from.
 
+Issue 175 (the engine's gap rule: no new position on a bar that follows a gap) was checked
+against each of the four: none is fixed by it, so all four markers stay. The same scenarios run
+through the real `Engine` are in `tests/test_gap_rule.py` (strict xfail as well). The rule refuses
+entries; it neither stops FVG from recording a gap formed across missing minutes, nor the opening
+range from being taken from a 09:31 bar, nor EMACrossing from carrying a position overnight.
+
 Findings, with line numbers of the algo files at the time of writing:
 
 - FVG (`Algos/FVG/FVG_Algo.py`, lines 87 to 119): the last three rows
