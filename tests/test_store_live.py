@@ -414,3 +414,69 @@ def test_null_store_accepts_the_new_methods():
     store.set_counts(run_id, {"symbol": {"AAPL": 1}})
     store.update_run_data(run_id, DataMeta())
     store.end_run(run_id, "completed", "session_end")
+
+
+# --- readers (issue 193) ---------------------------------------------------------
+
+
+def test_load_counts_reads_what_set_counts_wrote(db):
+    with SqliteStore(db) as store:
+        run_id = running(store)
+        other = running(store)
+        assert store.load_counts(run_id) == {}
+        store.set_counts(run_id, {"symbol": {"MSFT:fed": 2, "AAPL:fed": 3}, "algo": {"a1": 1}})
+        store.set_counts(run_id, {"symbol": {"AAPL:fed": 7}})
+        store.set_counts(other, {"symbol": {"AAPL:fed": 99}})
+        assert store.load_counts(run_id) == {"algo": {"a1": 1},
+                                             "symbol": {"AAPL:fed": 7, "MSFT:fed": 2}}
+        with pytest.raises(StoreError):
+            store.load_counts(99)
+
+
+def test_load_last_bars_is_the_latest_bar_of_each_symbol(db):
+    with SqliteStore(db) as store:
+        run_id = running(store)
+        other = running(store)
+        assert store.load_last_bars(run_id) == ()
+        store.write_bars(run_id, [bar(2, "MSFT", 50.0), bar(0, "AAPL", 1.0), bar(3, "AAPL", 3.0)])
+        store.write_bars(run_id, [bar(1, "AAPL", 2.0), bar(9, "MSFT", 55.5)])
+        store.write_bars(other, [bar(20, "AAPL", 8.0)])
+        assert store.load_last_bars(run_id) == (bar(3, "AAPL", 3.0), bar(9, "MSFT", 55.5))
+        with pytest.raises(StoreError):
+            store.load_last_bars(99)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_readers_return_empty_on_older_schemas(tmp_path, version):
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+    old = tmp_path / f"v{version}.db"
+    make_old_file(src, old, version)
+    store = open_store_readonly(str(old), env=NO_ENV)
+    try:
+        assert store.schema_version == version
+        assert store.load_counts(1) == {}
+        assert store.load_last_bars(1) == ()
+        with pytest.raises(StoreError):
+            store.load_counts(2)
+    finally:
+        store.close()
+
+
+def test_readers_work_on_a_readonly_current_database(db):
+    with SqliteStore(db) as store:
+        run_id = running(store)
+        store.write_bars(run_id, [bar(0)])
+        store.set_counts(run_id, {"symbol": {"AAPL:late": 4}})
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        assert store.load_counts(run_id) == {"symbol": {"AAPL:late": 4}}
+        assert store.load_last_bars(run_id) == (bar(0),)
+    finally:
+        store.close()
+
+
+def test_null_store_readers_are_empty():
+    store = NullStore()
+    assert store.load_counts(1) == {} and store.load_last_bars(1) == ()

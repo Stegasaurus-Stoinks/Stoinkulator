@@ -319,6 +319,10 @@ class Store(Protocol):
     def load_series(self, run_id: int, algo: str, start: datetime | None = None,
                     end: datetime | None = None) -> tuple[SeriesPoint, ...]: ...
 
+    def load_counts(self, run_id: int) -> dict[str, dict[str, int]]: ...
+
+    def load_last_bars(self, run_id: int) -> tuple[StoredBar, ...]: ...
+
     def close(self) -> None: ...
 
 
@@ -382,6 +386,12 @@ class NullStore:
 
     def load_series(self, run_id: int, algo: str, start: datetime | None = None,
                     end: datetime | None = None) -> tuple[SeriesPoint, ...]:
+        return ()
+
+    def load_counts(self, run_id: int) -> dict[str, dict[str, int]]:
+        return {}
+
+    def load_last_bars(self, run_id: int) -> tuple[StoredBar, ...]:
         return ()
 
     def close(self) -> None:
@@ -1253,6 +1263,48 @@ class SqliteStore:
                 out.extend(SeriesPoint(algo, name, _dt(t), v)
                            for t, v in conn.execute(sql, (series_id, *bounds)))
             return tuple(out)
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
+    def load_counts(self, run_id: int) -> dict[str, dict[str, int]]:
+        """The live counts of a run as `{scope: {key: value}}`, ordered by scope and key.
+
+        Empty for a run that stored none and for a database older than schema 3
+        (`run_counts` is not queried). An unknown run raises `StoreError`.
+        """
+        conn = self._db()
+        try:
+            self._require_run(conn, run_id)
+            if self._schema_version < 3:
+                return {}
+            out: dict[str, dict[str, int]] = {}
+            for scope, key, value in conn.execute(
+                    "SELECT scope, key, value FROM run_counts WHERE run_id=?"
+                    " ORDER BY scope, key", (run_id,)):
+                out.setdefault(scope, {})[key] = value
+            return out
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
+    def load_last_bars(self, run_id: int) -> tuple[StoredBar, ...]:
+        """The latest stored bar of each symbol of a run, ordered by symbol.
+
+        Empty for a run with no stored bars and for a database older than
+        schema 3 (`run_bars` is not queried). An unknown run raises `StoreError`.
+        """
+        conn = self._db()
+        try:
+            self._require_run(conn, run_id)
+            if self._schema_version < 3:
+                return ()
+            return tuple(
+                StoredBar(r[0], _dt(r[1]), r[2], r[3], r[4], r[5], r[6])
+                for r in conn.execute(
+                    "SELECT b.symbol, b.time, b.open, b.high, b.low, b.close, b.volume"
+                    " FROM run_bars b JOIN (SELECT symbol, MAX(time) AS last FROM run_bars"
+                    " WHERE run_id=? GROUP BY symbol) m"
+                    " ON b.symbol = m.symbol AND b.time = m.last"
+                    " WHERE b.run_id=? ORDER BY b.symbol", (run_id, run_id)))
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
 
