@@ -7,10 +7,12 @@ global state.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+
+import pandas as pd
 
 from .bars import BarStore
 from .broker import Broker
@@ -115,6 +117,12 @@ class Engine:
         self._ran = False
         self._gap_rule = GapRule({symbol: None for symbol in symbols})
         self._routed: tuple[tuple[object, Broker], ...] = tuple(routed)
+        # Per-run state, set by `_begin`.
+        self._stores: dict[str, BarStore] = {}
+        self._wants_algo_data = False
+        self._last_time: Any = None
+        self._last_bars: dict[str, Bar] = {}
+        self._last_times: dict[str, Any] = {}
 
     @property
     def algos(self) -> tuple[object, ...]:
@@ -181,52 +189,93 @@ class Engine:
                 algo.broker = routed_broker  # type: ignore[attr-defined]
 
     def _replay(self) -> None:
-        warmups = {symbol: self._feed.warmup(symbol) for symbol in self._symbols}
+        self._begin({symbol: self._feed.warmup(symbol) for symbol in self._symbols})
+        for timestamp, bars in self._feed:
+            self._step(timestamp, bars)
+        self._end_bars()
+        self._finish_ledger()
+
+    def _begin(self, warmups: Mapping[str, pd.DataFrame]) -> None:
+        """Seed the per-run state: one `BarStore` per symbol from its warm-up frame.
+
+        `warmups` must hold every feed symbol. Starts the gap rule from each
+        frame's last bar time (None for an empty frame) and clears the
+        last-bar bookkeeping. Calls nothing on the brokers, ledger or sink.
+        """
         self._gap_rule.start({s: (w["date"].iloc[-1] if len(w) else None)
                               for s, w in warmups.items()})
-        stores = {symbol: BarStore(warmups[symbol]) for symbol in self._symbols}
-        wants_algo_data = self._sink.wants_algo_data
-        last_time = None
-        last_bars: dict[str, Bar] = {}
-        last_times: dict[str, Any] = {}
-        for timestamp, bars in self._feed:
-            present = [symbol for symbol in self._symbols if symbol in bars]
-            if not present:
-                continue  # a feed should never yield this; nothing happened at this time
-            last_time = timestamp
+        self._stores = {symbol: BarStore(warmups[symbol]) for symbol in self._symbols}
+        self._wants_algo_data = self._sink.wants_algo_data
+        self._last_time = None
+        self._last_bars = {}
+        self._last_times = {}
+
+    def _step(self, timestamp: Any, bars: Mapping[str, Bar]) -> list[str]:
+        """Process one timestamp's batch; return the feed symbols that were present.
+
+        Needs `_begin` first. Order: append every present bar (and tell the gap
+        rule); `on_bar` on every bar-aware broker for each present symbol; update
+        each present symbol's algos (the gap rule's `end_bar` runs in a `finally`)
+        and publish to the sink; mark the ledger with the present closes. A batch
+        with no known symbol does nothing and returns `[]`. An exception from an
+        algo propagates after `end_bar`. The algos' brokers are not touched here:
+        the caller owns the `GapGuardBroker` wrapping.
+        """
+        present = [symbol for symbol in self._symbols if symbol in bars]
+        if not present:
+            return present  # a feed should never yield this; nothing happened at this time
+        self._last_time = timestamp
+        for symbol in present:
+            self._stores[symbol].append(bars[symbol])
+            self._last_bars[symbol] = bars[symbol]
+            self._last_times[symbol] = timestamp
+            self._gap_rule.on_bar(symbol, bars[symbol].date)
+        for broker in self._bar_brokers:
             for symbol in present:
-                stores[symbol].append(bars[symbol])
-                last_bars[symbol] = bars[symbol]
-                last_times[symbol] = timestamp
-                self._gap_rule.on_bar(symbol, bars[symbol].date)
-            for broker in self._bar_brokers:
-                for symbol in present:
-                    broker.on_bar(symbol, bars[symbol])
-            for symbol in present:
-                algo_data: list | None = [] if wants_algo_data else None
-                try:
-                    for algo in self._by_symbol[symbol]:
-                        algo.update(stores[symbol].view())  # type: ignore[attr-defined]
-                        if algo_data is not None:
-                            algo_data.append(algo.update_frontend())  # type: ignore[attr-defined]
-                finally:
-                    self._gap_rule.end_bar(symbol)
-                self._sink.on_bar(symbol, bars[symbol], algo_data)
-            if self._ledger is not None:
-                self._ledger.mark(timestamp, {s: bars[s].close for s in present})
-        if last_time is None:
+                broker.on_bar(symbol, bars[symbol])
+        for symbol in present:
+            algo_data: list | None = [] if self._wants_algo_data else None
+            try:
+                for algo in self._by_symbol[symbol]:
+                    algo.update(self._stores[symbol].view())  # type: ignore[attr-defined]
+                    if algo_data is not None:
+                        algo_data.append(algo.update_frontend())  # type: ignore[attr-defined]
+            finally:
+                self._gap_rule.end_bar(symbol)
+            self._sink.on_bar(symbol, bars[symbol], algo_data)
+        if self._ledger is not None:
+            self._ledger.mark(timestamp, {s: bars[s].close for s in present})
+        return present
+
+    def _last_bars_in_feed_order(self) -> dict[str, Bar]:
+        return {s: self._last_bars[s] for s in self._symbols if s in self._last_bars}
+
+    def _end_bars(self) -> None:
+        """Call `on_end` once on each bar-aware broker with each symbol's last bar.
+
+        Does nothing if no step has processed a bar. Does not touch the ledger.
+        """
+        if self._last_time is None:
             return
-        final = {s: last_bars[s] for s in self._symbols if s in last_bars}
+        final = self._last_bars_in_feed_order()
         for broker in self._bar_brokers:
             broker.on_end(dict(final))
-        if self._ledger is not None:
-            closes = {s: b.close for s, b in final.items()}
-            # A symbol whose data ended before the run's last timestamp is closed at
-            # its own last bar's time. When every symbol ended at the last timestamp
-            # (aligned data) the call is the same as it always was.
-            early = {s: t for s, t in last_times.items() if t != last_time}
-            if early:
-                self._ledger.finish(last_time, closes, self._end_commission,
-                                    symbol_times=early)
-            else:
-                self._ledger.finish(last_time, closes, self._end_commission)
+
+    def _finish_ledger(self) -> None:
+        """`Ledger.finish` at the last timestamp (backtest only).
+
+        No-op without a ledger or without any processed bar.
+        """
+        if self._last_time is None or self._ledger is None:
+            return
+        final = self._last_bars_in_feed_order()
+        closes = {s: b.close for s, b in final.items()}
+        # A symbol whose data ended before the run's last timestamp is closed at
+        # its own last bar's time. When every symbol ended at the last timestamp
+        # (aligned data) the call is the same as it always was.
+        early = {s: t for s, t in self._last_times.items() if t != self._last_time}
+        if early:
+            self._ledger.finish(self._last_time, closes, self._end_commission,
+                                symbol_times=early)
+        else:
+            self._ledger.finish(self._last_time, closes, self._end_commission)
