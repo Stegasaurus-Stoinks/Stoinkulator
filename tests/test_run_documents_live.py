@@ -20,6 +20,16 @@ from MainStoinker.engine.cli import main
 from MainStoinker.engine.cli_report import run_report_command, run_runs_command
 from MainStoinker.engine.gaprule import GapRuleReport
 from MainStoinker.engine.ledger import Ledger
+from MainStoinker.engine.live_counts import (
+    COUNT_DROPPED,
+    COUNT_FED,
+    COUNT_LATE,
+    COUNT_SCOPE_SYMBOL,
+    HEARTBEAT_INTERVAL,
+    LIVE_KINDS,
+    count_key,
+    parse_count_key,
+)
 from MainStoinker.engine.run_documents import (
     STALE_AFTER,
     is_live_run,
@@ -340,7 +350,9 @@ def test_report_shows_live_counts_and_open_positions(db, capsys):
     assert short[6:8] == ["51.0000", "-"]
 
     stale = report_text(db, last + STALE_AFTER + timedelta(seconds=61), capsys)
-    assert "liveness: stale (last write 2025-03-03 15:05:00 UTC, 4m01s ago)" in stale
+    assert ("liveness: stale (last write 2025-03-03 15:05:00 UTC, 4m01s ago; "
+            "the process may have died)") in stale
+    assert "process was killed" not in stale and "process was killed" not in text
 
     document = json.loads(report_text(db, last, capsys, as_json=True))
     assert document["run"]["liveness"] == "running"
@@ -396,9 +408,90 @@ def test_runs_shows_liveness_for_live_runs_only(db, capsys):
 
 
 def test_live_counts_record_keeps_keys_it_does_not_know():
+    wrong = {"weird": 1, "AAPL:dropped:a:b": 1, "AAPL:fed:x": 2, "AAPL:dropped": 3,
+             "AAPL:other": 4, ":fed": 5, "AAPL:dropped:": 6, "AAPL:late:x": 7}
     record = live_counts_record(
-        {"symbol": {"AAPL:fed": 4, "weird": 1, "AAPL:dropped:a:b": 1}, "run": {"x": 2}}, None)
+        {"symbol": {"AAPL:fed": 4, **wrong}, "run": {"x": 2}}, None)
     assert record["fed"] == {"AAPL": 4}
-    assert record["dropped"] == {"AAPL": {"a:b": 1}}
-    assert record["other"] == {"symbol": {"weird": 1}, "run": {"x": 2}}
+    assert record["dropped"] == {} and record["late"] == {}
+    assert record["other"] == {"symbol": wrong, "run": {"x": 2}}  # nothing is lost
     assert record["gap_rule"] is None
+
+
+def test_count_keys_round_trip_through_the_store(db):
+    keys = [count_key("AAPL", COUNT_FED), count_key("BRK.B", COUNT_FED),
+            count_key("BRK.B", COUNT_LATE), count_key("AAPL", COUNT_DROPPED, "stalled"),
+            count_key("BRK.B", COUNT_DROPPED, "backfill_only")]
+    assert keys[1] == "BRK.B:fed" and keys[4] == "BRK.B:dropped:backfill_only"
+    for key in keys:
+        parsed = parse_count_key(COUNT_SCOPE_SYMBOL, key)
+        assert parsed is not None and count_key(*parsed) == key
+    with SqliteStore(db) as store:
+        run_id = store.begin_run(meta("paper-live"))
+        store.write_algos(run_id, algos())
+        store.set_counts(run_id, {COUNT_SCOPE_SYMBOL: {k: i + 1 for i, k in enumerate(keys)}})
+        loaded = store.load_counts(run_id)
+    record = live_counts_record(loaded, None)
+    assert record["fed"] == {"AAPL": 1, "BRK.B": 2}
+    assert record["late"] == {"BRK.B": 3}
+    assert record["dropped"] == {"AAPL": {"stalled": 4}, "BRK.B": {"backfill_only": 5}}
+    assert "other" not in record
+
+
+def test_count_key_refuses_what_it_cannot_parse():
+    for args in (("A:B", COUNT_FED), ("", COUNT_FED), ("A", "bogus"), ("A", COUNT_DROPPED),
+                 ("A", COUNT_FED, "r"), ("A", COUNT_DROPPED, "a:b"), ("A", COUNT_DROPPED, "")):
+        with pytest.raises(ValueError):
+            count_key(*args)
+    assert parse_count_key("algo", "a1") is None
+    assert parse_count_key("algo", "AAPL:fed") is None
+
+
+def test_stale_after_is_a_multiple_of_the_heartbeat():
+    assert STALE_AFTER >= 3 * HEARTBEAT_INTERVAL
+    assert STALE_AFTER == 6 * HEARTBEAT_INTERVAL == timedelta(seconds=180)
+    assert set(LIVE_KINDS) == {"paper-live", "live"}
+
+
+def test_a_run_of_another_kind_is_live_when_a_live_column_is_set(db):
+    for name, end_reason in (("a.db", None), ("b.db", "session_end")):
+        path = db.with_name(name)
+        with SqliteStore(path, clock=Clock()) as store:
+            run_id = store.begin_run(meta("backtest"))
+            store.write_algos(run_id, algos())
+            if end_reason is None:
+                store.touch(run_id)
+            else:
+                store.end_run(run_id, "completed", end_reason)
+        run, _ = load(path)
+        assert run.summary.kind == "backtest" and is_live_run(run.summary)
+        assert "liveness" in run_summary_record(run.summary, run, now=START)
+    plain = db.with_name("c.db")
+    with SqliteStore(plain, clock=Clock()) as store:
+        store.begin_run(meta("backtest"))
+    run, _ = load(plain)
+    assert not is_live_run(run.summary)
+    live = db.with_name("d.db")
+    with SqliteStore(live, clock=Clock()) as store:
+        store.begin_run(meta("live"))
+    run, _ = load(live)
+    assert is_live_run(run.summary)
+
+
+def test_a_reused_broker_reference_starts_afresh(db):
+    led = Ledger()
+    a1 = led.open_account("a1", "AAPL", 1000)
+    o = a1.order_placed("x", time=minute(0), side="buy", quantity=1, order_type="market")
+    a1.fill("x", side="buy", quantity=1, price=D("10"), commission=0, time=minute(0),
+            reason="entry", order_id=o)
+    stop = a1.order_placed("x", time=minute(0), side="sell", quantity=1, order_type="stop",
+                           price=D("9"))
+    a1.fill("x", side="sell", quantity=1, price=D("9"), commission=0, time=minute(1),
+            reason="stop", order_id=stop)
+    a1.fill("x", side="buy", quantity=1, price=D("10"), commission=0, time=minute(5),
+            reason="entry")
+    store_live_run(db, led=led, counts=False)
+    run, _ = load(db)
+    (position,) = open_positions(run)
+    assert position["entry_time"] == minute(5).isoformat()
+    assert position["stop"] is None and position["target"] is None

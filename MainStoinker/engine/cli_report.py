@@ -281,6 +281,9 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
     lines = [f"run {s.run_id}"]
     if s.status == "completed":
         lines.append("status: completed")
+    elif s.status == "running" and live:
+        lines.append("status: incomplete (still marked running). Figures cover only what was "
+                     "stored.")
     elif s.status == "running":
         lines.append("status: incomplete (still marked running: the run is in progress, or its "
                      "process was killed). Figures cover only what was stored.")
@@ -343,7 +346,7 @@ def _liveness_lines(s: RunSummary, now: datetime, stale_after: timedelta) -> lis
         last = s.last_write_at if s.last_write_at is not None else s.started_at
         text = f"liveness: {state} (last write {_utc(last)} UTC"
         if state == "stale":
-            text += f", {_duration(last, now)} ago"
+            text += f", {_duration(last, now)} ago; the process may have died"
         lines.append(text + ")")
     if s.end_reason is not None:
         lines.append(f"end reason: {s.end_reason}")

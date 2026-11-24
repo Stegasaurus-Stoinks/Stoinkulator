@@ -45,15 +45,18 @@ from typing import Any
 
 from .gaprule import GapRuleReport
 from .ledger import IGNORED_KINDS, money
+from .live_counts import (
+    COUNT_FED,
+    COUNT_LATE,
+    LIVE_KINDS,
+    STALE_AFTER,
+    parse_count_key,
+)
 from .stats import fmt4, run_statistics, statistics_record
 from .store import RunData, RunSummary, StoredBar, gap_rule_to_json
 
-# A running run whose last write is older than this is "stale" (its writer is
-# probably dead). The live writers heartbeat well inside it.
-STALE_AFTER = timedelta(seconds=180)
-LIVE_KINDS: tuple[str, ...] = ("paper-live",)
-# Count keys, scope "symbol": "AAPL:fed", "AAPL:late", "AAPL:dropped:stalled".
-COUNT_FED, COUNT_LATE, COUNT_DROPPED = "fed", "late", "dropped"
+# STALE_AFTER, LIVE_KINDS and the count key format live in `live_counts`, which
+# the live writer imports too; `STALE_AFTER` is re-exported from here.
 
 
 def run_net(run: RunData) -> Decimal:
@@ -101,6 +104,7 @@ class _Pos:
     qty: Decimal = Decimal(0)
     cost: Decimal = Decimal(0)
     pending: Decimal = Decimal(0)
+    entry_time: datetime | None = None  # of the current position's first entry fill
 
 
 def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = None
@@ -108,23 +112,23 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
     """The positions still open after the stored fills, in the engine's order.
 
     Replays the fills with the ledger's rules (average cost; exits release the
-    pending entry commission). `entry_time` is the time of the first fill of the
-    position's broker reference. `stop` and `target` are the last price of the
-    placed `stop` / `target` order of that reference after modifications, null
-    when none was recorded or it was cancelled. When `last_bars` has the
+    pending entry commission). `entry_time` is the time of the first entry fill of
+    the current position (a reused broker reference starts afresh once flat).
+    `stop` and `target` are the last price of the `stop` / `target` order placed
+    for that position, after modifications, null when none was recorded or it
+    was cancelled. When `last_bars` has the
     position's symbol, `last_close` and `unrealised` (the ledger's: marked
     against the remaining cost, less the commission still pending) are added.
     A run closed by synthetic end-of-data fills has none.
     """
-    first: dict[tuple[str, Hashable], datetime] = {}
     book: dict[str, dict[Hashable, _Pos]] = {a.idname: {} for a in run.algos}
     for fill in run.fills:
-        first.setdefault((fill.account, fill.broker_ref), fill.time)
         held = book.setdefault(fill.account, {})
         pos = held.get(fill.broker_ref)
         if fill.reason == "entry":
             if pos is None:
-                pos = held[fill.broker_ref] = _Pos(fill.side == "buy", fill.symbol)
+                pos = held[fill.broker_ref] = _Pos(fill.side == "buy", fill.symbol,
+                                                   entry_time=fill.time)
             pos.qty += fill.quantity
             pos.cost += fill.quantity * fill.price
             pos.pending += fill.commission
@@ -143,6 +147,11 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
     for event in run.order_events:
         if event.kind == "placed" and event.order_type in ("stop", "target"):
             key = (event.account, event.broker_ref)
+            current = book.get(event.account, {}).get(event.broker_ref)
+            # an order placed before the current position's first entry belongs to an
+            # earlier position of a reused reference
+            if current is None or current.entry_time is None or event.time < current.entry_time:
+                continue
             placed[event.order_id] = (key, event.order_type)
             levels.setdefault(key, {})[event.order_type] = event.price
         elif event.order_id in placed:
@@ -157,7 +166,7 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
             key = (account, ref)
             lv = levels.get(key, {})
             average = money(pos.cost / pos.qty)
-            entry = first.get(key)
+            entry = pos.entry_time
             record: dict[str, Any] = {
                 "account": account, "symbol": pos.symbol,
                 "side": "long" if pos.long else "short",
@@ -191,13 +200,15 @@ def live_counts_record(counts: Mapping[str, Mapping[str, int]],
     other: dict[str, dict[str, int]] = {}
     for scope, keyed in counts.items():
         for key, value in keyed.items():
-            parts = key.split(":", 2)
-            if scope == "symbol" and len(parts) == 2 and parts[1] == COUNT_FED:
-                fed[parts[0]] = value
-            elif scope == "symbol" and len(parts) == 2 and parts[1] == COUNT_LATE:
-                late[parts[0]] = value
-            elif scope == "symbol" and len(parts) == 3 and parts[1] == COUNT_DROPPED:
-                dropped.setdefault(parts[0], {})[parts[2]] = value
+            parsed = parse_count_key(scope, key)
+            if parsed is None:
+                other.setdefault(scope, {})[key] = value
+            elif parsed.kind == COUNT_FED:
+                fed[parsed.symbol] = value
+            elif parsed.kind == COUNT_LATE:
+                late[parsed.symbol] = value
+            elif parsed.reason is not None:
+                dropped.setdefault(parsed.symbol, {})[parsed.reason] = value
             else:
                 other.setdefault(scope, {})[key] = value
     record: dict[str, Any] = {
