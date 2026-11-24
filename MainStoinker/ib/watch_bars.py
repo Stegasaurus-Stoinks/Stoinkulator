@@ -1,9 +1,12 @@
 """Owner-run live bar watcher: subscribe to IB's live-updating 1-minute bars and save the closed ones.
 
-    python -m MainStoinker.ib.watch_bars --port 7497 --symbols AAPL,MSFT,TSLA --minutes 30
+    python -m MainStoinker.ib.watch_bars --paper --symbols AAPL,MSFT,TSLA --minutes 30
 
-7497 is the paper port of TWS (data only, no opt-in variable). A live port is refused unless the
-owner has made their own opt-in in their own terminal; this module never sets it.
+`--paper` means port 7497 (the TWS paper port, data only) on 127.0.0.1 with the live opt-in absent
+from the environment, a connection built with `require_paper=True`, and the account list checked
+before the first request and all along (exit code 5, never retried). Without `--paper` a live port
+is refused unless the owner has made their own opt-in in their own terminal; this module never
+sets it.
 
 Only the owner runs it, in a real terminal, with TWS or IB Gateway open. It runs no algo and
 places no trade: it is built on `IbConnection` and `IbMarketData` (a data-only client that
@@ -50,6 +53,16 @@ acceptable, a partial row is not. Hence:
   a re-requested backfill is outstanding nothing is closed for that symbol; when it arrives its
   closed bars are written for minutes not yet in the file, and a minute already in the file that
   differs is reported as a row that may be stale.
+- A broken data farm (IB notices 2103 market data, 2105 historical, until 2104 / 2106 or 1101 /
+  1102) counts as an outage exactly like 1100: nothing is closed by time, and a minute that
+  overlapped it is not written ("spanned a data farm break"). If the OK notice never comes,
+  nothing is closed by time for the rest of the run and the summary says so.
+- Stale-update guard: a bar closed BY TIME is written only if its last live update arrived at
+  most 15 s before its minute ended on the stream's clock (covers a silent stall and a lag that
+  grows mid-run); otherwise "not written: last update came N s before the minute ended (stream
+  stalled?)". Trade-off: a thin symbol whose minute had no trade in its last 15 s AND no later
+  update (so only time can close it) loses that row; bars closed by a later update, the normal
+  case with updates every few seconds, are never affected.
 - Bars and updates of an earlier New York date than the server's (a start before 09:30
   backfills the previous session) are not written.
 - A live file that cannot be opened or appended (locked, unreadable, damaged, a last row that
@@ -106,11 +119,18 @@ from MainStoinker.engine.feed import Bar
 from MainStoinker.ib import events
 from MainStoinker.ib.bars import BadBar, bar_from_ib, data_time
 from MainStoinker.ib.cli import (
+    NOT_PAPER_LABEL,
+    NOT_PAPER_LINE,
+    PAPER_HOST,
+    PAPER_MODE_LINE,
+    PAPER_PORT,
     PathRefused,
     check_folder_usable,
     check_path,
     home_folder,
     make_folders,
+    paper_refusal,
+    paper_session_ok,
     port_refusal_text,
     private_values,
     remove_empty,
@@ -126,6 +146,7 @@ from MainStoinker.ib.connection import (
     ConnState,
     IbConnection,
     NotConnected,
+    NotPaperSession,
 )
 from MainStoinker.ib.history import DATA_ZONE, check_symbol
 from MainStoinker.ib.market_data import (
@@ -146,15 +167,19 @@ EXIT_FAILED = 1
 EXIT_REFUSED = 2
 EXIT_NO_CONNECTION = 3
 EXIT_STOPPED = 4
+EXIT_NOT_PAPER = 5
 EXIT_INTERRUPTED = 130
 
 EXIT_CODES_TEXT = """\
 exit codes:
   0    watched to the end and every symbol was streaming
-  1    finished, but a symbol stopped (IB error, unknown symbol) or delivered no bars
-  2    refused: console gate, port guard, bad arguments, unusable path
+  1    finished, but a symbol stopped (IB error, unknown symbol, unusable live file), had no
+       stream at the end (a re-request still outstanding) or delivered no bars
+  2    refused: console gate, port guard, --paper conditions, bad arguments, unusable path
   3    could not connect to TWS or IB Gateway
   4    stopped by a lost or closed connection, or by an unexpected error
+  5    --paper only: the account TWS is signed into is not a paper account (checked before
+       the first request and all along); nothing more was requested; never retried
   130  interrupted with Ctrl-C (requests cancelled, connection and recording closed)
 """
 
@@ -177,7 +202,10 @@ CLOSE_GRACE = 2  # a backfill bar this soon after its minute ended may still be 
 SETTLE_SECONDS = 90  # a bar with no later update this long after its minute is closed by time
 LABEL_CONFIRM = 10.0  # live updates this far apart must both show the lag before DELAYED is declared
 SESSION_GRACE = 20 * 60  # the last bars of a session wait for 16:20 (covers 15-minute delayed data)
-CONNECTION_NOTICES =frozenset({1100, 1101, 1102})  # connectivity lost, restored with data lost, restored
+FARM_BROKEN = {2103: "market", 2105: "historical"}  # IB notices: a data farm connection is broken
+FARM_OK = {2104: "market", 2106: "historical"}  # ... and that farm is OK again
+STALE_UPDATE = 15.0  # a bar closed by time needs a live update at most this long before its minute ended
+CONNECTION_NOTICES = frozenset({1100, 1101, 1102})  # connectivity lost, restored with data lost, restored
 DELAY_THRESHOLD = 120.0 # newest bar more than this behind server time in session: delayed data
 SESSION_OPEN_MINUTE = 9 * 60 + 30
 SESSION_CLOSE_MINUTE = 16 * 60
@@ -201,11 +229,22 @@ RecorderFactory = Callable[[Any], SessionRecorder | None]
 
 
 class LiveFileError(RuntimeError):
-    """A live file cannot be read or appended to (the message says why)."""
+    """A live file cannot be read or appended to (the message says why, naming the path once).
+
+    `locked` is True when the file could not be opened or appended to (another program may hold it),
+    False when its content is the problem (damaged, not UTF-8): then closing programs does not help."""
+
+    def __init__(self, message: str, *, locked: bool = False) -> None:
+        super().__init__(message)
+        self.locked = locked
 
 
 class _Closed(Exception):
     """The connection closed: stop and summarise."""
+
+
+class _NotPaper(Exception):
+    """`--paper`: the account list is not (or no longer) a paper account: stop and summarise."""
 
 
 class _Say:
@@ -235,15 +274,21 @@ def build_parser() -> argparse.ArgumentParser:
             "A bar is closed when an update with a later minute arrives. The session recording "
             "(on by default) grows with every update and may slow a long watch: use --no-record "
             "to avoid that.\n\n"
-            "Example, a paper account (port 7497, data only, no opt-in variable needed):\n"
-            "  python -m MainStoinker.ib.watch_bars --port 7497 --symbols AAPL,MSFT,TSLA --minutes 30\n"
+            "Example, a paper account (port 7497, data only, account check on):\n"
+            "  python -m MainStoinker.ib.watch_bars --paper --symbols AAPL,MSFT,TSLA --minutes 30\n"
             "A live port is refused unless the owner has made their own opt-in."
         ),
         epilog=EXIT_CODES_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--port", type=int, required=True, help="TWS or Gateway API port (no default)")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=None,
+                        help=f"TWS or Gateway API port (no default; with --paper: {PAPER_PORT})")
+    parser.add_argument("--host", default=PAPER_HOST)
+    parser.add_argument("--paper", action="store_true",
+                        help=f"paper mode: only port {PAPER_PORT} on {PAPER_HOST}, the live opt-in "
+                             "must not be set in the environment, and the account list IB sends "
+                             "must show a paper account before anything is requested and all along "
+                             "(else exit code 5, never retried)")
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID,
                         help=f"default {DEFAULT_CLIENT_ID} (the probe and fetch-bars use 21)")
     parser.add_argument("--symbols", nargs="+", default=["AAPL"], metavar="SYMBOL",
@@ -287,6 +332,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     if len(names) > MAX_SYMBOLS:
         parser.error(f"--symbols names {len(names)} symbols; at most {MAX_SYMBOLS}")
     args.symbols = names
+    if args.port is None:
+        if not args.paper:
+            parser.error("--port is required (or use --paper, which means port 7497)")
+        args.port = PAPER_PORT
     if not 1 <= args.port <= 65535:
         parser.error("--port must be 1 to 65535")
     if not 1 <= args.client_id <= MAX_CLIENT_ID or args.client_id in REFUSED_CLIENT_IDS:
@@ -402,7 +451,11 @@ class LiveFiles:
             handle.flush()
             os.fsync(handle.fileno())
         except OSError as exc:
-            raise LiveFileError(f"cannot write {path}: {type(exc).__name__}: {exc}") from exc
+            reason = exc.strerror or type(exc).__name__  # the text of OSError names the path again
+            raise LiveFileError(f"cannot open or append to {path}: {type(exc).__name__}: {reason}",
+                                locked=True) from exc
+        except ValueError as exc:  # UnicodeDecodeError: the file is not UTF-8 text
+            raise LiveFileError(f"cannot read {path}: {type(exc).__name__}; it was left untouched") from exc
         self._last[path] = bar.time
         return True
 
@@ -463,6 +516,7 @@ class _Forming:
     bar: Bar
     updates: int  # live updates received for this minute since the last backfill snapshot of it
     first_seen: float | None  # IB server time (epoch s) of the first update; None: from the backfill
+    last_at: float | None = None  # IB server time (epoch s) of the last live update
 
 
 @dataclass
@@ -487,6 +541,9 @@ class _Sym:
     previous_updates: int = 0  # live updates of an earlier date, ignored
     snapshot_only: int = 0  # minutes not written: seen only in a backfill snapshot
     lost_not_written: int = 0  # minutes not written: they overlapped a connection loss
+    farm_not_written: int = 0  # minutes not written: they overlapped a data farm break
+    stale_not_written: int = 0  # minutes not written: closed by time after a stalled stream
+    gap_not_written: int = 0  # minutes not written: dropped by a re-requested backfill
     skipped_closes: int = 0  # bars closed by an update that skipped empty minutes
     stale: int = 0  # late revisions that differ from the row already emitted
     emitted_bars: dict[int, tuple[Bar, bool]] = field(default_factory=dict)
@@ -578,7 +635,9 @@ class _Watcher:
         self.lost_noted = False
         self.lost_at_end = False
         self.closed = False
-        self.outages: list[list[float]] = []  # [start, end] in server time; end is inf while lost
+        # [start, end, kind] in server time; kind "loss" (1100) or a data farm ("market", "historical");
+        # end is inf while the outage lasts
+        self.outages: list[list[Any]] = []
         self.last_request: float | None = None  # monotonic clock of the last history request
         self._general_seen: dict[int, events.IbError] = {}
 
@@ -591,9 +650,14 @@ class _Watcher:
     def _lost(self) -> bool:
         return self.conn.state is ConnState.LOST
 
-    def _outage_ends(self, bar_time: int) -> list[float]:
-        """The ends of the outages that overlapped the minute starting at `bar_time`."""
-        return [end for start, end in self.outages if start < bar_time + 60 and end > bar_time]
+    def _outage_kinds(self, bar_time: int) -> set[str]:
+        """The kinds ("loss", "market", "historical") of the outages that overlapped the minute
+        starting at `bar_time`."""
+        return {kind for start, end, kind in self.outages if start < bar_time + 60 and end > bar_time}
+
+    def _down(self) -> bool:
+        """True while the connection is lost or a data farm is reported broken."""
+        return self._lost() or any(o[1] == math.inf for o in self.outages)
 
     # -- the session ----------------------------------------------------------------------
 
@@ -605,9 +669,14 @@ class _Watcher:
             self.say()
             self.say("Interrupted (Ctrl-C). Requests are cancelled and the connection is closed.")
             code = EXIT_INTERRUPTED
+        except _NotPaper:
+            code = EXIT_NOT_PAPER  # said once, with the result, by `run_watch`
         except _Closed:
-            self.say("STOPPED: the connection to TWS closed.")
-            code = EXIT_STOPPED
+            if getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True:
+                code = EXIT_NOT_PAPER  # the list failed and closed the connection: said by `run_watch`
+            else:
+                self.say("STOPPED: the connection to TWS closed.")
+                code = EXIT_STOPPED
         except Exception as exc:  # noqa: BLE001 - reported, not a traceback
             self.say(f"Unexpected {type(exc).__name__}: {exc}")
             code = EXIT_STOPPED
@@ -707,24 +776,37 @@ class _Watcher:
         if self.lost_at_end:
             self.say("The connection to IB is still lost (code 1100).")
             return EXIT_STOPPED
-        failed = any(s.phase == "stopped" or not s.had_bars for s in self.syms)
+        failed = any(s.phase in ("stopped", "backfill") or not s.had_bars for s in self.syms)
         return EXIT_FAILED if failed else EXIT_OK
 
     # -- reading ----------------------------------------------------------------------------
 
+    def _open_outage(self, kind: str) -> bool:
+        """Start an outage of `kind` unless one is already open; True if one was started."""
+        if any(o[2] == kind and o[1] == math.inf for o in self.outages):
+            return False
+        self.outages.append([self.server_now(), math.inf, kind])
+        return True
+
+    def _close_outages(self, kinds: Sequence[str]) -> None:
+        for outage in self.outages:
+            if outage[2] in kinds and outage[1] == math.inf:
+                outage[1] = self.server_now()
+
     def _check_state(self) -> None:
+        if getattr(self.args, "paper", False) is True and self.conn.paper_verified is not True:
+            raise _NotPaper  # before anything else: a failing account list ends the watch
         state = self.conn.state
         if state is ConnState.CLOSED:
             raise _Closed
         if state is ConnState.LOST and not self.lost_noted:
             self.lost_noted = True
-            self.outages.append([self.server_now(), math.inf])
+            self._open_outage("loss")
             self.say("IB connectivity LOST (code 1100): waiting for it to be restored; "
                      "the watch time keeps running; no bar is closed by time until it is restored.")
         elif state is ConnState.READY and self.lost_noted:
             self.lost_noted = False
-            if self.outages and self.outages[-1][1] == math.inf:
-                self.outages[-1][1] = self.server_now()
+            self._close_outages(["loss"])
             self.say("IB connectivity restored.")
 
     def _show_general(self) -> None:
@@ -734,6 +816,19 @@ class _Watcher:
                 notice = 2100 <= event.code < 2200 or event.code in CONNECTION_NOTICES
                 kind = "notice" if notice else "error"
                 self.say(f"IB {kind} {event.code}: {event.message}")
+                self._farm_notice(event.code)
+
+    def _farm_notice(self, code: int) -> None:
+        """A broken data farm (2103 market data, 2105 historical) is an outage like a lost connection
+        until its OK notice (2104, 2106) or a restore (1101, 1102): nothing closes by time, and a
+        minute that overlapped it is not written."""
+        if code in FARM_BROKEN:
+            if self._open_outage(FARM_BROKEN[code]):
+                self.say(f"IB data farm break ({code}): no bar is closed by time until it is OK again.")
+        elif code in FARM_OK:
+            self._close_outages([FARM_OK[code]])
+        elif code in (1101, 1102):
+            self._close_outages(list(FARM_BROKEN.values()))
 
     def _service(self, sym: _Sym, slice_: float) -> bool:
         """Read one thing for `sym`; True if something was received."""
@@ -919,6 +1014,7 @@ class _Watcher:
             forming = sym.forming
             if forming is not None and forming.bar.time < bar.time:
                 sym.forming = None  # older than the snapshot's window: its final values are not here
+                sym.gap_not_written += 1
                 self._not_written(sym, forming.bar, "its final values were not in the re-requested "
                                   "backfill")
                 forming = None
@@ -983,15 +1079,16 @@ class _Watcher:
         if sym.last_emitted is not None and bar.time <= sym.last_emitted:
             self._late(sym, bar, f"already emitted up to {_hm(sym.last_emitted)}")
         elif forming is None:
-            sym.forming = _Forming(bar, 1, now)
+            sym.forming = _Forming(bar, 1, now, now)
         elif bar.time == forming.bar.time:
             forming.bar = bar
             forming.updates += 1
+            forming.last_at = now
         elif bar.time < forming.bar.time:
             self._late(sym, bar, f"the forming minute is {_hm(forming.bar.time)}")
         else:
             self._close_forming(sym, now, "later", bar.time)
-            sym.forming = _Forming(bar, 1, now)
+            sym.forming = _Forming(bar, 1, now, now)
         self._show_forming(sym)
 
     def _late(self, sym: _Sym, bar: Bar, why: str) -> None:
@@ -1016,7 +1113,7 @@ class _Watcher:
 
     def _show_forming(self, sym: _Sym) -> None:
         forming = sym.forming
-        if self.args.quiet or forming is None or forming.updates == 0:
+        if self.args.quiet or forming is None or forming.updates == 0 or sym.phase == "stopped":
             return
         now = self.clock()
         if now - sym.last_forming_line < FORMING_EVERY:
@@ -1033,7 +1130,7 @@ class _Watcher:
         assert forming is not None
         sym.forming = None
         self._emit(sym, forming.bar, now, updates=forming.updates, first_seen=forming.first_seen,
-                   how=how, closer=closer)
+                   how=how, closer=closer, last_at=forming.last_at)
 
     def _settle(self, sym: _Sym) -> None:
         """Close the forming bar by time. Never while the connection is lost, while a re-requested
@@ -1041,7 +1138,7 @@ class _Watcher:
         time less the smallest lag bound seen for this symbol; it must be 90 s past the bar's end, and
         a bar that ends in the last two minutes of the session also waits for 16:20 server time."""
         forming = sym.forming
-        if forming is None or sym.phase != "live" or self._lost() or sym.lag_bound is None:
+        if forming is None or sym.phase != "live" or self._down() or sym.lag_bound is None:
             return
         bar = forming.bar
         now = self.server_now()
@@ -1053,12 +1150,14 @@ class _Watcher:
         self._close_forming(sym, now, "time")
 
     def _emit(self, sym: _Sym, bar: Bar, now: float, *, updates: int | None, first_seen: float | None,
-              how: str, closer: int | None = None) -> bool:
+              how: str, closer: int | None = None, last_at: float | None = None) -> bool:
         """Write and print one closed bar. True if a row was appended to its file.
 
         A bar closed from live data is written only if it is known finished with final values: it must
-        have had a live update after the backfill snapshot (`updates` above 0) and its minute must not
-        have overlapped a connection loss. Otherwise nothing is written and one line says why."""
+        have had a live update after the backfill snapshot (`updates` above 0), its minute must not
+        have overlapped a connection loss or a data farm break, and, closed by time, its last live
+        update (arrived at server time `last_at`) must be within `STALE_UPDATE` s of the minute's end
+        on the stream's clock. Otherwise nothing is written and one line says why."""
         if sym.phase == "stopped":
             return False
         if how in ("later", "time"):
@@ -1066,16 +1165,29 @@ class _Watcher:
                 sym.snapshot_only += 1
                 self._not_written(sym, bar, "seen only in the backfill snapshot (no live update)")
                 return False
-            if self._outage_ends(bar.time):
-                sym.lost_not_written += 1
-                self._not_written(sym, bar, "spanned a connection loss")
+            kinds = self._outage_kinds(bar.time)
+            if kinds:
+                if "loss" in kinds:
+                    sym.lost_not_written += 1
+                    self._not_written(sym, bar, "spanned a connection loss")
+                else:
+                    sym.farm_not_written += 1
+                    self._not_written(sym, bar, "spanned a data farm break")
                 return False
+            if how == "time" and last_at is not None and sym.lag_bound is not None:
+                gap = bar.time + 60 - (last_at - sym.lag_bound)  # by the stream's clock
+                if gap > STALE_UPDATE:
+                    sym.stale_not_written += 1
+                    self._not_written(sym, bar, f"last update came {gap:.0f} s before the minute "
+                                                "ended (stream stalled?)")
+                    return False
         try:
             written = self.files.write(sym.name, bar)
         except LiveFileError as exc:
+            advice = ("close it in other programs (for example Excel) and run again" if exc.locked
+                      else "check or move the file, then run again")
             self._stop(sym, "file not writable",
-                       f"{sym.name}: {exc}: close it in other programs (for example Excel) and run "
-                       f"again; {sym.name} stopped, the other symbols continue")
+                       f"{sym.name}: {exc}: {advice}; {sym.name} stopped, the other symbols continue")
             return False
         sym.emitted.append(bar.time)
         sym.emitted_bars[bar.time] = (bar, written)
@@ -1143,8 +1255,13 @@ class _Watcher:
         say()
         say("Summary")
         for sym in self.syms:
-            state = "streaming" if sym.phase in ("backfill", "live") else (
-                f"stopped: {sym.stop_reason}" if sym.phase == "stopped" else "never requested")
+            if sym.phase == "live":
+                state = "streaming"
+            elif sym.phase == "backfill":
+                state = ("NOT streaming at the end: a request was outstanding (a backfill was still "
+                         "awaited), so no bar was closed after it")
+            else:
+                state = f"stopped: {sym.stop_reason}" if sym.phase == "stopped" else "never requested"
             say(f"  {sym.name}: {state}{sym.tag}")
             if sym.delayed:
                 say(f"    stream: DELAYED, bars about {max(1, round(sym.lag / 60))} min "
@@ -1160,8 +1277,10 @@ class _Watcher:
                 f"backfill bars written: {sym.backfill_written}; backfilled after an outage: "
                 f"{sym.backfilled_late}")
             say(f"    minutes not written: snapshot only {sym.snapshot_only}, connection loss "
-                f"{sym.lost_not_written}; closes left out of the close-delay statistics: skipped "
-                f"minute {sym.skipped_closes}{', delayed stream' if sym.delayed else ''}")
+                f"{sym.lost_not_written}, data farm break {sym.farm_not_written}, stalled stream "
+                f"{sym.stale_not_written}, re-request gap {sym.gap_not_written}; closes left out of "
+                f"the close-delay statistics: skipped minute "
+                f"{sym.skipped_closes}{', delayed stream' if sym.delayed else ''}")
             if sym.previous_updates:
                 say(f"    updates of the previous session ignored: {sym.previous_updates}")
             if sym.previous_session:
@@ -1185,11 +1304,15 @@ class _Watcher:
                 say(f"    last closed bar: {_hm(bar.time)}  {_ohlc(bar)}  volume {bar.volume}")
             else:
                 say("    last closed bar: none")
-            if sym.forming is not None:
+            if sym.forming is not None and sym.phase != "stopped":
                 say(f"    still forming, not written: {_hm(sym.forming.bar.time)}  "
                     f"{_ohlc(sym.forming.bar)}  volume {sym.forming.bar.volume}")
             for path in self.files.written.get(sym.name, []):
                 say(f"    file: {path}")
+        open_farms = sorted({o[2] for o in self.outages if o[1] == math.inf and o[2] != "loss"})
+        if open_farms:
+            say(f"A data farm break ({', '.join(open_farms)}) was never reported OK again: nothing was "
+                "closed by time after it.")
         say(OFFSET_NOTE)
         say(COMPARE_NOTE)
 
@@ -1214,11 +1337,12 @@ def _missing_minutes(times: Sequence[int]) -> list[str]:
 
 _LABELS = {
     EXIT_OK: "watched to the end, every symbol streaming",
-    EXIT_FAILED: "finished, but a symbol stopped or delivered no bars",
+    EXIT_FAILED: "finished, but a symbol stopped, had no stream at the end or delivered no bars",
     EXIT_REFUSED: "refused, nothing was watched",
     EXIT_NO_CONNECTION: "could not connect",
     EXIT_STOPPED: "stopped early (lost or closed connection, or an unexpected error)",
     EXIT_INTERRUPTED: "interrupted with Ctrl-C",
+    EXIT_NOT_PAPER: NOT_PAPER_LABEL,
 }
 ADVICE_CLIENT_ID = ("Client id in use: another API client is connected with this id. Close it or pass "
                     "another --client-id.")
@@ -1226,7 +1350,8 @@ ADVICE_CONNECT = ("Cannot connect: check the port and that the API is enabled in
                   "(Global Configuration, API, Settings).")
 
 
-def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: list[str]) -> int | None:
+def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: list[str],
+             paper: bool = False) -> int | None:
     """None when connected, else the exit code (and the advice for the cause)."""
     say(f"Connecting to TWS at {args.host}:{args.port} (client id {args.client_id}, 2 attempts, "
         f"{args.connect_timeout:g} s each; TWS may ask you to accept the connection) ...")
@@ -1235,6 +1360,11 @@ def _connect(say: _Say, conn: IbConnection, args: argparse.Namespace, advice: li
     except (BrokerPortRefused, ClientIdRefused, BrokerConnectionRefusedHere) as exc:
         say(f"REFUSED: {exc}")
         return EXIT_REFUSED
+    except NotPaperSession:
+        if not paper:
+            raise
+        say(NOT_PAPER_LINE)  # never the exception text, never retried
+        return EXIT_NOT_PAPER
     except ConnectFailed as exc:
         for failure in exc.failures:
             say(f"  {failure.describe()}")
@@ -1279,13 +1409,19 @@ def run_watch(
     code = EXIT_STOPPED
     advice: list[str] = []
     not_connected = False
+    paper = getattr(args, "paper", False) is True
+    verified = False
     try:
         conn = connection_factory(args, [recorder] if recorder is not None else [])
-        refused = _connect(say, conn, args, advice)
+        refused = _connect(say, conn, args, advice, paper)
         if refused is not None:
             code = refused
             not_connected = True
+        elif paper and not paper_session_ok(conn, say):  # before the market data client, before any request
+            code = EXIT_NOT_PAPER
+            not_connected = True
         else:
+            verified = paper
             md = market_data_factory(conn)
             code = _Watcher(args, conn, md, say, files, clock, sleep, wall).run()
     except KeyboardInterrupt:
@@ -1296,6 +1432,11 @@ def run_watch(
         say(f"Unexpected {type(exc).__name__}: {exc}")
         code = EXIT_STOPPED
     finally:
+        if verified and conn is not None and conn.paper_verified is not True:
+            # the account list failed after READY: whatever the watch saw, this is the result
+            say(NOT_PAPER_LINE)
+            code = EXIT_NOT_PAPER
+            advice.clear()
         files.close()
         if conn is not None:
             try:
@@ -1356,6 +1497,12 @@ def main(
     stream = sys.stdout if out is None else out
     say = _Say(stream)
     wall_clock = wall or (lambda: datetime.now(UTC))
+    if args.paper:
+        refusal = paper_refusal(args.host, args.port, variables)  # before anything else is built
+        if refusal is not None:
+            say(refusal)
+            return EXIT_REFUSED
+        say(PAPER_MODE_LINE)
     try:
         resolve_paths(args, variables, today or datetime.now(NY).date(), Path.cwd())
     except PathRefused as exc:
@@ -1384,6 +1531,7 @@ def main(
             return IbConnection(
                 a.host, a.port, a.client_id, env=variables, attempts=2, retry_delay=3,
                 connect_timeout=a.connect_timeout, ready_timeout=15, observers=observers,
+                require_paper=a.paper,
             )
 
         def real_recorder(a: Any) -> SessionRecorder | None:

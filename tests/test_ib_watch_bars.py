@@ -216,6 +216,9 @@ class Rig:
         self.armed_count: int | None = None
         self.interrupt_after: int | None = None
         self.wall_offset = -0.4  # this computer's clock is 0.4 s behind IB
+        self.require_paper_override: bool | None = None  # build the connection otherwise than asked
+        self.accounts = "DU0000000"  # the list IB sends with nextValidId
+        self.mid_list: str | None = None  # a managedAccounts list that comes with the first clock answer
 
     # -- the watcher's clock -------------------------------------------------------------
 
@@ -327,10 +330,12 @@ class Rig:
 
     def client_factory(self, *, env: Any, on_event: Any, on_raw: Any, logger: Any) -> FakeIbClient:
         fake = FakeIbClient(DataOnlyClient(env, on_event, on_raw, logger), connect_behavior=self.behavior,
-                            farm_messages=FARM_MESSAGES if self.farm else ())
+                            farm_messages=FARM_MESSAGES if self.farm else (), managed_accounts=self.accounts)
         fake.respond("reqContractDetails", self._contract)
         fake.respond("reqHistoricalData", self._history)
-        fake.respond("reqCurrentTime", lambda: [("currentTime", self.server_epoch)])
+        fake.respond("reqCurrentTime", lambda: [
+            *([("managedAccounts", self.mid_list)] if self.mid_list else []),
+            ("currentTime", self.server_epoch)])
         self.fakes.append(fake)
         return fake
 
@@ -358,7 +363,9 @@ class Rig:
     def connection_factory(self, args: Any, observers: list[Any]) -> IbConnection:
         conn = IbConnection(args.host, args.port, args.client_id, env={}, client_factory=self.client_factory,
                             clock=self.plumb, sleep=self.plumb.sleep, poll_interval=0.002, attempts=2,
-                            retry_delay=3, observers=observers)
+                            retry_delay=3, observers=observers,
+                            require_paper=args.paper if self.require_paper_override is None
+                            else self.require_paper_override)
         self.connections.append(conn)
         return conn
 
@@ -397,9 +404,10 @@ class Rig:
             clock=self, sleep=self.sleep, wall=self.wall, today=date(2024, 8, 16), **extra)
 
     def watch(self, *extra: str, symbols: str | None = None, minutes: int = 5, record: bool = False,
-              port: str = "7497", **kw: Any) -> int:
+              port: str = "7497", paper: bool = False, **kw: Any) -> int:
         names = symbols if symbols is not None else ",".join(self.symbols)
-        argv = ["--port", port, "--symbols", names, "--minutes", str(minutes),
+        argv = ["--paper"] if paper else ["--port", port]
+        argv += ["--symbols", names, "--minutes", str(minutes),
                 "--out", str(self.tmp / "live")]
         if not record:
             argv.append("--no-record")
@@ -965,8 +973,10 @@ def test_a_bad_update_is_reported_and_skipped_without_killing_the_stream(rig: Ri
 
 
 def test_a_bar_without_a_later_update_is_closed_by_time_and_marked(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 0)  # the first update comes 1 s into the minute: the lag bound is 1 s
     rig.backfills = {"AAPL": [AAPL_BACKFILL]}
-    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 33, (33, 50.0), (100.0, 100.6, 99.9, 100.3, 1800))
     rig.at(rig.tt(36, 0.0), lambda: None)  # 09:33 ended at 09:34:00; 90 s later nothing came
     rig.end_at(4)
     assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK
@@ -1265,6 +1275,7 @@ def quiet_minute_rig(rig: Rig, revised: tuple[float, float, float, float, int]) 
     rig.server_epoch = ep(9, 33, 0)
     rig.backfills = {"AAPL": [AAPL_BACKFILL]}
     rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 33, (33, 50.0), (100.0, 100.5, 99.9, 100.2, 1000))  # 10 s before the end: not stale
     rig.at(rig.tt(35, 32.0), lambda: None)  # 09:33 is closed by time at 09:35:31
     rig.upd("AAPL", 33, (35, 40.0), revised)  # IB revises it afterwards
     rig.upd("AAPL", 35, (35, 45.0), (100.6, 100.6, 100.6, 100.6, 1))
@@ -1303,7 +1314,7 @@ def delayed_rig(rig: Rig, minutes: int) -> int:
     upd_at(rig, "AAPL", ep(9, 46), ep(10, 1, 1), (99.3, 99.3, 99.3, 99.3, 5))
     upd_at(rig, "AAPL", ep(9, 46), ep(10, 1, 30), (99.3, 99.9, 99.2, 99.8, 800))
     upd_at(rig, "AAPL", ep(9, 47), ep(10, 2, 1), (99.8, 99.8, 99.8, 99.8, 5))
-    upd_at(rig, "AAPL", ep(9, 47), ep(10, 2, 30), (99.8, 99.9, 99.7, 99.85, 600))
+    upd_at(rig, "AAPL", ep(9, 47), ep(10, 2, 50), (99.8, 99.9, 99.7, 99.85, 600))
     rig.end_at(minutes, symbols=1)
     return rig.watch(symbols="AAPL", minutes=minutes)
 
@@ -1497,7 +1508,7 @@ def test_closes_after_a_skipped_minute_are_left_out_of_the_close_delay_statistic
     line = [ln for ln in rig.text.splitlines() if ln.startswith("09:33  AAPL")][0]
     assert "closed by the 09:36 update, after 2 minutes without a bar" in line
     assert "closed after the minute ended, s (min / median / max): 3.0 / 3.0 / 3.0" in rig.text  # 09:36 only
-    assert "connection loss 0; closes left out of the close-delay statistics: skipped minute 1" in rig.text
+    assert "re-request gap 0; closes left out of the close-delay statistics: skipped minute 1" in rig.text
 
 
 # -- second review: a row is a finished bar with final values, or there is no row ---------------
@@ -1701,12 +1712,14 @@ def msft_only(rig: Rig) -> None:
     rig.end_at(5)
 
 
-def stopped_symbol_checks(rig: Rig, code: int) -> None:
+def stopped_symbol_checks(rig: Rig, code: int, *, excel: bool = True) -> None:
     assert code == watch_bars.EXIT_FAILED, rig.text
     assert "Unexpected" not in rig.text and "Traceback" not in rig.text
-    lines = [ln for ln in rig.text.splitlines() if "close it in other programs (for example Excel)" in ln]
-    assert len(lines) == 1 and lines[0].startswith("AAPL: ") and "AAPL_live_2024-08-16.csv" in lines[0]
+    lines = [ln for ln in rig.text.splitlines() if "AAPL_live_2024-08-16.csv" in ln and "stopped" in ln]
+    assert len(lines) == 1 and lines[0].startswith("AAPL: ")
+    assert lines[0].count("AAPL_live_2024-08-16.csv") == 1  # the path once
     assert "run again" in lines[0]
+    assert ("close it in other programs (for example Excel)" in lines[0]) is excel
     assert "AAPL: stopped: file not writable" in rig.text
     cancels = [c.args[0] for c in rig.fakes[-1].calls_named("cancelHistoricalData")]
     assert cancels.count(rig.req_ids["AAPL"]) == 1  # cancelled once, never polled again
@@ -1727,7 +1740,7 @@ def test_a_damaged_last_row_stops_only_that_symbol_and_leaves_the_file_alone(rig
     text = HEADER + "\n" + row + "\n" + tail
     path.write_text(text, encoding="utf-8", newline="\n")
     msft_only(rig)
-    stopped_symbol_checks(rig, rig.watch())
+    stopped_symbol_checks(rig, rig.watch(), excel=False)
     assert path.read_text(encoding="utf-8") == text  # untouched
 
 
@@ -1837,12 +1850,314 @@ def test_a_recording_with_events_is_kept_and_checked_after_a_run(rig: Rig) -> No
 def test_the_docstring_and_the_help_show_the_paper_port_and_no_live_example(
         capsys: pytest.CaptureFixture[str]) -> None:
     doc = watch_bars.__doc__ or ""
-    assert "--port 7497 --symbols AAPL,MSFT,TSLA" in doc and "7496" not in doc
+    assert "--paper --symbols AAPL,MSFT,TSLA" in doc and "7496" not in doc
     with pytest.raises(SystemExit):
         watch_bars.parse_args(["--help"])
     shown = capsys.readouterr().out
-    assert "--port 7497 --symbols AAPL,MSFT,TSLA" in shown and "7496" not in shown
+    assert "--paper --symbols AAPL,MSFT,TSLA" in shown and "7496" not in shown
     assert "own opt-in" in shown and "STOINK_ALLOW_LIVE_PORT" not in shown
+
+
+# -- third review: file encoding, farm breaks, stalls, wording, paper mode ---------------------------
+
+
+def test_a_live_file_that_is_not_utf8_stops_only_that_symbol_and_is_left_alone(rig: Rig) -> None:
+    path = rig.csv("AAPL")
+    path.parent.mkdir(parents=True)
+    row = f"2024-08-16 09:31:00,{ep(9, 31)},99.2,99.9,99.1,99.8,4000\n".encode()
+    content = HEADER.encode() + b"\n" + row + b"2024-08-16 09:32:00,x\xe9\xe8,1,2,3,4,5\n"
+    path.write_bytes(content)
+    msft_only(rig)
+    stopped_symbol_checks(rig, rig.watch(), excel=False)
+    assert "UnicodeDecodeError" in rig.text and "Unexpected" not in rig.text
+    assert path.read_bytes() == content
+
+
+def farm_rig(rig: Rig, broken: tuple[int, str], ok: int | None) -> None:
+    """09:33 and 09:34 are updated (09:34 last at 09:34:15), the farm breaks at 09:34:20 and is
+    reported OK again at 09:37:10 (or never). 09:34 is overdue for a time close from 09:35:31."""
+    rig.LIMIT = 300  # a gate that never opens fails in seconds, not minutes
+    rig.server_epoch = ep(9, 33, 0)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 33, (33, 50.0), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 34, (34, 1.0), (100.3, 100.3, 100.3, 100.3, 5))
+    rig.upd("AAPL", 34, (34, 15.0), (100.3, 100.9, 100.2, 100.5, 50))
+    code, text = broken
+    rig.at(rig.tt(34, 20.0), lambda: rig.fakes[-1].drop(code, text))
+    seen: list[bool] = []
+    rig.at(rig.tt(36, 0.0),
+           lambda: seen.append("09:34  AAPL" in rig.text or "AAPL 09:34 not written" in rig.text),
+           ready=lambda: f"data farm break ({code})" in rig.text)
+    rig.farm_seen = seen  # type: ignore[attr-defined]
+    if ok is not None:
+        ok_text = {2104: "Market data farm connection is OK:usfarm",
+                   2106: "HMDS data farm connection is OK:ushmds"}
+        rig.at(rig.tt(37, 10.0), lambda: rig.fakes[-1].drop(ok, ok_text.get(ok)), ready=lambda: bool(seen))
+        rig.at(rig.tt(37, 20.0), lambda: None, ready=lambda: "AAPL 09:34 not written" in rig.text)
+    rig.end_at(5, symbols=1)
+
+
+FARM_CASES = [((2105, "HMDS data farm connection is broken:ushmds"), 2106),
+              ((2103, "Market data farm connection is broken:usfarm"), 2104),
+              ((2105, "HMDS data farm connection is broken:ushmds"), 1102)]
+
+
+@pytest.mark.parametrize("broken,ok", FARM_CASES)
+def test_a_minute_that_overlapped_a_data_farm_break_is_not_written_and_nothing_closes_during_it(
+        rig: Rig, broken: tuple[int, str], ok: int) -> None:
+    farm_rig(rig, broken, ok)
+    assert rig.watch(symbols="AAPL", minutes=5) == watch_bars.EXIT_OK, rig.text
+    assert rig.farm_seen == [False]  # type: ignore[attr-defined]  # not closed by time during the break
+    assert "AAPL 09:34 not written: spanned a data farm break" in rig.text
+    assert "closed by time: no later update" not in rig.text
+    assert [r[0][11:16] for r in rig.rows("AAPL")] == ["09:30", "09:31", "09:33"]
+    assert "data farm break 1" in rig.text and "never reported OK again" not in rig.text
+
+
+def test_a_data_farm_break_that_is_never_reported_ok_closes_nothing_by_time_and_the_summary_says_so(
+        rig: Rig) -> None:
+    farm_rig(rig, (2105, "HMDS data farm connection is broken:ushmds"), None)
+    assert rig.watch(symbols="AAPL", minutes=5) == watch_bars.EXIT_OK, rig.text
+    assert rig.farm_seen == [False]  # type: ignore[attr-defined]
+    assert "09:34" not in "".join(r[0] for r in rig.rows("AAPL"))
+    assert "closed by time: no later update" not in rig.text
+    assert "A data farm break (historical) was never reported OK again" in rig.text
+    assert "still forming, not written: 09:34" in rig.text
+
+
+def stall_rig(rig: Rig, last_update: float) -> None:
+    """09:33 is updated at 09:33:01 and at `last_update`, then nothing: only time can close it."""
+    rig.server_epoch = ep(9, 33, 0)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    if last_update > 1.0:
+        rig.upd("AAPL", 33, (33, last_update), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.at(rig.tt(36, 0.0), lambda: None)
+    rig.end_at(4, symbols=1)
+
+
+@pytest.mark.parametrize("last_update,written", [(46.0, True), (45.0, False)])
+def test_a_bar_closed_by_time_needs_a_live_update_within_15_seconds_of_its_end(
+        rig: Rig, last_update: float, written: bool) -> None:
+    stall_rig(rig, last_update)  # the lag bound is 1 s: the stream's clock reads the update 1 s early
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    rows = [r[0][11:16] for r in rig.rows("AAPL")]
+    if written:
+        assert rows[-1] == "09:33" and "not written: last update came" not in rig.text
+    else:
+        assert "09:33" not in rows
+        assert ("AAPL 09:33 not written: last update came 16 s before the minute ended "
+                "(stream stalled?)") in rig.text
+        assert "stalled stream 1" in rig.text
+
+
+def test_a_silent_stall_writes_no_bar_closed_by_time(rig: Rig) -> None:
+    stall_rig(rig, 1.0)  # one update at 09:33:01 and then silence: 59 s before the minute ended
+    assert rig.watch(symbols="AAPL", minutes=4) == watch_bars.EXIT_OK, rig.text
+    assert "last update came 60 s before the minute ended (stream stalled?)" in rig.text
+    assert "09:33" not in "".join(r[0] for r in rig.rows("AAPL"))
+
+
+def test_a_thin_symbol_closed_by_a_later_update_is_not_affected_by_the_stall_guard(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 0)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))  # no trade for the rest of the minute
+    rig.upd("AAPL", 34, (34, 40.0), (100.2, 100.2, 100.2, 100.2, 3))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert rig.rows("AAPL")[-1][0][11:16] == "09:33" and "stalled" not in rig.text.split("Summary")[0]
+
+
+# -- counting and wording ----------------------------------------------------------------------
+
+
+def test_a_minute_dropped_by_a_rerequested_backfill_is_counted(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 0)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL, [(ep(9, 34), 100.3, 100.4, 100.2, 100.3, 100)]]}
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((34, 30.0), 1101)
+    rig.at(rig.tt(34, 40.0), lambda: None, ready=lambda: "re-requested backfill:" in rig.text)
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_OK, rig.text
+    assert "AAPL 09:33 not written: its final values were not in the re-requested backfill" in rig.text
+    assert "re-request gap 1" in rig.text
+
+
+def test_a_rerequest_still_outstanding_at_the_end_is_said_and_is_not_every_symbol_streaming(rig: Rig) -> None:
+    rig.server_epoch = ep(9, 33, 0)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 1.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((34, 30.0), 1101)
+    hold_history(rig, from_request=2)  # the answer never comes
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2) == watch_bars.EXIT_FAILED, rig.text
+    assert "AAPL: NOT streaming at the end" in rig.text
+    assert "every symbol streaming" not in rig.text
+    assert "had no stream at the end" in rig.text
+
+
+def test_a_stopped_symbol_prints_no_further_forming_line_and_no_still_forming(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_write = watch_bars.LiveFiles.write
+
+    def failing_write(self: watch_bars.LiveFiles, symbol: str, bar: Any) -> bool:
+        if bar.time == ep(9, 33):
+            raise watch_bars.LiveFileError("cannot open or append to X: PermissionError: denied", locked=True)
+        return real_write(self, symbol, bar)
+
+    monkeypatch.setattr(watch_bars.LiveFiles, "write", failing_write)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))  # closes 09:33: the write fails here
+    rig.upd("AAPL", 34, (34, 30.0), (100.2, 100.3, 100.2, 100.3, 9))
+    rig.end_at(3, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=3) == watch_bars.EXIT_FAILED, rig.text
+    after = rig.text.split("AAPL: cannot open or append")[1]
+    assert "forming 09:34" not in after.split("Summary")[0]
+    assert "still forming, not written" not in rig.text
+
+
+# -- --paper -----------------------------------------------------------------------------------
+
+
+PAPER_LINE = "paper mode: port 7497, account check on"
+LIVE_LOOKING = "U7654321"
+
+
+def paper_argv(rig: Rig, *extra: str) -> list[str]:
+    return ["--paper", "--symbols", "AAPL", "--minutes", "2", "--out", str(rig.live), "--no-record", *extra]
+
+
+@pytest.mark.parametrize("extra,env", [
+    (["--port", "7496"], {}), (["--port", "4002"], {}), (["--port", "7497", "--host", "127.0.0.2"], {}),
+    (["--host", "localhost"], {}), ([], {"STOINK_ALLOW_LIVE_PORT": "1"}),
+    ([], {"STOINK_ALLOW_LIVE_PORT": ""}),
+    (["--port", "7496"], {"STOINK_ALLOW_LIVE_PORT": "1"})])
+def test_paper_mode_refusals_build_nothing(rig: Rig, extra: list[str], env: dict[str, str]) -> None:
+    rig.env.update(env)
+    assert rig.main(*paper_argv(rig, *extra)) == watch_bars.EXIT_REFUSED
+    assert "Refused (--paper)" in rig.text and "Nothing was started." in rig.text
+    assert not rig.prompts
+    nothing_built(rig)
+    assert not rig.live.exists()
+
+
+def test_paper_mode_defaults_to_the_paper_port_and_says_so_first(rig: Rig) -> None:
+    assert watch_bars.parse_args(["--paper"]).port == 7497
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.end_at(2, symbols=1)
+    assert rig.watch(symbols="AAPL", minutes=2, paper=True) == watch_bars.EXIT_OK, rig.text
+    assert rig.text.splitlines()[0] == PAPER_LINE
+    assert len(rig.fakes) == 1 and len(rig.rows("AAPL")) >= 2
+    assert rig.prompts and "(7497)" in rig.prompts[0]  # the console gate stays
+
+
+def test_without_paper_there_is_no_paper_text_and_a_port_is_still_required(rig: Rig) -> None:
+    rig.end_at(1, symbols=1)
+    rig.watch(symbols="AAPL", minutes=1)
+    assert "paper mode" not in rig.text
+    with pytest.raises(SystemExit):
+        watch_bars.parse_args(["--symbols", "AAPL"])
+
+
+def test_paper_mode_keeps_the_console_gate(rig: Rig) -> None:
+    rig.typed = "nope"
+    assert rig.watch(symbols="AAPL", minutes=1, paper=True) == watch_bars.EXIT_REFUSED
+    assert len(rig.prompts) == 1
+    nothing_built(rig)
+
+
+def no_data_request(rig: Rig) -> None:
+    names = {c.name for f in rig.fakes for c in f.calls}
+    assert not names & {"reqContractDetails", "reqHistoricalData", "cancelHistoricalData"}, names
+
+
+@pytest.mark.parametrize("accounts", [LIVE_LOOKING, "", f"DU1234567,{LIVE_LOOKING}", "D1234567"])
+def test_a_live_looking_account_list_ends_with_the_not_paper_code_and_requests_nothing(
+        rig: Rig, accounts: str) -> None:
+    rig.accounts = accounts
+    code = rig.watch(symbols="AAPL", minutes=2, paper=True, record=True)
+    assert code == watch_bars.EXIT_NOT_PAPER == 5
+    assert len(rig.fakes) == 1  # not retried
+    no_data_request(rig)
+    assert "reqCurrentTime" not in {c.name for c in rig.fakes[0].calls}
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1
+    assert "U7654321" not in rig.text and "1234567" not in rig.text
+    assert f"(exit {code})" in rig.text and watch_bars.NOT_PAPER_LABEL in rig.text
+    assert not rig.live.exists() or not list(rig.live.rglob("*.csv"))
+
+
+def test_a_connection_that_cannot_vouch_for_the_account_sends_nothing_in_paper_mode(rig: Rig) -> None:
+    rig.require_paper_override = False  # opens fine, but `paper_verified` stays False
+    rig.accounts = LIVE_LOOKING
+    code = rig.watch(symbols="AAPL", minutes=2, paper=True)
+    assert code == watch_bars.EXIT_NOT_PAPER, rig.text
+    assert rig.connections[0].paper_verified is False
+    no_data_request(rig)
+    assert "reqCurrentTime" not in {c.name for c in rig.fakes[0].calls}
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1
+
+
+def test_a_failing_list_with_the_first_clock_answer_requests_nothing_more(rig: Rig) -> None:
+    rig.mid_list = LIVE_LOOKING
+    code = rig.watch(symbols="AAPL", minutes=2, paper=True)
+    assert code == watch_bars.EXIT_NOT_PAPER, rig.text
+    no_data_request(rig)
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+
+
+def test_a_failing_list_in_the_middle_of_a_watch_ends_it_with_the_not_paper_code(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))  # 09:33 is written
+    rig.at(rig.tt(34, 10.0), lambda: rig.fakes[-1].push("managedAccounts", LIVE_LOOKING))
+    rig.upd("AAPL", 35, (35, 2.0), (100.3, 100.3, 100.3, 100.3, 5))  # never read
+    rig.expected = 0
+    rig.end_at(4, symbols=1)
+    code = rig.watch(symbols="AAPL", minutes=4, paper=True)
+    assert code == watch_bars.EXIT_NOT_PAPER, rig.text
+    assert rig.text.count(watch_bars.NOT_PAPER_LINE) == 1 and "U7654321" not in rig.text
+    assert "STOPPED: the connection to TWS closed" not in rig.text
+    assert rig.rows("AAPL")[-1][0][11:16] == "09:33"  # what was written before stays
+    assert "Summary" in rig.text and f"(exit {code})" in rig.text
+
+
+def test_the_real_connection_is_built_with_require_paper_only_in_paper_mode(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    original = watch_bars.IbConnection
+
+    def spy(*args: Any, **kw: Any) -> IbConnection:
+        seen.append(dict(kw))
+        kw.update(client_factory=rig.client_factory, clock=rig.plumb, sleep=rig.plumb.sleep,
+                  poll_interval=0.002)
+        conn = original(*args, **kw)
+        rig.connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(watch_bars, "IbConnection", spy)
+    rig.accounts = LIVE_LOOKING  # the paper run stops at the account check; the other cannot connect
+    for paper in (True, False):
+        rig.behavior = ConnectBehavior.ACCEPT if paper else ConnectBehavior.REFUSE
+        rig.watch(symbols="AAPL", minutes=1, paper=paper, with_factories=False)
+    assert [s["require_paper"] for s in seen] == [True, False]
+
+
+def test_the_not_paper_code_is_new_documented_and_distinct() -> None:
+    codes = [watch_bars.EXIT_OK, watch_bars.EXIT_FAILED, watch_bars.EXIT_REFUSED,
+             watch_bars.EXIT_NO_CONNECTION, watch_bars.EXIT_STOPPED, watch_bars.EXIT_INTERRUPTED]
+    assert watch_bars.EXIT_NOT_PAPER not in codes
+    assert "  5    --paper only" in watch_bars.EXIT_CODES_TEXT
+
+
+def test_the_paper_helpers_are_the_ones_of_cli() -> None:
+    from MainStoinker.ib import cli
+
+    assert watch_bars.paper_refusal is cli.paper_refusal
+    assert watch_bars.paper_session_ok is cli.paper_session_ok
+    assert watch_bars.NOT_PAPER_LINE is cli.NOT_PAPER_LINE
 
 
 # -- source checks --------------------------------------------------------------------------
