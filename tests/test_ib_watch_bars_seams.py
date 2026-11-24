@@ -1054,4 +1054,4 @@ def test_a_listener_and_a_sink_do_not_change_the_output(rig: Rig, monkeypatch: p
             conn.close()
         for fake in rig2.fakes:
             fake.close()
-    assert with_seams == plain.replace("<tmp>", "<tmp>")
+    assert with_seams == plain
