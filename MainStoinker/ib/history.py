@@ -81,6 +81,17 @@ DEFAULT_WHAT_TO_SHOW = "TRADES"
 MANIFEST_NAME = "manifest.json"
 MANIFEST_VERSION = 1
 
+DAY_FINAL_AT = dtime(6, 0)
+"""When a day's 1-minute history counts as final: 06:00 New York time on the NEXT calendar day.
+
+Evidence (paper account, AAPL, 2026-11-23, 09:30 bar): fetched at about 22:19 New York the
+same day it had volume 127,184 and high 349.45; fetched at about 04:40 and at 10:09 the next
+day it had volume 1,030,534 and high 349.50. So IB's history was still not final 6 hours 19
+minutes after the close and was final by 04:40 the next morning; the exact moment is not
+known. 06:00 is a margin after the last observation that was still short, rounded to a
+clean hour. A day fetched before `day_final_utc(day)` is stored but provisional. Issue 174.
+"""
+
 STATUS_OK = "ok"
 STATUS_NO_DATA = "no_data"
 STATUS_FAILED = "failed"
@@ -122,6 +133,16 @@ def check_symbol(symbol: str) -> str:
 def session_close_utc(day: date) -> datetime:
     """16:00 New York of `day` as an aware UTC datetime (DST handled by the zone database)."""
     return datetime.combine(day, SESSION_CLOSE, tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
+
+
+def day_final_utc(day: date) -> datetime:
+    """`DAY_FINAL_AT` New York on the calendar day after `day`, as an aware UTC datetime.
+
+    The zone database handles daylight saving: 06:00 New York is 11:00 UTC in winter and
+    10:00 UTC in summer; a Friday's day is final on Saturday 06:00.
+    """
+    return datetime.combine(day + timedelta(days=1), DAY_FINAL_AT,
+                            tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +464,9 @@ class DayRecord:
     error_code: int | None = None
     error_text: str = ""
     fetched_utc: str = ""
+    # a refetch returned fewer bars than were stored: the stored bars were kept and this is
+    # how many IB sent (0 = not the case). Absent in older manifests.
+    refetch_fewer: int = 0
 
 
 def _is_int(value: object) -> bool:
@@ -494,6 +518,7 @@ class Manifest:
     def record(
         self, day: date, status: str, *, bars: int = 0, error_code: int | None = None,
         error_text: str = "", fetched_utc: datetime, complete_answer: bool = False,
+        refetch_fewer: int = 0,
     ) -> None:
         """Set the record of `day`; whatever is accepted here also loads back unchanged.
 
@@ -510,13 +535,44 @@ class Manifest:
             raise TypeError(f"day must be a date, got {day!r}")
         stamp = _aware(fetched_utc, "fetched_utc").astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         validate_day_fields(status, bars, error_code, error_text, stamp)
-        self.days[day.isoformat()] = DayRecord(status, bars, error_code, error_text, stamp)
+        if not _is_int(refetch_fewer) or refetch_fewer < 0:
+            raise ValueError("refetch_fewer must be an int of at least 0")
+        self.days[day.isoformat()] = DayRecord(status, bars, error_code, error_text, stamp,
+                                               refetch_fewer)
 
     def pending(self, days: Iterable[date]) -> list[date]:
         """The days still to request, in the given order: unknown and failed ones."""
         done = (STATUS_OK, STATUS_NO_DATA)
         return [d for d in days
                 if (rec := self.days.get(d.isoformat())) is None or rec.status not in done]
+
+    def is_provisional(self, day: date) -> bool:
+        """True when `day` is `ok` and was fetched before `day_final_utc(day)`.
+
+        Derived from the stored fetch time, so manifests written before provisional days
+        existed are read the same way. A record without a usable fetch time is complete.
+        """
+        rec = self.days.get(day.isoformat())
+        if rec is None or rec.status != STATUS_OK or not rec.fetched_utc:
+            return False
+        try:
+            fetched = datetime.strptime(rec.fetched_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_UTC)
+        except ValueError:
+            return False
+        return fetched < day_final_utc(day)
+
+    def provisional(self, days: Iterable[date]) -> list[date]:
+        """The days of `days` that are provisional, in the given order."""
+        return [d for d in days if self.is_provisional(d)]
+
+    def refetch_due(self, days: Iterable[date], server_now: datetime) -> list[date]:
+        """The provisional days that are final at `server_now`: to be fetched again.
+
+        A provisional day that is not final yet is NOT due (fetching before final cannot
+        change it for the better).
+        """
+        _aware(server_now, "server_now")
+        return [d for d in days if self.is_provisional(d) and server_now >= day_final_utc(d)]
 
     def mark_pending(self, days: Iterable[date]) -> list[date]:
         """Forget the records of `days` so `pending` asks for them again (a forced refetch).
@@ -531,7 +587,8 @@ class Manifest:
 
     def mark_gaps_pending(self, rows: Iterable[GapRow]) -> list[date]:
         """`mark_pending` for every day of a gap report that is `no_data`, `short` or `partial`."""
-        return self.mark_pending(r.day for r in rows if r.status != GAP_COMPLETE)
+        return self.mark_pending(r.day for r in rows
+                                 if r.status not in (GAP_COMPLETE, GAP_PROVISIONAL))
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -543,7 +600,8 @@ class Manifest:
             "what_to_show": self.what_to_show,
             "bar_size": self.bar_size,
             "days": {k: {"status": r.status, "bars": r.bars, "error_code": r.error_code,
-                         "error_text": r.error_text, "fetched_utc": r.fetched_utc}
+                         "error_text": r.error_text, "fetched_utc": r.fetched_utc,
+                         **({"refetch_fewer": r.refetch_fewer} if r.refetch_fewer else {})}
                      for k, r in sorted(self.days.items())},
         }
 
@@ -587,7 +645,10 @@ def _parse_manifest(text: str, expected: Manifest) -> Manifest:
             validate_day_fields(status, bars, code, text_, stamp)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"bad record for {key}: {exc}") from exc
-        result.days[day_key] = DayRecord(status, bars, code, text_, stamp)
+        fewer = rec.get("refetch_fewer", 0)  # optional; unknown fields in a record are ignored
+        if not _is_int(fewer) or fewer < 0:
+            fewer = 0
+        result.days[day_key] = DayRecord(status, bars, code, text_, stamp, fewer)
     return result
 
 
@@ -681,6 +742,7 @@ GAP_SHORT = "short"
 GAP_PARTIAL = "partial"
 GAP_NO_DATA = "no_data"
 GAP_NOT_FETCHED = "not_fetched"  # a day this run never asked IB for (the run stopped first)
+GAP_PROVISIONAL = "provisional"  # all 390 minutes, but fetched before the day's bars are final
 GAPS_CSV = "gaps.csv"
 GAPS_SUMMARY = "gaps_summary.txt"
 
@@ -720,14 +782,16 @@ def _ranges(missing: Sequence[datetime]) -> tuple[tuple[datetime, datetime], ...
 
 def gap_report(
     days: Iterable[date], bars: pd.DataFrame, *, data_zone: str = DATA_ZONE,
-    not_requested: Collection[date] = (),
+    not_requested: Collection[date] = (), provisional: Collection[date] = (),
 ) -> list[GapRow]:
     """One `GapRow` per day, in the order given, comparing `bars` (naive data-zone `date`) to the session.
 
     Status: `no_data` (no bar in the session minutes, so also a day that was
     never fetched, unless it is in `not_requested`), `not_fetched` (no bar, and the
     day is in `not_requested`: the run stopped before it was asked for; a day with
-    bars keeps its bar-based status), `complete` (all 390 minutes), `short` (bars complete from
+    bars keeps its bar-based status), `provisional` (all 390 minutes, and the day is in
+    `provisional`: fetched before it is final; a short or partial provisional day keeps
+    its `short` / `partial` status), `complete` (all 390 minutes), `short` (bars complete from
     09:30 to 12:59, an early close at 13:00, and nothing after) or `partial`
     (any other gap: a hole, a missing tail such as only 15:59, a one-bar day).
     Bars outside 09:30 to 15:59 are ignored; duplicates count once and order
@@ -745,7 +809,7 @@ def gap_report(
         if have == 0:
             status = GAP_NOT_FETCHED if day in not_requested else GAP_NO_DATA
         elif not missing:
-            status = GAP_COMPLETE
+            status = GAP_PROVISIONAL if day in provisional else GAP_COMPLETE
         elif have == EARLY_CLOSE_MINUTES and missing == minutes[EARLY_CLOSE_MINUTES:]:
             status = GAP_SHORT
         else:
@@ -778,12 +842,15 @@ def gaps_summary_text(rows: Sequence[GapRow], symbol: str = "") -> str:
     lines = [head] + [f"  {s}: {n}" for s, n in counts.items()]
     if not_fetched:  # only after a stopped run: a run that asked for every day has no such line
         lines.append(f"  {GAP_NOT_FETCHED}: {not_fetched}")
+    provisional = sum(1 for r in rows if r.status == GAP_PROVISIONAL)
+    if provisional:  # only while a day awaits its refetch
+        lines.append(f"  {GAP_PROVISIONAL}: {provisional}")
     lines.append(f"  missing minutes in days with data: "
                  f"{sum(r.missing_count for r in rows if r.status not in (GAP_NO_DATA, GAP_NOT_FETCHED))}")
     for r in rows:
         if r.status == GAP_COMPLETE:
             continue
-        detail = ("" if r.status in (GAP_NO_DATA, GAP_NOT_FETCHED)
+        detail = ("" if r.status in (GAP_NO_DATA, GAP_NOT_FETCHED, GAP_PROVISIONAL)
                   else " " + ", ".join(_range_text(s) for s in r.missing))
         lines.append(f"{r.day.isoformat()} {r.status}{detail}")
     return "\n".join(lines) + "\n"

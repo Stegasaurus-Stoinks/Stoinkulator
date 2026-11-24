@@ -8,7 +8,6 @@ passed in, every file is under `tmp_path`, and nothing opens a socket. Nothing h
 from __future__ import annotations
 
 import json
-import shutil
 import threading
 from collections.abc import Iterator
 from datetime import date
@@ -323,7 +322,7 @@ def test_bad_option_values_are_usage_errors(flag: str, value: str,
 def test_the_only_option_that_skips_the_gate_is_no_prompt_and_it_is_refused_without_paper() -> None:
     options = {o for action in cli.build_parser()._actions for o in action.option_strings}
     assert options == {"-h", "--help", "--symbols", "--start", "--end", "--port", "--host", "--client-id",
-                       "--out", "--record", "--no-record", "--connect-timeout", "--settle-hours",
+                       "--out", "--record", "--no-record", "--connect-timeout",
                        "--paper", "--no-prompt"}
     # --paper only adds checks; --no-prompt is the one option that skips the gate, and only with --paper
     # (tests/test_ib_cli_paper.py pins both)
@@ -581,13 +580,13 @@ def test_findings_are_listed_by_line_and_reason_never_by_the_matched_text(sess: 
 # -- fix round: the new driver states, advice, the symbol cap, the settle option ---------------------------
 
 
-def test_the_help_states_the_estimate_rule_the_cap_and_the_settle_option(
+def test_the_help_states_the_estimate_rule_and_the_cap(
         capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         cli.parse_args(["--help"])
     shown = " ".join(capsys.readouterr().out.split())
     assert "about 10 seconds per symbol-day" in shown
-    assert "At most 20 symbols" in shown and "--settle-hours" in shown
+    assert "At most 20 symbols" in shown and "--settle-hours" not in shown
 
 
 def test_at_most_twenty_symbols(capsys: pytest.CaptureFixture[str]) -> None:
@@ -612,48 +611,21 @@ def test_too_many_symbols_never_reach_the_gate(sess: Session, capsys: pytest.Cap
     capsys.readouterr()
 
 
-@pytest.mark.parametrize("value, ok", [("0", True), ("3", True), ("24", True), ("0.5", True), ("-0.1", False),
-                                       ("24.01", False), ("nan", False), ("inf", False), ("x", False)])
-def test_settle_hours_runs_from_0_to_24(value: str, ok: bool, capsys: pytest.CaptureFixture[str]) -> None:
-    argv = ["--symbols", "AAPL", *DAYS, "--port", "7497", "--settle-hours", value]
-    if ok:
-        assert cli.parse_args(argv).settle_hours == float(value)
-    else:
-        with pytest.raises(SystemExit) as info:
-            cli.parse_args(argv)
-        assert info.value.code == 2
+def test_the_settle_hours_option_is_gone(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as info:
+        cli.parse_args(["--symbols", "AAPL", *DAYS, "--port", "7497", "--settle-hours", "3"])
+    assert info.value.code == 2
     capsys.readouterr()
-    assert cli.parse_args(["--symbols", "AAPL", *DAYS, "--port", "7497"]).settle_hours == 3.0
 
 
-def test_settle_hours_reaches_the_driver_as_seconds(sess: Session, monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: list[float] = []
-    real = cli.fetch
-
-    def spy(*a: Any, **kw: Any) -> Any:
-        seen.append(kw["settle_seconds"])
-        return real(*a, **kw)
-
-    monkeypatch.setattr(cli, "fetch", spy)
-    assert sess.fetch("--settle-hours", "1.5", symbols="AAPL") == 0
-    assert sess.fetch(symbols="AAPL") == 0
-    assert seen == [5400.0, 10800.0]
-
-
-def test_a_day_without_data_is_retried_when_it_closed_less_than_settle_hours_ago(sess: Session) -> None:
-    """2024-08-19 closed 16 hours before the fake's server time: a holiday at 3 h, 'not yet' at 24 h."""
+def test_a_day_without_data_that_is_final_is_no_data(sess: Session) -> None:
+    """2024-08-19 closed 16 hours before the fake's server time, so it was final at 06:00 that morning."""
     from tests.test_ib_fetch import empty_end
 
     sess.rig.script(date(2024, 8, 19), empty_end)
     argv = ["--symbols", "AAPL", "--start", "2024-08-19", "--end", "2024-08-19", "--port", "7497", "--out",
             str(sess.tmp / "bars")]
     assert sess.main(*argv) == 0 and "1 no data" in sess.text
-    sess.out.truncate(0)
-    sess.out.seek(0)
-    shutil.rmtree(sess.tmp / "bars")
-    assert sess.main(*argv, "--settle-hours", "24") == 1
-    assert "failed: IB had no data for this day yet; it will be retried next run" in sess.text
-    assert "None" not in sess.text and "no data yet (session closed" not in sess.text
 
 
 def test_short_and_partial_days_and_the_run_total_are_listed(sess: Session) -> None:
