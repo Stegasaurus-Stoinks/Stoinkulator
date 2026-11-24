@@ -1,6 +1,7 @@
 """LiveBarAligner: minute batches from per-symbol closed bars (pure, time passed in)."""
 from __future__ import annotations
 
+import copy
 import random
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from MainStoinker.engine.live_feed import (
     DEFAULT_ALIGN_WAIT,
     DEFAULT_MAX_CLOCK_AHEAD,
     LATE,
+    MAX_PLAUSIBLE_EPOCH,
     REFUSED,
     LiveBarAligner,
 )
@@ -83,9 +85,17 @@ def test_late_bar_counted_not_fed() -> None:
 
 def test_late_when_time_passed_even_without_any_bar_for_the_minute() -> None:
     al = LiveBarAligner(["A", "B"])
-    assert al.poll(end(0) + 100) == []  # nothing pending, but minute 0 is now released
-    assert al.bar("A", mk(0)) == LATE
-    assert al.poll(end(0) + 200) == []
+    al.bar("A", mk(5))
+    assert len(al.poll(end(5) + 100)) == 1  # minutes 0 to 4 have no bar at all, and are released too
+    assert al.bar("B", mk(0)) == LATE
+    assert al.poll(end(5) + 200) == []
+
+
+def test_poll_before_the_first_bar_releases_nothing_by_time() -> None:
+    # was: a poll before any bar released minutes by time, so the first bar was late (#205 fix round)
+    al = LiveBarAligner(["A", "B"])
+    assert al.poll(end(0) + 100) == []
+    assert al.bar("A", mk(0)) == ACCEPTED
 
 
 def test_duplicate_and_backwards_bars_refused() -> None:
@@ -343,17 +353,18 @@ def test_decided_with_the_minute_end_does_not_lose_the_next_bar() -> None:
 
 def test_bar_behind_decided_point_is_late_with_its_own_counter_once_released() -> None:
     al = LiveBarAligner(["A", "B"])
-    al.decided("A", minute(2))
+    a2 = mk(2)
+    al.bar("A", a2)
     al.decided("B", minute(2))
-    assert al.poll(end(2)) == []  # nothing pending, but minutes 0 to 2 are released
-    assert al.bar("A", mk(1)) == LATE  # released, and at or before A's decided point
-    assert al.late_after_decided_counts() == {"A": 1, "B": 0}
+    assert al.poll(end(2)) == [(a2.date, {"A": a2})]  # minutes 0 to 2 are released
+    assert al.bar("B", mk(1)) == LATE  # released, and at or before B's decided point
+    assert al.late_after_decided_counts() == {"A": 0, "B": 1}
     assert al.late_counts() == {"A": 0, "B": 0}
-    assert al.bar("A", mk(1)) == REFUSED  # now a duplicate
-    a3 = mk(3)
-    assert al.bar("A", a3) == ACCEPTED
-    assert al.fed_counts() == {"A": 0, "B": 0}
-    assert counters_sum(al, "A") == 2  # given 3 bars, one pending
+    assert al.bar("B", mk(1)) == REFUSED  # now a duplicate
+    assert al.bar("B", mk(3)) == ACCEPTED
+    assert al.fed_counts() == {"A": 1, "B": 0}
+    assert counters_sum(al, "B") == 2  # given 3 bars: late, refused, and one still pending
+    assert al.pending_minutes() == 1
 
 
 def test_bar_behind_decided_point_but_pending_is_fed() -> None:
@@ -379,23 +390,38 @@ def test_duplicate_and_backwards_still_refused_after_decided() -> None:
 
 # --- clock guard -----------------------------------------------------------
 
-def test_default_clock_bound_is_600_seconds() -> None:
-    assert DEFAULT_MAX_CLOCK_AHEAD == 600
+def test_default_clock_bound_is_60_plus_wait_plus_20() -> None:
+    assert DEFAULT_MAX_CLOCK_AHEAD == 180
+    assert DEFAULT_MAX_CLOCK_AHEAD == 60 + DEFAULT_ALIGN_WAIT + 20
+    assert MAX_PLAUSIBLE_EPOCH == 1e11
 
 
-@pytest.mark.parametrize(
-    "bad_now",
-    [
-        (BASE + 60) * 1000.0,  # milliseconds
-        BASE + 5 * 3600.0,  # local time five hours ahead
-        BASE + 10**9,
-        float("nan"),
-        float("inf"),
-        -float("inf"),
-    ],
-    ids=["milliseconds", "five_hours", "far_future", "nan", "inf", "minus_inf"],
-)
-def test_poll_refuses_a_wrong_clock_and_changes_nothing(bad_now: float) -> None:
+IMPOSSIBLE_NOWS = [
+    (BASE + 60) * 1000.0,  # milliseconds
+    BASE * 1_000_000.0,  # microseconds
+    MAX_PLAUSIBLE_EPOCH * 1.5,
+    -1.0,
+    -float(BASE),
+    float("nan"),
+    float("inf"),
+    -float("inf"),
+]
+IMPOSSIBLE_IDS = ["ms", "us", "too_big", "minus_one", "minus_epoch", "nan", "inf", "minus_inf"]
+
+
+@pytest.mark.parametrize("bad_now", IMPOSSIBLE_NOWS, ids=IMPOSSIBLE_IDS)
+def test_first_poll_with_an_impossible_clock_raises_and_leaves_no_trace(bad_now: float) -> None:
+    al = LiveBarAligner(["A"])
+    with pytest.raises(ValueError, match="poll time"):
+        al.poll(bad_now)
+    a0 = mk(0)
+    assert al.bar("A", a0) == ACCEPTED
+    assert al.poll(end(0) + 5) == [(a0.date, {"A": a0})]
+    assert al.clock_clamped_count() == 0
+
+
+@pytest.mark.parametrize("bad_now", IMPOSSIBLE_NOWS, ids=IMPOSSIBLE_IDS)
+def test_poll_refuses_an_impossible_clock_and_changes_nothing(bad_now: float) -> None:
     al, twin = LiveBarAligner(["A", "B"]), LiveBarAligner(["A", "B"])
     for each in (al, twin):
         each.bar("A", mk(0))
@@ -415,6 +441,8 @@ def test_poll_refuses_a_wrong_clock_and_changes_nothing(bad_now: float) -> None:
         "refused_counts",
         "released_without_counts",
         "late_after_decided_counts",
+        "clock_clamped_count",
+        "max_clock_excess",
     ):
         assert getattr(al, name)() == getattr(twin, name)()
 
@@ -431,48 +459,164 @@ def test_poll_after_a_refused_clock_behaves_as_if_it_never_happened() -> None:
     assert al.poll(end(0)) == [(a0.date, {"A": a0, "B": b0})]
 
 
-def test_clock_bound_is_measured_from_the_newest_bar_or_decided_point() -> None:
-    al = LiveBarAligner(["A", "B"], max_clock_ahead=300)
+def test_clock_is_clamped_to_the_newest_bar_plus_the_bound() -> None:
+    al = LiveBarAligner(["A", "B"], max_clock_ahead=160)  # the smallest allowed: 60 + align_wait
     al.bar("A", mk(2))
-    al.poll(minute(2) + 300)  # exactly at the bound: fine
-    with pytest.raises(ValueError):
-        al.poll(minute(2) + 300.5)
-    al.decided("B", minute(6))  # a newer decided point moves the reference
-    al.poll(minute(6) + 300)
-    with pytest.raises(ValueError):
-        al.poll(minute(6) + 301)
-    al.poll(minute(2))  # a clock behind the data is not refused
+    assert al.poll(minute(2) + 159) == []
+    assert len(al.poll(minute(2) + 160)) == 1  # at the clamp: not clamped, released by time
+    assert al.clock_clamped_count() == 0
+    al.bar("A", mk(3))
+    assert len(al.poll(minute(3) + 160.5)) == 1  # 0.5 s over: clamped to +160, minute 3 released
+    assert al.clock_clamped_count() == 1
+    assert al.max_clock_excess() == 0.5
+    al.poll(minute(3) - 500)  # a clock behind the data is neither clamped nor refused
+    assert al.clock_clamped_count() == 1
 
 
 def test_clock_bound_covers_every_legitimate_poll() -> None:
-    # A bar of minute M is closed by time up to 90 s after M + 60, the aligner waits 100 s.
+    # a bar of minute M is closed by time up to 90 s after M + 60; the aligner waits 100 s
     assert 60 + 90 + 1 < DEFAULT_MAX_CLOCK_AHEAD
-    assert 60 + DEFAULT_ALIGN_WAIT + 1 < DEFAULT_MAX_CLOCK_AHEAD
-    al = LiveBarAligner(["A"])
-    al.bar("A", mk(0))
-    al.poll(end(0) + 90 + 1)
+    assert 60 + DEFAULT_ALIGN_WAIT < DEFAULT_MAX_CLOCK_AHEAD
+    al = LiveBarAligner(["A", "B"])
+    a0 = mk(0)
+    al.bar("A", a0)
+    assert al.poll(end(0) + 99) == []
+    assert al.poll(end(0) + 100) == [(a0.date, {"A": a0})]  # released at the exact deadline, not clamped
+    assert al.clock_clamped_count() == 0
 
 
-def test_clock_guard_is_off_without_a_reference_and_when_all_stopped() -> None:
-    al = LiveBarAligner(["A"])
-    assert al.poll(BASE * 1000.0) == []  # nothing seen yet: nothing to compare with
+def test_the_clock_is_not_used_when_all_stopped() -> None:
     al = LiveBarAligner(["A"])
     a0 = mk(0)
     al.bar("A", a0)
     al.stopped("A")
-    assert al.poll(BASE * 1000.0) == [(a0.date, {"A": a0})]  # the clock decides nothing any more
+    assert al.poll(BASE + 10**6) == [(a0.date, {"A": a0})]
+    assert al.clock_clamped_count() == 0
 
 
 def test_clock_bound_validation() -> None:
+    for bad in (-1, 0, 159.9, float("nan")):
+        with pytest.raises(ValueError):
+            LiveBarAligner(["A"], max_clock_ahead=bad)
+    LiveBarAligner(["A"], max_clock_ahead=160)  # exactly 60 + align_wait
     with pytest.raises(ValueError):
-        LiveBarAligner(["A"], max_clock_ahead=-1)
-    with pytest.raises(ValueError):
-        LiveBarAligner(["A"], max_clock_ahead=float("nan"))
-    al = LiveBarAligner(["A"], max_clock_ahead=0)
+        LiveBarAligner(["A"], align_wait=100, max_clock_ahead=159)
+    assert LiveBarAligner(["A"], align_wait=300).poll(0) == []  # the default grows with the wait
+    LiveBarAligner(["A"], align_wait=0, max_clock_ahead=60)
+
+
+# --- the clamp: outages, the close, the morning after, a wrong clock ----------
+
+def test_quiet_stretch_of_15_minutes_never_raises_and_loses_nothing() -> None:
+    symbols = ["A", "B", "C"]
+    al = LiveBarAligner(symbols)
+    got: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for i in range(3):
+        for s in symbols:
+            al.bar(s, mk(i))
+    t = end(2) + 4
+    while t < end(2) + 15 * 60:  # polls every 5 s through the outage
+        got += al.poll(t)
+        t += 5
+    assert [stamp for stamp, _ in got] == [mk(i).date for i in range(3)]
+    assert al.pending_minutes() == 0
+    assert al.clock_clamped_count() > 0  # the driver can see the stretch
+    # the feed comes back with minutes 18 to 20: all accepted and fed, none late
+    for i in (18, 19, 20):
+        for s in symbols:
+            assert al.bar(s, mk(i)) == ACCEPTED
+        got += al.poll(end(i) + 5)
+    assert [stamp for stamp, _ in got][3:] == [mk(i).date for i in (18, 19, 20)]
+    assert al.fed_counts() == dict.fromkeys(symbols, 6)
+    assert al.late_counts() == dict.fromkeys(symbols, 0)
+
+
+def test_quiet_stretch_releases_a_pending_minute_by_time() -> None:
+    al = LiveBarAligner(["A", "B"])
+    a0 = mk(0)
+    al.bar("A", a0)
+    out: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for t in range(end(0) + 5, end(0) + 1200, 5):
+        out += al.poll(t)
+    assert out == [(a0.date, {"A": a0})]
+    assert al.released_without_counts() == {"A": 0, "B": 1}
+
+
+def test_polling_for_30_minutes_after_the_last_bar_of_the_day_never_raises() -> None:
+    al = LiveBarAligner(["A"])
+    al.bar("A", mk(389))  # 15:59
+    out: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    for t in range(end(389), end(389) + 30 * 60, 5):
+        out += al.poll(t)
+    assert [stamp for stamp, _ in out] == [mk(389).date]
+    assert al.pending_minutes() == 0
+
+
+def test_backfill_of_yesterday_then_polls_the_next_morning() -> None:
+    symbols = ["A", "B"]
+    al = LiveBarAligner(symbols)
+    day = 86_400
+    for i in range(390):
+        for s in symbols:
+            assert al.bar(s, mk(i)) == ACCEPTED
+    assert len(al.poll(end(389) + 5)) == 390
+    for t in range(BASE + day - 600, BASE + day, 5):  # polls from 09:20 the next morning
+        assert al.poll(t) == []
+    today = Bar(START + pd.Timedelta(days=1), BASE + day, 1, 1, 1, 1, 1)
+    assert al.bar("A", today) == ACCEPTED
+    assert al.bar("B", today) == ACCEPTED
+    assert len(al.poll(BASE + day + 65)) == 1
+    assert al.late_counts() == dict.fromkeys(symbols, 0)
+
+
+def test_wrong_clock_five_hours_fast_before_any_bar_does_nothing_harmful() -> None:
+    al = LiveBarAligner(["A", "B"])
+    now = BASE + 5 * 3600.0
+    assert al.poll(now) == []
+    assert al.poll(now + 5) == []
+    a0, b0 = mk(0), mk(0, 20)
+    assert al.bar("A", a0) == ACCEPTED
+    assert al.bar("B", b0) == ACCEPTED
+    assert al.poll(BASE + 65) == [(a0.date, {"A": a0, "B": b0})]  # fed, in order, once
+    assert al.clock_clamped_count() == 0  # no reference, no clamp
+
+
+def test_wrong_clock_five_hours_fast_throughout_follows_the_documented_rule() -> None:
+    """Clock = newest bar + 180 s: only the newest minute is released by time (180-60-100 = 20 s)."""
+    symbols = ["A", "B"]
+    al = LiveBarAligner(symbols)
+    fast = 5 * 3600.0
+    got: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
+    a = [mk(i) for i in range(4)]
+    b = [mk(i, 20) for i in range(4)]
+    for i in range(4):
+        assert al.bar("A", a[i]) == ACCEPTED  # A's bar for minute i is first
+        got += al.poll(end(i) + 4 + fast)  # a poll with the wrong clock: releases minute i at once
+        assert al.bar("B", b[i]) == LATE  # so B's is late
+    assert [batch for _, batch in got] == [{"A": a[i]} for i in range(4)]
+    assert [stamp for stamp, _ in got] == sorted({stamp for stamp, _ in got})
+    assert al.late_counts() == {"A": 0, "B": 4}
+    assert al.fed_counts() == {"A": 4, "B": 0}
+    assert al.clock_clamped_count() == 4
+    assert al.max_clock_excess() == pytest.approx(end(3) + 4 + fast - (minute(3) + DEFAULT_MAX_CLOCK_AHEAD))
+    # a bar after the clamped clock's watermark is still accepted
+    assert al.bar("A", mk(5)) == ACCEPTED
+
+
+def test_a_huge_decided_value_does_not_move_the_clamp() -> None:
+    al = LiveBarAligner(["A", "B"])
     al.bar("A", mk(0))
-    al.poll(minute(0))
-    with pytest.raises(ValueError):
-        al.poll(minute(0) + 1)
+    al.decided("B", BASE * 1000)  # bogus
+    out = al.poll(end(0) + 5)
+    assert [list(b) for _, b in out] == [["A"]]  # B decided through "forever": released at once, as before
+    assert al.clock_clamped_count() == 0
+    al.poll(BASE + 10**6)  # a late clock is clamped to the newest BAR, not to the decided value
+    assert al.clock_clamped_count() == 1
+    assert al.max_clock_excess() == pytest.approx(BASE + 10**6 - (minute(0) + DEFAULT_MAX_CLOCK_AHEAD))
+    c = LiveBarAligner(["A", "B"])
+    c.decided("A", BASE * 1000)
+    assert c.poll(BASE + 10**6) == []  # no bar yet: nothing happens, however large decided is
+    assert c.bar("B", mk(0)) == ACCEPTED
 
 
 # --- date and time must agree ----------------------------------------------
@@ -488,10 +632,9 @@ def test_bar_whose_date_and_time_disagree_is_refused_without_effect() -> None:
         assert al.bar("A", bad) == REFUSED
     assert al.refused_counts() == {"A": 4, "B": 0}
     assert al.pending_minutes() == 0
-    assert al.poll(end(0) + 100) == []
     # nothing was recorded: the symbol's last bar is unchanged, so the right bar is not a duplicate
-    # (it is late here only because the poll above passed the deadline)
-    assert al.bar("A", good) == LATE
+    assert al.bar("A", good) == ACCEPTED
+    assert al.poll(end(0) + 100) == [(good.date, {"A": good})]
     assert counters_sum(al, "A") == 5
 
 
@@ -524,7 +667,10 @@ class Model:
         self.bars: dict[int, tuple[str, str, Bar]] = {}  # id(bar) -> (symbol, status, bar)
         self.fed: set[int] = set()
         self.batches: list[tuple[pd.Timestamp, dict[str, Bar]]] = []
-        self.refused_polls = 0
+        self.max_ahead = 60.0 + wait + 20.0  # the default bound for this align wait
+        self.clamped = 0
+        self.excess = 0.0
+        self.impossible_polls = 0
 
     def bar(self, symbol: str, i: int, price: float = 10.0) -> str:
         bar = mk(i, price)
@@ -549,28 +695,40 @@ class Model:
     def decided(self, symbol: str, through: int) -> None:
         self.al.decided(symbol, through)
         if symbol in self.active and through > self.dec[symbol]:
-            self.dec[symbol] = through
-            self.newest = max(self.newest, through)
+            self.dec[symbol] = through  # a decided point never moves the clamp reference
 
     def stopped(self, symbol: str) -> None:
         self.al.stopped(symbol)
         self.active.discard(symbol)
 
+    def poll_impossible(self, now: float) -> None:
+        before = copy.deepcopy(vars(self.al))
+        with pytest.raises(ValueError):
+            self.al.poll(now)
+        assert vars(self.al) == before, "state changed by a refused poll"
+        self.impossible_polls += 1
+
     def poll(self, now: float) -> None:
-        if self.active and self.newest != float("-inf") and now - self.newest > DEFAULT_MAX_CLOCK_AHEAD:
-            before = (self.al.fed_counts(), self.al.late_counts(), self.al.pending_minutes())
-            with pytest.raises(ValueError):
-                self.al.poll(now)
-            assert before == (self.al.fed_counts(), self.al.late_counts(), self.al.pending_minutes())
-            self.refused_polls += 1
+        if self.newest == float("-inf"):  # no bar yet: nothing happens at all
+            before = copy.deepcopy(vars(self.al))
+            assert self.al.poll(now) == []
+            assert vars(self.al) == before
             return
+        clock = now
         if self.active:
-            through = max(min(self.dec[s] for s in self.active), now - 60 - self.wait)
+            cap = self.newest + self.max_ahead
+            if clock > cap:
+                self.clamped += 1
+                self.excess = max(self.excess, clock - cap)
+                clock = cap
+            through = max(min(self.dec[s] for s in self.active), clock - 60 - self.wait)
         else:
             through = float("inf")
         expected = sorted(m for m in self.pending if m <= through)
         before = self.released
-        out = self.al.poll(now)
+        out = self.al.poll(now)  # never raises for a plausible now
+        assert self.al.clock_clamped_count() == self.clamped
+        assert self.al.max_clock_excess() == pytest.approx(self.excess)
         stamps = [stamp for stamp, _ in out]
         assert stamps == sorted(set(stamps)), "batches not strictly increasing"
         assert [int(next(iter(b.values())).time) for _, b in out] == expected, (now, through)
@@ -653,14 +811,16 @@ def test_adversarial_calls_in_both_orders_hold_the_invariants(seed: int) -> None
         elif roll < 0.63:
             model.stopped(symbol)
         else:
-            now += rng.choice([0, 1, 5, 5, 60, 100, 161, 600, 1200, -3, -60])  # jumps and skew
+            now += rng.choice([0, 1, 5, 5, 60, 100, 161, 600, 1200, 5 * 3600, -3, -60])  # jumps and skew
             if rng.random() < 0.6:
                 model.poll(now)
+            if rng.random() < 0.03:
+                model.poll_impossible(rng.choice([now * 1000, -1.0, float("nan"), float("inf"), 1e12]))
     model.finish()
 
 
-def test_the_property_test_exercises_the_clock_guard_and_late_bars() -> None:
-    refused = late = 0
+def test_the_property_test_exercises_the_clamp_and_late_bars() -> None:
+    clamped = late = 0
     for seed in range(300):
         rng = random.Random(seed)
         symbols = ["A", "B"]
@@ -671,9 +831,9 @@ def test_the_property_test_exercises_the_clock_guard_and_late_bars() -> None:
                 model.bar(symbol, rng.randint(0, 20), 1.0)
             else:
                 model.poll(BASE + rng.choice([0, 100, 300, 1000, 5000, 100000]))
-        refused += model.refused_polls
+        clamped += model.al.clock_clamped_count()
         late += sum(model.al.late_counts().values()) + sum(model.al.late_after_decided_counts().values())
-    assert refused > 100
+    assert clamped > 100
     assert late > 100
 
 

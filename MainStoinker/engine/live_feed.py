@@ -28,14 +28,36 @@ not after the symbol's last bar), the symbol is stopped, or its `date` and
 `time` disagree. Otherwise it is accepted while its minute is still pending
 and late once its minute was released.
 
-Clock guard: `poll(now)` raises `ValueError`, changing nothing, when `now` is
-not finite or is more than `max_clock_ahead` seconds after the start of the
-newest minute seen (newest bar, or newest decided point). `now` must be IB
-server time in seconds, never milliseconds or a local clock. See
-`DEFAULT_MAX_CLOCK_AHEAD`. Before any bar or decided point there is nothing to
-compare with and any finite `now` passes (so does any finite `now` once every
-symbol is stopped, as the clock then decides nothing), so deliver startup backfill before
-the first poll: a poll releases everything up to `now - 60 - align_wait`.
+Clock. `now` must be IB server time in seconds. `poll(now)` raises
+`ValueError`, changing nothing, only for a `now` that cannot be a time in
+seconds: not finite, negative or above `MAX_PLAUSIBLE_EPOCH` (milliseconds or
+worse). It never raises for anything else, so a long outage, the time after the
+close or the morning after a backfill is an ordinary poll.
+
+Time-based release uses a clamped clock: `min(now, newest_bar + max_clock_ahead)`,
+where `newest_bar` is the start of the newest minute of any bar given (not a
+decided point: a bogus `decided` cannot loosen the clamp). A poll whose clock
+was clamped (only counted while some symbol is active) increments
+`clock_clamped_count()` and raises `max_clock_excess()` to the largest excess
+seen. Before the first bar has arrived there is no reference: `poll` returns
+nothing and changes nothing, so a wrong first poll cannot poison the run.
+
+What the clamp means. A correct clock is at most about 150 s past the start of
+the newest minute in normal running (60 s, plus a bar closed by time up to 90 s
+after its end), and the newest pending minute needs `60 + align_wait` s to be
+released by time, so `max_clock_ahead` must be at least `60 + align_wait`
+(enforced). The default is that plus 20 s for 1 s clock resolution and skew:
+`DEFAULT_MAX_CLOCK_AHEAD` = 180 s, as small as that allows. The clamp only ever
+lowers the clock, so it never makes a bar of a correct clock late. A
+moderately wrong clock (fast by minutes or hours, for example a time-zone
+error) now behaves so: the effective clock runs `max_clock_ahead` ahead of the
+newest bar, so minutes starting up to `max_clock_ahead - 60 - align_wait` (20 s
+by default: the newest minute only) past the newest bar are released by time
+at once, the first poll after a minute's first bar releases it, and the other
+symbols' bars for that minute arrive late and are counted late. A wrong clock
+therefore shows up as late bars together with a non-zero clamp counter, and the
+driver must treat both as a fault. A long outage also clamps (the counter
+rises) but loses nothing: bars after it are accepted and fed.
 
 This module must not import anything from `MainStoinker.*` outside
 `MainStoinker.engine`, nor `ibapi`.
@@ -54,15 +76,14 @@ DEFAULT_ALIGN_WAIT = 100.0
 """Seconds after a minute's end at which it is released without slow symbols
 (approved decision D6; more than the watcher's 90 s settle time)."""
 
-DEFAULT_MAX_CLOCK_AHEAD = 600.0
-"""Largest accepted lead of `poll`'s `now` over the start of the newest minute
-seen, in seconds. A real poll is at most about 150 s after that start (the
-minute's 60 s, plus a bar closed by time up to 90 s after its end), so 600 s is
-four times the legitimate maximum and tolerates a quiet stretch of several
-minutes in which no new bar or decided point arrives. It still refuses what
-goes wrong in practice: milliseconds (1000 times too big), a local clock in the
-wrong time zone (hours off) or a clock fast by 10 minutes or more. A clock fast
-by less than that is not caught here and turns bars late, which is counted."""
+DEFAULT_MAX_CLOCK_AHEAD = 60.0 + DEFAULT_ALIGN_WAIT + 20.0
+"""How far past the start of the newest bar's minute the clock used for
+time-based release may run, in seconds: the 60 s of the minute, the align wait,
+and 20 s for clock resolution and skew (see the module doc for why this is the
+smallest sensible value)."""
+
+MAX_PLAUSIBLE_EPOCH = 1e11
+"""`poll` refuses a `now` above this (year 5138): epoch milliseconds are 1.7e12."""
 
 _NEW_YORK = "America/New_York"
 
@@ -78,18 +99,22 @@ class LiveBarAligner:
         self,
         symbols: Sequence[str],
         align_wait: float = DEFAULT_ALIGN_WAIT,
-        max_clock_ahead: float = DEFAULT_MAX_CLOCK_AHEAD,
+        max_clock_ahead: float | None = None,
     ) -> None:
         self._symbols: list[str] = list(dict.fromkeys(symbols))
         if not self._symbols:
             raise ValueError("LiveBarAligner needs at least one symbol")
         if align_wait < 0:
             raise ValueError("align_wait must not be negative")
-        if not max_clock_ahead >= 0:
-            raise ValueError("max_clock_ahead must not be negative")
+        if max_clock_ahead is None:
+            max_clock_ahead = 60.0 + align_wait + (DEFAULT_MAX_CLOCK_AHEAD - 60.0 - DEFAULT_ALIGN_WAIT)
+        if not max_clock_ahead >= 60.0 + align_wait:
+            raise ValueError("max_clock_ahead must be at least 60 + align_wait")
         self._wait = float(align_wait)
         self._max_ahead = float(max_clock_ahead)
-        self._newest = float("-inf")  # start of the newest minute seen (bar or decided point)
+        self._newest = float("-inf")  # start of the newest minute of any bar given
+        self._clamped = 0
+        self._excess = 0.0
         self._late_decided = dict.fromkeys(self._symbols, 0)
         self._order = {s: i for i, s in enumerate(self._symbols)}
         self._active: set[str] = set(self._symbols)
@@ -147,7 +172,6 @@ class LiveBarAligner:
         self._check(symbol)
         if symbol in self._active and through_epoch > self._decided[symbol]:
             self._decided[symbol] = through_epoch
-            self._newest = max(self._newest, through_epoch)
 
     def stopped(self, symbol: str) -> None:
         """Symbol will give nothing more; it no longer holds minutes back."""
@@ -157,23 +181,29 @@ class LiveBarAligner:
     def poll(self, server_now_epoch: float) -> list[tuple[pd.Timestamp, dict[str, Bar]]]:
         """Release every minute that is due at `server_now_epoch`; oldest first.
 
-        Raises `ValueError`, with no state changed, when `server_now_epoch` is
-        not finite or is more than `max_clock_ahead` seconds after the start of
-        the newest minute seen (see the module doc).
+        Raises `ValueError`, with no state changed, only when `server_now_epoch`
+        cannot be a time in seconds: not finite, negative or above
+        `MAX_PLAUSIBLE_EPOCH`. Otherwise time-based release uses the clock
+        clamped to `max_clock_ahead` past the newest bar (see the module doc).
+        Before the first bar this returns nothing and changes nothing.
         """
-        if not math.isfinite(server_now_epoch):
-            raise ValueError(f"poll time must be finite, got {server_now_epoch!r}")
-        ahead = server_now_epoch - self._newest
-        if self._active and self._newest != float("-inf") and ahead > self._max_ahead:
+        if not math.isfinite(server_now_epoch) or not 0 <= server_now_epoch <= MAX_PLAUSIBLE_EPOCH:
             raise ValueError(
-                f"poll time {server_now_epoch!r} is {ahead:.0f} s after the newest "
-                f"minute seen ({self._newest!r}), more than max_clock_ahead={self._max_ahead:g} s: "
-                "is it IB server time in seconds?"
+                f"poll time {server_now_epoch!r} cannot be an epoch time in seconds "
+                f"(finite, 0 to {MAX_PLAUSIBLE_EPOCH:g}): is it IB server time in seconds?"
             )
+        if self._newest == float("-inf"):
+            return []
+        clock = server_now_epoch
         if self._active:
+            cap = self._newest + self._max_ahead
+            if clock > cap:
+                self._clamped += 1
+                self._excess = max(self._excess, clock - cap)
+                clock = cap
             through = max(
                 min(self._decided[s] for s in self._active),
-                server_now_epoch - 60 - self._wait,
+                clock - 60 - self._wait,
             )
         else:
             through = float("inf")
@@ -204,6 +234,18 @@ class LiveBarAligner:
     def late_counts(self) -> dict[str, int]:
         """Per symbol: bars that arrived after their minute was released (not fed)."""
         return dict(self._late)
+
+    def clock_clamped_count(self) -> int:
+        """Polls (with an active symbol) whose clock ran past `max_clock_ahead` and was clamped.
+
+        Non-zero means a long quiet stretch or outage, or a wrong clock; if bars
+        also come back late, treat it as a fault.
+        """
+        return self._clamped
+
+    def max_clock_excess(self) -> float:
+        """The largest number of seconds by which a polled clock exceeded the clamp."""
+        return self._excess
 
     def late_after_decided_counts(self) -> dict[str, int]:
         """Per symbol: late bars whose minute was also at or before the symbol's decided point."""
