@@ -2043,7 +2043,9 @@ def test_paper_mode_refusals_build_nothing(rig: Rig, extra: list[str], env: dict
     assert not rig.live.exists()
 
 
-def test_paper_mode_defaults_to_the_paper_port_and_says_so_first(rig: Rig) -> None:
+@pytest.mark.parametrize("accounts", ["DU0000000", "DUX123456"])
+def test_paper_mode_defaults_to_the_paper_port_and_says_so_first(rig: Rig, accounts: str) -> None:
+    rig.accounts = accounts
     assert watch_bars.parse_args(["--paper"]).port == 7497
     rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
     rig.upd("AAPL", 34, (34, 2.0), (100.2, 100.2, 100.2, 100.2, 5))
