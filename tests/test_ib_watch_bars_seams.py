@@ -29,6 +29,7 @@ import pytest
 from MainStoinker.engine.feed import Bar
 from MainStoinker.engine.live_feed import LiveBarAligner
 from MainStoinker.ib import watch_bars
+from MainStoinker.ib.connection import ConnState
 from tests.fake_ib import make_bar
 from tests.test_ib_watch_bars import (  # noqa: F401  (`real_home_untouched` is an autouse fixture)
     AAPL_BACKFILL,
@@ -94,9 +95,13 @@ class Harness:
         self.watcher: Any = None
         self.aligner = LiveBarAligner(symbols) if align else None
         self.batches: list[Any] = []
-        # symbol, minute, the aligner's answer, the newest server time polled so far
-        self.results: list[tuple[str, int, str, float]] = []
+        # symbol, minute, the aligner's answer, the newest clock polled so far, how the bar was closed
+        self.results: list[tuple[str, int, str, float, str]] = []
         self.polled_max = -math.inf
+        self.clocks: list[Any] = []  # every StreamClock the hook got
+        self.states: list[dict[str, Any]] = []  # Watcher.stream_states() at each of those passes
+        self.release: dict[int, float] = {}  # minute -> server time of the poll that released it
+        self.poll_with_server_time = False  # the mistake the stream clock exists to avoid
         self.rows: list[tuple[str, Bar, str]] = []
 
     def now(self) -> float:
@@ -110,7 +115,8 @@ class Harness:
         self.note("sink", symbol, bar.time, how)
         self.rows.append((symbol, bar, how))
         if self.aligner is not None:
-            self.results.append((symbol, bar.time, self.aligner.bar(symbol, bar), self.polled_max))
+            answer = self.aligner.bar(symbol, bar)
+            self.results.append((symbol, bar.time, answer, self.polled_max, how))
         return True
 
     def close(self) -> None:
@@ -128,12 +134,21 @@ class Harness:
             self.aligner.stopped(symbol)
 
     # the pass hook
-    def on_pass(self, server_now: float) -> None:
+    def on_pass(self, clock: Any) -> None:
         self.passes += 1
+        self.clocks.append(clock)
+        self.states.append(self.watcher.stream_states() if self.watcher is not None else {})
         self.note("pass", "", NO_BAR)
-        if self.aligner is not None and self.watcher is not None and self.watcher.first_backfills_over():
-            self.polled_max = max(self.polled_max, server_now)
-            self.batches.extend(self.aligner.poll(server_now))
+        polled = clock.server_now if self.poll_with_server_time else clock.stream_now
+        if (self.aligner is not None and polled is not None and self.watcher is not None
+                and self.watcher.first_backfills_over()):
+            self.polled_max = max(self.polled_max, polled)
+            self.take(self.aligner.poll(polled), clock.server_now)
+
+    def take(self, batches: list[Any], at: float) -> None:
+        for batch in batches:
+            self.release[int(batch[1][next(iter(batch[1]))].time)] = at
+        self.batches.extend(batches)
 
     def seams(self, **more: Any) -> Any:
         return watch_bars.WatchSeams(extra_sinks=(self,), listener=self, on_pass=self.on_pass,
@@ -145,7 +160,7 @@ class Harness:
     def finish(self) -> None:
         """The last poll, after the run returned (every symbol was told `stopped`)."""
         if self.aligner is not None:
-            self.batches.extend(self.aligner.poll(self.now()))
+            self.take(self.aligner.poll(self.now()), self.now())
 
 
 def run_with(rig: Rig, monkeypatch: pytest.MonkeyPatch, seams: Any, *, symbols: str | None = None,
@@ -521,14 +536,20 @@ def test_end_to_end_with_the_real_aligner(rig: Rig, monkeypatch: pytest.MonkeyPa
     assert all(b[1] and list(b[1]) == [s for s in plan.symbols if s in b[1]] for b in facts["batches"])
     for symbol in plan.symbols:
         fed = {int(batch[symbol].time) for _, batch in facts["batches"] if symbol in batch}
-        late = {m for s, m, answer, _ in facts["results"] if s == symbol and answer == "late"}
-        accepted = {m for s, m, answer, _ in facts["results"] if s == symbol and answer == "accepted"}
+        late = {m for s, m, answer, _, _ in facts["results"] if s == symbol and answer == "late"}
+        accepted = {m for s, m, answer, _, _ in facts["results"] if s == symbol and answer == "accepted"}
         assert not fed & late
         assert fed | late == set(facts["rows"][symbol]), describe(facts)
         assert accepted == fed, "every accepted bar was released by the end (stopped releases the rest)"
         assert facts["fed"][symbol] == len(fed) and facts["late"][symbol] == len(late)
-        for s, m, answer, polled in facts["results"]:
-            if s == symbol and answer == "late":  # the stated reason: its minute was released by time
+        outage = any(n.split()[0] in ("loss", "loss_lost", "lost", "farm") for n in plan.notes[1:])
+        for s, m, answer, polled, how in facts["results"]:
+            if s == symbol and answer == "late":
+                # polled with the stream clock, a bar the watcher writes in time is never late. A late
+                # bar needs an outage or a 1101 in the session (nothing closes while it lasts, and a
+                # re-requested backfill then writes minutes the aligner released by time), and its
+                # minute must have been released by time before it arrived
+                assert outage, f"{symbol} {minute_label(m)} ({how}) late in a session without an outage"
                 assert polled >= m + 60 + 100, f"{symbol} {minute_label(m)} late without a poll to release it"
 
 
@@ -658,10 +679,12 @@ def test_on_pass_called_each_loop(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(watch_bars.Watcher, "_check_state", counting)
 
-    def hook(server_now: float) -> None:
+    def hook(clock: Any) -> None:
         w = started[0]
+        server_now = clock.server_now
         assert server_now == w.server_now() and isinstance(server_now, float)
         assert server_now == rig.server_epoch + (rig.t - w.clock0)
+        assert clock == w.stream_clock() and isinstance(clock, watch_bars.StreamClock)
         passes.append(server_now)
 
     rig.standard()
@@ -720,8 +743,14 @@ def test_backfill_since_open_duration_string() -> None:
     assert watch_bars.since_open_duration(at(9, 29, 59)) == "60 S"  # before the open: the shortest
     assert watch_bars.since_open_duration(at(9, 0, 0)) == "60 S"
     assert watch_bars.since_open_duration(at(10, 30, 30)) == f"{(61 + 1) * 60} S"  # 3630 s: 61 minutes + 1
-    assert watch_bars.since_open_duration(at(15, 59, 59)) == "23400 S"  # 390 minutes: the whole session
-    assert watch_bars.since_open_duration(at(16, 30)) == "23400 S"  # after the close: capped
+    assert watch_bars.since_open_duration(at(15, 59, 59)) == "23460 S"  # 390 minutes + 1
+    # after the close the request still reaches back to 09:30 of that session: 390 + the time since 16:00
+    assert watch_bars.since_open_duration(at(16, 0)) == "23460 S"
+    assert watch_bars.since_open_duration(at(16, 30)) == f"{(421) * 60} S"
+    assert watch_bars.since_open_duration(at(20, 0)) == f"{(631) * 60} S"
+    for hh, mm in ((16, 0), (16, 30), (20, 0)):
+        asked = int(watch_bars.since_open_duration(at(hh, mm)).split()[0])
+        assert at(hh, mm) - asked <= ep(9, 30)  # reaches the open
     assert watch_bars.since_open_minutes(at(12, 0)) == 151
     assert watch_bars.MAX_SINCE_OPEN_MINUTES == 390 == (16 - 9) * 60 - 30
 
@@ -1055,3 +1084,206 @@ def test_a_listener_and_a_sink_do_not_change_the_output(rig: Rig, monkeypatch: p
         for fake in rig2.fakes:
             fake.close()
     assert with_seams == plain
+
+
+# -- the stream clock: delayed streams, mixed streams, stopped streams -----------------------------------
+
+
+def _delayed_updates(rig: Rig, symbol: str, minutes: range, offsets: tuple[int, ...], lag: int,
+                     px: float) -> None:
+    for m in minutes:
+        for i, s in enumerate(offsets):
+            shown = (px, px + 0.5, px - 0.5, px + 0.1, 10 + 100 * i)
+            _update_at(rig, symbol, ep(9, m), ep(9, m) + lag + s, shown)
+
+
+def _backfill_of(first: int, last: int, px: float) -> list[tuple[Any, ...]]:
+    return [(ep(9, m), px, px + 0.5, px - 0.5, px + 0.2, 100) for m in range(first, last + 1)]
+
+
+def both_delayed(rig: Rig) -> None:
+    """The reviewer's e5: IB's clock says 10:00:25 and both streams are 15 minutes behind."""
+    rig.server_epoch = ep(10, 0, 25)
+    rig.backfills = {"AAPL": [_backfill_of(36, 45, 99.0)], "MSFT": [_backfill_of(36, 45, 400.0)]}
+    _delayed_updates(rig, "AAPL", range(45, 50), (35, 45, 58), 900, 99.0)
+    _delayed_updates(rig, "MSFT", range(45, 50), (38, 50, 59), 900, 400.0)
+    rig.end_at(6, symbols=2)
+
+
+def mixed(rig: Rig, *, msft_stops: bool = False) -> None:
+    """AAPL is live, MSFT is 15 minutes behind. MSFT's minutes 09:45 to 09:49 arrive at 10:00 to 10:05; AAPL
+    has them in its backfill, and goes on with 10:00 to 10:04 as they happen."""
+    rig.server_epoch = ep(10, 0, 25)
+    rig.backfills = {"AAPL": [_backfill_of(36, 59, 99.0) + [(ep(10, 0), 99.0, 99.5, 98.8, 99.2, 50)]],
+                     "MSFT": [_backfill_of(36, 45, 400.0)]}
+    for m in range(1, 5):
+        for s in (3, 30, 55):
+            _update_at(rig, "AAPL", ep(10, m), ep(10, m) + s, (99.0, 99.5, 98.8, 99.2, 10 + s))
+    for s in (30, 55):
+        _update_at(rig, "AAPL", ep(10, 0), ep(10, 0) + s, (99.0, 99.5, 98.8, 99.2, 10 + s))
+    # MSFT stops on 09:46's row: it sends nothing after the first update of 09:47
+    _delayed_updates(rig, "MSFT", range(45, 47 if msft_stops else 50), (38, 50, 59), 900, 400.0)
+    if msft_stops:
+        _update_at(rig, "MSFT", ep(9, 47), ep(9, 47) + 900 + 3, (400.0, 400.5, 399.5, 400.1, 10))
+    rig.end_at(6, symbols=2)
+
+
+def assert_nothing_lost(h: Harness) -> None:
+    assert h.aligner is not None
+    zeros = {s: 0 for s in h.symbols}
+    assert h.aligner.late_counts() == zeros
+    assert h.aligner.released_without_counts() == zeros
+    assert h.aligner.refused_counts() == zeros
+    assert h.aligner.late_after_decided_counts() == zeros
+    stamps = [b[0] for b in h.batches]
+    assert stamps and stamps == sorted(set(stamps))
+
+
+def test_two_delayed_symbols_lose_no_bar_when_polled_with_the_stream_clock(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    both_delayed(rig)
+    h = Harness(rig, ("AAPL", "MSFT"))
+    assert run_with(rig, monkeypatch, h.seams(), minutes=6, log=h) == 0, rig.text
+    h.finish()
+    assert_nothing_lost(h)
+    assert {int(b[1]["AAPL"].time) for b in h.batches} >= {ep(9, m) for m in range(36, 49)}
+    assert all(set(b[1]) == {"AAPL", "MSFT"} for b in h.batches)
+    for m in (46, 47, 48):  # released when the slower of the two has closed it, 15 minutes after it ended
+        assert 900 <= h.release[ep(9, m)] - (ep(9, m) + 60) < 960
+    # the clocks: the stream clock is the stream's, about 15 minutes behind IB's
+    measured = [c for c in h.clocks if c.stream_now is not None and c.server_now > ep(10, 1)]
+    assert measured and all(880 < c.server_now - c.stream_now < 960 for c in measured)
+
+
+def test_polled_with_server_time_the_same_session_loses_bars(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mistake the stream clock exists to avoid: polling the aligner with IB's server time."""
+    both_delayed(rig)
+    h = Harness(rig, ("AAPL", "MSFT"))
+    h.poll_with_server_time = True
+    run_with(rig, monkeypatch, h.seams(), minutes=6, log=h)
+    h.finish()
+    assert h.aligner is not None and sum(h.aligner.late_counts().values()) > 0
+
+
+def test_a_live_and_a_delayed_symbol_hold_the_live_bars_until_the_delayed_minute_is_decided(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    mixed(rig)
+    h = Harness(rig, ("AAPL", "MSFT"))
+    assert run_with(rig, monkeypatch, h.seams(), minutes=6, log=h) == 0, rig.text
+    h.finish()
+    assert_nothing_lost(h)
+    for m in (46, 47, 48):
+        batch = next(b for b in h.batches if int(b[1]["AAPL"].time) == ep(9, m))
+        assert set(batch[1]) == {"AAPL", "MSFT"}
+        held = h.release[ep(9, m)] - (ep(9, m) + 60)  # AAPL had its bar within seconds
+        assert 900 <= held < 960, held  # measured: the live symbol waits for the delayed one
+    assert 880 < max(c.server_now - c.stream_now for c in h.clocks if c.stream_now is not None) < 960
+    states = h.watcher.stream_states()
+    assert states["AAPL"].lag_bound is not None and states["AAPL"].lag_bound < 10
+    assert states["MSFT"].lag_bound is not None and 890 < states["MSFT"].lag_bound < 930
+    assert states["MSFT"].delayed and not states["AAPL"].delayed
+
+
+def test_when_the_delayed_symbol_stops_the_stream_clock_moves_to_the_remaining_symbols(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing(self: Any, symbol: str, bar: Any) -> bool:
+        if symbol == "MSFT" and bar.time == ep(9, 46):
+            raise watch_bars.LiveFileError("cannot open or append to X: PermissionError: denied", locked=True)
+        return REAL_FILES_WRITE(self, symbol, bar)
+
+    mixed(rig, msft_stops=True)
+    h = Harness(rig, ("AAPL", "MSFT"))
+    seams = h.seams()
+    monkeypatch.setattr(watch_bars.LiveFiles, "write", failing)
+    assert run_with(rig, monkeypatch, seams, minutes=6) == watch_bars.EXIT_FAILED, rig.text
+    h.finish()
+    before = [c for c, s in zip(h.clocks, h.states, strict=True) if s["MSFT"].running and c.stream_now]
+    after = [c for c, s in zip(h.clocks, h.states, strict=True) if not s["MSFT"].running and c.stream_now]
+    assert before and after
+    assert all(c.server_now - c.stream_now > 880 for c in before[-5:])
+    assert all(c.server_now - c.stream_now < 60 for c in after)  # now AAPL's clock
+    assert h.aligner is not None and h.aligner.late_counts() == {"AAPL": 0, "MSFT": 0}
+    assert h.aligner.refused_counts() == {"AAPL": 0, "MSFT": 0}
+
+
+def test_stream_now_is_none_until_a_lag_is_measured_and_server_time_when_nothing_runs(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.server_epoch = ep(9, 28, 0)
+    rig.backfills = {"AAPL": [[]]}
+    rig.upd("AAPL", 30, (30, 5.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.upd("AAPL", 31, (31, 3.0), (100.2, 100.2, 100.2, 100.2, 5))
+    rig.end_at(4, symbols=1)
+    h = Harness(rig, ("AAPL",), align=False)
+    assert run_with(rig, monkeypatch, h.seams(), symbols="AAPL", minutes=4) == 0, rig.text
+    assert h.clocks[0].stream_now is None and h.states[0]["AAPL"].lag_bound is None
+    first = next(i for i, c in enumerate(h.clocks) if c.stream_now is not None)
+    assert first > 0 and all(c.stream_now is None for c in h.clocks[:first])
+    assert all(c.stream_now is not None for c in h.clocks[first:])
+    assert h.states[first]["AAPL"].lag_bound == pytest.approx(5.0)
+    assert h.clocks[first].stream_now == pytest.approx(h.clocks[first].server_now - 5.0)
+    # no symbol running: the server time
+    for s in h.watcher.syms:
+        s.phase = "stopped"
+    final = h.watcher.stream_clock()
+    assert final.stream_now == final.server_now
+    assert not h.watcher.stream_states()["AAPL"].running
+
+
+def test_a_bar_closed_by_time_with_a_lag_bound_of_30_seconds_is_not_late(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watcher closes 09:33 by time at 09:35:30 on the stream clock (09:36:00 by IB's), the aligner
+    releases at 09:35:40 on the clock it is polled with: with the stream clock the bar comes first."""
+    rig.server_epoch = ep(9, 33, 20)
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    _update_at(rig, "AAPL", ep(9, 33), ep(9, 33, 30), (100.0, 100.5, 99.9, 100.2, 1000))  # lag bound 30
+    _update_at(rig, "AAPL", ep(9, 33), ep(9, 34, 25), (100.0, 100.6, 99.9, 100.3, 1800))
+    rig.backfills["MSFT"] = [[(ep(9, m), 400.0, 400.5, 399.5, 400.2, 100) for m in (30, 31, 32)]]
+    for m in range(33, 38):  # MSFT is current and keeps the aligner's newest minute moving
+        for s in (4, 40):
+            _update_at(rig, "MSFT", ep(9, m), ep(9, m, s), (400.0, 400.5, 399.5, 400.2, 10 + s))
+    for when in range(ep(9, 34, 40), ep(9, 38, 0), 10):  # a look every 10 s
+        _at(rig, when, lambda: None)
+    rig.end_at(5, symbols=2)
+    h = Harness(rig, ("AAPL", "MSFT"))
+    assert run_with(rig, monkeypatch, h.seams(), minutes=5, log=h) == 0, rig.text
+    h.finish()
+    assert "closed by time" in rig.text and ep(9, 33) in file_minutes(rig, "AAPL")
+    assert h.watcher.stream_states()["AAPL"].lag_bound == pytest.approx(30.0)
+    assert h.aligner is not None and h.aligner.late_counts() == {"AAPL": 0, "MSFT": 0}
+    batch = next(b for b in h.batches if int(b[1]["MSFT"].time) == ep(9, 33))
+    assert set(batch[1]) == {"AAPL", "MSFT"}  # the minute waited for the thin symbol's bar
+
+
+class _BadClose:
+    written: dict[str, list[Any]] = {}
+
+    def write(self, symbol: str, bar: Any, how: str) -> bool:
+        return True
+
+    def close(self) -> None:
+        raise RuntimeError("close boom")
+
+
+def test_a_sink_that_raises_in_close_is_one_line_and_the_connection_is_still_closed(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.standard()
+    seams = watch_bars.WatchSeams(extra_sinks=(_BadClose(),))
+    assert run_with(rig, monkeypatch, seams, minutes=5) == watch_bars.EXIT_OK, rig.text
+    assert rig.text.count("Closing the bar sinks raised RuntimeError: close boom") == 1
+    assert "Traceback" not in rig.text and "Result: " in rig.text
+    assert all(c.state is ConnState.CLOSED for c in rig.connections)
+
+
+def test_a_sink_that_raises_in_close_after_a_recorder_failure_is_one_line_too(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(args: Any) -> Any:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rig, "recorder_factory", refuse)
+    seams = watch_bars.WatchSeams(extra_sinks=(_BadClose(),))
+    assert run_with(rig, monkeypatch, seams, record=True) == watch_bars.EXIT_REFUSED, rig.text
+    assert "Cannot start the session recording: OSError: disk full" in rig.text
+    assert rig.text.count("Closing the bar sinks raised RuntimeError: close boom") == 1
+    assert "Traceback" not in rig.text
+    assert not rig.connections

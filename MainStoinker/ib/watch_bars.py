@@ -104,8 +104,18 @@ driver calls `run_watch` with a `WatchSeams`; this module sends no request it di
   one; `TeeBars` feeds several in sequence and returns the answer of the first (the files). Every row
   the watcher appends to a file (a `write` call, whatever the file answers) reaches every sink.
 - Notifications: a `BarListener` is told `decided(symbol, through_epoch)` and `stopped(symbol)`.
-- Pass hook: `on_pass(server_now)` once at the end of every pass of the reading loop, with IB's
-  server time in seconds, the clock this watcher decides with. An exception from it ends the watch
+- Pass hook: `on_pass(clock)` once at the end of every pass of the reading loop, with a
+  `StreamClock`: `server_now` (IB server time, seconds) and `stream_now`. The watcher decides each
+  symbol on that symbol's own stream clock, server time less its lag bound (closing by time, the
+  snapshot rule), so with delayed data server time is far ahead of what it has decided. `stream_now`
+  is the MINIMUM over the running symbols of (server time - lag bound), the clock under which every
+  running symbol's "closed by time" decisions are already past: it is what a driver passes to an
+  aligner's `poll`. It is `None` until some running symbol has a measured lag bound (do not poll
+  yet) and `server_now` when no symbol is running. The watcher closes a bar by time at minute end
+  + 90 s on the stream clock, an aligner releases by time at end + 100 s on the clock it is
+  polled with: polled with `stream_now` both are on one clock and the 10 s margin holds for any
+  lag; polled with `server_now` it does not. `Watcher.stream_states()` gives per symbol the lag
+  bound, the delayed flag and whether it still runs. An exception from the hook ends the watch
   like any unexpected error (exit 4); it must not block for long.
 - Limits: `minutes` (the run deadline, up to `MAX_DRIVER_MINUTES`) and `backfill_minutes` (up to
   `MAX_SINCE_OPEN_MINUTES`, 390 = the whole session) or `backfill_since_open` (the duration asks for
@@ -262,7 +272,8 @@ MAX_MINUTES = 420
 DEFAULT_BACKFILL_MINUTES = 10
 MAX_BACKFILL_MINUTES = 120
 MAX_SINCE_OPEN_MINUTES = 390  # a driver (not the command line) may ask for the whole session
-MAX_DRIVER_MINUTES = 600  # the longest run deadline a driver may ask for (the command line: MAX_MINUTES)
+MAX_REQUEST_MINUTES = 24 * 60  # a since-open request after the close reaches back to the open, at most a day
+MAX_DRIVER_MINUTES = 600 # the longest run deadline a driver may ask for (the command line: MAX_MINUTES)
 REQUEST_SPACING = 1.0  # seconds between two history requests
 IDENTICAL_REQUEST_SPACING = 15.0  # IB refuses an identical history request within 15 s
 MAX_REREQUESTS = 10  # per symbol; more means something is wrong, not a passing outage
@@ -598,12 +609,12 @@ def _check_limits(minutes: int | None, backfill_minutes: int | None, since_open:
 
 def since_open_minutes(server_now: float) -> int:
     """Minutes of backfill that reach back to 09:30 New York of the date of `server_now`: the whole
-    minutes since the open rounded up, plus one for the bar still forming; 1 before the open and at
-    most `MAX_SINCE_OPEN_MINUTES` (a whole session, also after the close)."""
+    minutes since the open rounded up, plus one for the bar still forming; 1 before the open. After
+    the close it still reaches back to the open (16:30 asks for 421 minutes), at most a day."""
     elapsed = server_now - _session_start(_ny(server_now).date())
     if elapsed <= 0:
         return 1
-    return min(MAX_SINCE_OPEN_MINUTES, math.ceil(elapsed / 60) + 1)
+    return min(MAX_REQUEST_MINUTES, math.ceil(elapsed / 60) + 1)
 
 
 def since_open_duration(server_now: float) -> str:
@@ -623,7 +634,7 @@ class WatchSeams:
 
     extra_sinks: tuple[ClosedBars, ...] = ()
     listener: BarListener | None = None
-    on_pass: Callable[[float], None] | None = None
+    on_pass: Callable[[StreamClock], None] | None = None
     minutes: int | None = None
     backfill_minutes: int | None = None
     backfill_since_open: bool = False
@@ -631,6 +642,25 @@ class WatchSeams:
 
     def __post_init__(self) -> None:
         _check_limits(self.minutes, self.backfill_minutes, self.backfill_since_open)
+
+
+@dataclass(frozen=True)
+class StreamClock:
+    """What `on_pass` gets: IB server time and the clock to poll an aligner with (see the module
+    docstring). `stream_now` is None until a running symbol has a measured lag bound."""
+
+    server_now: float
+    stream_now: float | None
+
+
+@dataclass(frozen=True)
+class StreamState:
+    """One symbol's stream as the watcher sees it: the smallest lag seen (s; None: not measured),
+    whether it is labelled delayed, and whether it still runs (False once stopped)."""
+
+    lag_bound: float | None
+    delayed: bool
+    running: bool
 
 
 @dataclass(frozen=True)
@@ -884,7 +914,7 @@ class Watcher:
     def __init__(self, args: argparse.Namespace, conn: IbConnection, md: IbMarketData, say: _Say,
                  files: ClosedBars, clock: Callable[[], float], sleep: Callable[[float], None],
                  wall: Callable[[], datetime], *, listener: BarListener | None = None,
-                 on_pass: Callable[[float], None] | None = None, minutes: int | None = None,
+                 on_pass: Callable[[StreamClock], None] | None = None, minutes: int | None = None,
                  backfill_minutes: int | None = None, backfill_since_open: bool = False) -> None:
         _check_limits(minutes, backfill_minutes, backfill_since_open)
         self.args = args
@@ -936,6 +966,22 @@ class Watcher:
         """True once every symbol's first backfill has been handled (its bars are in the sinks) or
         the symbol has stopped: a driver that polls an aligner starts after this."""
         return all(not s.first_backfill or s.phase == "stopped" for s in self.syms)
+
+    def stream_clock(self) -> StreamClock:
+        """Server time and the minimum over the running symbols of (server time - lag bound):
+        the clock every running symbol's closing by time has caught up with. A symbol whose lag
+        is not measured yet does not count; with none measured `stream_now` is None, and with no
+        symbol running it is the server time."""
+        now = self.server_now()
+        running = [s for s in self.syms if s.phase != "stopped"]
+        if not running:
+            return StreamClock(now, now)
+        bounds = [s.lag_bound for s in running if s.lag_bound is not None]
+        return StreamClock(now, now - max(bounds) if bounds else None)
+
+    def stream_states(self) -> dict[str, StreamState]:
+        """Per symbol: lag bound, delayed flag, running or stopped (read-only, any time)."""
+        return {s.name: StreamState(s.lag_bound, s.delayed, s.phase != "stopped") for s in self.syms}
 
     def drop_counts(self) -> dict[str, DropCounts]:
         """Per symbol, the counts the summary prints (a snapshot; read at any time)."""
@@ -1065,7 +1111,7 @@ class Watcher:
                     self._check_no_data(sym)
                     self._settle(sym)
             if self.on_pass is not None:
-                self.on_pass(self.server_now())  # after this pass's bars and notifications
+                self.on_pass(self.stream_clock())  # after this pass's bars and notifications
             if not progressed:
                 self.sleep(IDLE_SLEEP)
         self.lost_at_end = self.conn.state is ConnState.LOST
@@ -1328,7 +1374,7 @@ class Watcher:
         written or dropped. Nothing else is ever told, and only right after `last_emitted` moved;
         see "What `decided` promises" in the module docstring for why no row can follow for a
         minute at or before it."""
-        if self.listener is not None and sym.last_emitted is not None and sym.phase != "stopped":
+        if self.listener is not None and sym.last_emitted is not None:
             self.listener.decided(sym.name, sym.last_emitted)
 
     def _backfill(self, sym: _Sym, raw: Sequence[events.HistoricalBar]) -> None:
@@ -1774,7 +1820,10 @@ def run_watch(
     except (OSError, PathRefused) as exc:
         say(f"Cannot start the session recording: {type(exc).__name__}: {exc}")
         say(f"Result: {labels[EXIT_REFUSED]} (exit {EXIT_REFUSED})")
-        sink.close()
+        try:
+            sink.close()
+        except Exception as close_exc:  # noqa: BLE001 - one line, never a traceback
+            say(f"Closing the bar sinks raised {type(close_exc).__name__}: {close_exc}")
         return EXIT_REFUSED
     conn: IbConnection | None = None
     code = EXIT_STOPPED
