@@ -90,6 +90,20 @@ harmless ONLY because ``backtest`` is an offline subcommand of the package: that
 neutral text as for the two subcommands, so a path under ``MainStoinker/ib`` in a value, a
 second module, ``-c`` code, a wrapper, the entry script and the like still block it, and
 every rule that runs before the allowance has already judged the ORIGINAL text.
+The same allowance has a THIRD form (owner decision D9 of issue 187, unattended ``run`` on the
+paper account, issue 199): ``<venv python> -P -m MainStoinker run <args>``, the subcommand word
+``run`` next to ``fetch-bars`` and ``probe-data``, with the same interpreter rule, token rules
+and guarded options, and in addition: ``--minutes`` exactly once with 1 to 3 plain digits;
+``--algos``, ``--bars`` and ``--db`` each exactly once with an explicit value
+(no reliance on ``STOINK_DB`` or another default); ``--fills`` only ``realistic`` and only once
+if given; ``--help`` and every prefix of it, and any token that contains ``--order`` (the stage 3
+order option, in any spelling, case, abbreviation or ``=`` form; also as a value) refused
+outright; ``run`` has no positional argument, so every token is an option or its value.
+``--minutes``, ``--algos``, ``--bars``, ``--db``, ``--fills``, ``--orders`` and
+``--help`` join the guarded names for this form (no abbreviation, no other spelling). The
+neutral re-judgement replaces ``run`` by ``backtest``, like the other subcommand words. ``run``
+sends no order and places none (it reads data from TWS and simulates fills), but it writes the
+owner's run database: the clean ``origin/revival`` rule of CLAUDE.md applies with more weight.
 Not seen: a script or file that itself imports and runs the package (written
 in one call, run in another), ``bash script.sh``, aliases/functions, a module
 name built without the package name appearing anywhere (``'Main'+'Stoinker'``,
@@ -600,7 +614,9 @@ _CONNECT_MESSAGE = (
     "<args> with --paper and --no-prompt among the args (--port only 7497, --host only "
     "127.0.0.1; quote a symbol list: --symbols \"AAPL,MSFT\"; no --help); the live bar "
     "watcher is the same with -P -m MainStoinker.ib.watch_bars <args> and --minutes N "
-    "(1 to 3 digits) as well. A "
+    "(1 to 3 digits) as well; the unattended paper session is -P -m MainStoinker run "
+    "--algos F --bars D --db F --minutes N (each once, explicit; no --orders, no --help; "
+    "--fills only realistic). A "
     "drive-absolute path ending in .venv\\Scripts\\python.exe also works, in double "
     "quotes if it has spaces. No ; && || | & ` $ % < > ( ) quotes other than \", newline, cd, "
     "variable assignment or wrapper (start, cmd /c, powershell -c, bash -c) may appear, "
@@ -1235,11 +1251,18 @@ _PAPER_TOKEN = rf'(?:"[ {_PAPER_CHARS}]*"|[{_PAPER_CHARS}]+)'
 # because the arguments must start after a space.
 _PAPER_COMMAND = re.compile(
     rf"(?:& +)?(?P<py>{_PAPER_TOKEN}) +-P +-m +MainStoinker"
-    rf"(?: +(?P<sub>fetch-bars|probe-data)|(?P<mod>\.ib\.watch_bars))"
+    rf"(?: +(?P<sub>fetch-bars|probe-data|run)|(?P<mod>\.ib\.watch_bars))"
     rf"(?P<args>(?: +{_PAPER_TOKEN})+)"
 )
 _PAPER_MINUTES_VALUE = re.compile(r"[0-9]{1,3}")
 _PAPER_WATCHER_GUARDED = ("--minutes",)
+# The ``run`` form: the same bounded ``--minutes``, three required options given explicitly once,
+# ``--fills`` only ``realistic``, no ``--help`` and nothing that is or abbreviates ``--orders``.
+_PAPER_RUN_GUARDED = ("--minutes", "--algos", "--bars", "--db", "--fills", "--orders", "--help")
+_PAPER_RUN_REQUIRED = ("--algos", "--bars", "--db")
+_PAPER_RUN_FILLS = "realistic"
+_PAPER_RUN_NO_VALUE = frozenset({"--paper", "--no-prompt", "--no-record"})  # ``run`` flags without a value
+_PAPER_RUN_ORDER_WORD = "--order"
 _PAPER_TOKEN_RE = re.compile(_PAPER_TOKEN)
 # The interpreter: the project venv, written relative (``.venv\Scripts\python.exe``) or as
 # a drive-absolute path (``X:\...\.venv\Scripts\python.exe``, no other colon). Never a UNC
@@ -1302,8 +1325,15 @@ def _paper_match(command: str) -> re.Match[str] | None:
     if "--paper" not in tokens or "--no-prompt" not in tokens:  # exact, standalone, unquoted
         return None
     watcher = m.group("mod") is not None
+    run = m.group("sub") == "run"
+    if run and any(_PAPER_RUN_ORDER_WORD in t.lower() for t in tokens):
+        return None  # the stage 3 order option, in any spelling, case or place: never this form
     guarded = _PAPER_GUARDED + (_PAPER_WATCHER_GUARDED if watcher else ())
-    minutes: list[str | None] = []  # the value of each ``--minutes`` (watcher form only)
+    if run:
+        guarded += _PAPER_RUN_GUARDED
+    # the value of each ``--minutes`` (watcher and ``run`` forms) and of each run option
+    minutes: list[str | None] = []
+    run_values: dict[str, list[str | None]] = {g: [] for g in _PAPER_RUN_GUARDED}
     for i, tok in enumerate(tokens):
         if tok.startswith('"') or not tok.startswith("--"):
             continue
@@ -1317,9 +1347,12 @@ def _paper_match(command: str) -> re.Match[str] | None:
         # ``--paperx``); the ``=`` forms of the flags and of port and host are checked below
         if any(tok.startswith(g) and tok != g and tok[len(g)] != "=" for g in guarded):
             return None
-        if watcher and name == "--minutes":
+        if (watcher or run) and name == "--minutes":
             minutes.append(tok[len("--minutes=") :] if "=" in tok else
                            (tokens[i + 1] if i + 1 < len(tokens) else None))
+        if run and name in run_values:
+            run_values[name].append(tok[len(name) + 1 :] if "=" in tok else
+                                    (tokens[i + 1] if i + 1 < len(tokens) else None))
         if tok.startswith(("--paper=", "--no-prompt=")):
             return None
         following = tokens[i + 1] if i + 1 < len(tokens) else None
@@ -1331,17 +1364,51 @@ def _paper_match(command: str) -> re.Match[str] | None:
             return None
         if name == "--host" and tok != "--host" and tok != f"--host={_PAPER_HOST}":
             return None
-    if watcher:
-        # a bounded run: ``--minutes`` exactly once, with 1 to 3 plain digits (the watcher
+    if watcher or run:
+        # a bounded run: ``--minutes`` exactly once, with 1 to 3 plain digits (the command
         # itself refuses 0 and anything over 420)
         if len(minutes) != 1 or minutes[0] is None or not _PAPER_MINUTES_VALUE.fullmatch(minutes[0]):
             return None
+    if run and not (_paper_run_options_ok(run_values) and _paper_run_no_positional(tokens)):
+        return None
     return m
+
+
+def _paper_run_no_positional(tokens: list[str]) -> bool:
+    """``run`` has no positional argument: every token is an option or the value of the one before
+    (a flag takes none, ``--name=value`` carries its own), so a stray word such as a second
+    subcommand (``run backtest``, a trailing ``fetch-bars``) is refused here, not left to argparse."""
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("--"):
+            return False
+        if "=" in tok or tok in _PAPER_RUN_NO_VALUE:
+            i += 1
+        elif i + 1 < len(tokens):
+            i += 2
+        else:
+            return False  # an option with no value
+    return True
+
+
+def _paper_run_options_ok(values: dict[str, list[str | None]]) -> bool:
+    """The ``run`` form: ``--algos``, ``--bars``, ``--db`` once each with a real value, no
+    ``--help`` and no ``--orders`` at all, ``--fills`` only ``realistic`` and at most once."""
+    if values["--help"] or values["--orders"]:
+        return False
+    for name in _PAPER_RUN_REQUIRED:
+        found = values[name]
+        if len(found) != 1 or not found[0] or found[0].startswith(("-", '"-')):
+            return False
+    fills = values["--fills"]
+    return not fills or (len(fills) == 1 and fills[0] == _PAPER_RUN_FILLS)
 
 
 def allowed_paper_data_command(command: str) -> bool:
     """True only for the one allowed shape (see the header): a whole plain command that runs
-    ``fetch-bars`` or ``probe-data`` of the project package, or the module
+    ``fetch-bars`` or ``probe-data`` of the project package, or ``run`` (with ``--minutes N``,
+    ``--algos``, ``--bars`` and ``--db``), or the module
     ``MainStoinker.ib.watch_bars`` with ``--minutes N``, with ``--paper --no-prompt``, and
     that the rest of this hook would not block once its connecting part is neutral."""
     neutral = _paper_neutral(command)
@@ -1352,7 +1419,7 @@ def allowed_paper_data_command(command: str) -> bool:
 def _paper_neutral(command: str) -> str | None:
     """The allowed command with only the connecting part replaced by ``backtest``, else None.
 
-    ``-m MainStoinker fetch-bars|probe-data`` becomes ``-m MainStoinker backtest``, and the
+    ``-m MainStoinker fetch-bars|probe-data|run`` becomes ``-m MainStoinker backtest``, and the
     watcher form ``-m MainStoinker.ib.watch_bars`` becomes ``-m MainStoinker backtest``: the
     same offline command, with every argument unchanged. The whole hook judges this text
     (``allowed_paper_data_command``), so every OTHER reason to block the command still

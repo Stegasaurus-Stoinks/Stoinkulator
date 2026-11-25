@@ -17,8 +17,16 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   (N from 1 to 420: a bounded run, data only), under the same rules (main
   session only, clean `origin/revival` checkout, one broker session at a time,
   exit code 5 means not a paper account: stop, tell the owner); any other way of
-  running it is owner-run only. Everything else works only against offline data
-  and the test harness.
+  running it is owner-run only. Agents may also run the unattended paper session,
+  `python -m MainStoinker run`, with `--paper --no-prompt --minutes N` (N from 1 to
+  420: a bounded run) and `--algos`, `--bars` and `--db` each given explicitly once,
+  under the same rules (main session only, clean unmodified `origin/revival`
+  checkout, one broker session at a time, paper only, data from TWS and simulated
+  fills only: it places no orders; exit code 5 means not a paper account: stop,
+  tell the owner). A first write migrates the runs database, so the database path
+  is the owner's: agents use only the path the owner named for the session. Any
+  other way of running it is owner-run only. Everything else works only against
+  offline data and the test harness.
 - The live account, the live ports and `STOINK_ALLOW_LIVE_PORT` are the owner's
   alone: an agent never uses them, sets them or asks for them.
 - One broker session at a time, started by the main session, never by parallel
@@ -34,7 +42,8 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   against the owner's paper account in an attended `--paper` session on 2026-11-23,
   and it still rests on "no live Interactive Brokers account id begins with D".
 - Order placement on the paper account is NOT allowed yet: it is a separate
-  owner decision.
+  owner decision. Any `--orders` option of `run` (stage 3) is the owner's alone;
+  the hook allowance for `run` refuses it in every spelling.
 - Tests never connect.
 - Never change the defaults of `LiveTrading`, `LiveData`, `TWS_HOST` or
   `TWS_PORT` in `MainStoinker/MainStuff/Globals.py`. `tests/test_safe_defaults.py`
@@ -63,7 +72,13 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   variable assignment; the live opt-in name may not appear at all. The same
   shape with the module `.venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars <args>`
   is allowed too, and needs `--minutes` once with 1 to 3 digits besides
-  (`--no-prompt` makes the watcher itself require it, 1 to 420). The hook does
+  (`--no-prompt` makes the watcher itself require it, 1 to 420). The same shape
+  with the subcommand `run` (`.venv\Scripts\python.exe -P -m MainStoinker run <args>`)
+  is allowed as well, and needs `--minutes` once with 1 to 3 digits, and `--algos`,
+  `--bars` and `--db` each once with an explicit value (no reliance on `STOINK_DB`);
+  `--fills` only `realistic`; any token that contains `--order` (also `--orders`,
+  abbreviations and `=` forms) and `--help` are refused, and so is any stray word, as
+  `run` has no positional argument. The hook does
   not check which code is checked out or which interpreter file it is. It is a
   tripwire against accidents, not a security boundary.
 - Never set that variable, and never weaken, disable, bypass or work around
@@ -89,30 +104,38 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols "AAPL,MSFT" --start 2024-08-16 --end 2024-08-26 --paper --no-prompt   # DATA only, PAPER account only (TWS on 7497): bars to CSV; one session at a time, main session only
 .venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols "AAPL" --paper --no-prompt   # DATA only, PAPER account only: what market data the account gets
 .venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt   # DATA only, PAPER account only: watch live 1-minute bars for N minutes (1-420); one session at a time, main session only
+.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20); one session at a time, main session only; DB path from the owner
 ```
 
-Owner forms of the same three (the owner's terminal, prompted: you type the port;
+Owner forms of the same four (the owner's terminal, prompted: you type the port;
 `--paper` means 7497, a live port needs the owner's own opt-in, see
 `docs/owner-session-checklist.md`): `fetch-bars --symbols A,B --start D --end D --port P`,
-`probe-data --symbols A,B --port P`, `watch_bars --symbols A,B --minutes N --port P`
-(with `--paper` instead of `--port` for 7497). Options and outcomes: `docs/live-data.md`.
+`probe-data --symbols A,B --port P`, `watch_bars --symbols A,B --minutes N --port P`,
+`run --algos F --bars D --db F --minutes N --port P` (with `--paper` instead of `--port`
+for 7497; every algo needs `"mode": "paper"`, `--fills` is `realistic`, `--stop-file F` ends
+the run cleanly). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
 
-Exit codes (`--help` shows them; the not-paper code is 5 for `fetch-bars` and the
-watcher but 4 for `probe-data`, where 4 is otherwise unused: issue 177):
+Exit codes (`--help` shows them; the not-paper code is 5 for `fetch-bars`, the
+watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177):
 
-| code | `fetch-bars` | `probe-data` | `watch_bars` |
-|------|--------------|--------------|--------------|
-| 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming |
-| 1 | a day failed or a symbol not fetched | a step failed (incl. NO data) | a symbol stopped or delivered no bars |
-| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same |
-| 3 | could not connect | same | same |
-| 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault |
-| 5 | not a paper account | (unused) | not a paper account |
-| 130 | Ctrl-C | same | same |
+| code | `fetch-bars` | `probe-data` | `watch_bars` | `run` |
+|------|--------------|--------------|--------------|-------|
+| 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming | the session ended as planned (end of session at 16:20, `--minutes` elapsed or the stop file): stored `completed` |
+| 1 | a day failed or a symbol not fetched | a step failed (incl. NO data) | a symbol stopped or delivered no bars | a symbol stopped: stored `failed` |
+| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same | same, and a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running: nothing built or connected |
+| 3 | could not connect | same | same | same |
+| 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault | lost or closed connection, or an error: stored `failed` |
+| 5 | not a paper account | (unused) | not a paper account | not a paper account |
+| 6 | (unused) | (unused) | no data received for a symbol in the session: check the account's market data subscription | no data received for a symbol: stored `failed`, `no_data` |
+| 7 | (unused) | (unused) | (unused) | the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step that took too long): stored `failed` |
+| 130 | Ctrl-C | same | same | same (the run was ended in the store first) |
 
 Where data lands (the owner's folders, outside the repo and OneDrive; a command
 refuses a path inside either): `%USERPROFILE%\Stoinkulator\bars` (`fetch-bars`),
-`...\live` (watcher), `...\recordings` (session recordings). Bars are month files
+`...\live` (watcher and `run`), `...\recordings` (session recordings, `run` too:
+`run-<date>-<n>.jsonl`, on by default), `...\run-out` (the algos' working folder of `run`),
+and the run database named by `run --db` (the owner's file; a first write migrates it).
+Bars are month files
 `DIR/SYMBOL/SYMBOL_YYYY-MM.csv` (naive New York times, regular hours) with
 `manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them; live files are
 `DIR/SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`. Agents write there only through a
@@ -139,7 +162,10 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
 - `MainStoinker/Algos/<Name>/<Name>_Algo.py` each exposes `class Algo(ParentAlgo)`;
   loaded by name from `MainStuff/Algo_config.json`.
 - `MainStoinker/engine/` new engine package: `Broker` protocol, `SimBroker`; imports nothing legacy
-  (enforced by `tests/test_engine_import_boundary.py`).
+  (enforced by `tests/test_engine_import_boundary.py`). Live modules: `live_feed.py` aligns the
+  symbols' closed bars into one batch per minute; `live_store.py` the incremental writer of a live
+  run; `live_counts.py` live run kinds, heartbeat and count keys; `warmup.py` warm-up frames from
+  the month files.
 - `MainStoinker/api/` read-only web API (FastAPI, GET only) and static dashboard, started by `serve`;
   may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy
   (enforced by `tests/test_api_boundary.py`); the engine never imports it.
@@ -151,7 +177,9 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
   history, quotes, server time, contract lookup; `bars.py` IB bar to engine `Bar`; `history.py`
   day planning, pacing, manifest, gap report; `fetch.py` the fetch driver; `recorder.py` session
   recording with account/path redaction; `cli.py` `fetch-bars` and `probe-data` (gate, paper mode,
-  paths); `probe.py` the probe steps; `watch_bars.py` the live bar watcher; `contracts.py`, `events.py`.
+  paths); `probe.py` the probe steps; `watch_bars.py` the live bar watcher; `live_run.py` the
+  live paper session driver (watcher, aligner, engine and run writer; no orders); `run_cli.py` the
+  `run` command (paper only, refusals, gate); `contracts.py`, `events.py`.
 - `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests. Data time is naive
   `America/New_York` wall-clock time (session 09:30 to 16:00); algos' hard-coded times use it too.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.
