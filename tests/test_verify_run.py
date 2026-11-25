@@ -30,7 +30,7 @@ from MainStoinker.engine.algos import close_algo_logs
 from MainStoinker.engine.cli import _maybe_quiet, build_engine, main
 from MainStoinker.engine.feed import COLUMNS, Bar, read_offline_bars, write_month_file
 from MainStoinker.engine.ledger import Ledger
-from MainStoinker.engine.live_store import LiveRunWriter
+from MainStoinker.engine.live_store import LiveRunWriter, describe_today_bars
 from MainStoinker.engine.modes import build_router
 from MainStoinker.engine.paper_broker import CostModel
 from MainStoinker.engine.stats import fmt4
@@ -100,7 +100,7 @@ def build_session(
     root: Path, symbols: list[str], fills: str, *, rows: int = ROWS,
     drop: dict[str, range] | None = None, fail_at: int | None = None,
     stop_after: int | None = None, record_bars_dir: bool = True,
-    kill_after: int | None = None, reverse_algos: bool = False,
+    kill_after: int | None = None, reverse_algos: bool = False, backfill: int = 0,
 ) -> Session:
     """Drive a live session to its end (or its failure) and return what it stored.
 
@@ -108,7 +108,9 @@ def build_session(
     `fail_at` makes the first algo raise at that step; `stop_after` ends the session early
     as `failed` without an error; `kill_after` stops after that many steps without
     `end_live` or `finish` (a killed process: the run stays `running`); `reverse_algos`
-    lists the algos in the opposite order of the feed's symbols.
+    lists the algos in the opposite order of the feed's symbols; `backfill` makes the session
+    start after the open: that many of today's first bars are warm-up (stored in the
+    description with their digest, appended to the frames), the rest are stepped.
     """
     harness.reset_runtime_state()
     root.mkdir(parents=True)
@@ -117,12 +119,20 @@ def build_session(
     data, today = write_bars(bars_dir, symbols)
     frames, description, _warnings = live_warmup(bars_dir, symbols, today, 2)
     per_symbol: dict[str, list[Bar]] = {}
+    warm_today: dict[str, list[Bar]] = {}
     for symbol in symbols:
         after = data[symbol][data[symbol]["date"] >= pd.Timestamp(today)].head(rows)
         gone = set((drop or {}).get(symbol, ()))
         per_symbol[symbol] = [
             Bar(*row) for i, row in enumerate(
                 zip(*(after[c].tolist() for c in COLUMNS), strict=True)) if i not in gone]
+        warm_today[symbol], per_symbol[symbol] = (
+            per_symbol[symbol][:backfill], per_symbol[symbol][backfill:])
+        if backfill:
+            frames[symbol] = pd.concat(
+                [frames[symbol], after.head(backfill)[list(COLUMNS)]], ignore_index=True)
+    if backfill:
+        description["today_bars"], description["today_sha256"] = describe_today_bars(warm_today)
     batches: dict[Any, dict[str, Bar]] = {}
     for symbol in symbols:
         for bar in per_symbol[symbol]:
@@ -161,7 +171,7 @@ def build_session(
                       "slippage_per_share": fmt4(COSTS.slippage_per_share)}
             if fills == "realistic" else None}
         writer.begin(fills=fills, code_version="test", config=config,
-                     data=DataMeta(source="live", directory=str(bars_dir) if record_bars_dir else "",
+                     data=DataMeta(source="live", directory=str(bars_dir),
                                    symbols=tuple(symbols)),
                      algos=metas, warmup=frames, warmup_description=description)
         engine.start_live(frames, on_step=writer.on_step)
@@ -184,17 +194,20 @@ def build_session(
         data_meta = DataMeta(source="live", directory=str(bars_dir) if record_bars_dir else "",
                              symbols=tuple(symbols), first_bar=ordered[0][0],
                              last_bar=ordered[done - 1][0], replayed_minutes=done,
-                             missing_minutes=(), uncovered_minutes=0, warnings=(),
-                             gap_rule=engine.gap_report)
+                             missing_minutes=(), uncovered_minutes=0, warnings=())
         status = "failed" if failed or stop_after is not None else "completed"
         reason = ("error" if failed else "interrupted") if status == "failed" else "session_end"
         outcome = writer.finish(status, reason,  # type: ignore[arg-type]
                                 {(s, "fed", None): sum(1 for _, b in ordered[:done] if s in b)
-                                 for s in symbols}, data_meta)
+                                 for s in symbols}, data_meta, engine.gap_report)
         assert outcome.ok, outcome
         gap_bars = engine.gap_report.total_bars_after_gap
     close_algo_logs(algos)
     store.close()
+    if not record_bars_dir:  # `begin` refuses an empty directory: an old run is made by hand
+        data_json = json.loads(_data_json(db))
+        data_json["directory"] = ""
+        sql(db, "UPDATE runs SET data_json=? WHERE id=1", json.dumps(data_json))
     return Session(root, db, bars_dir, positions, done, gap_bars, failed, fills, list(symbols))
 
 
@@ -218,6 +231,8 @@ def sessions(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Session]:
                                    reverse_algos=True),
         "no-dir": build_session(base / "no-dir", ["AAPL"], "legacy", rows=300,
                                 record_bars_dir=False),
+        "mid-session": build_session(base / "mid-session", ["AAPL", "MSFT"], "realistic",
+                                     rows=700, backfill=60),
     }
 
 
@@ -532,6 +547,14 @@ def test_verify_of_a_realistic_run_without_stored_costs_is_unverifiable(
     assert code == EXIT_UNVERIFIABLE and "stores no costs" in out
 
 
+def _data_json(db: Path) -> str:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute("SELECT data_json FROM runs WHERE id=1").fetchone()[0]
+    finally:
+        con.close()
+
+
 def _config(db: Path) -> str:
     con = sqlite3.connect(db)
     try:
@@ -820,3 +843,137 @@ def test_the_replay_uses_the_feed_order_of_the_stored_symbols_not_the_algos_orde
     assert list(run.summary.data.symbols) == ["AAPL", "MSFT", "TSLA"]  # the feed's order
     code, out, err = verify(session, capsys)
     assert code == EXIT_VERIFIED, out + err
+
+
+# ------------------------------------------------------------------ a session started after the open
+
+
+def _set_description(db: Path, change: Any) -> None:
+    """Rewrite the stored warm-up description of run 1 with `change(description)`."""
+    config = json.loads(_config(db))
+    change(config["warmup"])
+    sql(db, "UPDATE runs SET config_json=? WHERE id=1", json.dumps(config))
+
+
+def test_a_session_started_after_the_open_stores_and_verifies_todays_bars(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = sessions["mid-session"]
+    description = json.loads(_config(session.db))["warmup"]
+    assert set(description["today_bars"]) == {"AAPL", "MSFT"}
+    assert all(len(rows) == 60 for rows in description["today_bars"].values())
+    assert set(description["today_sha256"]) == {"AAPL", "MSFT"}
+    assert all(row[0].startswith(description["today"]) for rows in description["today_bars"].values()
+               for row in rows)
+    run = stored_run(session.db)
+    assert run.fills, "the mid-session run does trade"
+    code, out, err = verify(session, capsys)
+    assert code == EXIT_VERIFIED, out + err
+    assert "verify: VERIFIED" in out and "today's" not in out
+
+
+def test_the_replay_of_a_mid_session_run_starts_from_the_month_files_plus_todays_bars(
+    sessions: dict[str, Session]
+) -> None:
+    from MainStoinker.engine.verify import add_today_bars, rebuild_warmup
+
+    session = sessions["mid-session"]
+    description = json.loads(_config(session.db))["warmup"]
+    month, problems = rebuild_warmup(session.bars, description, ["AAPL", "MSFT"])
+    assert not problems
+    both, problems = add_today_bars(month, description, ["AAPL", "MSFT"])
+    assert not problems
+    for symbol in ("AAPL", "MSFT"):
+        assert len(both[symbol]) == len(month[symbol]) + 60
+        assert both[symbol]["date"].iloc[-1].strftime("%H:%M") == "10:29"  # 60 bars after 09:30
+        assert both[symbol].iloc[:len(month[symbol])].equals(month[symbol])
+
+
+def test_a_changed_stored_today_bar_makes_the_run_unverifiable_not_a_mismatch(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The bars in the description no longer hash to the digest recorded with them: the record
+    changed, nothing says which of the two is the one the session used, so the verdict is
+    UNVERIFIABLE (it says nothing about the engine) and names the symbol and both digests."""
+    altered = sessions["mid-session"].copy(tmp_path / "tampered")
+    expected = json.loads(_config(altered.db))["warmup"]["today_sha256"]["MSFT"]
+
+    def change(description: dict[str, Any]) -> None:
+        description["today_bars"]["MSFT"][10][4] += 0.5  # a close
+
+    _set_description(altered.db, change)
+    code, out, err = verify(altered, capsys)
+    assert code == EXIT_UNVERIFIABLE, out + err
+    assert "verify: UNVERIFIABLE" in out and "today's backfill bars digest differs" in out
+    assert "MSFT" in out and "AAPL:" not in out
+    assert f"expected {expected}" in out
+    (problem,) = json.loads(verify(altered, capsys, "--json")[1])["verify"]["unverifiable"]
+    assert problem["symbol"] == "MSFT" and problem["expected"] == expected
+    assert problem["actual"] not in (None, expected)
+
+
+def test_a_dropped_stored_today_bar_makes_the_run_unverifiable(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    altered = sessions["mid-session"].copy(tmp_path / "dropped")
+    _set_description(altered.db, lambda d: d["today_bars"]["AAPL"].pop(20))
+    code, out, err = verify(altered, capsys)
+    assert code == EXIT_UNVERIFIABLE, out + err
+    assert "today's backfill bars digest differs" in out and "AAPL" in out
+
+
+@pytest.mark.parametrize("how,words", [
+    ("no-bars", "missing from the stored warm-up description"),
+    ("no-key", "missing from the stored warm-up description"),
+    ("no-key-no-digest", "has no `today_bars` for this symbol"),
+    ("no-digest", "no recorded digest"),
+])
+def test_missing_today_bars_or_digest_are_named_unverifiable(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path,
+    how: str, words: str
+) -> None:
+    altered = sessions["mid-session"].copy(tmp_path / how)
+
+    def change(description: dict[str, Any]) -> None:
+        if how == "no-bars":
+            description["today_bars"]["AAPL"] = []
+        elif how == "no-key":
+            del description["today_bars"]["AAPL"]
+        elif how == "no-key-no-digest":
+            del description["today_bars"]["AAPL"]
+            del description["today_sha256"]["AAPL"]
+        else:
+            del description["today_sha256"]["AAPL"]
+
+    _set_description(altered.db, change)
+    code, out, err = verify(altered, capsys)
+    assert code == EXIT_UNVERIFIABLE, out + err
+    assert words in out and "AAPL" in out
+
+
+def test_a_description_with_empty_today_bars_or_none_verifies_as_before(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A session started before the open (nothing backfilled), as the first driver stored it
+    (`today_bars` all empty, no digest), and a run stored before `today_bars` existed."""
+    empty = sessions["three-realistic"].copy(tmp_path / "empty")
+    _set_description(empty.db, lambda d: d.update(today_bars={s: [] for s in SYMBOLS}))
+    code, out, err = verify(empty, capsys)
+    assert code == EXIT_VERIFIED, out + err
+    with_digests = sessions["three-realistic"].copy(tmp_path / "empty-digests")
+    _set_description(with_digests.db, lambda d: d.update(
+        today_bars={s: [] for s in SYMBOLS}, today_sha256={}))
+    code, out, err = verify(with_digests, capsys)
+    assert code == EXIT_VERIFIED, out + err
+    code, out, err = verify(sessions["three-realistic"], capsys)  # no key at all
+    assert code == EXIT_VERIFIED, out + err
+    assert "today_bars" not in _config(sessions["three-realistic"].db)
+
+
+def test_a_run_stored_by_the_first_driver_with_todays_bars_and_no_digest_is_unverifiable(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    old = sessions["mid-session"].copy(tmp_path / "first-driver")
+    _set_description(old.db, lambda d: d.pop("today_sha256"))
+    code, out, _ = verify(old, capsys)
+    assert code == EXIT_UNVERIFIABLE and "no recorded digest" in out

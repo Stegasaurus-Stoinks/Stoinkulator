@@ -24,10 +24,11 @@ import pytest
 
 from MainStoinker.engine.cli import main as engine_main
 from MainStoinker.engine.engine import Engine
-from MainStoinker.engine.live_store import LiveRunWriter
+from MainStoinker.engine.live_store import BUSY_PAUSE, BUSY_RETRIES, LiveRunWriter
 from MainStoinker.engine.store import RunSummary, SqliteStore
 from MainStoinker.ib import run_cli
 from MainStoinker.ib.connection import IbConnection
+from MainStoinker.ib.live_run import STEP_HARD_SECONDS
 from tests import test_ib_live_run as live
 from tests.no_build import FACTORY_NAMES, forbid_building
 from tests.test_ib_cli_paper import LIVE_ID
@@ -81,9 +82,12 @@ def argv_of(tmp: Path, *, minutes: str = "8", paper: bool = True, no_prompt: boo
 
 
 def go(rig: Rig, argv: list[str], *, tty: bool = True, stdin: Any = None, recorder: bool = True,
-       entries: list[dict[str, Any]] | None = None, build: bool = True) -> int:
+       entries: list[dict[str, Any]] | None = None, build: bool = True,
+       store_opener: Any = "rig") -> int:
     """`run_cli.main` on the rig. The algos file is written unless one exists. `build=False` leaves
-    the connection to the command's own wiring (a test patches `run_cli.IbConnection`)."""
+    the connection to the command's own wiring (a test patches `run_cli.IbConnection`);
+    `store_opener=None` leaves the store to the command's own opener (a test patches
+    `run_cli.open_store`), another callable replaces the rig's."""
     if not (rig.tmp / "algos.json").exists():
         write_algos(rig.tmp, entries)
 
@@ -96,7 +100,7 @@ def go(rig: Rig, argv: list[str], *, tty: bool = True, stdin: Any = None, record
     return run_cli.main(
         argv, env=rig.env, stdin=Tty(tty) if stdin is None else stdin, input_fn=rig.input_fn,
         out=rig.out, market_data_factory=rig.market_data_factory, clock=rig, sleep=rig.sleep, wall=rig.wall,
-        today=DAY, store_opener=opener, **extra)
+        today=DAY, store_opener=opener if store_opener == "rig" else store_opener, **extra)
 
 
 def runs_of(tmp: Path) -> dict[int, RunSummary]:
@@ -750,6 +754,71 @@ def test_an_interrupt_in_the_engines_end_step_still_reports_the_open_positions(
     run = runs_of(rig.tmp)[1]
     assert (run.status, run.end_reason) == ("failed", "connection_closed")
     assert last_line(rig) == "Live session: failed, end reason connection_closed (exit 130)"
+
+
+def test_ctrl_c_inside_finish_while_the_database_is_busy_does_not_end_the_run_twice_and_stays_truthful(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    holder: dict[str, live.LockingStore] = {}
+
+    def opener(spec: str, env: Any) -> live.LockingStore:
+        store = live.LockingStore(Path(spec), clock=rig.wall, env={}, busy_timeout=0.05, lock_at=4,
+                                  release_after=None)
+        holder["store"] = store
+        return store
+
+    real = LiveRunWriter.finish
+    seen = {"finish": 0, "end_run": 0, "end_run_at_interrupt": -1}
+    real_end_run = live.LockingStore.end_run
+
+    def end_run(self: Any, *args: Any, **kw: Any) -> Any:
+        seen["end_run"] += 1
+        return real_end_run(self, *args, **kw)
+
+    def finish(self: LiveRunWriter, *args: Any, **kw: Any) -> Any:
+        seen["finish"] += 1
+        outcome = real(self, *args, **kw)  # busy: the run could not be closed
+        if seen["finish"] == 1:
+            seen["end_run_at_interrupt"] = seen["end_run"]
+            raise KeyboardInterrupt  # Ctrl-C as `finish` returns
+        return outcome
+
+    monkeypatch.setattr(live.LockingStore, "end_run", end_run)
+    monkeypatch.setattr(LiveRunWriter, "finish", finish)
+    standard_script(rig, last=9, minutes=12)
+    try:
+        assert go(rig, argv_of(rig.tmp, minutes="12"), store_opener=opener) == 130, rig.text
+    finally:
+        holder["store"].unlock()
+    lines = rig.text.splitlines()
+    assert seen["finish"] == 2 and seen["end_run_at_interrupt"] > 0  # it did try to end the run
+    assert seen["end_run"] == seen["end_run_at_interrupt"]  # the retry never tried again
+    assert lines[-1].startswith("Live session: the run could not be closed: still marked running")
+    assert "the database stayed busy" in lines[-1] and lines[-1].endswith("(exit 130)")
+    assert "Live session: failed, end reason" not in rig.text and "already" not in rig.text
+    assert runs_of(rig.tmp)[1].status == "running"  # what the last line said
+
+
+def test_the_live_store_is_opened_with_a_short_busy_timeout(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    real = run_cli.open_store
+
+    def spy(spec: str, **kw: Any) -> Any:
+        seen.append(kw)
+        return real(spec, **kw)
+
+    monkeypatch.setattr(run_cli, "open_store", spy)
+    quick_session(rig)
+    assert go(rig, argv_of(rig.tmp), store_opener=None) == 0, rig.text
+    assert seen and seen[0]["busy_timeout"] == run_cli.LIVE_BUSY_TIMEOUT == 2.0
+
+
+def test_the_worst_stall_of_one_store_call_is_far_below_the_step_limit() -> None:
+    """Each attempt waits the busy timeout; the writer repeats a busy call BUSY_RETRIES times with
+    BUSY_PAUSE between: the worst case of one step (or of `finish`'s slowest part)."""
+    worst = (1 + BUSY_RETRIES) * run_cli.LIVE_BUSY_TIMEOUT + BUSY_RETRIES * BUSY_PAUSE
+    assert worst < STEP_HARD_SECONDS / 2
+    assert (1 + BUSY_RETRIES) * 10.0 + BUSY_RETRIES * BUSY_PAUSE > STEP_HARD_SECONDS  # the default's
 
 
 def test_ctrl_c_inside_end_live_and_verify_does_not_leave_the_run_running(

@@ -95,6 +95,7 @@ RUN_KIND = LIVE_KINDS[0]  # "paper-live"
 MIN_MINUTES = 1
 MAX_MINUTES = 420  # a session from 09:25 to 16:20 is 415 minutes; the driver itself would take 600
 DEFAULT_WARMUP_DAYS = 2
+LIVE_BUSY_TIMEOUT = 2.0  # seconds one attempt of a store call waits for another writer
 NY = ZoneInfo(DATA_ZONE)
 
 EXIT_CODES_TEXT = """\
@@ -215,6 +216,14 @@ def _db_path(spec: str, home: Path) -> Path | None:
     if path == "~" or path.startswith(("~/", "~\\")):
         return home / path[2:] if len(path) > 2 else home
     return Path(path)
+
+
+def _open_live_store(spec: str, env: Mapping[str, str]) -> Store:
+    """The live run's writable store, with a SHORT busy timeout: the writer repeats a busy call
+    itself (`live_store.BUSY_RETRIES`), so one step can stall for at most
+    (1 + BUSY_RETRIES) * LIVE_BUSY_TIMEOUT + BUSY_RETRIES * BUSY_PAUSE seconds, well under the
+    driver's step limit (the store's default of 10 s would give about 63 s)."""
+    return open_store(spec, env=env, busy_timeout=LIVE_BUSY_TIMEOUT)
 
 
 def _running_runs(db_file: Path, variables: Mapping[str, str], now: datetime) -> list[int]:
@@ -357,7 +366,7 @@ def main(
             if not gate(args, tty, ask, say, describe_run):
                 return EXIT_REFUSED
         try:  # the first writable open of the database: every refusal and the gate are behind us
-            store = (store_opener or (lambda spec, e: open_store(spec, env=e)))(args.db, variables)
+            store = (store_opener or _open_live_store)(args.db, variables)
         except StoreError as exc:
             say(f"Refused: the run database cannot be used: {exc}")
             return EXIT_REFUSED
