@@ -84,6 +84,20 @@ class StoreError(Exception):
     """Anything that stops the store from doing what was asked."""
 
 
+class StoreBusyError(StoreError):
+    """The database is held by another connection (SQLite BUSY or LOCKED) and the busy
+    timeout ran out. Nothing of the failed call was written, so the same call can be
+    repeated (`LiveRunWriter` does so a bounded number of times)."""
+
+
+def _store_error(message: str, exc: sqlite3.Error) -> StoreError:
+    """`StoreBusyError` when `exc` is a busy/locked database, else a plain `StoreError`."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    busy = (code is not None and code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)) or (
+        code is None and "locked" in str(exc).lower())
+    return (StoreBusyError if busy else StoreError)(message)
+
+
 def _readonly_uri(path: Path) -> str:
     """SQLite `file:` URI (with `?mode=ro`) for an absolute path; pure, no I/O.
 
@@ -967,19 +981,19 @@ class SqliteStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
-            raise StoreError(f"cannot start a transaction: {exc}") from exc
+            raise _store_error(f"cannot start a transaction: {exc}", exc) from exc
         try:
             yield conn
         except BaseException as exc:
             _rollback(conn)
             if isinstance(exc, sqlite3.Error):
-                raise StoreError(str(exc)) from exc
+                raise _store_error(str(exc), exc) from exc
             raise
         try:
             conn.execute("COMMIT")
         except sqlite3.Error as exc:
             _rollback(conn)
-            raise StoreError(f"commit failed: {exc}") from exc
+            raise _store_error(f"commit failed: {exc}", exc) from exc
 
     def _require_wal(self, conn: sqlite3.Connection) -> None:
         """The switch to WAL can be silently refused (a network share, a VFS without

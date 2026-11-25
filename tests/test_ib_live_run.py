@@ -39,6 +39,7 @@ from MainStoinker.engine.warmup import live_warmup
 from MainStoinker.ib import live_run
 from MainStoinker.ib.connection import ConnState
 from MainStoinker.ib.market_data import IbMarketData
+from MainStoinker.ib.watch_bars import StreamClock, StreamState
 from tests import harness
 from tests.fake_ib import ConnectBehavior
 from tests.not_paper_text import assert_one_not_paper_line
@@ -508,7 +509,10 @@ def test_warmup_and_backfill_no_duplicate_or_missing_minute(
     assert not run.fills and not run.round_trips, "nothing trades on today's earlier bars (D1)"
     assert run.summary.data.replayed_minutes == 15
     assert "today's closed backfill bars {'AAPL': 15, 'MSFT': 15, 'TSLA': 15}" in text
-    assert "verify: not run: the session started after the open" in text
+    # a session started after the open is verified too: the month files plus today's stored bars
+    assert "verify: VERIFIED" in text and "not run" not in text
+    assert verify_stored(result, tmp_path) == 0
+    assert set(run.config["warmup"]["today_sha256"]) == set(SYMBOLS)
     assert result.counts()[("AAPL", "fed", None)] == 15
     gap = run.summary.data.gap_rule
     assert gap is not None and gap.total_bars_after_gap == 0  # the first bar follows the warm-up directly
@@ -541,10 +545,102 @@ def test_late_start_today_bars_are_warmup_only(
     monkeypatch.setattr(Engine, "step", counting)
     result = session(rig, tmp_path, stores, minutes=4)
     assert result.code == 0, rig.text
-    assert seen == [(390 + 15, FIRST + 60 * 14)]  # one warm-up day plus today's 15 closed bars
+    # one warm-up day plus today's 15 closed bars: the session's own start, then the replay of the
+    # end-of-session check (which rebuilds the same warm-up from the month files and the stored bars)
+    assert seen == [(390 + 15, FIRST + 60 * 14)] * 2
     first_rows = updates[0]
     assert first_rows == 0  # no algo update happened on the 15 warm-up bars: its data starts empty
     assert result.times("AAPL")[0] == "09:45" and not result.run().fills
+
+
+def test_a_symbol_that_starts_later_than_the_others_is_not_missing_the_minutes_of_its_warmup(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """TSLA's snapshot was taken a moment later than the others' (the requests are spaced): the
+    minute 09:44 closed in between, so it is in TSLA's warm-up and the first live bar of the
+    others. The stamp 09:44 has no TSLA bar, but TSLA is not missing it: `missing_minutes` counts
+    from a symbol's first fed minute."""
+    rig.server_epoch = ep(9, 45, 0)
+    set_backfills(rig, ("AAPL", "MSFT"), last_closed=13)
+    set_backfills(rig, ("TSLA",), last_closed=14)
+    script_minutes(rig, ("AAPL", "MSFT"), 14, 24)
+    script_minutes(rig, ("TSLA",), 15, 24)
+    rig.end_at(8, symbols=3)
+    result = session(rig, tmp_path, stores, minutes=8)
+    text = rig.text
+    assert result.code == 0, text
+    assert result.times("AAPL")[0] == "09:44" and result.times("TSLA")[0] == "09:45", text
+    fed = {s: result.counts()[(s, "fed", None)] for s in SYMBOLS}
+    assert fed["AAPL"] == fed["MSFT"] == fed["TSLA"] + 1
+    assert dict(result.run().summary.data.missing_minutes or ()) == dict.fromkeys(SYMBOLS, 0)
+    assert "verify: VERIFIED" in text
+
+
+class LockingStore(SqliteStore):
+    """A store whose database is taken by another connection from its n-th step write on: for
+    `release_after` attempts (a dashboard looking at it for a moment), or for good (None)."""
+
+    def __init__(self, *args: Any, lock_at: int, release_after: int | None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.lock_at, self.release_after = lock_at, release_after
+        self.writes = 0
+        self.attempts = 0
+        self.other: Any = None
+
+    def write_live_step(self, run_id: int, step: Any) -> None:
+        import sqlite3
+
+        self.writes += 1
+        if self.writes == self.lock_at:
+            self.other = sqlite3.connect(self._path, isolation_level=None)
+            self.other.execute("BEGIN IMMEDIATE")
+        if self.other is not None:
+            self.attempts += 1
+            if self.release_after is not None and self.attempts > self.release_after:
+                self.unlock()
+        super().write_live_step(run_id, step)
+
+    def unlock(self) -> None:
+        if self.other is not None:
+            self.other.execute("ROLLBACK")
+            self.other.close()
+            self.other = None
+
+
+def test_a_database_held_for_a_moment_does_not_lose_or_double_anything_in_a_session(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
+    standard_script(rig, last=9, minutes=12)
+    store = LockingStore(tmp_path / "runs.db", clock=rig.wall, env={}, busy_timeout=0.05,
+                         lock_at=4, release_after=2)
+    result = session(rig, tmp_path, stores, store=store, minutes=12)
+    text = rig.text
+    assert result.code == 0, text
+    assert store.other is None and store.attempts >= 3  # it was busy, and was written anyway
+    assert result.times("AAPL") == [f"09:{m}" for m in range(30, 40)]
+    assert result.counts()[("AAPL", "fed", None)] == 10
+    assert "Live session: completed, end reason minutes_elapsed (exit 0)" in text
+    assert "verify: VERIFIED" in text and verify_stored(result, tmp_path) == 0
+
+
+def test_a_database_that_stays_held_ends_the_session_and_the_last_line_says_what_is_stored(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
+    standard_script(rig, last=9, minutes=12)
+    store = LockingStore(tmp_path / "runs.db", clock=rig.wall, env={}, busy_timeout=0.05,
+                         lock_at=4, release_after=None)
+    try:
+        result = session(rig, tmp_path, stores, store=store, minutes=12)
+        text = rig.text
+        lines = text.splitlines()
+        assert result.code == 4, text
+        assert lines[-1].startswith("Live session: the run could not be closed: still marked "
+                                    "running in the database"), lines[-3:]
+        assert "the database stayed busy" in lines[-1] and "(exit 4)" in lines[-1]
+        assert "Live session: failed, end reason" not in text  # never claims what was not stored
+        assert "ERROR StoreBusyError" in text or "ERROR StoreError" in text
+    finally:
+        store.unlock()
+    summary = store.list_runs()[0]
+    assert summary.status == "running", summary  # what the last line said
+    assert len(result.times("AAPL")) == 3  # the three steps before the lock were stored
 
 
 def test_a_live_bar_not_after_the_symbols_newest_minute_is_not_given_on(
@@ -710,7 +806,8 @@ def test_f1_a_symbol_with_no_measured_lag_does_not_let_minutes_go_without_it(
         rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
     """MSFT's backfill holds only the previous session and its first update comes 15 minutes late:
     its lag is unmeasured. AAPL and TSLA are live. Minutes must not be released without MSFT (they
-    would arrive late); after STREAM_WAIT_LIMIT s the driver ends the run: no data."""
+    would arrive late). A symbol that shows no bar at all is a silent symbol after SILENT_LIMIT
+    (600 s), which is before STREAM_WAIT_LIMIT (900 s): the session ends with a data fault."""
     rig.backfills["MSFT"] = [[(ep(9, 30) - 86400 + 60 * k, 99.0, 99.5, 98.8, 99.2, 10) for k in range(5)]]
     script_minutes(rig, ("AAPL", "TSLA"), 0, 12)
     script_minutes(rig, ("MSFT",), 0, 3, delay={"MSFT": 900})
@@ -718,12 +815,82 @@ def test_f1_a_symbol_with_no_measured_lag_does_not_let_minutes_go_without_it(
     rig.end_at(12, symbols=3)
     result = session(rig, tmp_path, stores, minutes=12)
     text = rig.text
-    assert result.code == 6, text
+    assert result.code == 7, text
     summary = result.store.list_runs()[0]
-    assert (summary.status, summary.end_reason) == ("failed", "no_data")
+    assert (summary.status, summary.end_reason) == ("failed", "data_fault")
     assert all(result.counts()[(s, "fed", None)] == 0 for s in SYMBOLS)  # held, never released alone
     assert all(result.counts()[(s, "late", None)] == 0 for s in SYMBOLS)
-    assert "no lag measured for a symbol" in text
+    assert "MSFT has shown no bar and no decision" in text
+
+
+def test_the_stream_clock_may_stay_unmeasured_for_900_seconds_and_not_longer(
+        tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """`no_data` after STREAM_WAIT_LIMIT s with `stream_now` unmeasured while every symbol is alive
+    (a symbol that shows nothing is a silent symbol, a data fault, after 600 s)."""
+    assert live_run.STREAM_WAIT_LIMIT == 900.0
+    write_warmup_files(tmp_path / "bars")
+    given = UnitSession(tmp_path, stores).session
+
+    class Quiet:
+        def is_down(self) -> bool:
+            return False
+
+        def request_stop(self, reason: str) -> None:
+            pass
+
+    given.watcher = Quiet()  # type: ignore[assignment]
+    states = {s: StreamState(None, False, True) for s in SYMBOLS}
+    start = FIRST + 10
+
+    def look(elapsed: float) -> None:
+        for symbol in SYMBOLS:
+            given.alive_at[symbol] = start + elapsed - 30.0  # alive: not silent
+        given._check_faults(StreamClock(start + elapsed, None), states)  # noqa: SLF001
+
+    for elapsed in (0.0, 300.0, 301.0, 600.0, 899.0, 900.0):
+        look(elapsed)
+        assert given.fault is None, elapsed
+    look(901.0)
+    assert given.fault is not None and given.fault.reason == "no_data"
+    assert given.fault.code == 6 and "for 900 s of the session" in given.fault.message
+
+
+def test_the_aligner_is_polled_with_the_stream_clock_not_with_server_time(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """Every stream runs about 100 s behind IB's clock (below the delayed-data threshold), and the
+    last bar of each symbol is closed by time. The aligner must release a minute only when the
+    STREAM has passed it: polled with server time it would release minutes whose bars have not
+    arrived yet, and those bars would come late (a data fault)."""
+    script_minutes(rig, SYMBOLS, 0, 9, delay=dict.fromkeys(SYMBOLS, 100))
+    ticks(rig, FIRST + 700, FIRST + 900, 10)
+    rig.end_at(14, symbols=3)
+    result = session(rig, tmp_path, stores, minutes=14)
+    text = rig.text
+    assert result.code == 0, text
+    assert result.store.list_runs()[0].end_reason == "minutes_elapsed"
+    for symbol in SYMBOLS:
+        assert result.times(symbol) == [f"09:{m}" for m in range(30, 40)], text  # the last by time
+        assert result.counts()[(symbol, "late", None)] == 0
+    assert "late bars" not in text and "came late" not in text
+
+
+def test_a_halt_of_several_minutes_at_the_open_does_not_end_a_healthy_session(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """No symbol shows a bar of today for 8 minutes (a delayed opening): `stream_now` is unmeasured
+    all that time, which is more than the old 300 s limit and less than the present one, and
+    the session goes on once the bars flow."""
+    for symbol in SYMBOLS:
+        rig.backfills[symbol] = [[(ep(9, 30) - 86400 + 60 * k, 99.0, 99.5, 98.8, 99.2, 10)
+                                  for k in range(5)]]
+    script_minutes(rig, SYMBOLS, 8, 16)
+    ticks(rig, FIRST + 20, FIRST + 700, 10)
+    rig.end_at(14, symbols=3)
+    result = session(rig, tmp_path, stores, minutes=14)
+    text = rig.text
+    assert result.code == 0, text
+    assert result.store.list_runs()[0].end_reason == "minutes_elapsed"
+    assert "no lag measured" not in text
+    assert result.counts()[("AAPL", "fed", None)] > 0
 
 
 # -- (k) heartbeat -----------------------------------------------------------------------

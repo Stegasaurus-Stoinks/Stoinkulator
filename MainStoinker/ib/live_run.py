@@ -35,8 +35,10 @@ The sequence of a session
    is what it costs).
 6. The end, on EVERY path (watcher stopped, connection closed, not paper, Ctrl-C, fault, error):
    one last poll of what is decided, `engine.end_live()` (open positions are LEFT OPEN and listed
-   in the output), then `writer.finish(status, reason, counts, data_meta)` with the gap rule, the
-   counts and the full `DataMeta`; then the end-of-session check of the stored run
+   in the output), then `writer.finish(status, reason, counts, data_meta, engine.gap_report)` with
+   the counts and the full `DataMeta` (the last output line says what was STORED: a run that could
+   not be closed is "still marked running in the database"); then the end-of-session check of the
+   stored run
    (`report --verify`, printed; an UNVERIFIABLE verdict is an alarm about the record, a MISMATCH
    about the engine; neither changes the exit code).
 
@@ -48,7 +50,9 @@ Warm-up, backfill and live (the hand-over rule)
   exactly the closed bars of each symbol's FIRST backfill snapshot (also those a file of an
   earlier run already holds). They are appended to that symbol's warm-up frame: algos see them in
   the frame, but no algo is updated on them and nothing trades on them (D1). A bar still forming in
-  the snapshot is not among them: it comes later, closed live.
+  the snapshot is not among them: it comes later, closed live. They are stored in the run's warm-up
+  description (`today_bars`, digest `today_sha256`), which is what lets `report --verify` rebuild
+  the warm-up of a session that started after the open.
 * Everything else (`how` `later`, `time`, `backfilled`) is a live bar and goes to the aligner at
   once, also while the engine has not started yet. The first bar stepped of a symbol is the first
   one the aligner releases for it.
@@ -150,7 +154,7 @@ from MainStoinker.engine.live_counts import (
     LIVE_KINDS,
 )
 from MainStoinker.engine.live_feed import LATE, LiveBarAligner
-from MainStoinker.engine.live_store import CountSpec, LiveRunWriter
+from MainStoinker.engine.live_store import CountSpec, FinishOutcome, LiveRunWriter, describe_today_bars
 from MainStoinker.engine.modes import DEFAULT_MODE, ModeError, build_router
 from MainStoinker.engine.paper_broker import CostModel
 from MainStoinker.engine.run_documents import liveness
@@ -193,7 +197,8 @@ STEP_HARD_SECONDS = 60.0  # a step slower than this ends the run (`step_too_slow
 STALE_BATCH_AGE = 300.0  # a batch released this long after its minute ended is history: not stepped
 HEARTBEAT_EVERY = 20.0  # wall seconds without a write before the run is touched (< HEARTBEAT_INTERVAL)
 SESSION_END_MARGIN = 60.0  # seconds after 16:20 server time at which a session ends anyway
-STREAM_WAIT_LIMIT = 300.0  # session seconds with `stream_now` unmeasured before `no_data`
+STREAM_WAIT_LIMIT = 900.0  # session seconds with `stream_now` unmeasured before `no_data`
+# (a delayed opening or a halt of several minutes must not end a healthy session)
 SILENT_LIMIT = 600.0  # session seconds a symbol may be without any bar or decision
 STOP_FILE_EVERY = 1.0  # seconds (monotonic clock) between two looks for the stop file
 
@@ -208,8 +213,6 @@ DROP_FIELDS: tuple[tuple[str, str], ...] = (
     ("stalled_stream", "stalled"),
     ("rerequest_gap", "rerequest_gap"),
 )
-
-_STAMP = "%Y-%m-%d %H:%M:%S"
 
 
 class SessionRefused(Exception):
@@ -364,10 +367,11 @@ class _Counts:
     overlap: dict[str, int]  # live bars not given on: not after the symbol's newest minute
     late_allowed: dict[str, int]  # late bars of a re-requested backfill
     late_other: dict[str, int]  # late bars of any other kind: a fault
+    span: dict[str, int]  # stepped minutes from the symbol's first fed minute (missing = span - fed)
 
     @classmethod
     def new(cls, symbols: Sequence[str]) -> _Counts:
-        return cls(*(dict.fromkeys(symbols, 0) for _ in range(5)))
+        return cls(*(dict.fromkeys(symbols, 0) for _ in range(6)))
 
 
 @dataclass
@@ -380,6 +384,7 @@ class _Session:
     wall: Callable[[], datetime]
     say: Callable[[str], None]
     devnull: TextIO
+    sleep: Callable[[float], None] | None = None  # the pause between the writer's busy retries
     aligner: LiveBarAligner = field(init=False)
     counts: _Counts = field(init=False)
     watcher: Watcher | None = None
@@ -559,17 +564,16 @@ class _Session:
                                                         plan.warmup_days)
         frames = {s: f.copy() for s, f in frames.items()}
         description = dict(description)
-        added: dict[str, list[list[Any]]] = {}
         for symbol in plan.symbols:
             bars = sorted(self.warm_today[symbol], key=lambda b: b.time)
-            added[symbol] = [[b.date.strftime(_STAMP), b.open, b.high, b.low, b.close, b.volume]
-                             for b in bars]
             if bars:
                 frames[symbol] = pd.concat([frames[symbol], _frame_of(bars)],
                                            ignore_index=True)[list(COLUMNS)]
         # today's earlier bars are part of the algos' history but not of the month files: a later
-        # check of the run can only rebuild them from here
+        # check of the run (`report --verify`) rebuilds them from here, and checks their digest
+        added, digests = describe_today_bars(self.warm_today)
         description["today_bars"] = added
+        description["today_sha256"] = digests
         self.today = today
         self.started_server = clock.server_now
         self.description = description
@@ -588,7 +592,8 @@ class _Session:
         with self._algo_env():
             self.engine = build_engine(plan.entries, StoredBarsFeed(frames, []), router, ledger,
                                        self.algos)
-        self.writer = LiveRunWriter(self.store, ledger, self.engine.algos)
+        self.writer = LiveRunWriter(self.store, ledger, self.engine.algos,
+                                    **({} if self.sleep is None else {"sleep": self.sleep}))
         metas = [AlgoMeta(cfg["idname"], entry["ID"], cfg["ticker"], router.modes[cfg["idname"]],
                           plan.capital, cfg) for entry in plan.entries for cfg in entry["data"]]
         version = plan.code_version
@@ -673,8 +678,11 @@ class _Session:
         self.longest_step = max(self.longest_step, elapsed)
         self.last_stamp = self.wall()
         self.stamps.append(stamp)
-        for symbol in bars:
-            self.counts.fed[symbol] += 1
+        for symbol in self.plan.symbols:
+            if symbol in bars:
+                self.counts.fed[symbol] += 1
+            if self.counts.fed[symbol]:  # a minute the symbol lacks only counts after its first
+                self.counts.span[symbol] += 1
         if elapsed > STEP_SLOW_SECONDS:
             self.slow_steps.append((_hm(minute), elapsed))
             self.say(f"live: the step of {_hm(minute)} took {elapsed:.1f} s (more than "
@@ -882,7 +890,7 @@ def _data_meta(session: _Session, engine: Engine) -> DataMeta:
         first_bar=stamps[0].to_pydatetime() if stamps else None,
         last_bar=stamps[-1].to_pydatetime() if stamps else None,
         files=session.files, replayed_minutes=len(stamps),
-        missing_minutes=tuple((s, len(stamps) - fed[s]) for s in plan.symbols),
+        missing_minutes=tuple((s, session.counts.span[s] - fed[s]) for s in plan.symbols),
         uncovered_minutes=_uncovered_minutes(stamps), warnings=tuple(warnings),
         gap_rule=engine.gap_report)
 
@@ -901,8 +909,9 @@ def _describe_position(position: LivePosition) -> str:
 
 
 def _finish_run(session: _Session, status: str, reason: str | None, say: Callable[[str], None]
-                ) -> tuple[bool, tuple[LivePosition, ...]]:
-    """Flush, `end_live`, `writer.finish`. Returns (finished cleanly, open positions)."""
+                ) -> tuple[FinishOutcome | None, tuple[LivePosition, ...]]:
+    """Flush, `end_live`, `writer.finish`. Returns (the writer's outcome, open positions); the
+    outcome is None when no run was begun."""
     positions: tuple[LivePosition, ...] = ()
     engine, writer = session.engine, session.writer
     session.flush()
@@ -913,11 +922,28 @@ def _finish_run(session: _Session, status: str, reason: str | None, say: Callabl
         except Exception as exc:  # noqa: BLE001
             say(f"live: end_live raised {type(exc).__name__}: {exc}")
     if writer is None or engine is None or session.run_id is None:
-        return False, positions
-    outcome = writer.finish(status, reason, _counts_of(session), _data_meta(session, engine))  # type: ignore[arg-type]
+        return None, positions
+    outcome = writer.finish(status, reason, _counts_of(session),  # type: ignore[arg-type]
+                            _data_meta(session, engine), engine.gap_report)
     for line in outcome.errors:
         say(f"live: the run's record: {line}")
-    return outcome.ok, positions
+    return outcome, positions
+
+
+def _stored_status_text(outcome: FinishOutcome | None, status: str, reason: str | None) -> str:
+    """What the database says about the run after the session, for the last output line.
+
+    The session's own verdict (`status`, `reason`) is what it meant to store; this is what was
+    stored: the same when the writer closed the run cleanly, otherwise the truth.
+    """
+    if outcome is None or outcome.ok:
+        return f"{status}, end reason {reason}"
+    if outcome.status is None:
+        why = "the database stayed busy" if outcome.busy else "the store refused the end"
+        return (f"the run could not be closed: still marked running in the database ({why}); "
+                f"the session meant {status}, end reason {reason}")
+    return (f"stored as {outcome.status}, end reason {outcome.reason} (the session meant "
+            f"{status}, end reason {reason}; the run's record has errors)")
 
 
 def _verify(session: _Session, store: Store, say: Callable[[str], None]) -> None:
@@ -927,11 +953,6 @@ def _verify(session: _Session, store: Store, say: Callable[[str], None]) -> None
         return
     if not session.stamps:
         say("live: verify: no bar was fed, nothing to verify")
-        return
-    if any(session.warm_today.values()):
-        say("live: verify: not run: the session started after the open, so today's earlier bars "
-            "are warm-up that `report --verify` cannot rebuild yet (they are stored under the run's "
-            "config 'warmup', 'today_bars')")
         return
     try:
         run = store.load_run(session.run_id)
@@ -987,7 +1008,7 @@ def run_live_session(
             setattr(args, name, default)
     args.minutes = plan.minutes
     with open(os.devnull, "w") as devnull:
-        session = _Session(plan, store, clock, wall, say, devnull)
+        session = _Session(plan, store, clock, wall, say, devnull, sleep)
         seams = WatchSeams(extra_sinks=(_Sink(session),), listener=session,
                            on_pass=session.on_pass, minutes=plan.minutes,
                            backfill_since_open=True, on_watcher=session.set_watcher)
@@ -1009,9 +1030,9 @@ def _end(session: _Session, watcher_code: int, store: Store, say: Callable[[str]
         close_algo_logs(session.algos)
         say(f"live: no run was stored ({reason}): nothing was fed")
         return code
-    clean, positions = _finish_run(session, status, reason, say)
+    outcome, positions = _finish_run(session, status, reason, say)
     close_algo_logs(session.algos)
-    if not clean:
+    if outcome is None or not outcome.ok:
         code = code if status == "failed" else EXIT_STOPPED
     say(f"live: run {session.run_id} {status} ({reason}): {sum(session.counts.fed.values())} bar(s) "
         f"fed in {len(session.stamps)} minute(s); fed {_nonzero(session.counts.fed)}, late "
@@ -1030,7 +1051,7 @@ def _end(session: _Session, watcher_code: int, store: Store, say: Callable[[str]
     else:
         say("live: no position left open")
     _verify(session, store, say)
-    say(f"Live session: {status}, end reason {reason} (exit {code})")
+    say(f"Live session: {_stored_status_text(outcome, status, reason)} (exit {code})")
     return code
 
 

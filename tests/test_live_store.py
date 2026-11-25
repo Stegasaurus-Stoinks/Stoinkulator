@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -35,7 +36,15 @@ from MainStoinker.engine.engine import Engine, EngineConfig, LivePosition
 from MainStoinker.engine.feed import Bar, CsvBarFeed
 from MainStoinker.engine.ledger import Ledger
 from MainStoinker.engine.live_counts import HEARTBEAT_INTERVAL, LIVE_KINDS, count_key
-from MainStoinker.engine.live_store import FinishOutcome, LiveRunWriter, LiveWriterError
+from MainStoinker.engine.live_store import (
+    BUSY_PAUSE,
+    BUSY_RETRIES,
+    FinishOutcome,
+    LiveRunWriter,
+    LiveWriterError,
+    describe_today_bars,
+    today_frame,
+)
 from MainStoinker.engine.modes import build_router
 from MainStoinker.engine.paper_broker import CostModel, PaperBroker
 from MainStoinker.engine.router import MappingRouter
@@ -46,7 +55,9 @@ from MainStoinker.engine.stats import fmt4
 from MainStoinker.engine.store import (
     AlgoMeta,
     DataMeta,
+    RunMeta,
     SqliteStore,
+    StoreBusyError,
     StoreError,
     open_store_readonly,
 )
@@ -78,6 +89,21 @@ class Clock:
 
 
 # ------------------------------------------------------------------ the driver
+
+
+def run_config(entries: list, costs: CostModel, capital: Decimal) -> dict[str, Any]:
+    """What a driver passes as `config`: everything `report --verify` needs."""
+    return {"entries": entries, "capital": fmt4(capital),
+            "costs": {"commission_per_share": fmt4(costs.commission_per_share),
+                      "commission_minimum": fmt4(costs.commission_minimum),
+                      "slippage_per_share": fmt4(costs.slippage_per_share)}}
+
+
+def description_of(symbols: Any) -> dict[str, Any]:
+    """A warm-up description that covers `symbols` (the digests are not rebuilt here)."""
+    return {"today": "2025-01-02", "trading_days": 1, "symbols": {
+        s: {"files": [f"{s}_2025-01.csv"], "days": ["2025-01-01"], "warmup_sha256": "0" * 64}
+        for s in symbols}}
 
 
 class FlakyStore(SqliteStore):
@@ -125,13 +151,18 @@ class Driver:
     fed_times: list = field(default_factory=list)
     fills: str = "legacy"
     entries: list = field(default_factory=list)
+    costs: CostModel | None = None
+    capital: Decimal = Decimal("10000")
 
     def start(self) -> int:
+        assert self.costs is not None
         self.run_id = self.writer.begin(
-            fills=self.fills, code_version="test", config={"entries": self.entries},
+            fills=self.fills, code_version="test",
+            config=run_config(self.entries, self.costs, self.capital),
             data=DataMeta(source="live", directory=str(self.out),
                           symbols=tuple(self.feed.symbols())),
-            algos=self.metas, warmup=self.warmup, warmup_description={"today": "2025-01-02"})
+            algos=self.metas, warmup=self.warmup,
+            warmup_description=description_of(self.feed.symbols()))
         self.engine.start_live(self.warmup, on_step=self.writer.on_step)
         return self.run_id
 
@@ -155,8 +186,8 @@ class Driver:
                 (s, "fed", None): self.position for s in self.feed.symbols()},
             DataMeta(source="live", directory=str(self.out), symbols=tuple(self.feed.symbols()),
                      first_bar=first, last_bar=last, replayed_minutes=self.position,
-                     missing_minutes=(), uncovered_minutes=0, warnings=(),
-                     gap_rule=self.engine.gap_report))
+                     missing_minutes=(), uncovered_minutes=0, warnings=()),
+            self.engine.gap_report)
         close_algo_logs(self.algos)
         return self.outcome
 
@@ -184,7 +215,7 @@ def make_driver(env: Env, db: Path, fills: str, *, entries: list | None = None,
                       capital, cfg) for entry in entries for cfg in entry["data"]]
     return Driver(engine, ledger, LiveRunWriter(store, ledger, engine.algos), store, feed,
                   algos, list(feed), {s: feed.warmup(s) for s in feed.symbols()}, metas, out,
-                  fills=fills, entries=entries)
+                  fills=fills, entries=entries, costs=costs, capital=capital)
 
 
 def run_live(env: Env, db: Path, fills: str, **kwargs: Any) -> Driver:
@@ -345,8 +376,7 @@ def test_heartbeat_without_bars_updates_the_last_write(tmp_path: Path) -> None:
     writer = LiveRunWriter(store, ledger, [])
     with pytest.raises(LiveWriterError, match="begin"):
         writer.heartbeat()
-    writer.begin(fills="realistic", code_version="t", config={}, data=DataMeta(source="live"),
-                 algos=[], warmup={})
+    writer.begin(**synth_begin(algos=[]))
     assert store.list_runs()[0].last_write_at == T0
     for _ in range(3):
         clock.now += HEARTBEAT_INTERVAL
@@ -381,7 +411,8 @@ class Synth:
         self.engine.step(bar(index).date, {"AAA": bar(index)})
 
 
-def synth(tmp_path: Path, actions: dict | None = None, store: SqliteStore | None = None) -> Synth:
+def synth(tmp_path: Path, actions: dict | None = None, store: SqliteStore | None = None,
+          sleep: Callable[[float], None] | None = None) -> Synth:
     from tests.test_engine import ListFeed
 
     ledger = Ledger()
@@ -391,19 +422,33 @@ def synth(tmp_path: Path, actions: dict | None = None, store: SqliteStore | None
                     NullSink(), [algo], ledger=ledger)
     db = tmp_path / "synth.db"
     store = store or SqliteStore(db, env=NO_ENV)
-    writer = LiveRunWriter(store, ledger, engine.algos)
-    writer.begin(fills="realistic", code_version="t", config={},
-                 data=DataMeta(source="live", symbols=("AAA",)),
-                 algos=[AlgoMeta("a-AAA", "Script", "AAA", "paper", Decimal(10_000), {})],
-                 warmup=warm("AAA"))
+    writer = LiveRunWriter(store, ledger, engine.algos, sleep=sleep or (lambda _s: None))
+    writer.begin(**synth_begin())
     engine.start_live(warm("AAA"), on_step=writer.on_step)
     return Synth(engine, algo, ledger, writer, store, db)
+
+
+SYNTH_ENTRIES = [{"ID": "Script", "data": [{"idname": "a-AAA", "ticker": "AAA"}]}]
+SYNTH_FED = {("AAA", "fed", None): 0}
+
+
+def synth_begin(**over: Any) -> dict[str, Any]:
+    """The arguments of a valid `begin` of the synthetic one-algo session."""
+    given: dict[str, Any] = dict(
+        fills="realistic", code_version="t",
+        config=run_config(SYNTH_ENTRIES, COSTS, Decimal(10_000)),
+        data=DataMeta(source="live", directory="bars", symbols=("AAA",)),
+        algos=[AlgoMeta("a-AAA", "Script", "AAA", "paper", Decimal(10_000), {})],
+        warmup=warm("AAA"), warmup_description=description_of(["AAA"]))
+    given.update(over)
+    return given
 
 
 def finish(s: Synth, status: str = "completed", reason: str | None = "session_end",
            counts: dict | None = None) -> FinishOutcome:
     s.engine.end_live()
-    return s.writer.finish(status, reason, counts or {}, DataMeta(source="live"))  # type: ignore[arg-type]
+    return s.writer.finish(status, reason, SYNTH_FED if counts is None else counts,  # type: ignore[arg-type]
+                           DataMeta(source="live"), s.engine.gap_report)
 
 
 def test_the_final_equity_point_includes_fills_made_by_end_live(tmp_path: Path) -> None:
@@ -560,7 +605,7 @@ def test_finish_never_raises_for_a_dead_store_and_reports_the_original_error(
     assert any("end_run" in e for e in outcome.errors)
     assert isinstance(s.writer.error, StoreError) and "disk full" in str(s.writer.error)
     assert store.load_run(1).summary.status == "running"  # could not be ended: stale by heartbeat
-    assert s.writer.finish("completed", None, {}, DataMeta()) is outcome  # a second call is inert
+    assert s.writer.finish("completed", None, {}, DataMeta(), s.engine.gap_report) is outcome  # inert
 
 
 def test_a_refused_end_reason_still_ends_the_run_failed(tmp_path: Path) -> None:
@@ -578,8 +623,7 @@ def test_a_refused_end_reason_still_ends_the_run_failed(tmp_path: Path) -> None:
 def test_begin_twice_is_refused_and_a_finished_writer_takes_no_more(tmp_path: Path) -> None:
     s = synth(tmp_path)
     with pytest.raises(LiveWriterError, match="already"):
-        s.writer.begin(fills="realistic", code_version="t", config={},
-                       data=DataMeta(), algos=[], warmup={})
+        s.writer.begin(**synth_begin())
     assert finish(s).ok
     with pytest.raises(LiveWriterError, match="finished"):
         s.writer.heartbeat()
@@ -608,7 +652,7 @@ def test_finish_stores_counts_through_count_key_and_the_full_data_meta(
         assert data.replayed_minutes == 60 and data.symbols == ("AAPL",)
         assert data.gap_rule == driver.engine.gap_report
         assert run.summary.end_reason == "minutes_elapsed"
-        assert run.config["warmup"] == {"today": "2025-01-02"}
+        assert run.config["warmup"] == description_of(["AAPL"])
         assert run.config["entries"] == driver.entries
     finally:
         store.close()
@@ -617,7 +661,7 @@ def test_finish_stores_counts_through_count_key_and_the_full_data_meta(
 def test_a_bad_count_key_ends_the_run_failed(tmp_path: Path) -> None:
     s = synth(tmp_path)
     s.step(0)
-    outcome = finish(s, counts={("AAA", "dropped", "bogus"): 1})
+    outcome = finish(s, counts={("AAA", "fed", None): 1, ("AAA", "dropped", "bogus"): 1})
     assert outcome.status == "failed" and outcome.reason == "error"
     assert "counts" in outcome.errors[0]
     assert s.store.load_counts(1) == {}
@@ -732,3 +776,343 @@ def test_the_stored_bars_replay_to_the_stored_fills(
     assert driver.positions  # the replay's synthetic closes are the live open positions
     assert sorted((r.account, r.quantity) for r in ledger.round_trips if r.synthetic) == sorted(
         (p.account, p.quantity) for p in driver.positions)
+
+
+# ------------------------------------------------------------------ the guards of begin (issue 217)
+
+
+def bare_writer(tmp_path: Path) -> tuple[LiveRunWriter, SqliteStore]:
+    store = SqliteStore(tmp_path / "guards.db", env=NO_ENV)
+    return LiveRunWriter(store, Ledger(), []), store
+
+
+def test_begin_accepts_the_valid_run_and_a_legacy_run_without_costs(tmp_path: Path) -> None:
+    writer, store = bare_writer(tmp_path)
+    config = run_config(SYNTH_ENTRIES, COSTS, Decimal(10_000))
+    config["costs"] = None
+    assert writer.begin(**synth_begin(fills="legacy", config=config)) == 1
+    assert store.list_runs()[0].kind == "paper-live"
+    store.close()
+
+
+@pytest.mark.parametrize("name,over,words", [
+    ("last_bar", dict(data=DataMeta(source="live", directory="bars", symbols=("AAA",),
+                                    last_bar=datetime(2025, 1, 2, 9, 31))), "last_bar is set"),
+    ("windows path", dict(data=DataMeta(source="live", directory="bars", symbols=("AAA",),
+                                        warnings=(r"file C:\Users\x\bars\AAA.csv is odd",))),
+     "a warning contains a path"),
+    ("posix path", dict(data=DataMeta(source="live", directory="bars", symbols=("AAA",),
+                                      warnings=("read /home/x/bars/AAA.csv",))),
+     "a warning contains a path"),
+    ("no entries", dict(config={"capital": "1.0000", "costs": run_config(
+        SYNTH_ENTRIES, COSTS, Decimal(1))["costs"]}), "no `entries`"),
+    ("empty entries", dict(config=run_config([], COSTS, Decimal(1))), "no `entries`"),
+    ("no capital", dict(config={"entries": SYNTH_ENTRIES, "costs": run_config(
+        SYNTH_ENTRIES, COSTS, Decimal(1))["costs"]}, algos=[]), "no capital"),
+    ("no costs", dict(config={"entries": SYNTH_ENTRIES, "capital": "1.0000"}), "no `costs`"),
+    ("partial costs", dict(config={"entries": SYNTH_ENTRIES, "capital": "1.0000",
+                                   "costs": {"commission_per_share": "0.0050"}}), "no `costs`"),
+    ("no description", dict(warmup_description=None), "no warm-up description"),
+    ("no symbols in description", dict(warmup_description={"today": "2025-01-02"}),
+     "has no `symbols`"),
+    ("symbol not described", dict(warmup_description=description_of(["ZZZ"])),
+     "does not cover AAA"),
+    ("description without digest", dict(warmup_description={"symbols": {"AAA": {
+        "files": ["a"], "days": ["2025-01-01"]}}}), "does not cover AAA"),
+    ("no directory", dict(data=DataMeta(source="live", symbols=("AAA",))), "data.directory"),
+    ("no symbols", dict(data=DataMeta(source="live", directory="bars")), "data.symbols is empty"),
+    ("other symbols", dict(data=DataMeta(source="live", directory="bars", symbols=("BBB",)),
+                           warmup_description=description_of(["BBB"])), "not the algos' tickers"),
+])
+def test_begin_refuses_a_run_that_could_not_be_verified_or_holds_what_it_must_not(
+    tmp_path: Path, name: str, over: dict[str, Any], words: str
+) -> None:
+    writer, store = bare_writer(tmp_path)
+    with pytest.raises(LiveWriterError, match="begin\\(\\) refused") as caught:
+        writer.begin(**synth_begin(**over))
+    assert words in str(caught.value), (name, str(caught.value))
+    assert store.list_runs() == () and writer.run_id is None  # nothing was stored
+    store.close()
+
+
+def test_begin_names_every_problem_at_once(tmp_path: Path) -> None:
+    writer, store = bare_writer(tmp_path)
+    with pytest.raises(LiveWriterError) as caught:
+        writer.begin(**synth_begin(
+            config={}, data=DataMeta(source="live", last_bar=datetime(2025, 1, 2)),
+            warmup_description=None))
+    for words in ("last_bar", "no `entries`", "no `costs`", "data.directory", "data.symbols",
+                  "no warm-up description"):
+        assert words in str(caught.value)
+    store.close()
+
+
+def today_rows(count: int) -> list[list[Any]]:
+    return [[f"2025-01-02 09:{30 + i}:00", 10.0 + i, 10.5 + i, 9.5 + i, 10.25 + i, 100 + i]
+            for i in range(count)]
+
+
+def test_begin_checks_the_today_bars_against_their_digest_and_the_warmup_frames(
+    tmp_path: Path
+) -> None:
+    rows = today_rows(3)
+    bars = {"AAA": [Bar(pd.Timestamp(r[0]), 0, *r[1:5], r[5]) for r in rows]}
+    described, digests = describe_today_bars(bars)
+    assert described == {"AAA": rows} and set(digests) == {"AAA"}
+    frames = {"AAA": pd.concat([warm("AAA")["AAA"], today_frame(rows)], ignore_index=True)}
+    good = dict(description_of(["AAA"]), today_bars=described, today_sha256=digests)
+    writer, store = bare_writer(tmp_path)
+    assert writer.begin(**synth_begin(warmup=frames, warmup_description=good)) == 1
+    stored_description = store.load_run(1).config["warmup"]
+    assert stored_description["today_bars"] == described
+    assert stored_description["today_sha256"] == digests
+    store.close()
+    for number, (bad, words) in enumerate((
+        (dict(good, today_sha256={}), "no matching `today_sha256`"),
+        (dict(good, today_sha256={"AAA": "0" * 64}), "no matching `today_sha256`"),
+        (dict(good, today_bars={"AAA": today_rows(2)}), "no matching `today_sha256`"),
+        (dict(good, today_bars="x"), "not a mapping"),
+    )):
+        writer, store = bare_writer(tmp_path / f"bad{number}")
+        with pytest.raises(LiveWriterError, match=words):
+            writer.begin(**synth_begin(warmup=frames, warmup_description=bad))
+        store.close()
+    # the engine's frames must end with exactly those bars
+    writer, store = bare_writer(tmp_path / "frames")
+    with pytest.raises(LiveWriterError, match="does not end with the 3 today_bars"):
+        writer.begin(**synth_begin(warmup=warm("AAA"), warmup_description=good))
+    store.close()
+
+
+# ------------------------------------------------------------------ the guards of finish (issue 217)
+
+
+def test_finish_takes_the_gap_report_as_a_required_argument(tmp_path: Path) -> None:
+    s = synth(tmp_path)
+    s.step(0)
+    s.engine.end_live()
+    with pytest.raises(TypeError, match="gap_rule"):
+        s.writer.finish("completed", "session_end", SYNTH_FED, DataMeta())  # type: ignore[call-arg]
+    with pytest.raises(LiveWriterError, match="gap report"):
+        s.writer.finish("completed", "session_end", SYNTH_FED, DataMeta(), None)  # type: ignore[arg-type]
+    assert s.store.load_run(1).summary.status == "running"  # nothing was written, nothing lost
+    outcome = s.writer.finish("completed", "session_end", SYNTH_FED, DataMeta(),
+                              s.engine.gap_report)
+    assert outcome.ok
+    assert s.store.load_run(1).summary.data.gap_rule == s.engine.gap_report
+
+
+def test_finish_stores_the_gap_report_whatever_the_data_meta_says(tmp_path: Path) -> None:
+    from MainStoinker.engine.gaprule import GapRuleReport
+
+    s = synth(tmp_path)
+    s.step(0)
+    s.engine.end_live()
+    outcome = s.writer.finish("completed", "session_end", SYNTH_FED,
+                              DataMeta(source="live", gap_rule=GapRuleReport()), s.engine.gap_report)
+    assert outcome.ok
+    assert s.store.load_run(1).summary.data.gap_rule == s.engine.gap_report
+
+
+def test_finish_flags_missing_fed_counts_and_a_completed_run_is_ended_failed(
+    tmp_path: Path
+) -> None:
+    s = synth(tmp_path)
+    s.step(0)
+    outcome = finish(s, "completed", "session_end", counts={("AAA", "late", None): 0})
+    assert not outcome.ok and outcome.status == "failed" and outcome.reason == "error"
+    assert "no fed count for AAA" in outcome.errors[0]
+    run = s.store.load_run(1)
+    assert (run.summary.status, run.summary.end_reason) == ("failed", "error")
+    assert s.store.load_counts(1) == {"symbol": {count_key("AAA", "late"): 0}}
+
+
+def test_finish_flags_missing_fed_counts_of_a_failed_run_without_changing_its_reason(
+    tmp_path: Path
+) -> None:
+    s = synth(tmp_path)
+    s.step(0)
+    outcome = finish(s, "failed", "interrupted", counts={})
+    assert not outcome.ok and outcome.status == "failed" and outcome.reason == "interrupted"
+    assert "no fed count for AAA" in outcome.errors[0]
+
+
+# ------------------------------------------------------------------ a busy database (issue 217)
+
+
+class Holder:
+    """A second real connection that holds the database's write lock until `release()`."""
+
+    def __init__(self, db: Path) -> None:
+        self._con = sqlite3.connect(db, isolation_level=None)
+        self.held = False
+
+    def hold(self) -> None:
+        self._con.execute("BEGIN IMMEDIATE")
+        self.held = True
+
+    def release(self) -> None:
+        if self.held:
+            self._con.execute("ROLLBACK")
+            self.held = False
+
+    def close(self) -> None:
+        self.release()
+        self._con.close()
+
+
+class Napper:
+    """The injected sleep: records every pause and releases the lock on the n-th one."""
+
+    def __init__(self, holder: Holder | None = None, release_on: int | None = None) -> None:
+        self.holder, self.release_on = holder, release_on
+        self.pauses: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        if self.holder is not None and self.release_on == len(self.pauses):
+            self.holder.release()
+
+
+def busy_store(tmp_path: Path) -> SqliteStore:
+    return SqliteStore(tmp_path / "synth.db", env=NO_ENV, busy_timeout=0.05)
+
+
+def test_a_locked_database_raises_a_busy_error_and_other_failures_do_not(tmp_path: Path) -> None:
+    store = busy_store(tmp_path)
+    run_id = store.begin_run(RunMeta(kind="paper-live", fills="realistic", code_version="t"))
+    holder = Holder(tmp_path / "synth.db")
+    holder.hold()
+    try:
+        with pytest.raises(StoreBusyError) as caught:
+            store.touch(run_id)
+        assert isinstance(caught.value, StoreError)  # callers that catch StoreError still do
+    finally:
+        holder.close()
+    with pytest.raises(StoreError) as other:
+        store.touch(999)  # no such run: not a busy database
+    assert not isinstance(other.value, StoreBusyError)
+    store.touch(run_id)  # the connection is usable again
+    store.close()
+
+
+def test_a_step_write_is_retried_while_the_database_is_busy_and_nothing_is_lost_or_doubled(
+    tmp_path: Path
+) -> None:
+    holder = Holder(tmp_path / "synth.db")
+    store = busy_store(tmp_path)
+    nap = Napper(holder, release_on=2)  # the lock goes on the second pause
+    s = synth(tmp_path, {1: lambda a, t: a.enter(t), 3: lambda a, t: a.enter(t)}, store, sleep=nap)
+    try:
+        s.step(0)
+        s.step(1)
+        holder.hold()
+        s.step(2)  # busy twice, then written, inside this one step
+        assert nap.pauses == [BUSY_PAUSE, BUSY_PAUSE] and s.writer.error is None
+        s.step(3)
+        outcome = finish(s, counts={("AAA", "fed", None): 4})
+    finally:
+        holder.close()
+    assert outcome.ok and nap.pauses == [BUSY_PAUSE, BUSY_PAUSE]
+    run = s.store.load_run(1)
+    assert run.fills == s.ledger.fills and run.order_events == s.ledger.orders
+    assert len(run.fills) >= 1
+    assert [r[1] for r in bars_table(s.db)] == [bar(i).date.isoformat() for i in range(4)]
+    con = sqlite3.connect(s.db)
+    try:  # no equity point twice
+        assert con.execute("SELECT COUNT(*) - COUNT(DISTINCT algo || time) FROM equity"
+                           " WHERE algo IS NOT NULL").fetchone() == (0,)
+    finally:
+        con.close()
+    store.close()
+
+
+def test_a_database_that_stays_busy_fails_the_step_after_the_bounded_retries(
+    tmp_path: Path
+) -> None:
+    holder = Holder(tmp_path / "synth.db")
+    store = busy_store(tmp_path)
+    nap = Napper()
+    s = synth(tmp_path, store=store, sleep=nap)
+    try:
+        s.step(0)
+        holder.hold()
+        with pytest.raises(StoreBusyError):
+            s.step(1)
+        assert nap.pauses == [BUSY_PAUSE] * BUSY_RETRIES
+        assert sum(nap.pauses) == pytest.approx(BUSY_RETRIES * BUSY_PAUSE) and sum(nap.pauses) <= 5.0
+        assert isinstance(s.writer.error, StoreBusyError)
+    finally:
+        holder.close()
+    store.close()
+
+
+def test_finish_retries_every_part_and_succeeds_when_the_lock_goes(tmp_path: Path) -> None:
+    holder = Holder(tmp_path / "synth.db")
+    store = busy_store(tmp_path)
+    nap = Napper(holder, release_on=1)
+    s = synth(tmp_path, {1: lambda a, t: a.enter(t)}, store, sleep=nap)
+    try:
+        for i in range(3):
+            s.step(i)
+        holder.hold()
+        outcome = finish(s, counts={("AAA", "fed", None): 3})
+    finally:
+        holder.close()
+    assert outcome.ok and outcome.status == "completed" and not outcome.busy
+    assert nap.pauses == [BUSY_PAUSE]
+    run = s.store.load_run(1)
+    assert run.summary.status == "completed" and run.fills == s.ledger.fills
+    assert run.summary.data.gap_rule == s.engine.gap_report
+    assert s.store.load_counts(1) == {"symbol": {count_key("AAA", "fed"): 3}}
+    store.close()
+
+
+def test_finish_retries_end_run_when_the_lock_comes_back_just_before_it(tmp_path: Path) -> None:
+    holder = Holder(tmp_path / "synth.db")
+    nap = Napper(holder, release_on=2)
+
+    class LockBeforeEnd(SqliteStore):
+        def update_run_data(self, run_id: int, data: DataMeta) -> None:
+            super().update_run_data(run_id, data)
+            holder.hold()  # the dashboard grabs the database between two parts of finish
+
+    store = LockBeforeEnd(tmp_path / "synth.db", env=NO_ENV, busy_timeout=0.05)
+    s = synth(tmp_path, store=store, sleep=nap)
+    try:
+        s.step(0)
+        outcome = finish(s, counts={("AAA", "fed", None): 1})
+    finally:
+        holder.close()
+    assert outcome.ok and outcome.status == "completed"
+    assert nap.pauses == [BUSY_PAUSE, BUSY_PAUSE]
+    assert s.store.load_run(1).summary.status == "completed"
+    store.close()
+
+
+def test_finish_with_a_database_that_never_frees_is_bounded_and_says_the_run_is_still_running(
+    tmp_path: Path
+) -> None:
+    holder = Holder(tmp_path / "synth.db")
+    store = busy_store(tmp_path)
+    nap = Napper()
+    s = synth(tmp_path, store=store, sleep=nap)
+    try:
+        s.step(0)
+        holder.hold()
+        outcome = finish(s, counts={("AAA", "fed", None): 1})
+        # the first part (the final write) and end_run use all their retries, counts and data one try
+        assert len(nap.pauses) == 2 * BUSY_RETRIES and set(nap.pauses) == {BUSY_PAUSE}
+    finally:
+        holder.close()
+    assert not outcome.ok and outcome.status is None and outcome.reason is None and outcome.busy
+    assert any("the run could not be closed" in e and "still marked running" in e
+               for e in outcome.errors)
+    assert s.store.load_run(1).summary.status == "running"  # what the outcome says is what is stored
+    assert s.writer.finish("completed", None, {}, DataMeta(), s.engine.gap_report) is outcome
+    store.close()
+
+
+def test_the_retry_constants_are_a_few_seconds_in_total() -> None:
+    assert BUSY_RETRIES >= 3 and 0 < BUSY_PAUSE <= 2.0
+    assert BUSY_RETRIES * BUSY_PAUSE <= 5.0
