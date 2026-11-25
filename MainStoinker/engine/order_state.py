@@ -18,7 +18,16 @@ Rules (decisions issue 230, task 226, planner rulings on the PR 261 reviews):
   once `Inactive` has been seen the leg counts as not protecting whatever came before or after
   (anomaly `inactive_seen`); when statuses or acks report different quantities the smallest
   counts (anomaly `quantity_conflict`). Both last until `confirm_live` or a terminal status.
-  A legitimate resize upwards therefore raises `quantity_conflict` until the caller confirms.
+  `inactive_seen` requires the caller to request open orders and then `confirm_live` (issue 238);
+  until then the stop is not resized and no new protection is requested.
+  A resize marked sent remembers the reports seen so far; a report first seen afterwards that
+  equals the requested total confirms it and supersedes only those earlier reports, so an entry
+  that fills in parts stays protected with no anomaly; a stale report first seen after the mark
+  still lowers the quantity (`quantity_conflict`), whatever its order against the confirmation.
+  Reports are deduplicated by event (a re-delivered one changes nothing).
+  `confirm_live` is a statement about now, from the same ordered stream (after the broker's
+  end-of-open-orders marker); it refuses a leg that was never bound, and it keeps a sent cancel
+  (the leg stays not protecting until a terminal status or a refusal of the cancel).
 * Terminal statuses: Filled (by executions) > Rejected > Cancelled; a contradictory pair is
   kept deterministic and recorded as a `status_conflict` anomaly. Inactive is NOT final.
 * The exec-id correction format (`X.NN`, highest suffix wins) is an ASSUMPTION to check against
@@ -208,7 +217,11 @@ class OrderLifecycle:
         self.symbol = symbol
         self.order_id = order_id
         self._ordered = quantity
-        self._reported: set[int] = set()  # quantities the broker has reported; the smallest counts
+        # Ack/Status events that report a quantity (deduped by event), the resizes marked sent
+        # (total, reports seen before the mark) and quantities fixed by `confirm_live`.
+        self._reports: set[Ack | Status] = set()
+        self._marks: list[tuple[int, frozenset[Ack | Status]]] = []
+        self._synthetic: set[int] = set()
         self._quantities = {quantity}
         self._by_base: dict[str, tuple[int, Execution]] = {}
         self._exec_ids: set[str] = set()
@@ -248,28 +261,50 @@ class OrderLifecycle:
                 return Applied.DUPLICATE
             self._seen.add(event)
             return self._execution(event, was_terminal)
-        before = (self._working_seen, self._inactive_ever, frozenset(self._reported),
+        before = (self._working_seen, self._inactive_ever, frozenset(self._reports),
                   frozenset(self._terminals), self._status_fill_seen)
         if isinstance(event, Rejected):
             self._terminals.add(OrderState.REJECTED)
         elif isinstance(event, Ack):
             self._working_seen = True
-            self._confirm(event.quantity)
+            self._confirm(event)
         elif self._status(event) is Applied.IGNORED:
             return Applied.IGNORED
-        after = (self._working_seen, self._inactive_ever, frozenset(self._reported),
+        after = (self._working_seen, self._inactive_ever, frozenset(self._reports),
                  frozenset(self._terminals), self._status_fill_seen)
         if was_terminal:
             return Applied.LATE
         return Applied.APPLIED if after != before else Applied.DUPLICATE
 
-    def _confirm(self, quantity: int | None) -> None:
-        if quantity is not None and quantity > 0:
-            self._reported.add(quantity)
-            self._quantities.add(quantity)
+    def _confirm(self, event: Ack | Status) -> None:
+        if event.quantity is not None and event.quantity > 0:
+            self._reports.add(event)
+            self._quantities.add(event.quantity)
+
+    def mark_resize(self, total: int) -> None:
+        """A modify to this total quantity was sent: the reports seen so far are remembered. A report
+        first seen afterwards that equals `total` confirms it and supersedes exactly those earlier
+        reports; any other report first seen afterwards still counts (and can raise a conflict)."""
+        self._marks.append((total, frozenset(self._reports)))
+
+    @property
+    def reported_quantities(self) -> tuple[int, ...]:
+        """The reported quantities that still count (superseded ones left out), sorted."""
+        superseded: set[Ack | Status] = set()
+        for total, before in self._marks:
+            if any(e.quantity == total for e in self._reports if e not in before):
+                superseded |= before
+        counted = {e.quantity for e in self._reports if e not in superseded and e.quantity}
+        return tuple(sorted(counted | self._synthetic))
+
+    @property
+    def order_quantity(self) -> int:
+        return self._ordered
 
     def confirm_live(self, quantity: int) -> None:
-        """Reconciliation: an open-orders snapshot shows this order working with this total quantity.
+        """Reconciliation: an open-orders snapshot, taken from the same ordered stream (after the
+        broker's end-of-open-orders marker), shows this order working with this total quantity. It is
+        a statement about now: it overrides every Inactive or quantity event seen so far.
 
         The only way (besides a terminal status) to clear `inactive_seen` and `quantity_conflict`.
         """
@@ -277,7 +312,11 @@ class OrderLifecycle:
             raise ValueError("quantity must be positive")
         if self.is_terminal:
             raise ValueError(f"order {self.order_ref} is {self.state.value}, not live")
-        self._reported = {quantity}
+        if self.order_id is None:
+            raise ValueError(f"order {self.order_ref} has no order id: it was never sent")
+        self._reports = set()
+        self._marks = []
+        self._synthetic = {quantity}
         self._quantities.add(quantity)
         self._inactive_ever = False
         self._working_seen = True
@@ -286,7 +325,7 @@ class OrderLifecycle:
         name = event.status
         if name in _WORKING_STATUSES:
             self._working_seen = True
-            self._confirm(event.quantity)
+            self._confirm(event)
         elif name in _CANCELLED_STATUSES:
             self._terminals.add(OrderState.CANCELLED)
         elif name == "Inactive":
@@ -348,7 +387,8 @@ class OrderLifecycle:
     @property
     def quantity(self) -> int:
         """The smallest quantity the broker has reported (the conservative one), else as ordered."""
-        return min(self._reported) if self._reported else self._ordered
+        reported = self.reported_quantities
+        return reported[0] if reported else self._ordered
 
     @property
     def max_quantity(self) -> int:
@@ -403,8 +443,9 @@ class OrderLifecycle:
             found.add("status_conflict: " + ", ".join(sorted(k.value for k in kinds)))
         if self._inactive_ever and not self._terminals:
             found.add("inactive_seen")
-        if len(self._reported) > 1:
-            found.add("quantity_conflict: " + ", ".join(str(q) for q in sorted(self._reported)))
+        reported = self.reported_quantities
+        if len(reported) > 1:
+            found.add("quantity_conflict: " + ", ".join(str(q) for q in reported))
         return tuple(sorted(found))
 
     @property
@@ -575,6 +616,7 @@ class BracketState:
             raise ValueError(
                 f"resize of {role} to {quantity} leaves {quantity - leg.filled_qty} against {self.held} held")
         self._sent_resize[role] = (quantity, leg.quantity)
+        leg.mark_resize(quantity)
 
     def confirm_live(self, role: str, quantity: int) -> None:
         """Reconciliation from an open-orders snapshot: this stop or target is working with this total
@@ -585,11 +627,12 @@ class BracketState:
         leg = self._legs[role]
         if quantity <= leg.filled_qty:
             raise ValueError(f"quantity {quantity} does not exceed the {leg.filled_qty} already filled")
-        leg.confirm_live(quantity)
+        leg.confirm_live(quantity)  # refuses a leg that was never sent
         self._uncertain.discard(role)
         self._reject_notes.pop(role, None)
-        self._sent_cancel.discard(role)
         self._sent_resize.pop(role, None)
+        # A sent cancel is NOT cleared: the snapshot may predate it. The leg stays not protecting
+        # until a terminal status, or a refusal of the cancel (which makes it uncertain again).
 
     # -- events
 

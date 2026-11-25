@@ -867,8 +867,10 @@ def _build(filled: int, marks: list, events: list) -> BracketState:
     return b
 
 
-def _check_invariants(b: BracketState, marks: list) -> None:
+def _check_invariants(b: BracketState, marks: list, applied: list | None = None) -> None:
     cancel_sent = {m[1] for m in marks if m[0] == "cancel"}
+    if any(isinstance(e, Rejected) and e.order_id == 2 for e in applied or ()):
+        cancel_sent.discard("S")  # a refusal puts the cancel back (the leg is uncertain instead)
     s = b.snapshot()
     for role, quantity in s.pending_resizes:
         assert quantity - b.legs[role].filled_qty <= s.held  # requested protection never exceeds held
@@ -895,3 +897,151 @@ def test_random_brackets_order_independent_and_invariants():
             rng.shuffle(shuffled)
             other = _build(filled, marks, shuffled)
             assert view(other) == expected, (filled, marks, events, shuffled)
+
+
+def _check_covering_invariant(b: BracketState) -> None:
+    stop = b.legs["S"]
+    if b.held > 0 and not b.unprotected:
+        reported = stop.reported_quantities
+        smallest = reported[0] if reported else stop.order_quantity
+        assert smallest - stop.filled_qty >= b.held
+
+
+def test_random_brackets_covering_stop_uses_smallest_reported_quantity():
+    rng = random.Random(2262)
+    for _ in range(1200):
+        filled, marks, events = _random_bracket_case(rng)
+        _check_covering_invariant(_build(filled, marks, events))
+
+
+def test_random_brackets_with_confirm_live_mid_script_keep_invariants():
+    """confirm_live is a statement about now: no shuffle equality across the call, only invariants."""
+    rng = random.Random(2263)
+    calls = 0
+    for _ in range(1200):
+        filled, marks, events = _random_bracket_case(rng)
+        cut = rng.randint(0, len(events))
+        b = _build(filled, marks, events[:cut])
+        role = rng.choice("ST")
+        leg = b.legs[role]
+        if not leg.is_terminal and leg.order_id is not None:
+            try:
+                b.confirm_live(role, rng.choice([leg.filled_qty + b.held or 10, 10, 20]))
+                calls += 1
+            except ValueError:
+                pass
+        for i, event in enumerate(events[cut:], start=cut):
+            b.apply(event)
+            _check_invariants(b, marks, events[:i + 1])
+            _check_covering_invariant(b)
+    assert calls > 300
+
+
+# ------------------------------------------------------------------ follow-ups of the third review
+
+
+def _resize_chain(rng: random.Random) -> BracketState:
+    """The entry fills in parts; after each part the stop and target are resized up and IB confirms."""
+    b = bracket()
+    b.apply(Ack(1))
+    b.apply(Ack(2, 10))
+    b.apply(Ack(3, 10))
+    cuts = sorted(rng.sample(range(1, 10), rng.randint(1, 4))) + [10]
+    done = 0
+    for i, cut in enumerate(cuts):
+        b.apply(ex(f"e{i}", cut - done, order_id=1))
+        done = cut
+        phase: list = [Commission(f"e{i}", 0.1)]
+        for role, total in b.pending_resizes:
+            b.mark_resized(role, total)
+            phase.append(Status({"S": 2, "T": 3}[role], "Submitted", quantity=total))
+        rng.shuffle(phase)
+        for event in phase + phase:  # the second pass is a redelivery
+            b.apply(event)
+    return b
+
+
+def test_resize_chain_stays_protected_with_no_anomaly():
+    rng = random.Random(7)
+    for _ in range(300):
+        b = _resize_chain(rng)
+        assert b.held == 10 and not b.unprotected and b.anomalies == ()
+        assert b.pending_resizes == () and b.resize_requests() == []
+        _check_covering_invariant(b)
+
+
+def test_resize_confirmation_flow_from_the_review():
+    b = bracket()
+    b.apply(Ack(2, 10))
+    b.apply(ex("e1", 4, order_id=1))
+    b.mark_resized("S", 4)
+    b.apply(Status(2, "Submitted", quantity=4))
+    b.apply(ex("e2", 3, order_id=1))
+    assert b.pending_resizes[0] == ("S", 7)
+    b.mark_resized("S", 7)
+    assert b.resize_requests() == [("T", 7)]
+    b.apply(Status(2, "Submitted", quantity=7))
+    assert b.legs["S"].quantity == 7 and not b.unprotected and b.anomalies == ()
+
+
+def test_stale_smaller_report_after_the_mark_is_flagged_in_either_order():
+    snaps = set()
+    for stale_first in (True, False):
+        b = bracket()
+        b.apply(Ack(2, 10))
+        b.apply(ex("e1", 4, order_id=1))
+        b.mark_resized("S", 4)
+        reports = [Status(2, "Submitted", quantity=4), Status(2, "Submitted", quantity=2, filled=1.0)]
+        for event in (reversed(reports) if stale_first else reports):
+            b.apply(event)
+        assert b.legs["S"].quantity == 2 and b.unprotected
+        assert any(a.startswith("leg S: quantity_conflict") for a in b.anomalies)
+        snaps.add(view(b))
+    assert len(snaps) == 1
+
+
+def test_report_seen_before_the_mark_does_not_confirm_it():
+    b = bracket()
+    b.apply(ex("e1", 4, order_id=1))
+    b.apply(Status(2, "Submitted", quantity=4))  # before the mark: not a confirmation
+    b.apply(Ack(2, 10))
+    b.mark_resized("S", 4)
+    assert b.legs["S"].reported_quantities == (4, 10) and b.anomalies
+
+
+def test_reports_are_deduplicated_by_event():
+    order = lifecycle()
+    order.apply(Status(1, "Submitted", quantity=4))
+    order.apply(Status(1, "Submitted", quantity=4))
+    assert order.reported_quantities == (4,)
+
+
+def test_confirm_live_refuses_an_unbound_leg():
+    b = BracketState("r1", "FT", "a1", "BUY", 10)
+    b.bind("E", 1)
+    b.apply(ex("e1", 10, order_id=1))
+    assert b.unprotected
+    with pytest.raises(ValueError, match="order id"):
+        b.confirm_live("S", 10)
+    assert b.unprotected and b.legs["S"].state is OrderState.INTENT
+
+
+def test_confirm_live_keeps_a_sent_cancel():
+    b = bracket()
+    b.apply(Ack(2))
+    b.apply(Status(1, "Cancelled"))
+    b.mark_cancel_sent("S")
+    b.mark_cancel_sent("T")
+    b.apply(ex("e1", 10, order_id=1))
+    b.confirm_live("S", 10)  # a snapshot taken while the cancel was in flight
+    assert b.unprotected and b.awaiting_stop_resolution and b.needs_protection == 0
+    b.apply(Status(2, "Cancelled"))
+    assert b.needs_protection == 10 and not b.awaiting_stop_resolution
+    c = bracket()
+    c.apply(Ack(2))
+    c.apply(ex("e1", 10, order_id=1))
+    c.mark_cancel_sent("S")
+    c.confirm_live("S", 10)
+    c.apply(Rejected(2, 1, "x"))  # the cancel is refused: uncertain, then confirmed live again
+    c.confirm_live("S", 10)
+    assert not c.unprotected
