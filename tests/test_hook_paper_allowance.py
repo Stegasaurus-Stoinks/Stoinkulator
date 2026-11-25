@@ -569,9 +569,10 @@ def test_the_commands_shown_in_claude_md_are_the_allowed_shape() -> None:
     text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     block = text.split("## Commands", 1)[1].split("```")[1]
     paper = [ln.split("   #")[0].strip() for ln in block.splitlines() if "--no-prompt" in ln]
-    assert len(paper) == 3
+    assert len(paper) == 4  # the `run` line of issue 199 is the fourth
     assert any(" fetch-bars " in c for c in paper) and any(" probe-data " in c for c in paper)
     assert any(" -m MainStoinker.ib.watch_bars " in c and " --minutes " in c for c in paper)
+    assert any(" -m MainStoinker run " in c and " --minutes " in c for c in paper)
     for command in paper:
         assert hook.allowed_paper_data_command(command), command
 
@@ -603,6 +604,14 @@ def test_claude_md_states_the_paper_rules() -> None:
         "same rules (main session only, clean `origin/revival` checkout, one broker session at a "
         "time, exit code 5 means not a paper account: stop, tell the owner)",
         "The hook does not check which code is checked out or which interpreter file it is.",
+        "Agents may also run the unattended paper session, `python -m MainStoinker run`, with "
+        "`--paper --no-prompt --minutes N` (N from 1 to 420: a bounded run) and `--algos`, `--bars` "
+        "and `--db` each given explicitly once, under the same rules (main session only, clean "
+        "unmodified `origin/revival` checkout, one broker session at a time, paper only, data from "
+        "TWS and simulated fills only: it places no orders; exit code 5 means not a paper account: "
+        "stop, tell the owner)",
+        "the database path is the owner's: agents use only the path the owner named for the session",
+        "Any `--orders` option of `run` (stage 3) is the owner's alone",
     ):
         assert phrase in text, phrase
 
@@ -1102,3 +1111,435 @@ def test_every_prefix_of_a_guarded_option_name_is_refused_for_the_watcher() -> N
                 assert hook.allowed_paper_data_command(command) is False, command
                 count += 1
     assert count > 15
+
+
+# =============================================================================================
+# The third subcommand word: `<venv python> -P -m MainStoinker run <args>` (issue 199, the
+# unattended `run` on the paper account). `--paper --no-prompt`, `--minutes` once (1 to 3 digits),
+# `--algos`, `--bars` and `--db` once each with an explicit value, `--fills` only `realistic`,
+# no `--help`, and nothing that is or abbreviates `--orders`.
+# =============================================================================================
+
+BEFORE_RUN = (REPO_ROOT / "tests" / "fixtures" / "hook_baseline"
+              / "block_live_launch_before_run_allowance.py.txt")
+# sha256 of the frozen copy of the hook as it was before the `run` allowance (LF line endings)
+BEFORE_RUN_SHA256 = "e944e43ec8db57cbedb7c6acfe5bd31dc26ea22d40d14623106f6755d2cb6ede"
+
+
+@functools.cache
+def _before_run() -> types.ModuleType:
+    """The hook as it was before the `run` allowance."""
+    data = BEFORE_RUN.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(data).hexdigest() == BEFORE_RUN_SHA256, "the frozen pre-run hook was edited"
+    module = types.ModuleType("block_live_launch_before_run")
+    module.__file__ = str(BEFORE_RUN)
+    exec(compile(data.decode("utf-8"), module.__file__, "exec"), module.__dict__)
+    return module
+
+
+RUN_BASE = "--algos C:/s/algos.json --bars C:/s/bars --db C:/s/runs.db"
+RUN_ARGS = f"{RUN_BASE} --minutes 415 --paper --no-prompt"
+
+
+def run(py: str = UP, args: str = RUN_ARGS, mid: str = " -P", sub: str = "run") -> str:
+    return f"{py}{mid} {MODULE} {sub} {args}"
+
+
+def is_run_shape(command: str) -> bool:
+    m = hook._paper_match(command)
+    return m is not None and m.group("sub") == "run"
+
+
+def only_the_run_shape_got_looser(command: str) -> bool:
+    """Blocked now, or blocked before the `run` allowance too, or exactly the new shape."""
+    if hook.decide(command)[0] or _before_run().decide(command)[0]:
+        return True
+    return is_run_shape(command) and hook.allowed_paper_data_command(command)
+
+
+ALLOWED_RUN = [
+    run(),
+    run(UPF),
+    run(QP),
+    run(QPF),
+    run("& " + QP),
+    run("& " + UP),
+    run('".venv\\Scripts\\python.exe"'),
+    run("C:/Stonks/.venv/Scripts/python.exe"),
+    run('"D:\\work dir\\Stonks\\.venv\\Scripts\\python.exe"'),
+    run(args="--paper --no-prompt --minutes 415 --db C:/s/runs.db --bars C:/s/bars --algos C:/s/a.json"),
+    run(args=f"{RUN_BASE} --paper --no-prompt --minutes 1"),
+    run(args=f"{RUN_BASE} --paper --no-prompt --minutes 420"),
+    run(args=f"{RUN_BASE} --paper --no-prompt --minutes=30"),
+    run(args=f"{RUN_BASE} --paper --no-prompt --minutes 007"),
+    run(args="--algos=C:/s/a.json --bars=C:/s/bars --db=C:/s/runs.db --minutes 9 --paper --no-prompt"),
+    run(args="--db sqlite:///C:/s/runs.db --algos C:/s/a.json --bars C:/s/bars "
+             "--minutes 9 --paper --no-prompt"),
+    run(args=f"{RUN_ARGS} --port 7497"),
+    run(args=f"{RUN_ARGS} --port=7497 --host 127.0.0.1"),
+    run(args=f"{RUN_ARGS} --host=127.0.0.1"),
+    run(args=f"{RUN_ARGS} --fills realistic"),
+    run(args=f"{RUN_ARGS} --fills=realistic"),
+    run(args='--algos "C:/my dir/a.json" --bars "C:/my dir/bars" --db "C:/my dir/r.db" '
+             "--minutes 5 --paper --no-prompt"),
+    run(args=f"{RUN_ARGS} --out C:/s/live --stop-file C:/s/stop.flag --warmup-days 3 --no-record"),
+    run(args=f"{RUN_ARGS} --record C:/s/rec.jsonl --client-id 20 --connect-timeout 30"),
+    run(args=f"{RUN_ARGS} --capital 100000 --commission-per-share 0.005 --slippage-per-share 0.01"),
+    run(args="--algos C:\\s\\a.json --bars C:\\s\\bars --db C:\\s\\r.db --minutes 5 --paper --no-prompt"),
+    "  " + run() + "\n",
+]
+
+
+def refused_run_table() -> list[str]:
+    out: list[str] = []
+
+    def add(*items: str) -> None:
+        out.extend(items)
+
+    def a(args: str, **kw: str) -> str:
+        return run(args=args, **kw)
+
+    # the interpreter and the module
+    for py in ("python", "python.exe", "py", "py -3", "uv run python", "pipx run", "pythonw",
+               ".venv\\Scripts\\pythonw.exe", "venv\\Scripts\\python.exe", "..\\.venv\\Scripts\\python.exe",
+               "\\\\srv\\x\\.venv\\Scripts\\python.exe", "/c/x/.venv/Scripts/python.exe",
+               "C:/x/../.venv/Scripts/python.exe", "VAR=1 .venv\\Scripts\\python.exe"):
+        add(run(py))
+    add(
+        f"{UP} -m MainStoinker run {RUN_ARGS}",  # no -P
+        run(mid=" -P -P"), run(mid=" -u"), run(mid=" -I"), run(mid=" -P -I"),
+        f"{UP} -P -mMainStoinker run {RUN_ARGS}",
+        f"{UP} -P --module MainStoinker run {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker.ib.run_cli {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker.ib.live_run {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker.engine.cli run {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker.__main__ run {RUN_ARGS}",
+        f"{UP} -P -m mainstoinker run {RUN_ARGS}",
+        f"{UP} -P -m MAINSTOINKER run {RUN_ARGS}",
+        f'{UP} -P -c "import MainStoinker.ib.run_cli" {RUN_ARGS}',
+        f"{UP} -P -c print(1) -m MainStoinker run {RUN_ARGS}",
+        f"{UP} -P MainStoinker/ib/run_cli.py {RUN_ARGS}",
+        f"{UP} -P MainStoinker\\ib\\run_cli.py {RUN_ARGS}",
+        f"{UP} -P MainStoinker/__main__.py run {RUN_ARGS}",
+        f"{UP} -P MainStoinker run {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker run {RUN_ARGS} -m MainStoinker.ib.run_cli",
+        f"{UP} -P -m MainStoinker run {RUN_ARGS} -c x",
+    )
+    # the subcommand word: exact, case-sensitive, nothing glued, quoted or escaped
+    for sub in ("Run", "RUN", "run2", "run-", "r\\un", "ru n", '"run"', "'run'", "`run`", "run\u200b",
+                "\u0440un", "run.", ".run", "run,", "run;", "rn", "ru", "runn", "live", "paper", "watch"):
+        add(run(sub=sub))
+    add(
+        f"{UP} -P -m MainStoinker {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker run backtest {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker run\t{RUN_ARGS}",
+        f"{UP} -P -m MainStoinker\trun {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker\u00a0run {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker run\u00a0{RUN_ARGS}",
+        f"{UP} -P\t-m MainStoinker run {RUN_ARGS}",
+        f"{UP} -P -m MainStoinker run",
+    )
+    # the flags
+    add(
+        a(f"{RUN_BASE} --minutes 415 --no-prompt"),
+        a(f"{RUN_BASE} --minutes 415 --paper"),
+        a(f"{RUN_BASE} --minutes 415"),
+        a(f"{RUN_BASE} --minutes 415 --paper=1 --no-prompt"),
+        a(f"{RUN_BASE} --minutes 415 --paper --no-prompt=1"),
+        a(f"{RUN_BASE} --minutes 415 --pape --no-prompt"),
+        a(f"{RUN_BASE} --minutes 415 --paper --no-p"),
+        a(f"{RUN_BASE} --minutes 415 --no-prompt --pap"),
+        a(f"{RUN_BASE} --minutes 415 --PAPER --no-prompt"),
+        a(f'{RUN_BASE} --minutes 415 "--paper" --no-prompt'),
+        a(f"{RUN_BASE} --minutes 415 -paper --no-prompt"),
+        a(f"{RUN_BASE} --minutes 415 --paper --no-prompt --paper=false"),
+    )
+    # --minutes: exactly once, 1 to 3 plain digits
+    add(
+        a(f"{RUN_BASE} --paper --no-prompt"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes 30 --minutes 31"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes=30 --minutes 30"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes=30 --minutes=30"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes 1000"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes 0001"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes -5"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes +5"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes 3x"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes 3.0"),
+        a(f'{RUN_BASE} --paper --no-prompt --minutes "30"'),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes="),
+        a(f"{RUN_BASE} --paper --no-prompt --minute 30"),
+        a(f"{RUN_BASE} --paper --no-prompt --min 30"),
+        a(f"{RUN_BASE} --paper --no-prompt --m 30"),
+        a(f"{RUN_BASE} --paper --no-prompt --MINUTES 30"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes,30"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutesx 30"),
+        a(f"{RUN_BASE} --paper --no-prompt --minutes:30"),
+        a(f"{RUN_BASE} --paper --no-prompt -minutes 30"),
+    )
+    # --algos, --bars, --db: each exactly once, explicit, with a value
+    for name in ("--algos", "--bars", "--db"):
+        rest = " ".join(p for p in ("--algos C:/s/a.json", "--bars C:/s/bars", "--db C:/s/r.db")
+                        if not p.startswith(name))
+        flags = "--minutes 30 --paper --no-prompt"
+        add(
+            a(f"{rest} {flags}"),  # missing: no reliance on a default (STOINK_DB and the like)
+            a(f"{RUN_BASE} {flags} {name} C:/s/y"),  # given twice
+            a(f"{RUN_BASE} {flags} {name}=C:/s/y"),
+            a(f"{rest} {flags} {name}"),  # no value at all
+            a(f"{rest} {flags} {name}="),
+            a(f"{rest} {flags} {name} --fills"),
+            a(f"{rest} {flags} {name} --minutes"),
+            a(f'{rest} {flags} "{name}" C:/s/x'),
+            a(f"{rest} {flags} {name.upper()} C:/s/x"),
+            a(f"{rest} {flags} {name}x C:/s/x"),
+            a(f"{rest} {flags} {name[:-1]} C:/s/x"),
+        )
+    add(
+        a("--algos --bars C:/s/b --db C:/s/r.db --minutes 30 --paper --no-prompt"),
+        a("--algos C:/s/a.json --bars --db C:/s/r.db --minutes 30 --paper --no-prompt"),
+        a("--algos C:/s/a.json --bars C:/s/b --db --minutes 30 --paper --no-prompt"),
+        a("--algos C:/s/a.json --bars C:/s/b --db -x --minutes 30 --paper --no-prompt"),
+        a("--alg C:/s/a.json --bars C:/s/b --db C:/s/r.db --minutes 30 --paper --no-prompt"),
+        a("--algos C:/s/a.json --bar C:/s/b --db C:/s/r.db --minutes 30 --paper --no-prompt"),
+        a("--algos C:/s/a.json --bars C:/s/b --d C:/s/r.db --minutes 30 --paper --no-prompt"),
+    )
+    # --port and --host
+    for bad in ("7496", "4002", "4001", "74970", "0", "", "7498", "7497.0", "7497,7496"):
+        add(a(f"{RUN_ARGS} --port {bad}".rstrip()))
+    add(
+        a(f"{RUN_ARGS} --port 7497 --port 7496"),
+        a(f"{RUN_ARGS} --port=7496"),
+        a(f"{RUN_ARGS} --port=4002"),
+        a(f"{RUN_ARGS} --port"),
+        a(f"{RUN_ARGS} --po 7497"),
+        a(f"{RUN_ARGS} --PORT 7497"),
+        a(f"{RUN_ARGS} --host localhost"),
+        a(f"{RUN_ARGS} --host 127.0.0.2"),
+        a(f"{RUN_ARGS} --host=localhost"),
+        a(f"{RUN_ARGS} --host"),
+        a(f"{RUN_ARGS} --hos 127.0.0.1"),
+        a(f"{RUN_ARGS} --host 127.0.0.1 --host localhost"),
+    )
+    # --fills: only `realistic`, only once
+    add(
+        a(f"{RUN_ARGS} --fills legacy"),
+        a(f"{RUN_ARGS} --fills=legacy"),
+        a(f"{RUN_ARGS} --fills"),
+        a(f"{RUN_ARGS} --fills="),
+        a(f"{RUN_ARGS} --fills Realistic"),
+        a(f"{RUN_ARGS} --fills realistic --fills realistic"),
+        a(f"{RUN_ARGS} --fills realistic --fills legacy"),
+        a(f'{RUN_ARGS} --fills "realistic"'),
+        a(f"{RUN_ARGS} --fill realistic"),
+        a(f"{RUN_ARGS} --fil realistic"),
+        a(f"{RUN_ARGS} --f realistic"),
+        a(f"{RUN_ARGS} --fillsx realistic"),
+        a(f"{RUN_ARGS} --FILLS realistic"),
+    )
+    # --orders (stage 3): never, in any spelling; --help and -h
+    for opt in ("--orders", "--orders=on", "--orders on", "--orders paper", "--orders live", "--orders=",
+                "--order", "--order=1", "--order paper", "--ORDERS", "--Orders=1", "--orde", "--ord", "--or",
+                "--o", "--orders-paper", "--orders_paper", "--ordersx", "--orders,on", "--orders:on",
+                '"--orders"', '"--orders=1"', "--orders\\ x", "--ord\\ers", "-orders", "-o", "--"):
+        add(a(f"{RUN_ARGS} {opt}"), a(f"{opt} {RUN_ARGS}"))
+    add(
+        a(f"{RUN_ARGS} --out C:/x/--orders"),  # also as a value
+        a(f"{RUN_ARGS} --stop-file --orders"),
+        a(f"{RUN_ARGS} --db=--orders"),
+        a(f"{RUN_ARGS} --help"),
+        a(f"{RUN_ARGS} -h"),
+        a(f"{RUN_ARGS} --hel"),
+        a(f"{RUN_ARGS} --h"),
+        a(f"{RUN_ARGS} --HELP"),
+        a(f"{RUN_ARGS} --help=1"),
+        a("--help"),
+        a("-h"),
+    )
+    # shell syntax, wrappers, the live opt-in name
+    for tail in (" ; echo", " && echo", " || echo", " | cat", " & echo", " > out.txt", " 2>&1", " `x`",
+                 " $(x)", " $x", " %x%", " (x)", " {x}", " [x]", " @x", " *", " ?", " ~", " !", " #x", "\nx",
+                 " \\\nx",
+                 " ^\nx", " <x", "\t&& x"):
+        add(run() + tail)
+    for head in ("cd x;", "cd x &&", "Set-Location x;", "VAR=x", "A=1 B=2", "$env:A=1;", "set A=1&&", "start",
+                 "cmd /c", "powershell -c", "pwsh -c", "bash -c", "sh -c", "call", "env", "nohup", "time",
+                 "timeout 5", "xargs", "sudo", "Start-Process", "iex", "wsl", "exec", "command"):
+        add(f"{head} {run()}")
+    add(
+        f"{ENV_NAME}=1 {run()}",
+        f"$env:{ENV_NAME}=1; {run()}",
+        f"set {ENV_NAME}=1&& {run()}",
+        run(args=f"{RUN_ARGS} --out C:/s/{ENV_NAME}"),
+        run(args=f"{RUN_ARGS} {ENV_NAME.lower()}"),
+        run(args=f"{RUN_ARGS} {ENV_NAME}=1"),
+        run(args=f'{RUN_ARGS} --out "C:/s/{ENV_NAME.title()}"'),
+    )
+    # chaining after, or before, an allowed command; another connecting subcommand next to it
+    add(
+        run() + " ; " + run(),
+        run() + " && " + fetch(),
+        fetch() + " && " + run(),
+        run() + " | " + run(),
+        run() + " & " + run(),
+        run() + " ; python -m MainStoinker.ib.run_cli " + RUN_ARGS,
+        run() + " fetch-bars",
+        run() + " -m MainStoinker.ib.watch_bars",
+        run(sub="run backtest"),
+        run(args=f'{RUN_ARGS} --out "{ENTRY}"'),
+        run(args=f'{RUN_ARGS} --out "C:\\x\\Stonks data collect.bat"'),
+        run(args=f'{RUN_ARGS} --out "C:\\x\\MainStoinker\\ib\\bars"'),
+        run(args=f'{RUN_ARGS} "MainStoinker/testy/testy.py"'),
+        run(args=f'{RUN_ARGS} --out "C:\\x -m MainStoinker.ib.cli"'),
+        run(args=f'{RUN_ARGS} --out "a --orders b"'),
+        run(args=f'{RUN_ARGS} --out "a -x b"'),
+    )
+    return [c for c in dict.fromkeys(out) if c not in ALLOWED_RUN]
+
+
+REFUSED_RUN = refused_run_table()
+
+
+def test_the_run_tables_are_big_enough() -> None:
+    assert len(set(ALLOWED_RUN)) >= 20
+    assert len(set(REFUSED_RUN)) >= 40
+    assert not set(ALLOWED_RUN) & set(REFUSED_RUN)
+    assert not set(ALLOWED_RUN) & set(ALLOWED + ALLOWED_WATCH + REFUSED + REFUSED_WATCH)
+    assert not set(REFUSED_RUN) & set(ALLOWED + ALLOWED_WATCH)
+
+
+@pytest.mark.parametrize("command", ALLOWED_RUN)
+def test_allowed_run_spellings(command: str) -> None:
+    assert hook.allowed_paper_data_command(command) is True
+    assert hook.decide(command) == (False, "")
+    assert hook.main(json.dumps({"tool_name": "PowerShell", "tool_input": {"command": command}})) == 0
+    assert is_run_shape(command)
+    assert _before_run().decide(command)[0] is True  # blocked before: this shape is the only change
+
+
+@pytest.mark.parametrize("command", REFUSED_RUN)
+def test_refused_run_variants(command: str) -> None:
+    assert hook.decide(command)[0] is True, command
+    assert hook.main(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})) == 2
+    assert hook.allowed_paper_data_command(command) is False, command
+    assert only_the_run_shape_got_looser(command)
+
+
+EVERY_ROW = REFUSED + REFUSED_WATCH + REFUSED_RUN + ALLOWED + ALLOWED_WATCH + ALLOWED_RUN
+
+
+@pytest.mark.parametrize("command", EVERY_ROW)
+def test_only_the_run_shape_is_looser_than_before_the_run_allowance(command: str) -> None:
+    now, before = hook.decide(command)[0], _before_run().decide(command)[0]
+    if before is False:
+        assert now is False  # the old verdicts stay as they were
+    if now is False and before is True:
+        assert is_run_shape(command) and hook.allowed_paper_data_command(command)
+
+
+def test_every_older_row_keeps_its_verdict() -> None:
+    for command in REFUSED + REFUSED_WATCH:
+        assert hook.decide(command)[0] == _before_run().decide(command)[0], command
+    for command in ALLOWED + ALLOWED_WATCH:
+        assert hook.decide(command) == (False, "")
+
+
+@pytest.mark.parametrize("sub", ["fetch-bars", "probe-data", "backtest", "runs", "report", "serve"])
+def test_other_subcommands_keep_their_verdict_with_the_run_options(sub: str) -> None:
+    command = run(sub=sub)
+    assert hook.decide(command)[0] == _before_run().decide(command)[0]
+    assert (hook.allowed_paper_data_command(command) is True) == (sub in ("fetch-bars", "probe-data"))
+
+
+def test_the_neutral_text_of_the_run_form_is_the_offline_subcommand() -> None:
+    for command in (ALLOWED_RUN[0], ALLOWED_RUN[4], ALLOWED_RUN[8], ALLOWED_RUN[-1]):
+        neutral = hook._paper_neutral(command)
+        assert neutral == command.replace(" -m MainStoinker run ", " -m MainStoinker backtest ", 1)
+        assert hook._decide(neutral, 1) == (False, "")
+        assert hook._decide(command, 1)[0] is True  # harmless only because of the replaced word
+    assert hook._paper_neutral(REFUSED_RUN[0]) is None
+
+
+def test_the_run_form_without_its_options_stays_refused_and_with_them_is_allowed() -> None:
+    assert hook.decide(f"{UP} -P -m MainStoinker run --paper --no-prompt")[0] is True
+    assert hook.decide(f"{UP} -P -m MainStoinker run --paper --no-prompt --minutes 30")[0] is True
+    assert hook.decide(run()) == (False, "")
+
+
+def test_a_run_with_the_order_word_is_refused_by_the_function_and_by_the_hook() -> None:
+    for opt in ("--orders", "--orders=paper", "--order", "--ORDERS=1", "--orders paper"):
+        command = run(args=f"{RUN_ARGS} {opt}")
+        assert hook.allowed_paper_data_command(command) is False, command
+        assert hook.decide(command)[0] is True, command
+        assert hook._paper_match(command) is None, command
+
+
+def test_other_blocks_still_apply_to_the_allowed_run_shape() -> None:
+    for tail in (f' --out "{ENTRY}"', ' --out "C:\\x\\Stonks data collect.bat"',
+                 ' --out "C:\\x\\MainStoinker\\ib\\bars"', ' "MainStoinker/testy/testy.py"'):
+        command = ALLOWED_RUN[0] + tail
+        assert hook.decide(command)[0] is True
+        assert hook.allowed_paper_data_command(command) is False
+
+
+def test_the_allowance_is_still_off_for_decoded_and_folded_run_text() -> None:
+    import base64
+
+    encoded = base64.b64encode(ALLOWED_RUN[0].encode("utf-16-le")).decode()
+    assert hook.decide(f"powershell -EncodedCommand {encoded}")[0] is True
+    assert hook.decide(ALLOWED_RUN[0].replace("--paper", "\uff0d\uff0dpaper"))[0] is True
+    assert hook.decide(ALLOWED_RUN[0].replace("run", "\uff52\uff55\uff4e", 1))[0] is True
+
+
+def test_the_function_is_still_called_in_one_place_and_the_message_names_run() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert len(re.findall(r"allowed_paper_data_command\(", text)) == 2
+    assert text.count("_paper_neutral(") == 2
+    reason = hook.decide(f"{UP} -P -m MainStoinker run --port 7497")[1]
+    for word in ("-P -m MainStoinker run", "--algos", "--bars", "--db", "--minutes", "--orders", "--paper"):
+        assert word in reason
+    assert ENV_NAME not in reason
+
+
+RUN_PROPERTY_BASES = [ALLOWED_RUN[0], ALLOWED_RUN[4], ALLOWED_RUN[8], ALLOWED_RUN[10]]
+
+
+@pytest.mark.parametrize("original", RUN_PROPERTY_BASES)
+def test_any_forbidden_character_or_wrapper_anywhere_is_refused_for_run(original: str) -> None:
+    variants = _variants(original)
+    assert len(variants) > 500
+    for label, mutated in variants:
+        if _benign(label, mutated, original):
+            assert hook.allowed_paper_data_command(mutated), label
+            continue
+        assert hook.allowed_paper_data_command(mutated) is False, (label, mutated)
+        assert hook.decide(mutated)[0] or not _before_run().decide(mutated)[0], (label, mutated)
+
+
+@pytest.mark.parametrize("original", RUN_PROPERTY_BASES)
+def test_a_backslash_inside_any_option_token_is_refused_for_run(original: str) -> None:
+    tokens = SPLIT.findall(original.strip())
+    count = 0
+    for i, tok in enumerate(tokens):
+        if not tok.startswith("--"):
+            continue
+        for k in range(1, len(tok)):
+            mutated = " ".join([*tokens[:i], tok[:k] + "\\" + tok[k:], *tokens[i + 1 :]])
+            assert hook.allowed_paper_data_command(mutated) is False, mutated
+            assert hook.decide(mutated)[0] or not _before_run().decide(mutated)[0], mutated
+            count += 1
+    assert count > 30
+
+
+def test_every_prefix_of_a_guarded_option_name_is_refused_for_run() -> None:
+    count = 0
+    for name in ("--paper", "--no-prompt", "--minutes", "--port", "--host", "--algos", "--bars", "--db",
+                 "--fills", "--orders", "--help"):
+        for k in range(3, len(name)):
+            short = name[:k]
+            for command in (run(args=f"{RUN_ARGS} {short} 7497"), run(args=f"{RUN_ARGS} {short}=1"),
+                            run(args=f"{RUN_ARGS} {short}")):
+                assert hook.allowed_paper_data_command(command) is False, command
+                count += 1
+    assert count > 40
