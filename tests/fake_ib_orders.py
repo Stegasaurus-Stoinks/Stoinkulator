@@ -5,7 +5,8 @@ threading rules (everything TWS says is delivered by ``run()``, on that thread, 
 arguments deep-copied), the same 504 answer when not connected and the same
 ``EWrapper`` signature check for every callback it plays. ``tests/fake_ib.py`` itself is
 untouched: ``FakeIbClient`` keeps having no order-capable method, and only this class
-adds them. It never imports ``ibapi.connection`` and never opens a socket.
+adds them. Its own source imports neither ``ibapi.connection`` nor a socket module, and it
+never opens a socket.
 
 Order calls it implements (``ORDER_IMPLEMENTED``; signatures equal ``EClient``'s):
 ``placeOrder``, ``cancelOrder``, ``reqOpenOrders``, ``reqAllOpenOrders``,
@@ -50,15 +51,30 @@ reqCompletedOrders + completedOrdersEnd                 unverified
 reqExecutions + commission reports + execDetailsEnd    unverified
 reqPositions + positionEnd                              unverified
 whatIf: openOrder with orderState preview, no order     unverified
+whatIf uses up its order id (a reused id is 103)        unverified
+Unused id below the highest used id gives error 103     unverified
 cancelOrder answers PendingCancel, Cancelled, error 202 unverified
+openOrder/completedOrder Order carries orderId,         unverified
+  clientId, permId (as the decoder sets them)
+Late fill after a cancel (script flag only)             unverified
+Correction changes filled quantity and position         unverified
+Realised PnL UNSET on an opening fill                   unverified
 =====================================================  =================================
 
 Known differences from real IB: the order of ``execDetails`` against ``orderStatus`` is
 fixed here (execDetails first) and can be changed per order with ``FillPlan.transform``;
 a modification of an open order is not modelled (a reused id is always 103); permIds,
 execIds and times are made up (``execId`` ends in ``.01.<revision>``); the realised PnL of a
-commission report is 0; positions use a simple average cost; ``reqExecutions`` filters on
-symbol, side, account and client id only; whatIf does not consume the order id.
+commission report is UNSET_DOUBLE on an opening fill and a simple average-cost figure on a
+closing one; positions use a simple average cost; ``reqExecutions`` filters on symbol, side,
+account and client id only. Where IB's behaviour is unknown the fake takes the strict side: a
+whatIf request uses up its id, and an unused id lower than the highest used one is 103.
+``drain()`` and ``run_in_thread()`` are one or the other, never both.
+
+The import test only reads this file's own source (no ``socket``, no ``ibapi.connection``);
+the module's base, ``tests.fake_ib``, imports ``ibapi.client`` as the existing fake does,
+which pulls ``ibapi.connection`` into ``sys.modules``. The behavioural guard is the test that
+makes ``Connection`` raise and runs a whole scenario.
 
 Accounts are synthetic (``DUX123456``); no real account id belongs in this file.
 """
@@ -73,7 +89,7 @@ from decimal import Decimal
 from typing import Any
 
 from ibapi.commission_and_fees_report import CommissionAndFeesReport
-from ibapi.const import NO_VALID_ID
+from ibapi.const import NO_VALID_ID, UNSET_DOUBLE
 from ibapi.contract import Contract
 from ibapi.errors import NOT_CONNECTED
 from ibapi.execution import Execution, ExecutionFilter
@@ -95,7 +111,9 @@ ORDER_IMPLEMENTED = (
     "reqPositions",
     "cancelPositions",
 )
-_ORDER_ID_504 = frozenset({"placeOrder", "cancelOrder"})  # client.py: these carry the order id
+# Not connected: ibapi 10.37.2 ``placeOrder`` answers error(orderId, ...); ``cancelOrder`` and the
+# requests answer error(NO_VALID_ID, ...).
+_ORDER_ID_504 = frozenset({"placeOrder"})
 
 DUPLICATE_ORDER_ID = 103
 WARNING_CODES = frozenset({399})  # delivered, and the order goes on
@@ -148,6 +166,11 @@ class _OrderRec:
         self.order_id = order_id
         self.contract = contract
         self.order = order
+        # What TWS puts on the wire and the decoder sets on the Order it hands to openOrder
+        # and completedOrder (orderdecoder.py): the ids, on the fake's own copy.
+        order.orderId = order_id
+        order.clientId = client_id
+        order.permId = perm_id
         self.perm_id = perm_id
         self.client_id = client_id
         self.status = "PreSubmitted"
@@ -234,6 +257,7 @@ class FakeOrderIbClient(FakeIbClient):
         self._executions: list[tuple[Contract, Execution]] = []
         self._commissions: dict[str, CommissionAndFeesReport] = {}
         self._positions: dict[tuple[str, str], list[Any]] = {}
+        self._realized: dict[str, float] = {}
         self._held: list[tuple[int, Played]] = []
         self._tick = 0
         self._next_perm_id = 1_000_001
@@ -308,7 +332,13 @@ class FakeOrderIbClient(FakeIbClient):
             self._push_played(played)
 
     def drain(self) -> int:
-        """Deliver everything queued, on the calling thread, and stay connected. Returns the count."""
+        """Deliver everything queued, on the calling thread, and stay connected. Returns the count.
+
+        One or the other: ``drain()`` or ``run_in_thread()``, never both (two consumers of one
+        queue); it raises while a thread started by ``run_in_thread`` is alive.
+        """
+        if any(t.is_alive() for t in self._threads):
+            raise RuntimeError("drain() while a run_in_thread() thread is alive: two queue consumers")
         n = 0
         while True:
             try:
@@ -328,10 +358,17 @@ class FakeOrderIbClient(FakeIbClient):
         *,
         commission: float | None = 1.0,
         commission_delay: int = 0,
+        late_fill: bool = False,
     ) -> None:
-        """The exchange fills (part of) a resting order."""
+        """The exchange fills (part of) a resting order.
+
+        A terminal order (Filled, Cancelled, Inactive) is refused with ``ValueError`` unless
+        ``late_fill=True``: the script says "a fill that crossed the cancel".
+        """
         with self._lock:
             rec = self._orders[order_id]
+            if rec.status in TERMINAL and not late_fill:
+                raise ValueError(f"order {order_id} is {rec.status}: pass late_fill=True for a late fill")
             played, held = self._fill(rec, _dec(shares), price, commission, commission_delay)
             if rec.remaining == 0:
                 rec.status = "Filled"
@@ -366,6 +403,17 @@ class FakeOrderIbClient(FakeIbClient):
             if shares is not None:
                 new.shares = _dec(shares)
             self._executions.append((copy.deepcopy(contract), new))
+            self._realized[new.execId] = self._realized.get(exec_id, UNSET_DOUBLE)
+            rec = self._orders.get(original.orderId)
+            if rec is not None:  # the correction replaces the original: filled quantity and position follow
+                rec.filled += new.shares - original.shares
+                rec.notional += float(new.shares) * new.price - float(original.shares) * original.price
+                new.cumQty = rec.filled
+                new.avgPrice = rec.avg_price
+                sign = 1 if new.side == "BOT" else -1
+                self._apply_position(
+                    new.acctNumber, contract, sign * (new.shares - original.shares), new.price
+                )
             played: list[Played] = [("execDetails", -1, contract, new)]
             held: list[tuple[int, Played]] = []
             amount = commission if commission is not None else (
@@ -389,15 +437,17 @@ class FakeOrderIbClient(FakeIbClient):
     @_recorded_order
     def placeOrder(self, orderId: int, contract: Contract, order: Order):
         with self._lock:
-            if order.whatIf:
-                self.whatif_requests.append(orderId)
-                self._play([self._whatif_played(orderId, contract, order)], [])
-                return
-            if orderId in self._used_ids:
+            # Strict side of two unknowns (unverified): an id that is used, or lower than the
+            # highest id used, is 103; a whatIf request uses its id up like any other.
+            if orderId in self._used_ids or (self._used_ids and orderId < max(self._used_ids)):
                 self._error(orderId, DUPLICATE_ORDER_ID, _DUPLICATE_TEXT)
                 return
             self._used_ids.add(orderId)
             self._next_id = max(self._next_id, orderId + 1)
+            if order.whatIf:
+                self.whatif_requests.append(orderId)
+                self._play([self._whatif_played(orderId, contract, order)], [])
+                return
             code = self._errors["place"].pop(0) if self._errors["place"] else None
             rec = _OrderRec(
                 orderId, copy.deepcopy(contract), copy.deepcopy(order), self._perm(), self.clientId or 0
@@ -565,7 +615,10 @@ class FakeOrderIbClient(FakeIbClient):
         state.status = "PreSubmitted"
         for key, value in self.whatif_values.items():
             setattr(state, key, value)
-        return ("openOrder", order_id, copy.deepcopy(contract), copy.deepcopy(order), state)
+        shown = copy.deepcopy(order)
+        shown.orderId = order_id
+        shown.clientId = self.clientId or 0
+        return ("openOrder", order_id, copy.deepcopy(contract), shown, state)
 
     def _reject(self, rec: _OrderRec, code: int) -> None:
         text = REJECT_TEXTS[code].format(id=rec.order_id)
@@ -644,7 +697,9 @@ class FakeOrderIbClient(FakeIbClient):
         ex.avgPrice = rec.avg_price
         ex.orderRef = rec.order.orderRef
         self._executions.append((copy.deepcopy(rec.contract), ex))
-        self._apply_position(ex.acctNumber, rec.contract, shares if side == "BOT" else -shares, price)
+        delta = shares if side == "BOT" else -shares
+        self._realized[ex.execId] = self._realized_pnl(ex.acctNumber, rec.contract, delta, price)
+        self._apply_position(ex.acctNumber, rec.contract, delta, price)
         if rec.remaining == 0:
             rec.status = "Filled"
         played: list[Played] = [("execDetails", -1, rec.contract, ex), self._status_played(rec)]
@@ -660,11 +715,20 @@ class FakeOrderIbClient(FakeIbClient):
         report.execId = exec_id
         report.commissionAndFees = amount
         report.currency = "USD"
+        report.realizedPNL = self._realized.get(exec_id, UNSET_DOUBLE)
         item: Played = ("commissionAndFeesReport", report)
         if delay > 0:
             held.append((self._tick + delay, item))
         else:
             played.append(item)
+
+    def _realized_pnl(self, account: str, contract: Contract, delta: Decimal, price: float) -> float:
+        """TWS sends UNSET_DOUBLE on an opening fill; a closing fill carries the realised PnL."""
+        _, qty, avg = self._positions.get((account, contract.symbol), [contract, Decimal(0), 0.0])
+        if qty == 0 or (qty > 0) == (delta > 0):
+            return UNSET_DOUBLE
+        closed = min(abs(delta), abs(qty))
+        return float(closed) * (price - avg) * (1 if qty > 0 else -1)
 
     def _apply_position(self, account: str, contract: Contract, delta: Decimal, price: float) -> None:
         key = (account, contract.symbol)

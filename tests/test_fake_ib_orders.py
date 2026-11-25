@@ -120,6 +120,11 @@ def test_partial_fills_sum_by_exec_id(fake: FakeOrderIbClient) -> None:
     got = new(fake)
     by_exec = {a[2].execId: a[2].shares for a in only(got, "execDetails")}
     assert len(by_exec) == 3 and sum(by_exec.values()) == Decimal(10)
+    execs = [a[2] for a in only(got, "execDetails")]
+    assert [e.cumQty for e in execs] == [Decimal(3), Decimal(6), Decimal(10)]
+    assert [e.avgPrice for e in execs] == pytest.approx(
+        [100.0, (3 * 100 + 3 * 101) / 6, (3 * 100 + 3 * 101 + 4 * 102) / 10]
+    )
     cum = [a[2] for a in only(got, "orderStatus")][2:]  # after PreSubmitted, Submitted
     assert cum == [Decimal(3), Decimal(6), Decimal(10)]
     final = only(got, "orderStatus")[-1]
@@ -227,9 +232,14 @@ def test_whatif_creates_no_order(fake: FakeOrderIbClient) -> None:
     assert names(got) == [
         "openOrderEnd", "completedOrdersEnd", "execDetailsEnd", "positionEnd",
     ]  # fmt: skip
-    # the id was not consumed
+    # strict side of an unknown: the whatIf used the id up
     fake.placeOrder(500, stock(), order())
-    assert DUPLICATE_ORDER_ID not in [a[2] for a in only(new(fake), "error")]
+    assert [a[2] for a in only(new(fake), "error")] == [DUPLICATE_ORDER_ID]
+    assert fake.order_ids() == []
+    fake.placeOrder(500, stock(), order(whatIf=True))
+    assert [a[2] for a in only(new(fake), "error")] == [DUPLICATE_ORDER_ID]
+    fake.placeOrder(501, stock(), order())
+    assert fake.order_ids() == [501]
 
 
 def test_reused_order_id_is_error_103(fake: FakeOrderIbClient) -> None:
@@ -258,6 +268,43 @@ def test_fake_never_imports_ibapi_connection() -> None:
         elif isinstance(node, ast.ImportFrom):
             assert "connection" not in (node.module or "")
             assert all(a.name != "connection" for a in node.names)
+        # the module's own source only: no socket module either (the base class's imports are not
+        # this file's; see test_scenarios_never_touch_ibapi_connection_or_a_socket)
+        if isinstance(node, ast.Import):
+            assert all(a.name.split(".")[0] != "socket" for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert (node.module or "").split(".")[0] != "socket"
+
+
+def test_scenarios_never_touch_ibapi_connection_or_a_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    import ibapi.connection as ibconn
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("the order fake touched a socket or ibapi.connection")
+
+    for owner, attr in [
+        (socket, "socket"),
+        (socket, "create_connection"),
+        (socket, "getaddrinfo"),
+        (ibconn.Connection, "__init__"),
+        (ibconn.Connection, "connect"),
+        (ibconn.Connection, "sendMsg"),
+        (EClient, "connect"),
+    ]:
+        monkeypatch.setattr(owner, attr, boom)
+    assert not issubclass(FakeOrderIbClient, EClient)
+    with FakeOrderIbClient(OrderRecorder()) as f:
+        f.connect("127.0.0.1", 7497, 24)
+        f.placeOrder(1, stock(), order())
+        f.cancelOrder(1, OrderCancel())
+        f.reqOpenOrders()
+        f.reqAllOpenOrders()
+        f.reqCompletedOrders(False)
+        f.reqExecutions(2, ExecutionFilter())
+        f.reqPositions()
+        f.drain()
 
 
 # -- the rest of the behaviour -----------------------------------------------
@@ -285,7 +332,8 @@ def test_not_connected_answers_504_with_the_order_id() -> None:
     f = FakeOrderIbClient(OrderRecorder())
     f.placeOrder(42, stock(), order())
     f.reqPositions()
-    assert [(d.args[0], d.args[2]) for d in f.delivered] == [(42, 504), (-1, 504)]
+    f.cancelOrder(42, OrderCancel())  # ibapi 10.37.2: only placeOrder carries the order id
+    assert [(d.args[0], d.args[2]) for d in f.delivered] == [(42, 504), (-1, 504), (-1, 504)]
     assert f.order_ids() == []
 
 
@@ -379,3 +427,88 @@ def test_order_callback_arguments_are_checked_against_ewrapper(fake: FakeOrderIb
         fake.push("orderStatus", 1, "Filled")
     with pytest.raises(AttributeError):
         fake.push("noSuchCallback")
+
+
+# -- review fixes (PR 262) -----------------------------------------------------
+
+
+def test_open_and_completed_orders_carry_the_ids_the_decoder_sets(fake: FakeOrderIbClient) -> None:
+    mine = order(kind="LMT", lmtPrice=90.0)
+    assert (mine.orderId, mine.clientId, mine.permId) == (0, 0, 0)
+    fake.placeOrder(500, stock(), mine)
+    fake.placeOrder(501, stock(), order())
+    fake.seed_open_order(stock("MSFT"), order(kind="LMT", lmtPrice=1.0), order_id=900, client_id=0)
+    fake.reqAllOpenOrders()
+    fake.reqCompletedOrders(False)
+    got = new(fake)
+    assert (mine.orderId, mine.clientId, mine.permId) == (0, 0, 0)  # the caller's object is a copy
+    opens = {a[0]: a for a in only(got, "openOrder")}
+    statuses = {a[0]: a for a in only(got, "orderStatus")}
+    perm_ids = set()
+    for oid in (500, 900):
+        shown = opens[oid][2]
+        assert (shown.orderId, shown.clientId) == (oid, 24 if oid == 500 else 0)
+        assert shown.permId > 0 and shown.permId == statuses[oid][5]
+        perm_ids.add(shown.permId)
+    done = only(got, "completedOrder")[0][1]
+    assert (done.orderId, done.clientId) == (501, 24) and done.permId > 0
+    assert len(perm_ids | {done.permId}) == 3  # unique
+
+
+def test_lower_unused_id_is_refused_like_a_reused_one(fake: FakeOrderIbClient) -> None:
+    fake.placeOrder(505, stock(), order())
+    new(fake)
+    fake.placeOrder(503, stock(), order())  # never used, but below the highest used id
+    assert [a[2] for a in only(new(fake), "error")] == [DUPLICATE_ORDER_ID]
+    assert fake.order_ids() == [505]
+    fake.placeOrder(506, stock(), order())
+    assert only(new(fake), "error") == []
+
+
+def test_correction_changes_filled_quantity_and_position(fake: FakeOrderIbClient) -> None:
+    fake.placeOrder(500, stock(), order())
+    first = only(new(fake), "execDetails")[0][2]
+    fake.correct_execution(first.execId, shares=8, price=101.0)
+    corrected = only(new(fake), "execDetails")[0][2]
+    assert (corrected.cumQty, corrected.avgPrice) == (Decimal(8), 101.0)
+    fake.reqPositions()
+    pos = only(new(fake), "position")
+    assert [(p[2], p[3]) for p in pos] == [(Decimal(8), 100.0)]
+    assert fake._orders[500].filled == Decimal(8)
+
+
+def test_fill_on_a_terminal_order_needs_the_late_fill_flag(fake: FakeOrderIbClient) -> None:
+    fake.placeOrder(500, stock(), order(kind="LMT", lmtPrice=99.0))
+    fake.exchange_cancel(500)
+    new(fake)
+    with pytest.raises(ValueError, match="late_fill"):
+        fake.fill(500, 3, 99.0)
+    assert fake.status_of(500) == "Cancelled" and new(fake) == []
+    fake.fill(500, 3, 99.0, late_fill=True)  # a fill that crossed the cancel
+    got = new(fake)
+    assert "execDetails" in names(got) and fake.status_of(500) == "Cancelled"
+    fake.placeOrder(501, stock(), order())
+    new(fake)
+    with pytest.raises(ValueError, match="late_fill"):
+        fake.fill(501, 1, 100.0)
+
+
+def test_realized_pnl_is_unset_on_opening_fills_and_set_on_closing(fake: FakeOrderIbClient) -> None:
+    from ibapi.const import UNSET_DOUBLE
+
+    fake.placeOrder(500, stock(), order("BUY"))
+    fake.market_price = 103.0
+    fake.placeOrder(501, stock(), order("SELL"))
+    reports = [a[0] for a in only(new(fake), "commissionAndFeesReport")]
+    assert reports[0].realizedPNL == UNSET_DOUBLE
+    assert reports[1].realizedPNL == pytest.approx(30.0)
+
+
+def test_drain_while_a_run_thread_is_active_raises() -> None:
+    rec = OrderRecorder()
+    with FakeOrderIbClient(rec) as f:
+        f.connect("127.0.0.1", 7497, 24)
+        f.run_in_thread()
+        with pytest.raises(RuntimeError, match="two queue consumers"):
+            f.drain()
+        f.drop("connectionClosed")
