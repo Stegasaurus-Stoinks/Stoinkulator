@@ -119,27 +119,30 @@ def test_running_run_listed_first_with_liveness(db):
     clock = Clock()
     now = START + timedelta(hours=2)
     with SqliteStore(db, clock=clock) as store:
+        # the stale and the running runs are the OLDEST: newest-first would put the
+        # backtest and the completed run before them
+        stale = live_run(store, clock, started=START, touched=now - STALE_AFTER
+                         - timedelta(seconds=1))
+        running = live_run(store, clock, started=START, touched=now - timedelta(seconds=10))
+        running2 = live_run(store, clock, started=START, touched=now)
         done = live_run(store, clock, started=START, touched=START + timedelta(minutes=1),
                         status="completed", reason="session_end")
         clock.now = START
         backtest = store.begin_run(meta())
         store.end_run(backtest, "completed")
-        stale = live_run(store, clock, started=START, touched=now - STALE_AFTER
-                         - timedelta(seconds=1))
-        running = live_run(store, clock, started=START, touched=now - timedelta(seconds=10))
-        running2 = live_run(store, clock, started=START, touched=now)
-    assert (done, backtest, stale, running, running2) == (1, 2, 3, 4, 5)
+    assert (stale, running, running2, done, backtest) == (1, 2, 3, 4, 5)
     body = client_at(db, now).get("/api/runs").json()
-    assert [r["run_id"] for r in body["runs"]] == [5, 4, 3, 2, 1]  # running, stale, rest
+    # running, then stale, then the rest (newest first within each group)
+    assert [r["run_id"] for r in body["runs"]] == [3, 2, 1, 5, 4]
     by_id = {r["run_id"]: r for r in body["runs"]}
     assert {i: by_id[i].get("liveness") for i in by_id} == {
-        5: "running", 4: "running", 3: "stale", 2: None, 1: "completed"}
-    assert by_id[1]["end_reason"] == "session_end"
-    assert by_id[4]["end_reason"] is None
-    assert by_id[4]["last_write_at"] == (now - timedelta(seconds=10)).isoformat()
-    assert "liveness" not in by_id[2] and "end_reason" not in by_id[2]  # a backtest's entry
+        3: "running", 2: "running", 1: "stale", 5: None, 4: "completed"}
+    assert by_id[4]["end_reason"] == "session_end"
+    assert by_id[2]["end_reason"] is None
+    assert by_id[2]["last_write_at"] == (now - timedelta(seconds=10)).isoformat()
+    assert "liveness" not in by_id[5] and "end_reason" not in by_id[5]  # a backtest's entry
 
-    detail = client_at(db, now).get("/api/runs/4").json()
+    detail = client_at(db, now).get("/api/runs/2").json()
     assert detail["run"]["liveness"] == "running" and detail["run"]["end_reason"] is None
     assert detail["run"]["last_write_at"] == (now - timedelta(seconds=10)).isoformat()
     positions = {p["account"]: p for p in detail["open_positions"]}
@@ -148,10 +151,10 @@ def test_running_run_listed_first_with_liveness(db):
     assert detail["live_counts"]["fed"] == {"AAPL": 3, "MSFT": 2}
     assert detail["live_counts"]["late"] == {"MSFT": 1}
     assert detail["live_counts"]["dropped"] == {"AAPL": {"stalled": 1, "snapshot_only": 2}}
-    assert client_at(db, now).get("/api/runs/3").json()["run"]["liveness"] == "stale"
-    assert client_at(db, now).get("/api/runs/1").json()["run"]["liveness"] == "completed"
+    assert client_at(db, now).get("/api/runs/1").json()["run"]["liveness"] == "stale"
+    assert client_at(db, now).get("/api/runs/4").json()["run"]["liveness"] == "completed"
     # a backtest's detail has none of the live keys
-    assert set(client_at(db, now).get("/api/runs/2").json()) == {"run", "accounts", "total"}
+    assert set(client_at(db, now).get("/api/runs/5").json()) == {"run", "accounts", "total"}
 
 
 def test_liveness_follows_the_clock_of_the_app(db):
@@ -348,6 +351,76 @@ def test_no_path_in_live_responses(tmp_path):
         for needle in forbidden:
             assert needle not in text
     assert "live-files-folder" not in texts[1]  # the list never named a directory
+
+
+WARNINGS = (
+    r"missing bars in C:\Users\someone\OneDrive - Corp\Stonks\OfflineData\AAPL.csv today",
+    "cannot read 'C:/Users/someone/data dir/MSFT.csv'.",
+    r"share \\server\share\bars\TSLA.csv is gone",
+    "wrote /home/someone/runs/live/AAPL_live.csv, then stopped",
+    "see ~/Stonks/OfflineData/MSFT.csv (stale)",
+    "no path here: 3/4 symbols, 10:00 and 5/6 bars; ratio a/b",
+)
+SCRUBBED = (
+    "missing bars in AAPL.csv today",
+    "cannot read 'MSFT.csv'.",
+    "share TSLA.csv is gone",
+    "wrote AAPL_live.csv, then stopped",
+    "see MSFT.csv (stale)",
+    "no path here: 3/4 symbols, 10:00 and 5/6 bars; ratio a/b",
+)
+
+
+def warned_database(tmp_path: Path) -> Path:
+    """A live run (1) and a backtest (2), both with path-like warnings."""
+    db = tmp_path / "warned.db"
+    clock = Clock()
+    with SqliteStore(db, clock=clock) as store:
+        run_id = live_run(store, clock, started=START, touched=START)
+        store.update_run_data(run_id, replace(live_meta().data, warnings=WARNINGS))
+        backtest = store.begin_run(replace(meta(), data=replace(
+            meta().data, warnings=WARNINGS)))
+        store.end_run(backtest, "completed")
+    return db
+
+
+def test_warnings_show_no_path_on_live_and_backtest_runs(tmp_path):
+    client = client_at(warned_database(tmp_path), START)
+    for url in ("/api/runs/1", "/api/runs/2"):
+        response = client.get(url)
+        assert response.json()["run"]["data_warnings"] == list(SCRUBBED)
+        for needle in ("someone", "C:", "server", "/home", "\\\\"):
+            assert needle not in response.text
+    compared = client.get("/api/compare", params={"runs": "1,2"})
+    assert compared.status_code == 200
+    assert [r["data_warnings"] for r in compared.json()["runs"]] == [list(SCRUBBED)] * 2
+    assert "someone" not in compared.text
+
+
+def test_live_bars_read_with_a_limit(db, monkeypatch):
+    bars_run(db, last_bar=T0)
+    seen: list[int | None] = []
+    original = SqliteStore.load_bars
+
+    def spy(self, run_id, symbol, start=None, end=None, limit=None):
+        seen.append(limit)
+        return original(self, run_id, symbol, start, end, limit)
+
+    monkeypatch.setattr(SqliteStore, "load_bars", spy)
+    monkeypatch.setattr(routes_bars, "MAX_BARS", 2)
+    client = client_at(db, START)
+    # one bar of the day cannot be served: 3 servable bars, but the 3 rows read hold only 2,
+    # so the window is read whole to decide, and it is too wide as before
+    response = client.get("/api/runs/1/bars", params={"symbol": "AAPL"})
+    assert response.status_code == 422 and "window too wide" in response.json()["detail"]
+    assert seen == [3, None]
+    # all servable: decided from MAX_BARS + 1 rows, nothing more is read
+    seen.clear()
+    clean = [b for b in bar_rows() if b.volume != 12.5]
+    other = db.with_name("clean.db")
+    bars_run(other, last_bar=T0, bars=clean)
+    response = client_at(other, START).get("/api/runs/1/bars", params={"symbol": "AAPL"})
+    assert response.status_code == 422 and seen == [3]
 
 
 def test_live_kinds_are_the_source_rule():

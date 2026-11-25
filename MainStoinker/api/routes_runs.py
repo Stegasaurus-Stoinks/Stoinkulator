@@ -16,6 +16,7 @@ newest first. A backtest's response is exactly what it was before.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import PureWindowsPath
 from typing import Any
@@ -28,6 +29,37 @@ from MainStoinker.engine.run_documents import is_live_run, report_document, run_
 from MainStoinker.engine.store import Store
 
 router = APIRouter()
+
+
+_PATH_START = r"(?:[A-Za-z]:[\\/]|\\\\|~[\\/]|(?<![\w.:/\\])/(?=[^\s/]))"
+_QUOTED_PATH = re.compile(rf"(?P<q>[\"']){_PATH_START}.*?(?P=q)")
+# Folders of a bare path may hold single spaces ("OneDrive - Corp\..."); the last component may not.
+_BARE_PATH = re.compile(
+    rf"{_PATH_START}(?:[^\\/\s\"']+(?: [^\\/\s\"']+)*[\\/])*[^\\/\s\"']*")
+_TRAILING = ".,;:!?)]}"
+
+
+def _last_component(path: str) -> str:
+    tail = path.rstrip(_TRAILING)
+    punct = path[len(tail):]
+    name = re.split(r"[\\/]+", tail.rstrip("\\/"))[-1]
+    return (name or "-") + punct
+
+
+def scrub_warning(text: str) -> str:
+    """A warning with every path in it (drive, UNC, `/`-rooted, `~`) reduced to its last component."""
+    text = _QUOTED_PATH.sub(
+        lambda m: m["q"] + _last_component(m[0][1:-1]) + m["q"], text)
+    return _BARE_PATH.sub(lambda m: _last_component(m[0]), text)
+
+
+def scrub_document(document: dict[str, Any]) -> dict[str, Any]:
+    """`document` with the paths of `run.data_warnings` removed (the API never shows a path)."""
+    header = document["run"]
+    warnings = header.get("data_warnings")
+    if warnings:
+        header["data_warnings"] = [scrub_warning(w) for w in warnings]
+    return document
 
 
 def last_folder_name(directory: str) -> str:
@@ -63,10 +95,10 @@ def _run_detail(store: Store, run_id: int, now: datetime) -> dict[str, Any]:
     run = store.load_run(run_id)
     directory = last_folder_name(run.summary.data.directory)
     if not is_live_run(run.summary):
-        return report_document(run, data_directory=directory, now=now)
-    return report_document(
+        return scrub_document(report_document(run, data_directory=directory, now=now))
+    return scrub_document(report_document(
         run, data_directory=directory, now=now, counts=store.load_counts(run_id),
-        last_bars={b.symbol: b for b in store.load_last_bars(run_id)})
+        last_bars={b.symbol: b for b in store.load_last_bars(run_id)}))
 
 
 @router.get("/api/runs")

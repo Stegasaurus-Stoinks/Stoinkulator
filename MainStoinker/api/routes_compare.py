@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 
 from MainStoinker.api.db import with_store
 from MainStoinker.api.errors import NotFound
-from MainStoinker.api.routes_runs import last_folder_name
+from MainStoinker.api.routes_runs import last_folder_name, scrub_document
 from MainStoinker.engine.run_documents import report_document
 from MainStoinker.engine.store import Store
 
@@ -46,7 +46,8 @@ def _compare(store: Store, ids: list[int]) -> dict[str, Any]:
     for run_id in ids:
         if run_id not in known:
             raise NotFound(f"no run {run_id}")
-    docs = [report_document(run, data_directory=last_folder_name(run.summary.data.directory))
+    docs = [scrub_document(report_document(
+                run, data_directory=last_folder_name(run.summary.data.directory)))
             for run in (store.load_run(run_id) for run_id in ids)]
     algos: dict[str, dict[str, Any]] = {}
     for doc in docs:

@@ -90,12 +90,20 @@ def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
         raise HTTPException(422, str(error)) from None
     if first is None or last is None:
         return {"symbol": symbol, "available": True, "reason": None, "bars": []}
-    stored = store.load_bars(run_id, symbol, first, last)
-    frame = pd.DataFrame(
-        [(b.time, b.open, b.high, b.low, b.close, b.volume) for b in stored],
-        columns=["date", *_PRICES, "volume"])
-    frame["date"] = pd.to_datetime(frame["date"])
-    return _served(symbol, _servable(frame).reset_index(drop=True), None)
+    def servable(limit: int | None) -> tuple[pd.DataFrame, int]:
+        stored = store.load_bars(run_id, symbol, first, last, limit=limit)
+        frame = pd.DataFrame(
+            [(b.time, b.open, b.high, b.low, b.close, b.volume) for b in stored],
+            columns=["date", *_PRICES, "volume"])
+        frame["date"] = pd.to_datetime(frame["date"])
+        return _servable(frame).reset_index(drop=True), len(stored)
+
+    # One row more than the limit is enough to know the window is too wide; if rows that
+    # cannot be served were among them, the whole window is read to count the others.
+    window, read = servable(MAX_BARS + 1)
+    if read > MAX_BARS and len(window) <= MAX_BARS:
+        window, _ = servable(None)
+    return _served(symbol, window, None)
 
 
 def _bars(store: Store, run_id: int, symbol: str,
