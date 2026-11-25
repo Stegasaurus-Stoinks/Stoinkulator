@@ -619,7 +619,10 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
     # The algos table (what the dashboard shows) against the config the replay was built from.
     found.append(_compare_records("algos", list(run.algos), list(replayed.algos),
                                   lambda a: a.idname))
-    gap_found, gap_compared = _compare_gap_rule(summary.data.gap_rule, replayed.gap_report,
+    # A run still marked running may hold a provisional gap rule (the live writer's heartbeat
+    # stores one, as of that moment): it is not final, so it is not compared.
+    stored_gap_rule = None if summary.status == "running" else summary.data.gap_rule
+    gap_found, gap_compared = _compare_gap_rule(stored_gap_rule, replayed.gap_report,
                                                 completed=completed)
     found.append(gap_found)
     if not gap_compared and not gap_found:

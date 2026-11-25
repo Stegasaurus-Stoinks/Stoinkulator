@@ -101,6 +101,7 @@ def build_session(
     drop: dict[str, range] | None = None, fail_at: int | None = None,
     stop_after: int | None = None, record_bars_dir: bool = True,
     kill_after: int | None = None, reverse_algos: bool = False, backfill: int = 0,
+    heartbeat_every: int | None = None,
 ) -> Session:
     """Drive a live session to its end (or its failure) and return what it stored.
 
@@ -110,7 +111,9 @@ def build_session(
     `end_live` or `finish` (a killed process: the run stays `running`); `reverse_algos`
     lists the algos in the opposite order of the feed's symbols; `backfill` makes the session
     start after the open: that many of today's first bars are warm-up (stored in the
-    description with their digest, appended to the frames), the rest are stepped.
+    description with their digest, appended to the frames), the rest are stepped;
+    `heartbeat_every` makes the writer store provisional counts and data (as the live driver's
+    heartbeat does) after every that many steps.
     """
     harness.reset_runtime_state()
     root.mkdir(parents=True)
@@ -184,6 +187,14 @@ def build_session(
                 writer.fed(stamp, bars)
                 engine.step(stamp, bars)
                 done += 1
+                if heartbeat_every and done % heartbeat_every == 0:
+                    writer.heartbeat(
+                        {(s, "fed", None): sum(1 for _, b in ordered[:done] if s in b)
+                         for s in symbols},
+                        DataMeta(source="live", directory=str(bars_dir), symbols=tuple(symbols),
+                                 first_bar=ordered[0][0], last_bar=stamp, replayed_minutes=done,
+                                 missing_minutes=(), uncovered_minutes=0, warnings=(),
+                                 gap_rule=engine.gap_report))
         except RuntimeError:
             failed = True
         if kill_after is not None:  # the process dies here: no end_live, no finish
@@ -231,6 +242,12 @@ def sessions(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Session]:
                                    reverse_algos=True),
         "no-dir": build_session(base / "no-dir", ["AAPL"], "legacy", rows=300,
                                 record_bars_dir=False),
+        "provisional": build_session(
+            base / "provisional", ["AAPL", "MSFT"], "realistic", rows=700, heartbeat_every=40,
+            drop={"AAPL": range(100, 104), "MSFT": range(300, 302)}),
+        "killed-provisional": build_session(
+            base / "killed-provisional", ["AAPL", "MSFT"], "realistic", kill_after=450,
+            heartbeat_every=40, drop={"AAPL": range(100, 104)}),
         "mid-session": build_session(base / "mid-session", ["AAPL", "MSFT"], "realistic",
                                      rows=700, backfill=60),
     }
@@ -977,3 +994,25 @@ def test_a_run_stored_by_the_first_driver_with_todays_bars_and_no_digest_is_unve
     _set_description(old.db, lambda d: d.pop("today_sha256"))
     code, out, _ = verify(old, capsys)
     assert code == EXIT_UNVERIFIABLE and "no recorded digest" in out
+
+
+def test_verify_passes_on_a_run_that_stored_provisional_counts_and_data_midway(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = sessions["provisional"]
+    run = stored_run(session.db)
+    assert run.summary.status == "completed" and run.summary.data.gap_rule is not None
+    code, out, err = verify(session, capsys)
+    assert code == EXIT_VERIFIED, out + err
+
+
+def test_verify_does_not_compare_the_provisional_counts_of_a_run_left_running(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = sessions["killed-provisional"]
+    run = stored_run(session.db)
+    assert run.summary.status == "running"
+    assert run.summary.data.last_bar is not None  # the heartbeat stored a provisional data record
+    assert run.summary.data.gap_rule is not None
+    code, out, err = verify(session, capsys)
+    assert code == EXIT_VERIFIED, out + err

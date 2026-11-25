@@ -631,3 +631,44 @@ def test_live_module_is_referenced_and_the_views_use_the_lifecycle_for_their_tim
         assert "setInterval" not in source and "setTimeout" not in source, view  # never a bare timer in a view
     live = (STATIC / "js" / "live.js").read_text(encoding="utf-8")
     assert "ctx.onCleanup(stop)" in live
+
+
+# --- provisional counts, both gap-rule shapes, "so far" (issue 220) -------------------------------
+
+
+def test_provisional_counts_both_gap_shapes_and_the_so_far_notes(node_workdir: Path) -> None:
+    out = run_node(node_workdir, "live_so_far", OVERVIEW_SOURCE + """
+const noteTexts = (container, label) => byClass(sectionOf(container, label), "so-far").map((n) => n.textContent);
+const out = {};
+// a running run: provisional counts get the note, and the bar range says so far
+served = detail({}, { live_counts: { ...COUNTS, provisional: true } });
+let container = await open(render, { runId: 5 });
+out.runningCounts = noteTexts(container, "Live counts");
+out.runningRows = rowTexts(sectionOf(container, "Live counts").all("table")[0]).length;
+out.runningTable = noteTexts(container, "Per-algo results");
+out.range = container.textContent.includes("(data time), so far");
+// nothing fed yet, provisional: the empty text stays
+served = detail({}, { live_counts: { fed: {}, dropped: {}, late: {}, gap_rule: null, provisional: true } });
+out.empty = sectionOf(await open(render, { runId: 5 }), "Live counts").textContent;
+// both shapes of suppressed_entries (a number in live_counts, an object in run.gap_rule) give the same sentence
+const { gapRuleLines } = await import("./js/live.js");
+out.numberShape = gapRuleLines({ bars_after_gap: {}, suppressed_entries: 2 });
+out.objectShape = gapRuleLines({ bars_after_gap: {}, suppressed_entries: { count: 2, by_algo: [] } });
+// failed and stale runs are "so far" too, a completed run is not
+served = detail({ liveness: "failed", status: "failed", incomplete: false });
+out.failed = noteTexts(await open(render, { runId: 5 }), "Per-algo results").length;
+served = detail({ liveness: "stale" });
+out.stale = noteTexts(await open(render, { runId: 5 }), "Per-algo results").length;
+served = ENDED();
+const done = await open(render, { runId: 5 });
+out.completed = noteTexts(done, "Per-algo results").length;
+out.completedCounts = noteTexts(done, "Live counts").length;
+console.log(JSON.stringify(out));
+""")
+    assert isinstance(out, dict)
+    assert len(out["runningCounts"]) == 1 and out["runningCounts"][0].startswith("So far")
+    assert out["runningRows"] == 2 and out["range"] is True
+    assert len(out["runningTable"]) == 1 and "running" in out["runningTable"][0]
+    assert "No minutes counted yet." in out["empty"]
+    assert out["objectShape"] == out["numberShape"] == ["2 entries refused on bars that follow a gap."]
+    assert out["failed"] == 1 and out["stale"] == 1 and out["completed"] == 0 and out["completedCounts"] == 0

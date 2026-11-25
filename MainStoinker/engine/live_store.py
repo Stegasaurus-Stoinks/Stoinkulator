@@ -56,6 +56,12 @@ and ends the run. It is best effort after an earlier store error: it tries to en
 the run as `failed`, never raises for a store problem, and reports the problems in
 the returned `FinishOutcome` (the first error ever seen is also `writer.error`).
 
+Provisional counts: `heartbeat(counts, data_meta)` also stores the counts and the data record as
+they stand (first and last bar, minute counts, warnings, gap rule), so a dashboard shows them while
+the run is running. A busy database skips that part until the next heartbeat (`provisional_skipped`
+counts them) and never fails a step or the session. `finish` overwrites both with the final values;
+a run that completed holds exactly what it would hold without any provisional write.
+
 Marker delay (decision of issue 192): every indicator series of an algo is held back
 by the tracker's `settle` bars (its `order`: 10 for Elliot, 2 for FunctionTest), so
 stop and trade markers of such an algo reach the store that many bars late although
@@ -208,6 +214,7 @@ class LiveRunWriter:
         self._buffer_bars: list[StoredBar] = []
         self._pending: tuple[Hashable, dict[str, Bar]] | None = None
         self._last_equity_time: datetime | None = None
+        self._provisional_skipped = 0
 
     # --- state -------------------------------------------------------------
 
@@ -323,15 +330,58 @@ class LiveRunWriter:
             self._fail(exc)
             raise
 
-    def heartbeat(self) -> None:
+    def heartbeat(self, counts: Mapping[CountSpec, int] | None = None,
+                  data_meta: DataMeta | None = None) -> None:
         """Touch the run without data (a driver calls it at least every
-        `HEARTBEAT_INTERVAL`, also during an outage)."""
+        `HEARTBEAT_INTERVAL`, also during an outage).
+
+        With `counts` (as for `finish`) and/or `data_meta` (the full `DataMeta` as it stands,
+        gap report included) the run's counts and data record are also refreshed, so a
+        dashboard sees them while the run is still running. These are PROVISIONAL: `finish`
+        writes the final values over them, and `report --verify` ignores them for a run that
+        did not complete. A provisional write is best effort: when the database is busy (or the
+        write fails otherwise) it is skipped, counted in `provisional_skipped`, and tried again
+        with the next heartbeat; it never fails the writer or the session. The plain touch
+        keeps its busy retries and its failure behaviour.
+        """
         run_id = self._require_run()
+        stamped = self._write_provisional(run_id, counts, data_meta)
+        if stamped:
+            return  # each provisional write stamps `last_write_at` itself
         try:
             self._retried(lambda: self._store.touch(run_id))
         except BaseException as exc:
             self._fail(exc)
             raise
+
+    @property
+    def provisional_skipped(self) -> int:
+        """How many provisional writes (counts or data record) a heartbeat gave up on."""
+        return self._provisional_skipped
+
+    def _write_provisional(self, run_id: int, counts: Mapping[CountSpec, int] | None,
+                           data_meta: DataMeta | None) -> bool:
+        """Best-effort provisional counts and data record; True when every part asked for
+        was stored (and so the run was stamped). Single attempt: no pause inside a heartbeat."""
+        stored = False
+        complete = True
+        if counts is not None:
+            try:
+                rows = {count_key(*spec): int(value) for spec, value in counts.items()}
+                if rows:
+                    self._store.set_counts(run_id, {COUNT_SCOPE_SYMBOL: rows})
+                    stored = True
+            except Exception:  # noqa: BLE001 - provisional data never fails the run
+                self._provisional_skipped += 1
+                complete = False
+        if data_meta is not None:
+            try:
+                self._store.update_run_data(run_id, data_meta)
+                stored = True
+            except Exception:  # noqa: BLE001
+                self._provisional_skipped += 1
+                complete = False
+        return stored and complete
 
     # --- internals -----------------------------------------------------------
 

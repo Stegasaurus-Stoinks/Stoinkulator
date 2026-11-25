@@ -916,6 +916,28 @@ def test_heartbeat_during_an_outage_keeps_the_run_from_going_stale(
     assert first - ep(9, 38, 40) <= 30 and ep(9, 42, 40) - last <= 30  # also at both ends of the window
 
 
+def test_the_heartbeat_hands_the_writer_the_counts_and_the_data_so_far(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore], monkeypatch: pytest.MonkeyPatch) -> None:
+    from MainStoinker.engine.live_store import LiveRunWriter
+    real = LiveRunWriter.heartbeat
+    seen: list[tuple[Any, Any]] = []
+
+    def spy(self: LiveRunWriter, counts: Any = None, data_meta: Any = None) -> None:
+        seen.append((counts, data_meta))
+        real(self, counts, data_meta)
+
+    monkeypatch.setattr(LiveRunWriter, "heartbeat", spy)
+    outage(rig, down=(38, 40.0), up=(42, 40.0))
+    result = session(rig, tmp_path, stores)
+    assert result.code == 0, rig.text
+    assert len(seen) >= 8
+    counts, data_meta = seen[-1]
+    assert counts and all(value >= 0 for value in counts.values())
+    assert any(key[1] == "fed" and value > 0 for key, value in counts.items())
+    assert data_meta is not None and data_meta.last_bar is not None and data_meta.gap_rule is not None
+    assert data_meta.replayed_minutes and data_meta.replayed_minutes > 0
+
+
 # -- (l) abandoned runs ----------------------------------------------------------------------
 
 

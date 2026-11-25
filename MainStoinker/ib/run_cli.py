@@ -100,8 +100,8 @@ NY = ZoneInfo(DATA_ZONE)
 
 EXIT_CODES_TEXT = """\
 exit codes:
-  0    the session ended as planned: the end of the session (16:20 New York), --minutes elapsed
-       or the stop file; the run is stored as completed
+  0    the session ended as planned: the end of the session (about 16:20 New York, at the latest
+       16:21), --minutes elapsed or the stop file; the run is stored as completed
   1    a symbol stopped (IB error, unusable live file): the run is stored as failed
   2    refused: usage error, console gate, port guard, --paper conditions (port, host,
        STOINK_ALLOW_LIVE_PORT set), a mode other than paper, legacy fills, an unusable path or

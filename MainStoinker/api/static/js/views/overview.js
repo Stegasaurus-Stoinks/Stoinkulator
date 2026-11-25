@@ -1,7 +1,7 @@
 // The run overview: status, settings, the account equity chart with its drawdown, the per-algo table
 // (the columns of `report RUN`, with a TOTAL row) and notes. Follows the view contract in main.js.
 //
-// Exports: render, ALGO_COLUMNS, displayStatus, runDurationSeconds, buildRows, statusNotes, runNotes,
+// Exports: render, soFarNote, ALGO_COLUMNS, displayStatus, runDurationSeconds, buildRows, statusNotes, runNotes,
 // settingRows. The last five are pure (no DOM) so node can test them.
 import { ApiError, HEALTH_EVENT, getJson, isAbortError } from "../api.js";
 import { createEquityChart } from "../charts/equity.js";
@@ -118,6 +118,7 @@ export function runNotes(doc) {
     notes.push("Bars that follow a gap (entries signalled on them were refused): "
       + gappedBars.map(([symbol, n]) => symbol + " " + n).join(", ") + ".");
   }
+  // an object {count, by_algo} here (a plain number is `live_counts`' shape, read by `gapRuleLines` in live.js)
   const refused = rule.suppressed_entries && typeof rule.suppressed_entries === "object" ? rule.suppressed_entries : {};
   const refusedCount = numberOrNull(refused.count) || 0;
   if (refusedCount > 0) {
@@ -175,6 +176,7 @@ export function settingRows(run) {
   const costs = run.costs && typeof run.costs === "object" ? run.costs : {};
   const range = run.first_bar || run.last_bar
     ? barTime(run.first_bar) + " to " + barTime(run.last_bar) + " (data time)"
+      + (isLiveRun(run) && run.liveness !== "completed" ? ", so far" : "")
     : DASH;
   const symbols = Array.isArray(run.symbols) && run.symbols.length > 0 ? run.symbols.join(", ") : DASH;
   return [
@@ -262,6 +264,14 @@ function statusContent(run) {
   return [statusLine(run), warning ? h("p", { class: "warning", role: "note" }, warning) : null].filter(Boolean);
 }
 
+// The "so far" note of a live run that has not completed (running, stale or failed): its final equity and
+// totals are the last stored figures. Null for a completed run.
+export function soFarNote(run) {
+  if (!isLiveRun(run) || run.liveness === "completed") return null;
+  return h("p", { class: "muted so-far" },
+    "So far: this run is " + String(run.liveness) + ", not completed. Final equity and the totals are the last stored figures.");
+}
+
 function notesSection(notes) {
   return h("section", { class: "panel", "aria-label": "Notes" }, h("h3", {}, "Notes"),
     h("ul", { class: "notes" }, notes.map((note) => h("li", {}, note))));
@@ -288,6 +298,7 @@ export async function render(container, params, ctx) {
   let liveBox = null; // the live parts and the refresh note; only for a run that has live keys
   let statusBox = null;
   let notesSlot = null;
+  let soFarSlot = null;
   let table = null;
   let chart = null;
 
@@ -347,7 +358,9 @@ export async function render(container, params, ctx) {
   }
 
   table = algoTable(doc, runId);
-  parts.push(h("section", { "aria-label": "Per-algo results" }, h("h3", {}, "Algos"), table.element));
+  if (liveBox) soFarSlot = h("div", { class: "so-far-slot" }, ...[soFarNote(doc.run)].filter(Boolean));
+  parts.push(h("section", { "aria-label": "Per-algo results" }, h("h3", {}, "Algos"),
+    ...(soFarSlot ? [soFarSlot] : []), table.element));
   const notes = runNotes(doc);
   if (liveBox) {
     // a live run's notes change while it runs: a slot that holds the section (or nothing)
@@ -393,6 +406,7 @@ export async function render(container, params, ctx) {
       current = docNext.value;
       statusBox.replaceChildren(...statusContent(current.run));
       table.update({ rows: buildRows(current) });
+      soFarSlot.replaceChildren(...[soFarNote(current.run)].filter(Boolean));
       const next = runNotes(current);
       notesSlot.replaceChildren(...(next.length > 0 ? [notesSection(next)] : []));
     }
