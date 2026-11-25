@@ -243,7 +243,7 @@ def test_help_and_usage_errors_build_no_client() -> None:
 
 
 def test_paper_refuses_other_port_host_and_optin_env(rig: Rig) -> None:
-    for extra in (["--port", "7496"], ["--port", "4002"], ["--port", "4001"], ["--host", "10.0.0.5"],
+    for extra in (["--port", "7496"], ["--port", "4002"], ["--port", "4001"], ["--host", "203.0.113.5"],
                   ["--host", "localhost"]):
         rig.out.truncate(0)
         rig.out.seek(0)
