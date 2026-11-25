@@ -526,7 +526,7 @@ CALLBACKS = {
 
 @pytest.mark.parametrize("name", sorted(CALLBACKS))
 @pytest.mark.parametrize("account", [LIVE_LOOKING, "", "DU123456 ", "xDU1", "U1234567"])
-def test_non_account_callback_trips(name, account):
+def test_non_paper_account_in_each_callback_trips(name, account):
     client, got = make_client()
     stub = with_stub(client, AT_PROTOBUF)
     with pytest.raises(AccountTripwire) as err:
@@ -620,7 +620,10 @@ def test_callbacks_never_raise_into_ibapi_except_the_tripwire():
     client.openOrderEnd()
     client.position(PAPER, contract(), Decimal(1), 1.0)
     client.execDetails(1, contract(), _exec())
-    assert client.callback_failures > 0
+    # four callbacks, each with a failing raw hook and a failing event hook
+    assert client.callback_failures == 8
+    assert set(client.first_failures) == {"on_raw", "on_event"}
+    assert client.tripped is None
 
 
 def test_callbacks_never_call_the_client(monkeypatch):
@@ -664,3 +667,158 @@ def test_signatures_match_ewrapper():
     for name in names:
         assert (inspect.signature(getattr(AccountReadClient, name))
                 == inspect.signature(getattr(EWrapper, name))), name
+
+
+# -- client id and a final trip -----------------------------------------------
+
+
+def test_client_id_constant_is_24():
+    assert account_client.ACCOUNT_CLIENT_ID == 24  # decision O9 in issue 230
+
+
+@pytest.mark.parametrize("client_id", [0, 1, 20, 22, 23, 25, -1, 2**31])
+def test_connect_refuses_any_client_id_other_than_24(connect_recorder, client_id):
+    client, _ = make_client()
+    with pytest.raises(account_client.ClientIdRefused):
+        client.connect("127.0.0.1", 7497, client_id)
+    assert connect_recorder == []
+
+
+@pytest.mark.parametrize("client_id", ["24", 24.0, True, None, b"24"])
+def test_connect_refuses_a_client_id_that_is_not_an_exact_int(connect_recorder, client_id):
+    client, _ = make_client()
+    with pytest.raises(account_client.ClientIdRefused):
+        client.connect("127.0.0.1", 7497, client_id)
+    assert connect_recorder == []
+
+
+def test_connect_accepts_client_id_24(connect_recorder):
+    client, _ = make_client()
+    assert client.connect("127.0.0.1", 7497, 24) == "delegated"
+    assert connect_recorder == [("127.0.0.1", 7497, 24)]
+
+
+def test_client_id_is_checked_before_the_port_guard(connect_recorder):
+    client, _ = make_client()
+    with pytest.raises(account_client.ClientIdRefused):
+        client.connect("127.0.0.1", 7496, 0)
+    assert connect_recorder == []
+
+
+def test_a_tripped_client_refuses_to_connect_again(connect_recorder):
+    client, _ = make_client()
+    with_stub(client, AT_PROTOBUF)
+    with pytest.raises(AccountTripwire):
+        client.position(LIVE_LOOKING, contract(), Decimal(1), 1.0)
+    with pytest.raises(AccountTripwire):
+        client.connect("127.0.0.1", 7497, 24)
+    assert connect_recorder == []
+
+
+# -- ibapi's real decoder reaches the overrides -------------------------------
+
+
+def _decoder(client: AccountReadClient, server_version: int = AT_PROTOBUF_PLACE):
+    from ibapi.decoder import Decoder
+
+    return Decoder(client, server_version)
+
+
+def _b(*items: object) -> list[bytes]:
+    return [str(i).encode() for i in items]
+
+
+def _position_fields(account: str) -> list[bytes]:
+    # POSITION_DATA after the message id: version 3.
+    return _b(3, account, 265598, "AAPL", "STK", "", 0.0, "", "", "SMART", "USD", "AAPL",
+              "NMS", 10, 10.5)
+
+
+def test_decoder_text_position_and_managed_accounts_reach_the_overrides():
+    from ibapi.message import IN
+
+    client, got = make_client()
+    with_stub(client, AT_PROTOBUF_PLACE)
+    dec = _decoder(client)
+    dec.interpret(_b(1, PAPER), IN.MANAGED_ACCTS)
+    dec.interpret(_position_fields(PAPER), IN.POSITION_DATA)
+    dec.interpret(_b(1), IN.POSITION_END)
+    assert got == [
+        events.ManagedAccounts(PAPER),
+        account_client.Position(PAPER, 265598, "AAPL", "STK", "USD", Decimal(10), 10.5),
+        account_client.PositionEnd(),
+    ]
+
+
+def test_decoder_text_position_non_paper_trips_and_delivers_nothing():
+    from ibapi.message import IN
+
+    client, got = make_client()
+    stub = with_stub(client, AT_PROTOBUF_PLACE)
+    dec = _decoder(client)
+    with pytest.raises(AccountTripwire):
+        dec.interpret(_position_fields(LIVE_LOOKING), IN.POSITION_DATA)
+    assert stub.disconnected
+    assert [type(e) for e in got] == [events.ConnectionClosed]
+
+
+def test_decoder_text_managed_accounts_non_paper_trips():
+    from ibapi.message import IN
+
+    client, got = make_client()
+    stub = with_stub(client, AT_PROTOBUF_PLACE)
+    with pytest.raises(AccountTripwire):
+        _decoder(client).interpret(_b(1, f"{PAPER},{LIVE_LOOKING}"), IN.MANAGED_ACCTS)
+    assert stub.disconnected
+    assert [type(e) for e in got] == [events.ConnectionClosed]
+
+
+def _open_order_proto(account: str) -> bytes:
+    from ibapi.protobuf.OpenOrder_pb2 import OpenOrder as OpenOrderProto
+
+    p = OpenOrderProto()
+    p.orderId = 5
+    p.contract.symbol, p.contract.secType, p.contract.conId = "AAPL", "STK", 265598
+    p.order.action, p.order.orderType, p.order.totalQuantity = "BUY", "MKT", "10"
+    p.order.account, p.order.permId, p.order.orderRef = account, 77, "stoink-1"
+    p.orderState.status = "Submitted"
+    return p.SerializeToString()
+
+
+def _execution_proto(account: str) -> bytes:
+    from ibapi.protobuf.ExecutionDetails_pb2 import ExecutionDetails as ExecutionDetailsProto
+
+    p = ExecutionDetailsProto()
+    p.reqId = 7
+    p.contract.symbol, p.contract.secType = "AAPL", "STK"
+    p.execution.execId, p.execution.acctNumber, p.execution.orderId = "0001.1", account, 5
+    p.execution.side, p.execution.shares, p.execution.price = "BOT", "10", 10.5
+    return p.SerializeToString()
+
+
+def test_decoder_protobuf_open_order_and_execution_reach_the_overrides():
+    from ibapi.message import IN
+
+    client, got = make_client()
+    with_stub(client, AT_PROTOBUF_PLACE)
+    dec = _decoder(client)
+    dec.processProtoBuf(_open_order_proto(PAPER), IN.OPEN_ORDER)
+    dec.processProtoBuf(_execution_proto(PAPER), IN.EXECUTION_DATA)
+    assert [type(e).__name__ for e in got] == ["OpenOrder", "ExecDetails"]
+    assert got[0].account == PAPER and got[0].order_id == 5 and got[0].order_ref == "stoink-1"
+    assert got[1].account == PAPER and got[1].exec_id == "0001.1"
+
+
+@pytest.mark.parametrize("which", ["open_order", "execution"])
+def test_decoder_protobuf_non_paper_trips_and_delivers_nothing(which):
+    from ibapi.message import IN
+
+    client, got = make_client()
+    stub = with_stub(client, AT_PROTOBUF_PLACE)
+    dec = _decoder(client)
+    payload, msg_id = ((_open_order_proto(LIVE_LOOKING), IN.OPEN_ORDER) if which == "open_order"
+                       else (_execution_proto(LIVE_LOOKING), IN.EXECUTION_DATA))
+    with pytest.raises(AccountTripwire):
+        dec.processProtoBuf(payload, msg_id)
+    assert stub.disconnected
+    assert [type(e) for e in got] == [events.ConnectionClosed]

@@ -140,6 +140,14 @@ class AccountMessageRefused(RuntimeError):
     """
 
 
+ACCOUNT_CLIENT_ID = 24
+"""The account and order connection's client id, fixed forever (#230, decision O9)."""
+
+
+class ClientIdRefused(RuntimeError):
+    """`connect` was given a client id other than `ACCOUNT_CLIENT_ID`."""
+
+
 class AccountTripwire(RuntimeError):
     """A callback named a non-paper account (or none); the client disconnected."""
 
@@ -436,7 +444,17 @@ class AccountReadClient(EWrapper, EClient):
             self._conn = _GuardedConnection(value)
 
     def connect(self, host: str, port: int, clientId: int):
-        """Refuse a non-int port, run the port guard, then `EClient.connect`."""
+        """Refuse a tripped client, a client id other than 24 and a non-int port, run
+        the port guard, then `EClient.connect`. All refusals come before any socket."""
+        if self.tripped is not None:
+            raise AccountTripwire(
+                "Refusing to connect: this client tripped on a non-paper account and is final."
+            )
+        if type(clientId) is not int or clientId != ACCOUNT_CLIENT_ID:
+            raise ClientIdRefused(
+                f"Refusing to connect: the account client id is fixed at {ACCOUNT_CLIENT_ID} "
+                f"(decision O9), not {clientId!r}; client id 0 would bind TWS-owned orders."
+            )
         if type(port) is not int:
             raise BrokerPortRefused(
                 f"Refusing to connect: broker port {port!r} is not an int."
