@@ -13,8 +13,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -782,6 +785,30 @@ def test_verify_cross_checks_the_stored_bars_against_the_run_record(
     sql(none.db, "DELETE FROM run_counts WHERE run_id=1")
     code, out, _ = verify(none, capsys)
     assert code == EXIT_UNVERIFIABLE and "bar counts not recorded" in out
+
+
+def test_verify_in_a_fresh_process_prints_only_the_report(
+    sessions: dict[str, Session], tmp_path: Path
+) -> None:
+    """The legacy algo modules print when they are first imported; a fresh process (unlike
+    this one, where they are loaded already) must not let that reach stdout."""
+    session = sessions["one-legacy"]
+    work = tmp_path / "fresh-cwd"
+    work.mkdir()
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    base = [sys.executable, "-P", "-m", "MainStoinker", "report", "1", "--db", str(session.db),
+            "--verify", "--bars", str(session.bars)]
+    as_json = subprocess.run([*base, "--json"], cwd=work, env=env, capture_output=True,
+                             text=True, timeout=300)
+    assert as_json.returncode == EXIT_VERIFIED, as_json.stdout + as_json.stderr
+    assert json.loads(as_json.stdout)["verify"]["outcome"] == "verified"
+    as_text = subprocess.run(base, cwd=work, env=env, capture_output=True, text=True,
+                             timeout=300)
+    assert as_text.returncode == EXIT_VERIFIED, as_text.stdout + as_text.stderr
+    lines = as_text.stdout.splitlines()
+    assert lines[0] == "run 1"
+    assert lines[-1].startswith("verify: VERIFIED")
+    assert list(work.iterdir()) == []
 
 
 def test_the_replay_uses_the_feed_order_of_the_stored_symbols_not_the_algos_order(

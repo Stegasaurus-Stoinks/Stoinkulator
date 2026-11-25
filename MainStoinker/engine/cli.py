@@ -1021,7 +1021,10 @@ def make_verifier(bars: str | None) -> Callable[[Store, RunData], VerifyResult]:
             raise CliError(f"--bars {explicit} is not a directory")
 
     def verifier(store: Store, run: RunData) -> VerifyResult:
-        return verify_run(store, run, bars_dir=explicit, replayer=replay_stored_run)
+        # Importing an algo runs legacy import-time code that prints to stdout (as in
+        # `backtest`, which silences it with --quiet): nothing of that may reach the report.
+        with _maybe_quiet(True):
+            return verify_run(store, run, bars_dir=explicit, replayer=replay_stored_run)
 
     return verifier
 
