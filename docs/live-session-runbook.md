@@ -20,16 +20,18 @@ says VERIFIED; the dashboard showed the run while it ran; the next-morning compa
 4. TWS's auto-restart time is outside 09:25 to 16:25 New York. A restart closes the connection
    and ends the run.
 5. The computer stays awake and on power until after 16:25 New York: no sleep, no update restart.
-6. Back up the runs database. The first write by this code (`run`, or `backtest --db`) migrates
+6. Back up the live runs database. The first write by this code (`run`, or `backtest --db`) migrates
    an older database to the current schema, and a database written by newer code is refused by
    older code, so there is no way back except the copy. Close `serve` first, then:
 
        New-Item -ItemType Directory -Force "$env:USERPROFILE\Stoinkulator\runs-backup" | Out-Null
-       Copy-Item "$env:USERPROFILE\Stoinkulator\runs.db*" "$env:USERPROFILE\Stoinkulator\runs-backup"
+       Copy-Item "$env:USERPROFILE\Stoinkulator\live-runs.db*" "$env:USERPROFILE\Stoinkulator\runs-backup"
 
-   `%USERPROFILE%\Stoinkulator\runs.db` is the path the store suggests (the code has no default
+   `%USERPROFILE%\Stoinkulator\live-runs.db` is the path unattended sessions use (the code has no default
    path: you give `--db`, or set `STOINK_DB`). If you keep the database elsewhere, copy that file
    and the files beside it that start with the same name. If there is no database yet, skip this.
+   Unattended sessions write to `live-runs.db`, a separate file, and never to `runs.db`: `runs.db` holds
+   backtest runs and no session opens it for writing (a first write migrates a schema-2 database one way).
 7. The algos file: `"mode": "paper"` on every algo (a live run refuses any other mode), at most 5
    symbols in all. Issue 187, D10: FunctionTest and EMACrossing for the first sessions. Keep the file
    outside the repository if you like; the placeholder below is `ALGOS_FILE`.
@@ -63,7 +65,7 @@ says VERIFIED; the dashboard showed the run while it ran; the next-morning compa
 
 ## Start (about 09:25 New York)
 
-    .venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS_FILE --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\runs.db" --stop-file "$env:USERPROFILE\Stoinkulator\stop-run" --paper --no-prompt --minutes 415
+    .venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS_FILE --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\live-runs.db" --stop-file "$env:USERPROFILE\Stoinkulator\stop-run" --paper --no-prompt --minutes 415
 
 `--paper` means port 7497 on 127.0.0.1, the live opt-in absent, and an account check. 415 minutes
 cover 09:25 to 16:20; the session ends on its own once the last bar is decided (about 16:20, at the
@@ -96,7 +98,7 @@ the pre-open watcher run of 2026-11-25 first; if it did not roll, start at 09:30
 
 In a second terminal, from the repository root (needs `requirements-web.txt`):
 
-    .venv\Scripts\python.exe -m MainStoinker serve --db "$env:USERPROFILE\Stoinkulator\runs.db"
+    .venv\Scripts\python.exe -m MainStoinker serve --db "$env:USERPROFILE\Stoinkulator\live-runs.db"
 
 Open `http://127.0.0.1:8750`. Reading never blocks the run. Run `serve` on the same database file;
 it only reads. What to look for:
@@ -134,15 +136,15 @@ it only reads. What to look for:
    (`minutes_elapsed` and `stop_file` are also `completed`). Anything else: see the failure table.
 2. List the runs and print the report (replace RUN with the run id):
 
-       .venv\Scripts\python.exe -m MainStoinker runs --db "$env:USERPROFILE\Stoinkulator\runs.db"
-       .venv\Scripts\python.exe -m MainStoinker report RUN --db "$env:USERPROFILE\Stoinkulator\runs.db"
+       .venv\Scripts\python.exe -m MainStoinker runs --db "$env:USERPROFILE\Stoinkulator\live-runs.db"
+       .venv\Scripts\python.exe -m MainStoinker report RUN --db "$env:USERPROFILE\Stoinkulator\live-runs.db"
 
    The report gives the statistics per algo and in total, the liveness and end reason, the live
    counts (minutes fed, dropped by the watcher with the reason, late and not fed), the gap rule
    (bars that follow a gap, entries refused, pending entries cancelled) and the open positions.
 3. Verify the run exactly. This replays the stored bars through the engine and compares:
 
-       .venv\Scripts\python.exe -m MainStoinker report RUN --verify --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\runs.db"
+       .venv\Scripts\python.exe -m MainStoinker report RUN --verify --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\live-runs.db"
 
    The session already printed the same check at its end (`live: verify: ...`). Results:
 
@@ -161,7 +163,7 @@ it only reads. What to look for:
    percent between feeds):
 
        .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols AAPL,MSFT --start YYYY-MM-DD --end YYYY-MM-DD --paper --no-prompt
-       .venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS_FILE --data "$env:USERPROFILE\Stoinkulator\bars" --out "$env:USERPROFILE\Stoinkulator\compare-YYYY-MM-DD" --replay-from YYYY-MM-DD --fills realistic --db "$env:USERPROFILE\Stoinkulator\runs.db" --quiet
+       .venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS_FILE --data "$env:USERPROFILE\Stoinkulator\bars" --out "$env:USERPROFILE\Stoinkulator\compare-YYYY-MM-DD" --replay-from YYYY-MM-DD --fills realistic --db "$env:USERPROFILE\Stoinkulator\live-runs.db" --quiet
 
    YYYY-MM-DD is the day of the session in both commands. `fetch-bars` needs TWS on the paper
    login again. The fetched day stays provisional until 06:00, so do it after that time.

@@ -58,9 +58,9 @@ is sent. It is paper only: it needs `--paper` and refuses everything else. The w
 checks afterwards and what to do for each exit code) is `docs/live-session-runbook.md`. In short,
 from the repository root, with TWS on the paper login and Read-Only API ON:
 
-    .venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS_FILE --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\runs.db" --stop-file "$env:USERPROFILE\Stoinkulator\stop-run" --paper --no-prompt --minutes 415
+    .venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS_FILE --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\live-runs.db" --stop-file "$env:USERPROFILE\Stoinkulator\stop-run" --paper --no-prompt --minutes 415
 
-Every algo in the file needs `"mode": "paper"`. Back up the runs database before the first start
+Every algo in the file needs `"mode": "paper"`. Back up the live runs database (`live-runs.db`, not `runs.db`, which holds backtest runs and is never written by a session) before the first start
 (the new schema is a one-way migration). Without `--no-prompt` you type `7497` when asked. After the
 session: `report RUN --db ...` and `report RUN --verify --bars ... --db ...`. Never run it on a live
 port, and never turn Read-Only API off.

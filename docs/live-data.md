@@ -137,7 +137,7 @@ subscription). Run `fetch-bars` for the same day after 06:00 New York next day t
 
 ### `run`
 
-    python -m MainStoinker run --algos ALGOS.json --bars BARS --db runs.db --paper --no-prompt --minutes 415
+    python -m MainStoinker run --algos ALGOS.json --bars BARS --db live-runs.db --paper --no-prompt --minutes 415
 
 Runs the algos of an algos file on live 1-minute bars from the paper account. The bars come from
 the same watcher as `watch_bars`; each closed bar goes into the engine, and the algos trade on the
@@ -356,7 +356,7 @@ machine's idea of "home"); a command with neither set refuses to start.
   `probe-data-DATE-NNN.jsonl`, `watch-bars-DATE-NNN.jsonl` or `run-DATE-NNN.jsonl`; an existing
   file is never overwritten.
 - `run` also writes the run database (`--db`, or `STOINK_DB`; the path
-  `%USERPROFILE%\Stoinkulator\runs.db` is the one the store suggests, there is no default) and
+  `%USERPROFILE%\Stoinkulator\live-runs.db` is the one unattended sessions use, there is no default) and
   `%USERPROFILE%\Stoinkulator\run-out` (the algos' working folder); its live files go to the same
   `live` folder as the watcher's.
 
