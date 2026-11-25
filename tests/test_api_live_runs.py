@@ -397,6 +397,21 @@ def test_warnings_show_no_path_on_live_and_backtest_runs(tmp_path):
     assert "someone" not in compared.text
 
 
+@pytest.mark.parametrize(("text", "expected"), [
+    (r"C:\a\one.csv and D:/b/two.csv", "one.csv and two.csv"),
+    (r"C:\a b\one.csv, D:\c\two.csv", "one.csv, two.csv"),
+    (r"from C:\a\one.csv to \\srv\x\two.csv done", "from one.csv to two.csv done"),
+    ("/data/one.csv and /data/two.csv", "one.csv and two.csv"),
+    (r"C:\a\one.csv, then ~/b/two.csv.", "one.csv, then two.csv."),
+    ("see https://example.com/a/b.csv and http://host:8750/x", None),
+    ("file:///C:/data/x.csv is a URL; 3/4 and a/b stay", None),
+    ("fetch 'https://example.com/a b/c.csv' failed", None),
+])
+def test_scrub_warning_stops_at_the_next_path_and_leaves_urls(text, expected):
+    from MainStoinker.api.routes_runs import scrub_warning
+    assert scrub_warning(text) == (text if expected is None else expected)
+
+
 def test_live_bars_read_with_a_limit(db, monkeypatch):
     bars_run(db, last_bar=T0)
     seen: list[int | None] = []

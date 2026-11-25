@@ -230,6 +230,29 @@ class StoredBar:
 
 
 @dataclass(frozen=True)
+class LiveStep:
+    """Everything one incremental write of a live run adds (`Store.write_live_step`).
+
+    Ledger records are given once each, as with `write_results`. `series` are the
+    indicator series declared since the last write (a name already declared is
+    updated, not an error) and `series_points` their new points (a point already
+    stored for that time is overwritten). `bars` are the bars the engine consumed.
+    `final_equity` replaces the latest group of equity points written (see
+    `SqliteStore.write_live_step`).
+    """
+
+    order_events: Sequence[OrderEvent] = ()
+    fills: Sequence[Fill] = ()
+    round_trips: Sequence[RoundTrip] = ()
+    equity: Sequence[EquityPoint] = ()
+    ignored_events: Sequence[IgnoredEvent] = ()
+    series: Sequence[SeriesInfo] = ()
+    series_points: Sequence[SeriesPoint] = ()
+    bars: Sequence[StoredBar] = ()
+    final_equity: Sequence[EquityPoint] = ()
+
+
+@dataclass(frozen=True)
 class RunData:
     """Everything stored for one run, as the ledger's own record types.
 
@@ -304,6 +327,8 @@ class Store(Protocol):
 
     def touch(self, run_id: int) -> None: ...
 
+    def write_live_step(self, run_id: int, step: LiveStep) -> None: ...
+
     def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None: ...
 
     def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None: ...
@@ -368,6 +393,9 @@ class NullStore:
         return None
 
     def touch(self, run_id: int) -> None:
+        return None
+
+    def write_live_step(self, run_id: int, step: LiveStep) -> None:
         return None
 
     def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None:
@@ -829,6 +857,10 @@ class SqliteStore:
         self._readonly = readonly
         self._schema_version = 0
         self._equity_state: dict[tuple[int, str | None], _EquityState] = {}
+        # run id -> (time, last equity seq before it, compressor states before it) of the
+        # latest group of equity points `write_live_step` wrote: what `final_equity` undoes.
+        self._equity_undo: dict[int, tuple[datetime, int, dict[
+            tuple[int, str | None], _EquityState | None]]] = {}
         self._path = str(path)
         if readonly:
             self._open_readonly(busy_timeout, os.environ if env is None else env)
@@ -1225,6 +1257,139 @@ class SqliteStore:
                     rows)
             except sqlite3.IntegrityError as exc:
                 raise StoreError(f"a series point is already stored for that time: {exc}") from exc
+
+    def write_live_step(self, run_id: int, step: LiveStep) -> None:
+        """One incremental write of a live run: records, series, bars and a heartbeat, in
+        ONE transaction (all or nothing; a failure leaves the compressor as it was).
+
+        - Ledger records as `write_results` stores them (each given once; a repeated
+          fill id raises `StoreError`). Equity points arrive in time order and are
+          compressed as there; the points of one time are kept apart, so the latest
+          group can be replaced.
+        - `final_equity`: replaces the latest group of equity points written by this
+          store object (`Ledger.finish` does the same at the end of a backtest): its
+          rows are removed, the compressor goes back to where it was before that
+          group, and these points are written instead. Every point must have the time
+          of that group (else `StoreError`); with no such group it raises. Applied
+          after `equity` of the same call, so a call may add the tail and replace.
+        - `series` are upserted (draw type and position are updated, the id is kept);
+          `series_points` are upserted by (series, time), so a rebuilt tracker handing
+          out a point again does not violate the key; a point of an undeclared series
+          raises. Every value must be finite.
+        - `bars` are plain inserts: a second bar for a symbol and minute raises.
+        - `last_write_at` is set.
+        """
+        info_rows = [
+            (run_id, _text(i.account, "series account"), _text(i.name, "series name"),
+             _text(i.draw_type, "series draw_type"), _series_position(i.position))
+            for i in step.series]
+        point_rows = [(_text(p.account, "series account"), _text(p.name, "series name"),
+                       _series_time(p.time), _finite(p.value)) for p in step.series_points]
+        bar_rows = [_bar_row(run_id, b) for b in step.bars]
+        saved = {k: replace(v) for k, v in self._equity_state.items()}
+        saved_undo = dict(self._equity_undo)
+        try:
+            with self._tx() as conn:
+                self._require_run(conn, run_id, running=True)
+                self._insert_records(conn, run_id, step)
+                groups: dict[datetime, list[EquityPoint]] = {}
+                for p in step.equity:
+                    groups.setdefault(p.time, []).append(p)
+                for group in groups.values():
+                    self._write_equity_group(conn, run_id, group)
+                if step.final_equity:
+                    self._replace_equity_group(conn, run_id, step.final_equity)
+                if info_rows:
+                    conn.executemany(
+                        "INSERT INTO algo_series (run_id, algo, name, draw_type, position)"
+                        " VALUES (?,?,?,?,?) ON CONFLICT (run_id, algo, name) DO UPDATE SET"
+                        " draw_type=excluded.draw_type, position=excluded.position", info_rows)
+                if point_rows:
+                    ids = {(a, n): i for i, a, n in conn.execute(
+                        "SELECT id, algo, name FROM algo_series WHERE run_id=?", (run_id,))}
+                    rows = []
+                    for algo, name, time_text, value in point_rows:
+                        if (algo, name) not in ids:
+                            raise StoreError(f"series {name!r} of {algo!r} was not declared")
+                        rows.append((ids[(algo, name)], time_text, value))
+                    conn.executemany(
+                        "INSERT INTO algo_series_points (series_id, time, value) VALUES (?,?,?)"
+                        " ON CONFLICT (series_id, time) DO UPDATE SET value=excluded.value", rows)
+                if bar_rows:
+                    try:
+                        conn.executemany(
+                            "INSERT INTO run_bars (run_id, symbol, time, open, high, low, close,"
+                            " volume) VALUES (?,?,?,?,?,?,?,?)", bar_rows)
+                    except sqlite3.IntegrityError as exc:
+                        raise StoreError(
+                            f"a bar is already stored for that symbol and minute: {exc}") from exc
+                self._stamp(conn, run_id)
+        except BaseException:
+            self._equity_state = saved
+            self._equity_undo = saved_undo
+            raise
+
+    @staticmethod
+    def _insert_records(conn: sqlite3.Connection, run_id: int, step: LiveStep) -> None:
+        conn.executemany(
+            "INSERT INTO order_events (run_id, algo, order_id, broker_ref, kind, time,"
+            " side, quantity_e4, order_type, price_e4) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [(run_id, e.account, e.order_id, _encode_ref(e.broker_ref), e.kind,
+              e.time.isoformat(), e.side, _opt_e4(e.quantity), e.order_type,
+              _opt_e4(e.price)) for e in step.order_events])
+        conn.executemany(
+            "INSERT INTO fills (run_id, fill_id, order_id, algo, broker_ref, symbol,"
+            " side, quantity_e4, price_e4, commission_e4, time, reason, synthetic)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(run_id, f.fill_id, f.order_id, f.account, _encode_ref(f.broker_ref),
+              f.symbol, f.side, _to_e4(f.quantity), _to_e4(f.price),
+              _to_e4(f.commission), f.time.isoformat(), f.reason, int(f.synthetic))
+             for f in step.fills])
+        conn.executemany(
+            "INSERT INTO trades (run_id, algo, broker_ref, symbol, side, quantity_e4,"
+            " entry_time, exit_time, entry_price_e4, exit_price_e4, gross_e4,"
+            " commission_e4, net_e4, duration_us, exit_reason, synthetic)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(run_id, t.account, _encode_ref(t.broker_ref), t.symbol, t.side,
+              _to_e4(t.quantity), t.entry_time.isoformat(), t.exit_time.isoformat(),
+              _to_e4(t.entry_price), _to_e4(t.exit_price), _to_e4(t.gross),
+              _to_e4(t.commission), _to_e4(t.net), t.duration // timedelta(microseconds=1),
+              t.exit_reason, int(t.synthetic)) for t in step.round_trips])
+        conn.executemany(
+            "INSERT INTO ignored_events (run_id, algo, broker_ref, kind, time)"
+            " VALUES (?,?,?,?,?)",
+            [(run_id, i.account, _encode_ref(i.broker_ref), i.kind, i.time.isoformat())
+             for i in step.ignored_events])
+
+    def _write_equity_group(self, conn: sqlite3.Connection, run_id: int,
+                            points: Sequence[EquityPoint]) -> None:
+        """Write the equity points of one time, remembering how to take them back."""
+        mark = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM equity").fetchone()[0]
+        before: dict[tuple[int, str | None], _EquityState | None] = {}
+        for p in points:
+            key = (run_id, p.account)
+            state = self._equity_state.get(key)
+            before[key] = None if state is None else replace(state)
+        self._write_equity(conn, run_id, points)
+        self._equity_undo[run_id] = (points[0].time, mark, before)
+
+    def _replace_equity_group(self, conn: sqlite3.Connection, run_id: int,
+                              points: Sequence[EquityPoint]) -> None:
+        undo = self._equity_undo.get(run_id)
+        if undo is None:
+            raise StoreError("no equity group written by this store to replace")
+        when, mark, before = undo
+        wrong = [p for p in points if p.time != when]
+        if wrong:
+            raise StoreError(f"final equity points must have the time {when.isoformat()} of "
+                             f"the group they replace, not {wrong[0].time.isoformat()}")
+        conn.execute("DELETE FROM equity WHERE run_id=? AND seq>?", (run_id, mark))
+        for key, state in before.items():
+            if state is None:
+                self._equity_state.pop(key, None)
+            else:
+                self._equity_state[key] = state
+        self._write_equity_group(conn, run_id, points)
 
     @staticmethod
     def _require_run(conn: sqlite3.Connection, run_id: int, *, running: bool = False) -> None:

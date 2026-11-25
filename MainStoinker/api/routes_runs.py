@@ -31,11 +31,15 @@ from MainStoinker.engine.store import Store
 router = APIRouter()
 
 
-_PATH_START = r"(?:[A-Za-z]:[\\/]|\\\\|~[\\/]|(?<![\w.:/\\])/(?=[^\s/]))"
-_QUOTED_PATH = re.compile(rf"(?P<q>[\"']){_PATH_START}.*?(?P=q)")
-# Folders of a bare path may hold single spaces ("OneDrive - Corp\..."); the last component may not.
+_START = r"(?:[A-Za-z]:[\\/]|\\\\|~[\\/]|/(?=[^\s/]))"  # drive, UNC, `~`, `/`-rooted
+_QUOTED_PATH = re.compile(rf"(?P<q>[\"']){_START}.*?(?P=q)")
+_WORD = r"[^\\/\s\"',]+"
+# A bare path starts where no word, `.`, `:` or separator precedes it (so `scheme://host/x` and
+# `3/4` are not paths). Its folders may hold single spaces ("OneDrive - Corp\..."), but not
+# ", ", " and ", " to " or the start of a following path; the last component has no space.
 _BARE_PATH = re.compile(
-    rf"{_PATH_START}(?:[^\\/\s\"']+(?: [^\\/\s\"']+)*[\\/])*[^\\/\s\"']*")
+    rf"(?<![\w.:/\\]){_START}"
+    rf"(?:{_WORD}(?: (?!(?:and|to)\b)(?!{_START}){_WORD})*[\\/])*[^\\/\s\"',]*")
 _TRAILING = ".,;:!?)]}"
 
 

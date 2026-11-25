@@ -10,23 +10,28 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 import MainStoinker.engine.store as store_module
+from MainStoinker.engine.ledger import EquityPoint
 from MainStoinker.engine.store import (
     END_REASONS,
     MIGRATIONS,
     SCHEMA_VERSION,
     DataMeta,
+    LiveStep,
     NullStore,
+    SeriesInfo,
+    SeriesPoint,
     SqliteStore,
     StoredBar,
     StoreError,
     open_store_readonly,
 )
-from tests.test_store import NO_ENV, T0, algos, meta, stored_run
+from tests.test_store import NO_ENV, T0, algos, build_ledger, meta, stored_run
 
 V2_TABLES = ("runs", "algos", "order_events", "fills", "trades", "equity", "ignored_events",
              "algo_series", "algo_series_points")
@@ -537,3 +542,174 @@ def test_load_bars_works_on_a_readonly_current_database_and_null_store(db):
     finally:
         store.close()
     assert NullStore().load_bars(1, "AAPL") == ()
+
+
+# --- write_live_step (issue 192) ---------------------------------------------------
+
+D = Decimal
+ACCOUNTS = ("a1", "a2", None)
+
+
+def group(minute: int, level: str, day: int = 0) -> list[EquityPoint]:
+    """One mark: a point per account and the total, every one at the same equity level."""
+    when = T0 + timedelta(days=day, minutes=minute)
+    equity = D(level)
+    return [EquityPoint(when, account, D(1000), equity - 1000, D(0), D(0), equity)
+            for account in ACCOUNTS]
+
+
+def run_equity(store: SqliteStore, run_id: int) -> list[EquityPoint]:
+    return list(store.load_run(run_id).equity)
+
+
+def reference_equity(db: Path, groups: list[list[EquityPoint]]) -> list[EquityPoint]:
+    """What a backtest stores for the same marks: one `write_results`, then `end_run`."""
+    with SqliteStore(db.with_name("reference.db"), env=NO_ENV) as store:
+        run_id = running(store)
+        store.write_results(run_id, equity=[p for g in groups for p in g])
+        store.end_run(run_id, "completed")
+        return run_equity(store, run_id)
+
+
+@pytest.mark.parametrize("final", [
+    "unchanged", "changed", "back-to-the-old-level", "new-session", "new-session-unchanged"])
+def test_final_equity_replaces_the_latest_group_exactly_as_finish_does(db, final):
+    marks = [group(m, "1000") for m in range(4)] + [group(4, "1005"), group(5, "1005")]
+    day = 1 if final.startswith("new-session") else 0
+    if day:
+        marks.append(group(0, "1005", day=1))  # a session boundary just before the last mark
+    last = marks[-1]
+    minute = 0 if day else 5  # minutes after T0 of the last mark
+    replaced = {"unchanged": last, "changed": group(minute, "990", day=day),
+                "back-to-the-old-level": group(minute, "1000", day=day),
+                "new-session": group(0, "995", day=1),
+                "new-session-unchanged": last}[final]
+    with SqliteStore(db, env=NO_ENV) as store:
+        run_id = running(store)
+        for g in marks:  # one mark per step, as the live writer sends them
+            store.write_live_step(run_id, LiveStep(equity=g))
+        store.write_live_step(run_id, LiveStep(final_equity=replaced))
+        store.end_run(run_id, "completed")
+        live = run_equity(store, run_id)
+    assert live == reference_equity(db, [*marks[:-1], replaced])
+    times = [(p.account, p.time) for p in live]
+    assert len(set(times)) == len(times)  # never a duplicate point
+
+
+def test_final_equity_can_replace_in_the_same_call_as_the_tail_and_more_than_once(db):
+    marks = [group(m, "1000") for m in range(3)]
+    tail = [group(3, "1002"), group(4, "1004")]
+    final = group(4, "1001")
+    with SqliteStore(db, env=NO_ENV) as store:
+        run_id = running(store)
+        for g in marks:
+            store.write_live_step(run_id, LiveStep(equity=g))
+        store.write_live_step(run_id, LiveStep(equity=[p for g in tail for p in g],
+                                               final_equity=final))
+        again = group(4, "1003")
+        store.write_live_step(run_id, LiveStep(final_equity=again))
+        store.end_run(run_id, "completed")
+        live = run_equity(store, run_id)
+    assert live == reference_equity(db, [*marks, tail[0], again])
+
+
+def test_final_equity_must_match_a_group_this_store_wrote(db):
+    with SqliteStore(db, env=NO_ENV) as store:
+        run_id = running(store)
+        with pytest.raises(StoreError, match="no equity group"):
+            store.write_live_step(run_id, LiveStep(final_equity=group(0, "1000")))
+        store.write_live_step(run_id, LiveStep(equity=group(0, "1000")))
+        store.write_live_step(run_id, LiveStep(equity=group(1, "1001")))
+        before = run_equity(store, run_id)
+        with pytest.raises(StoreError, match="time"):
+            store.write_live_step(run_id, LiveStep(final_equity=group(0, "999")))
+        assert run_equity(store, run_id) == before  # nothing changed, the state is intact
+        store.write_live_step(run_id, LiveStep(final_equity=group(1, "1002")))
+        store.end_run(run_id, "completed")
+        assert run_equity(store, run_id) == reference_equity(
+            db, [group(0, "1000"), group(1, "1002")])
+
+
+def test_a_failed_live_step_changes_nothing_and_can_be_sent_again(db):
+    ledger = build_ledger()
+    step = LiveStep(order_events=ledger.orders, fills=ledger.fills,
+                    round_trips=ledger.round_trips, equity=ledger.equity_points,
+                    ignored_events=ledger.ignored_events, bars=[bar(0), bar(0)])  # a duplicate
+    with SqliteStore(db, env=NO_ENV) as store:
+        run_id = running(store)
+        with pytest.raises(StoreError, match="already stored"):
+            store.write_live_step(run_id, step)
+        empty = store.load_run(run_id)
+        assert (empty.fills, empty.order_events, empty.equity, empty.round_trips) == ((),) * 4
+        assert store.load_last_bars(run_id) == ()
+        assert store.list_runs()[0].last_write_at is None  # not even the heartbeat
+        store.write_live_step(run_id, LiveStep(
+            order_events=ledger.orders, fills=ledger.fills, round_trips=ledger.round_trips,
+            equity=ledger.equity_points, ignored_events=ledger.ignored_events, bars=[bar(0)]))
+        store.end_run(run_id, "completed")
+        run = store.load_run(run_id)
+    with SqliteStore(db.with_name("whole.db"), env=NO_ENV) as whole:
+        whole_id, _ = stored_run(whole, ledger)
+        expected = whole.load_run(whole_id)
+    assert (run.order_events, run.fills, run.round_trips, run.equity, run.ignored_events) == (
+        expected.order_events, expected.fills, expected.round_trips, expected.equity,
+        expected.ignored_events)
+
+
+def test_live_step_upserts_series_and_points(db):
+    info = SeriesInfo("a1", "ema", "line", 0)
+    when = T0 + timedelta(minutes=3)
+    with SqliteStore(db, env=NO_ENV) as store:
+        run_id = running(store)
+        store.write_live_step(run_id, LiveStep(
+            series=[info], series_points=[SeriesPoint("a1", "ema", when, 1.5)]))
+        # a tracker rebuilt after a restart hands out everything again: no key violation
+        store.write_live_step(run_id, LiveStep(
+            series=[SeriesInfo("a1", "ema", "dots", 2), SeriesInfo("a1", "rsi", "line", 1)],
+            series_points=[SeriesPoint("a1", "ema", when, 2.5),
+                           SeriesPoint("a1", "ema", when + timedelta(minutes=1), 3.5),
+                           SeriesPoint("a1", "rsi", when, 7.0)]))
+        points = store.load_series(run_id, "a1")
+        assert [(p.name, p.time, p.value) for p in points] == [
+            ("ema", when, 2.5), ("ema", when + timedelta(minutes=1), 3.5), ("rsi", when, 7.0)]
+        run = store.load_run(run_id)
+        assert sorted((s.name, s.draw_type, s.position) for s in run.series) == [
+            ("ema", "dots", 2), ("rsi", "line", 1)]
+        with pytest.raises(StoreError, match="not declared"):
+            store.write_live_step(run_id, LiveStep(
+                series_points=[SeriesPoint("a1", "nope", when, 1.0)]))
+        with pytest.raises(StoreError, match="finite"):
+            store.write_live_step(run_id, LiveStep(
+                series_points=[SeriesPoint("a1", "ema", when, float("nan"))]))
+        assert store.load_series(run_id, "a1") == points
+
+
+def test_live_step_stores_bars_once_and_stamps_the_heartbeat(db):
+    clock = Clock()
+    with SqliteStore(db, env=NO_ENV, clock=clock) as store:
+        run_id = running(store)
+        assert store.list_runs()[0].last_write_at is None
+        clock.now += timedelta(seconds=7)
+        store.write_live_step(run_id, LiveStep(bars=[bar(0), bar(0, "MSFT")]))
+        assert store.list_runs()[0].last_write_at == clock.now
+        clock.now += timedelta(seconds=7)
+        store.write_live_step(run_id, LiveStep())  # nothing but the stamp
+        assert store.list_runs()[0].last_write_at == clock.now
+        assert {b.symbol for b in store.load_last_bars(run_id)} == {"AAPL", "MSFT"}
+        with pytest.raises(StoreError, match="already stored"):
+            store.write_live_step(run_id, LiveStep(bars=[bar(0)]))
+        store.end_run(run_id, "completed")
+        with pytest.raises(StoreError, match="already completed"):
+            store.write_live_step(run_id, LiveStep(bars=[bar(1)]))
+
+
+def test_live_step_is_refused_by_a_readonly_store_and_ignored_by_the_null_store(db):
+    with SqliteStore(db, env=NO_ENV) as store:
+        run_id = running(store)
+    reader = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        with pytest.raises(StoreError, match="read-only"):
+            reader.write_live_step(run_id, LiveStep(bars=[bar(0)]))
+    finally:
+        reader.close()
+    assert NullStore().write_live_step(1, LiveStep(bars=[bar(0)])) is None
