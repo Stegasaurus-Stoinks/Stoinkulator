@@ -645,7 +645,9 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
 SCHEMA_VERSION = len(MIGRATIONS)
 END_REASONS: tuple[str, ...] = (
     "session_end", "minutes_elapsed", "stop_file", "connection_closed", "not_paper",
-    "interrupted", "error", "abandoned")
+    "interrupted", "error", "abandoned",
+    # the live session driver's faults (issue 197): the run was stopped on purpose
+    "delayed_data", "data_fault", "symbol_stopped", "no_data", "step_too_slow")
 
 
 def _to_e4(value: Decimal | int | str) -> int:
