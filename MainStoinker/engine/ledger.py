@@ -36,11 +36,11 @@ This module must not import anything from `MainStoinker.*` outside
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
-from typing import Literal
+from typing import ClassVar, Literal, TypeVar
 
 Side = Literal["buy", "sell"]
 FillReason = Literal["entry", "stop", "target", "algo_exit", "end_of_data"]
@@ -50,6 +50,7 @@ IgnoredKind = Literal["close", "modify_stop", "take_profit"]
 IGNORED_KINDS: tuple[str, ...] = ("close", "modify_stop", "take_profit")
 
 FILL_REASONS: tuple[str, ...] = ("entry", "stop", "target", "algo_exit", "end_of_data")
+_R = TypeVar("_R", "OrderEvent", "Fill", "IgnoredEvent")
 ZERO = Decimal("0.0000")
 _QUANT = Decimal("0.0001")
 
@@ -81,6 +82,11 @@ class OrderEvent:
     quantity: Decimal | None = None
     order_type: str | None = None  # "market", "limit", "stop", "target", ...
     price: Decimal | None = None
+    # Run-wide order of recording, shared with `Fill` and `IgnoredEvent`. Deliberately
+    # not a dataclass field (set by the ledger; a record loaded from a store has None),
+    # so equality, `dataclasses.fields` (verify) and the serializers do not see it.
+    # Issue 245 (T21) turns it into a stored field.
+    seq: ClassVar[int | None] = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,11 @@ class Fill:
     time: datetime
     reason: FillReason
     synthetic: bool = False
+    # Real-fill metadata, None for simulated fills (room for the IB order path). Out of
+    # `repr`, so the frozen repr-based digests of simulated runs do not change.
+    exec_time: datetime | None = field(default=None, repr=False)  # the broker's own time
+    commission_final: bool | None = field(default=None, repr=False)  # False: only an estimate
+    seq: ClassVar[int | None] = None  # see `OrderEvent.seq`
 
 
 @dataclass(frozen=True)
@@ -143,6 +154,7 @@ class IgnoredEvent:
     broker_ref: Hashable
     kind: IgnoredKind
     time: datetime
+    seq: ClassVar[int | None] = None  # see `OrderEvent.seq`
 
 
 @dataclass(frozen=True)
@@ -162,6 +174,68 @@ class AccountInfo:
     idname: str
     symbol: str
     capital: Decimal
+
+
+@dataclass(frozen=True)
+class PositionLevels:
+    """Lifecycle facts of one open position: entry time and its working stop / target."""
+
+    entry_time: datetime
+    stop: Decimal | None
+    target: Decimal | None
+
+
+def open_position_levels(fills: Iterable[Fill], order_events: Iterable[OrderEvent]
+                         ) -> dict[tuple[str, Hashable], PositionLevels]:
+    """Entry time and protective levels of every position still open after `fills`.
+
+    The one lifecycle rule shared by `Engine.end_live` and the run documents. Fills
+    and events are in recording order. A position runs from its first entry fill
+    until its quantity is back to zero; a reference that goes flat starts afresh
+    when it is reused, so nothing of the earlier position (entry time, stop,
+    target) carries over. `stop` / `target` are the last price of the `stop` /
+    `target` order recorded for the CURRENT position, after modifications; None
+    when none was recorded or it was cancelled. An order event stamped before the
+    time its reference last went flat belongs to the earlier position (a stop
+    placed with an entry order, one bar before its fill, is recorded after the
+    previous position's close). Only keys with an open position are returned.
+    """
+    held: dict[tuple[str, Hashable], Decimal] = {}  # open quantity
+    entered: dict[tuple[str, Hashable], datetime] = {}  # first entry fill of the current position
+    closed_at: dict[tuple[str, Hashable], datetime] = {}
+    for fill in fills:
+        key = (fill.account, fill.broker_ref)
+        if fill.reason == "entry":
+            if key not in held:
+                held[key] = Decimal(0)
+                entered[key] = fill.time
+            held[key] += fill.quantity
+        elif key in held:
+            held[key] -= fill.quantity
+            if held[key] <= 0:
+                del held[key], entered[key]
+                closed_at[key] = fill.time
+    levels: dict[tuple[str, Hashable], dict[str, Decimal | None]] = {}
+    placed: dict[int, tuple[tuple[str, Hashable], str]] = {}
+    for event in order_events:
+        if event.kind == "placed" and event.order_type in ("stop", "target"):
+            key = (event.account, event.broker_ref)
+            closed = closed_at.get(key)
+            if key not in held or (closed is not None and event.time < closed):
+                continue
+            placed[event.order_id] = (key, event.order_type)
+            levels.setdefault(key, {})[event.order_type] = event.price
+        elif event.order_id in placed:
+            key, kind = placed[event.order_id]
+            if event.kind == "modified" and event.price is not None:
+                levels[key][kind] = event.price
+            elif event.kind == "cancelled":
+                levels[key][kind] = None
+    out: dict[tuple[str, Hashable], PositionLevels] = {}
+    for key, entry_time in entered.items():
+        lv = levels.get(key, {})
+        out[key] = PositionLevels(entry_time, lv.get("stop"), lv.get("target"))
+    return out
 
 
 class _Position:
@@ -248,6 +322,13 @@ class Ledger:
         self._marks: dict[str, Decimal] = {}
         self._next_order_id = 1
         self._next_fill_id = 1
+        self._next_seq = 1  # one counter for order events, fills and ignored events
+
+    def _stamp(self, record: _R) -> _R:
+        """Give a new record the next run-wide sequence number (1, 2, 3, ...)."""
+        object.__setattr__(record, "seq", self._next_seq)
+        self._next_seq += 1
+        return record
 
     # --- setup -------------------------------------------------------------
 
@@ -279,9 +360,9 @@ class Ledger:
                 raise KeyError(f"unknown order {order_id} for account {idname!r}")
             ref = prior.broker_ref
         assert order_id is not None
-        event = OrderEvent(order_id, idname, ref, kind, time, side,
-                           None if quantity is None else money(quantity), order_type,
-                           None if price is None else money(price))
+        event = self._stamp(OrderEvent(order_id, idname, ref, kind, time, side,
+                                       None if quantity is None else money(quantity), order_type,
+                                       None if price is None else money(price)))
         if kind == "placed":
             self._orders[order_id] = event
         self._order_events.append(event)
@@ -334,8 +415,8 @@ class Ledger:
         synthetic = synthetic or reason == "end_of_data"
         fill_id = self._next_fill_id
         self._next_fill_id += 1
-        self._fills.append(Fill(fill_id, order_id, idname, ref, acct.info.symbol, side, qty, px,
-                                comm, time, reason, synthetic))
+        self._fills.append(self._stamp(Fill(fill_id, order_id, idname, ref, acct.info.symbol, side,
+                                            qty, px, comm, time, reason, synthetic)))
         if reason != "entry" and pos.open_qty == 0:
             self._close(acct, pos, time, reason, synthetic)
         return fill_id
@@ -343,7 +424,7 @@ class Ledger:
     def _ignored(self, idname: str, ref: Hashable, kind: IgnoredKind, time: datetime) -> None:
         if kind not in IGNORED_KINDS:
             raise ValueError(f"unknown ignored kind {kind!r}")
-        self._ignored_events.append(IgnoredEvent(idname, ref, kind, time))
+        self._ignored_events.append(self._stamp(IgnoredEvent(idname, ref, kind, time)))
 
     def _close(self, acct: _AccountState, pos: _Position, time: datetime, reason: FillReason,
                synthetic: bool) -> None:

@@ -19,7 +19,7 @@ from .bars import BarStore
 from .broker import Broker
 from .feed import Bar, BarFeed
 from .gaprule import GapGuardBroker, GapRule, GapRuleReport
-from .ledger import Ledger
+from .ledger import Ledger, open_position_levels
 from .router import BarAwareBroker, BrokerRouter, SingleBrokerRouter
 from .sink import EventSink
 
@@ -392,30 +392,15 @@ class Engine:
         ledger = self._ledger
         if ledger is None:
             return ()
-        opened: dict[tuple[str, Hashable], datetime] = {}
-        for fill in ledger.fills:
-            opened.setdefault((fill.account, fill.broker_ref), fill.time)
-        # Working protective orders per position, from the order events in order.
-        levels: dict[tuple[str, Hashable], dict[str, Decimal | None]] = {}
-        placed: dict[int, tuple[tuple[str, Hashable], str]] = {}
-        for event in ledger.orders:
-            if event.kind == "placed" and event.order_type in ("stop", "target"):
-                key = (event.account, event.broker_ref)
-                placed[event.order_id] = (key, event.order_type)
-                levels.setdefault(key, {})[event.order_type] = event.price
-            elif event.order_id in placed:
-                key, kind = placed[event.order_id]
-                if event.kind == "modified" and event.price is not None:
-                    levels[key][kind] = event.price
-                elif event.kind == "cancelled":
-                    levels[key][kind] = None
+        # The same lifecycle rule as the run documents (one shared function).
+        lifecycle = open_position_levels(ledger.fills, ledger.orders)
         result = []
         for pos in ledger.open_positions():
-            key = (pos.account, pos.broker_ref)
-            lv = levels.get(key, {})
+            lv = lifecycle.get((pos.account, pos.broker_ref))
             result.append(LivePosition(
                 pos.account, pos.broker_ref, pos.symbol, pos.side, pos.quantity,
-                pos.average_price, opened.get(key), lv.get("stop"), lv.get("target")))
+                pos.average_price, None if lv is None else lv.entry_time,
+                None if lv is None else lv.stop, None if lv is None else lv.target))
         return tuple(result)
 
     def _replay(self) -> None:

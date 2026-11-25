@@ -44,7 +44,7 @@ from decimal import Decimal
 from typing import Any
 
 from .gaprule import GapRuleReport
-from .ledger import IGNORED_KINDS, money
+from .ledger import IGNORED_KINDS, money, open_position_levels
 from .live_counts import (
     COUNT_FED,
     COUNT_LATE,
@@ -104,7 +104,6 @@ class _Pos:
     qty: Decimal = Decimal(0)
     cost: Decimal = Decimal(0)
     pending: Decimal = Decimal(0)
-    entry_time: datetime | None = None  # of the current position's first entry fill
 
 
 def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = None
@@ -123,14 +122,12 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
     A run closed by synthetic end-of-data fills has none.
     """
     book: dict[str, dict[Hashable, _Pos]] = {a.idname: {} for a in run.algos}
-    closed_at: dict[tuple[str, Hashable], datetime] = {}
     for fill in run.fills:
         held = book.setdefault(fill.account, {})
         pos = held.get(fill.broker_ref)
         if fill.reason == "entry":
             if pos is None:
-                pos = held[fill.broker_ref] = _Pos(fill.side == "buy", fill.symbol,
-                                                   entry_time=fill.time)
+                pos = held[fill.broker_ref] = _Pos(fill.side == "buy", fill.symbol)
             pos.qty += fill.quantity
             pos.cost += fill.quantity * fill.price
             pos.pending += fill.commission
@@ -144,42 +141,21 @@ def open_positions(run: RunData, last_bars: Mapping[str, StoredBar] | None = Non
             pos.pending -= release
             if pos.qty <= 0:
                 del held[fill.broker_ref]
-                closed_at[(fill.account, fill.broker_ref)] = fill.time
-    levels: dict[tuple[str, Hashable], dict[str, Decimal | None]] = {}
-    placed: dict[int, tuple[tuple[str, Hashable], str]] = {}
-    for event in run.order_events:
-        if event.kind == "placed" and event.order_type in ("stop", "target"):
-            key = (event.account, event.broker_ref)
-            # Orders belong to the position of their reference that was current when they
-            # were recorded: those recorded before the last time the reference went flat
-            # belong to an earlier position (a stop placed with an entry order, one bar
-            # before its fill, is recorded after the previous position's close).
-            closed = closed_at.get(key)
-            if event.broker_ref not in book.get(event.account, {}) or (
-                    closed is not None and event.time < closed):
-                continue
-            placed[event.order_id] = (key, event.order_type)
-            levels.setdefault(key, {})[event.order_type] = event.price
-        elif event.order_id in placed:
-            key, kind = placed[event.order_id]
-            if event.kind == "modified" and event.price is not None:
-                levels[key][kind] = event.price
-            elif event.kind == "cancelled":
-                levels[key][kind] = None
+    lifecycle = open_position_levels(run.fills, run.order_events)
     out: list[dict[str, Any]] = []
     for account, held in book.items():
         for ref, pos in held.items():
             key = (account, ref)
-            lv = levels.get(key, {})
+            lv = lifecycle.get(key)
             average = money(pos.cost / pos.qty)
-            entry = pos.entry_time
+            entry = None if lv is None else lv.entry_time
             record: dict[str, Any] = {
                 "account": account, "symbol": pos.symbol,
                 "side": "long" if pos.long else "short",
                 "quantity": fmt4(pos.qty), "entry_price": fmt4(average),
                 "entry_time": None if entry is None else entry.isoformat(),
-                "stop": None if lv.get("stop") is None else fmt4(lv["stop"]),
-                "target": None if lv.get("target") is None else fmt4(lv["target"]),
+                "stop": None if lv is None or lv.stop is None else fmt4(lv.stop),
+                "target": None if lv is None or lv.target is None else fmt4(lv.target),
             }
             bar = None if last_bars is None else last_bars.get(pos.symbol)
             if bar is not None:
