@@ -3,26 +3,52 @@
 Pure logic with no broker, socket or `ibapi` import. A transport turns what the broker
 says into the event dataclasses below and feeds them in; nothing here sends anything.
 
-Rules (decisions issue 230, task 226):
+Rules (decisions issue 230, task 226, planner rulings on the PR 261 review):
 
 * Quantities come only from executions keyed by `exec_id`. A status never changes a
-  quantity: it decides only "working" or "terminal". A `Filled` status without the
-  executions to back it is a hint (`fill_unconfirmed`), not a fill.
-* The state of an order is a pure function of the set of events it has seen, so a
-  duplicate or out-of-order delivery changes nothing. The one order-dependent input is
-  which terminal status came first when two contradictory ones arrive: the first stays.
-* An execution is a fact and is always counted, even on an order that is already terminal
-  (a cancel that lost the race against a fill): it is reported as `LATE` and the state only
-  changes if it completes the order, which makes it FILLED.
-* An overfill (more executed than ordered, or both exits of a bracket filled) is fatal:
-  `fatal` is set and never cleared.
+  quantity: it decides only working or terminal. A `Filled` status without the executions
+  to back it is a hint (`fill_unconfirmed`), not a fill.
+* Everything is derived from the set of events seen, so duplicates and reordering change
+  nothing. The only arrival-ordered inputs are (a) the Inactive/working axis of one order
+  (an Inactive order may return to Submitted; statuses carry no sequence number) and (b) the
+  confirmed quantity of an order (the last status or ack that reports one).
+* Terminal statuses: Filled (by executions) > Rejected > Cancelled; a contradictory pair is
+  kept deterministic and recorded as a `status_conflict` anomaly. Inactive is NOT final.
+* An execution is a fact and is counted even on an order that is already terminal (a cancel
+  that lost a race), and then reported as `LATE`. Executions are validated (positive whole
+  shares, finite positive price, matching symbol and side when both are known); anything
+  else is not counted and is recorded as an anomaly. An execId `X.NN` replaces an earlier
+  execution with the base `X` (highest suffix wins, whatever the arrival order). Amounts are
+  floats here; the store converts to integer `e4` values at its boundary.
+* B1. A fatal flag latches only when an order's executions exceed the largest quantity it was
+  ever ordered for, or exit executions exceed the entry's ORDERED quantity. Exits ahead of the
+  entry's reported fills but within the ordered quantity are `exit_ahead_of_entry`, derived
+  and not latched; it clears when the entry's executions arrive.
+* B2. Protection follows the position held (entry filled minus exits executed). Every live
+  protective leg should have a remaining quantity of `held` (resize request). The other exit
+  is cancelled only when held is 0 and the entry can fill no more, or when an exit has
+  completely filled for the held quantity.
+* B3. `unprotected` is derived: held > 0 and the live stop (not Inactive, no cancel sent) has
+  less remaining than held. `needs_protection` is then the quantity held when the stop is not
+  live at all; the caller decides between a new stop and a flatten.
+* S2. Requests are a pure function of state: `pending_cancels` and `pending_resizes` stay set
+  until the broker confirms (a status for a cancel, a status or ack reporting the new quantity
+  for a resize). `cancel_requests()` / `resize_requests()` are those minus what the caller has
+  marked as sent; an error for that order id while a request is outstanding puts it back.
+  A resize means: new TOTAL quantity of the leg, so its remainder equals `held`.
+* `orderRef` uniqueness across databases and resets is the caller's job (the shared sequence
+  of issue 227); this module only checks the shape.
 """
 
 from __future__ import annotations
 
+import math
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 
 # --------------------------------------------------------------------------- events
 
@@ -32,6 +58,7 @@ class Ack:
     """The broker has seen the order (an open-order callback)."""
 
     order_id: int
+    quantity: int | None = None  # total quantity the broker holds, when the callback says
 
 
 @dataclass(frozen=True)
@@ -41,15 +68,18 @@ class Status:
     order_id: int
     status: str
     filled: float = 0.0  # what the broker says; informational, never used for quantities
+    quantity: int | None = None  # total quantity, when known (confirms a resize)
 
 
 @dataclass(frozen=True)
 class Execution:
     order_id: int
     exec_id: str
-    shares: int
+    shares: int | float | Decimal
     price: float
     time: str = ""
+    symbol: str | None = None
+    side: str | None = None  # BUY or SELL (the transport maps the broker's words)
 
 
 @dataclass(frozen=True)
@@ -91,36 +121,89 @@ class OrderState(Enum):
     FILLED = "filled"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
-    INACTIVE = "inactive"
+    INACTIVE = "inactive"  # not final: the broker may return it to Submitted
 
 
-TERMINAL_STATES = frozenset(
-    {OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED, OrderState.INACTIVE})
+TERMINAL_STATES = frozenset({OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED})
+LIVE_STATES = frozenset({OrderState.PENDING_SUBMIT, OrderState.WORKING, OrderState.PARTIALLY_FILLED})
 
 _WORKING_STATUSES = frozenset({"PendingSubmit", "PreSubmitted", "Submitted", "PendingCancel"})
 _CANCELLED_STATUSES = frozenset({"Cancelled", "ApiCancelled"})
+_SUFFIX = re.compile(r"^(?P<base>.*)\.(?P<n>\d+)$")
+
+
+def _whole_shares(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float | Decimal):
+        try:
+            finite = math.isfinite(value) if isinstance(value, float) else value.is_finite()
+            whole = finite and value == int(value)
+        except (ValueError, OverflowError):
+            return None
+        return int(value) if whole and int(value) > 0 else None
+    return None
+
+
+def _good_price(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float | Decimal):
+        return False
+    try:
+        return math.isfinite(float(value)) and float(value) > 0
+    except (ValueError, OverflowError):
+        return False
+
+
+def _exec_key(exec_id: str) -> tuple[str, int]:
+    match = _SUFFIX.match(exec_id)
+    if match is None:
+        return exec_id, -1
+    return match["base"], int(match["n"])
+
+
+@dataclass(frozen=True)
+class OrderSnapshot:
+    order_ref: str
+    side: str
+    quantity: int
+    state: OrderState
+    filled_qty: int
+    avg_price: float | None
+    commission: float
+    fill_unconfirmed: bool
+    anomalies: tuple[str, ...]
 
 
 class OrderLifecycle:
-    """One order: intent, pending submit, working, partially filled, then exactly one terminal state."""
+    """One order: intent, pending submit, working, partially filled, then one terminal state."""
 
-    def __init__(self, order_ref: str, side: str, quantity: int, order_id: int | None = None) -> None:
+    def __init__(self, order_ref: str, side: str, quantity: int, order_id: int | None = None,
+                 symbol: str | None = None) -> None:
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, not {side!r}")
         if quantity <= 0:
             raise ValueError("quantity must be positive")
         self.order_ref = order_ref
         self.side = side
-        self.quantity = quantity
+        self.symbol = symbol
         self.order_id = order_id
-        self.executions: dict[str, Execution] = {}
-        self.commissions: dict[str, float] = {}
-        self.log: list[tuple[Event, Applied]] = []
-        self.anomalies: list[str] = []
-        self.status_fill_seen = False
+        self._ordered = quantity
+        self._confirmed: int | None = None
+        self._quantities = {quantity}
+        self._by_base: dict[str, tuple[int, Execution]] = {}
+        self._exec_ids: set[str] = set()
+        self._commissions: dict[str, float] = {}
+        self._seen: set[Event] = set()
+        self._log: list[tuple[Event, Applied]] = []
+        self._anomalies: set[str] = set()
+        self._status_fill_seen = False
         self._submitted = False
         self._working_seen = False
-        self._terminal: OrderState | None = None  # first terminal status; never replaced
+        self._inactive = False
+        self._inactive_ever = False
+        self._terminals: set[OrderState] = set()
 
     # -- inputs
 
@@ -130,120 +213,177 @@ class OrderLifecycle:
             self.order_id = order_id
         self._submitted = True
 
-    def resize(self, quantity: int) -> None:
-        """Change the ordered quantity (protection sized to a partial fill)."""
-        if quantity <= 0:
-            raise ValueError("quantity must be positive")
-        self.quantity = quantity
-
     def apply(self, event: Event) -> Applied:
         outcome = self._apply(event)
-        self.log.append((event, outcome))
+        self._log.append((event, outcome))
         return outcome
 
     def _apply(self, event: Event) -> Applied:
-        if isinstance(event, Execution):
-            return self._execution(event)
-        if isinstance(event, Commission):
-            return self._commission(event)
         if isinstance(event, ConnectionState):
             return Applied.IGNORED
+        if isinstance(event, Commission):
+            return self._commission(event)
         if event.order_id != self.order_id:
             return Applied.IGNORED
         was_terminal = self.is_terminal
-        if isinstance(event, Ack):
-            return self._working(was_terminal)
+        if isinstance(event, Execution):
+            if event in self._seen:
+                return Applied.DUPLICATE
+            self._seen.add(event)
+            return self._execution(event, was_terminal)
+        before = (self._working_seen, self._inactive, self._inactive_ever, self._confirmed,
+                  frozenset(self._terminals), self._status_fill_seen)
         if isinstance(event, Rejected):
-            return self._terminal_status(OrderState.REJECTED, was_terminal)
-        return self._status(event, was_terminal)
-
-    def _working(self, was_terminal: bool) -> Applied:
+            self._terminals.add(OrderState.REJECTED)
+        elif isinstance(event, Ack):
+            self._working_seen = True
+            self._confirm(event.quantity)
+        elif self._status(event) is Applied.IGNORED:
+            return Applied.IGNORED
+        after = (self._working_seen, self._inactive, self._inactive_ever, self._confirmed,
+                 frozenset(self._terminals), self._status_fill_seen)
         if was_terminal:
             return Applied.LATE
-        if self._working_seen:
-            return Applied.DUPLICATE
-        self._working_seen = True
-        return Applied.APPLIED
+        return Applied.APPLIED if after != before else Applied.DUPLICATE
 
-    def _terminal_status(self, state: OrderState, was_terminal: bool) -> Applied:
-        if self._terminal is not None:
-            return Applied.DUPLICATE if self._terminal is state else Applied.LATE
-        self._terminal = state
-        return Applied.LATE if was_terminal else Applied.APPLIED
+    def _confirm(self, quantity: int | None) -> None:
+        if quantity is not None and quantity > 0:
+            self._confirmed = quantity
+            self._quantities.add(quantity)
 
-    def _status(self, event: Status, was_terminal: bool) -> Applied:
+    def _status(self, event: Status) -> Applied:
         name = event.status
         if name in _WORKING_STATUSES:
-            return self._working(was_terminal)
-        if name in _CANCELLED_STATUSES:
-            return self._terminal_status(OrderState.CANCELLED, was_terminal)
-        if name == "Inactive":
-            return self._terminal_status(OrderState.INACTIVE, was_terminal)
-        if name == "Filled":
-            if self.status_fill_seen:
-                return Applied.DUPLICATE
-            self.status_fill_seen = True  # a hint only; executions decide
-            return Applied.LATE if was_terminal else Applied.APPLIED
-        self.anomalies.append(f"unknown status {name!r}")
-        return Applied.IGNORED
+            self._working_seen = True
+            self._inactive = False
+            self._confirm(event.quantity)
+        elif name in _CANCELLED_STATUSES:
+            self._terminals.add(OrderState.CANCELLED)
+        elif name == "Inactive":
+            self._inactive = self._inactive_ever = True
+        elif name == "Filled":
+            self._status_fill_seen = True  # a hint only; executions decide
+        else:
+            self._anomalies.add(f"unknown status {name!r}")
+            return Applied.IGNORED
+        return Applied.APPLIED
 
-    def _execution(self, event: Execution) -> Applied:
-        if event.shares <= 0:
-            self.anomalies.append(f"execution {event.exec_id} with non-positive shares")
+    def _execution(self, event: Execution, was_terminal: bool) -> Applied:
+        shares = _whole_shares(event.shares)
+        if shares is None or not _good_price(event.price):
+            self._anomalies.add(
+                f"bad execution {event.exec_id}: shares {event.shares!r}, price {event.price!r}")
             return Applied.IGNORED
-        if event.order_id != self.order_id:
+        if event.symbol is not None and self.symbol is not None and event.symbol != self.symbol:
+            self._anomalies.add(f"execution {event.exec_id} for symbol {event.symbol}, not {self.symbol}")
             return Applied.IGNORED
-        known = self.executions.get(event.exec_id)
-        if known is not None:
-            if known != event:
-                self.anomalies.append(f"execution {event.exec_id} repeated with different content")
-            return Applied.DUPLICATE
-        was_terminal = self.is_terminal
-        self.executions[event.exec_id] = event
+        if event.side is not None and event.side != self.side:
+            self._anomalies.add(f"execution {event.exec_id} on side {event.side}, not {self.side}")
+            return Applied.IGNORED
+        clean = replace(event, shares=shares, price=float(event.price))
+        self._exec_ids.add(event.exec_id)
+        base, suffix = _exec_key(event.exec_id)
+        current = self._by_base.get(base)
+        if current is not None:
+            cur_suffix, cur = current
+            if (suffix, shares, clean.price) <= (cur_suffix, cur.shares, cur.price):
+                if suffix == cur_suffix and cur != clean:
+                    self._anomalies.add(f"execution {event.exec_id} repeated with different content")
+                return Applied.DUPLICATE  # an older correction, or the same one again
+            if suffix == cur_suffix:
+                self._anomalies.add(f"execution {event.exec_id} repeated with different content")
+        self._by_base[base] = (suffix, clean)
         return Applied.LATE if was_terminal else Applied.APPLIED
 
     def _commission(self, event: Commission) -> Applied:
-        known = self.commissions.get(event.exec_id)
+        if isinstance(event.amount, bool) or not isinstance(event.amount, int | float) \
+                or not math.isfinite(event.amount):
+            self._anomalies.add(f"bad commission {event.exec_id}: {event.amount!r}")
+            return Applied.IGNORED
+        known = self._commissions.get(event.exec_id)
         if known is not None:
             if known != event.amount:
-                self.anomalies.append(f"commission {event.exec_id} repeated with a different amount")
+                self._anomalies.add(f"commission {event.exec_id} repeated with a different amount")
+                self._commissions[event.exec_id] = max(known, event.amount)
             return Applied.DUPLICATE
-        self.commissions[event.exec_id] = event.amount  # may precede its execution
+        self._commissions[event.exec_id] = event.amount  # may precede its execution
         return Applied.APPLIED
 
     # -- derived
 
+    def has_exec(self, exec_id: str) -> bool:
+        """True if this order has seen the execution (even one a correction has replaced)."""
+        return exec_id in self._exec_ids
+
+    @property
+    def quantity(self) -> int:
+        """The quantity as last confirmed by the broker, else as ordered."""
+        return self._confirmed if self._confirmed is not None else self._ordered
+
+    @property
+    def max_quantity(self) -> int:
+        """The largest quantity this order was ever ordered or confirmed for."""
+        return max(self._quantities)
+
+    @property
+    def executions(self) -> Mapping[str, Execution]:
+        """The counted executions (corrections applied), by exec id; read-only."""
+        return MappingProxyType({e.exec_id: e for _, e in self._by_base.values()})
+
+    @property
+    def log(self) -> tuple[tuple[Event, Applied], ...]:
+        return tuple(self._log)
+
     @property
     def filled_qty(self) -> int:
-        return sum(e.shares for e in self.executions.values())
+        return sum(int(e.shares) for _, e in self._by_base.values())
+
+    @property
+    def remaining(self) -> int:
+        return max(self.quantity - self.filled_qty, 0)
 
     @property
     def avg_price(self) -> float | None:
         qty = self.filled_qty
         if qty == 0:
             return None
-        return sum(e.shares * e.price for e in self.executions.values()) / qty
+        return sum(int(e.shares) * e.price for _, e in self._by_base.values()) / qty
 
     @property
     def commission(self) -> float:
-        return sum(a for x, a in self.commissions.items() if x in self.executions)
+        counted = {e.exec_id for _, e in self._by_base.values()}
+        return sum(a for x, a in self._commissions.items() if x in counted)
 
     @property
     def overfilled(self) -> bool:
-        return self.filled_qty > self.quantity
+        return self.filled_qty > self.max_quantity
 
     @property
     def fill_unconfirmed(self) -> bool:
         """A Filled status was seen but the executions do not (yet) add up to the quantity."""
-        return self.status_fill_seen and self.filled_qty < self.quantity
+        return self._status_fill_seen and self.filled_qty < self.quantity
+
+    @property
+    def anomalies(self) -> tuple[str, ...]:
+        found = set(self._anomalies)
+        kinds = set(self._terminals)
+        if self._inactive_ever:
+            kinds.add(OrderState.INACTIVE)
+        if len(kinds) > 1:
+            found.add("status_conflict: " + ", ".join(sorted(k.value for k in kinds)))
+        return tuple(sorted(found))
 
     @property
     def state(self) -> OrderState:
         filled = self.filled_qty
         if filled >= self.quantity:
             return OrderState.FILLED
-        if self._terminal is not None:
-            return self._terminal
+        if OrderState.REJECTED in self._terminals:
+            return OrderState.REJECTED
+        if OrderState.CANCELLED in self._terminals:
+            return OrderState.CANCELLED
+        if self._inactive:
+            return OrderState.INACTIVE
         if filled > 0:
             return OrderState.PARTIALLY_FILLED
         if self._working_seen:
@@ -256,6 +396,14 @@ class OrderLifecycle:
     def is_terminal(self) -> bool:
         return self.state in TERMINAL_STATES
 
+    @property
+    def is_live(self) -> bool:
+        return self.state in LIVE_STATES
+
+    def snapshot(self) -> OrderSnapshot:
+        return OrderSnapshot(self.order_ref, self.side, self.quantity, self.state, self.filled_qty,
+                             self.avg_price, self.commission, self.fill_unconfirmed, self.anomalies)
+
 
 # --------------------------------------------------------------------------- orderRef codec
 
@@ -263,7 +411,7 @@ ORDER_REF_PREFIX = "stk1"
 ORDER_REF_MAX_LEN = 32
 ROLES = ("E", "S", "T", "X")  # entry, stop, target, exit
 _FIELD = re.compile(r"[A-Za-z0-9_.\-]+")
-_PAPER_ID = re.compile(r"D[UFI][A-Z]?[0-9]+")
+_ACCOUNT_SHAPE = re.compile(r"[A-Za-z]{1,3}[0-9]{5,}")  # the recorder scrubber's shape
 
 
 @dataclass(frozen=True)
@@ -277,12 +425,15 @@ class OrderRef:
 def _check_field(name: str, value: str) -> None:
     if not _FIELD.fullmatch(value):
         raise ValueError(f"orderRef {name} {value!r} must be non-empty and use letters, digits, _ . -")
-    if _PAPER_ID.search(value):
+    if _ACCOUNT_SHAPE.fullmatch(value):
         raise ValueError(f"orderRef {name} looks like an account id")
 
 
 def encode_order_ref(run: str, algo: str, ref: str, role: str) -> str:
-    """`stk1|<run>|<algo>|<ref>|<role>`, at most 32 characters, never an account id."""
+    """`stk1|<run>|<algo>|<ref>|<role>`, at most 32 characters, never an account id.
+
+    Uniqueness (across databases and resets) is the caller's job (issue 227's shared sequence).
+    """
     for name, value in (("run", run), ("algo", algo), ("ref", ref)):
         _check_field(name, value)
     if role not in ROLES:
@@ -310,35 +461,82 @@ def decode_order_ref(text: str) -> OrderRef:
 
 ENTRY, STOP, TARGET = "E", "S", "T"
 _EXITS = (STOP, TARGET)
+_LEG_ORDER = (ENTRY, STOP, TARGET)
+
+
+@dataclass(frozen=True)
+class BracketSnapshot:
+    legs: tuple[tuple[str, OrderSnapshot], ...]
+    held: int
+    fatal: str | None
+    unprotected: bool
+    needs_protection: int
+    exit_ahead_of_entry: bool
+    pending_cancels: tuple[str, ...]
+    pending_resizes: tuple[tuple[str, int], ...]
+    terminal_exit: str | None
+    is_closed: bool
+    anomalies: tuple[str, ...]
+    connection: str
 
 
 class BracketState:
     """Entry, stop and target as one unit (market entry, GTC stop, GTC limit target)."""
 
     def __init__(self, run: str, algo: str, ref: str, side: str, quantity: int,
-                 has_target: bool = True) -> None:
+                 has_target: bool = True, symbol: str | None = None) -> None:
         self.run, self.algo, self.ref = run, algo, ref
         exit_side = "SELL" if side == "BUY" else "BUY"
-        self.legs: dict[str, OrderLifecycle] = {
-            ENTRY: OrderLifecycle(encode_order_ref(run, algo, ref, ENTRY), side, quantity),
-            STOP: OrderLifecycle(encode_order_ref(run, algo, ref, STOP), exit_side, quantity),
+        self._legs: dict[str, OrderLifecycle] = {
+            ENTRY: OrderLifecycle(encode_order_ref(run, algo, ref, ENTRY), side, quantity,
+                                  symbol=symbol),
+            STOP: OrderLifecycle(encode_order_ref(run, algo, ref, STOP), exit_side, quantity,
+                                 symbol=symbol),
         }
         if has_target:
-            self.legs[TARGET] = OrderLifecycle(
-                encode_order_ref(run, algo, ref, TARGET), exit_side, quantity)
+            self._legs[TARGET] = OrderLifecycle(
+                encode_order_ref(run, algo, ref, TARGET), exit_side, quantity, symbol=symbol)
         self.connection = ""
-        self.fatal: str | None = None
         self._ids: dict[int, str] = {}
         self._orphans: dict[str, Commission] = {}
-        self._cancel_sent: set[str] = set()
-        self._exit_role: str | None = None  # the exit leg that executed first
+        self._anomalies: set[str] = set()
+        self._sent_cancel: set[str] = set()
+        self._sent_resize: dict[str, int] = {}
+        self._fatal_latched = False
+
+    # -- wiring
+
+    @property
+    def legs(self) -> Mapping[str, OrderLifecycle]:
+        return MappingProxyType(self._legs)
 
     def bind(self, role: str, order_id: int) -> None:
         """Record the broker order id of a leg (and mark it submitted)."""
-        leg = self.legs[role]
-        self._ids = {i: r for i, r in self._ids.items() if r != role}
+        if role not in self._legs:
+            raise ValueError(f"no leg {role!r} in this bracket")
+        if order_id in self._ids:
+            raise ValueError(f"order id {order_id} is already bound to leg {self._ids[order_id]}")
+        if role in self._ids.values():
+            raise ValueError(f"leg {role} is already bound")
         self._ids[order_id] = role
-        leg.submit(order_id)
+        self._legs[role].submit(order_id)
+
+    def mark_cancel_sent(self, role: str) -> None:
+        if role not in self._legs:
+            raise ValueError(f"no leg {role!r} in this bracket")
+        self._sent_cancel.add(role)
+
+    def mark_resized(self, role: str, quantity: int) -> None:
+        """Note that a modify to this total quantity was sent. It takes effect when confirmed."""
+        if role not in _EXITS or role not in self._legs:
+            raise ValueError(f"only a stop or target can be resized, not {role!r}")
+        leg = self._legs[role]
+        if quantity <= leg.filled_qty or quantity - leg.filled_qty > self.held:
+            raise ValueError(
+                f"resize of {role} to {quantity} leaves {quantity - leg.filled_qty} against {self.held} held")
+        self._sent_resize[role] = quantity
+
+    # -- events
 
     def apply(self, event: Event) -> Applied:
         if isinstance(event, ConnectionState):
@@ -348,42 +546,44 @@ class BracketState:
             return self._commission(event)
         role = self._ids.get(event.order_id)
         if role is None:
+            if isinstance(event, Execution):
+                self._anomalies.add(f"execution {event.exec_id} for unknown order id {event.order_id}")
             return Applied.IGNORED
-        outcome = self.legs[role].apply(event)
+        leg = self._legs[role]
+        if (isinstance(event, Rejected) and role in _EXITS
+                and leg.state in (OrderState.WORKING, OrderState.PARTIALLY_FILLED)
+                and (role in self._sent_cancel or role in self._sent_resize)):
+            # an error for a live leg with a request outstanding is a refused cancel or modify
+            self._sent_cancel.discard(role)
+            self._sent_resize.pop(role, None)
+            self._anomalies.add(f"request refused on leg {role}: code {event.code}")
+            return Applied.APPLIED
+        outcome = leg.apply(event)
         if isinstance(event, Execution):
-            if role in _EXITS and self._exit_role is None and outcome is not Applied.DUPLICATE:
-                self._exit_role = role
             orphan = self._orphans.pop(event.exec_id, None)
             if orphan is not None:
-                self.legs[role].apply(orphan)
-        self._check_fatal()
+                leg.apply(orphan)
+        for r, wanted in list(self._sent_resize.items()):
+            if self._legs[r].quantity == wanted:
+                del self._sent_resize[r]
+        if self._fatal_conditions():
+            self._fatal_latched = True
         return outcome
 
     def _commission(self, event: Commission) -> Applied:
-        for leg in self.legs.values():
-            if event.exec_id in leg.executions:
+        for leg in self._legs.values():
+            if leg.has_exec(event.exec_id):
                 return leg.apply(event)
         if event.exec_id in self._orphans:
             return Applied.DUPLICATE
         self._orphans[event.exec_id] = event
         return Applied.APPLIED
 
-    def _check_fatal(self) -> None:
-        if self.fatal is not None:
-            return
-        for role, leg in self.legs.items():
-            if leg.overfilled:
-                self.fatal = f"overfill: leg {role} executed {leg.filled_qty} of {leg.quantity}"
-                return
-        exit_qty = sum(self.legs[r].filled_qty for r in _EXITS if r in self.legs)
-        if exit_qty > self.entry_filled_qty:
-            self.fatal = f"overfill: exits executed {exit_qty} against an entry of {self.entry_filled_qty}"
-
     # -- derived
 
     @property
     def entry(self) -> OrderLifecycle:
-        return self.legs[ENTRY]
+        return self._legs[ENTRY]
 
     @property
     def entry_filled_qty(self) -> int:
@@ -391,61 +591,111 @@ class BracketState:
 
     @property
     def exit_filled_qty(self) -> int:
-        return sum(self.legs[r].filled_qty for r in _EXITS if r in self.legs)
+        return sum(self._legs[r].filled_qty for r in _EXITS if r in self._legs)
 
     @property
-    def position_qty(self) -> int:
-        """Shares held in the entry's direction (never negative)."""
+    def held(self) -> int:
+        """Shares held in the entry's direction: entry filled minus exits executed (never negative)."""
         return max(self.entry_filled_qty - self.exit_filled_qty, 0)
 
+    position_qty = held
+
     @property
-    def desired_protection_qty(self) -> int:
-        """Protection covers exactly what the entry has filled so far."""
-        return self.entry_filled_qty
+    def exit_ahead_of_entry(self) -> bool:
+        """Exits executed beyond the entry's reported fills; not latched, clears when the entry reports."""
+        return self.exit_filled_qty > self.entry_filled_qty
+
+    def _fatal_conditions(self) -> list[str]:
+        found = [f"overfill: leg {r} executed {leg.filled_qty} of {leg.max_quantity}"
+                 for r in _LEG_ORDER if r in self._legs and (leg := self._legs[r]).overfilled]
+        if self.exit_filled_qty > self.entry.max_quantity:
+            found.append(f"overfill: exits executed {self.exit_filled_qty} "
+                         f"against an entry ordered {self.entry.max_quantity}")
+        return found
+
+    @property
+    def fatal(self) -> str | None:
+        found = self._fatal_conditions()
+        if found:
+            return "; ".join(found)
+        return "overfill (latched; a correction has since cleared it)" if self._fatal_latched else None
 
     @property
     def terminal_exit(self) -> str | None:
-        """The one exit leg that ended the position, `S` or `T`, once it is completely filled."""
-        if self._exit_role is not None and self.legs[self._exit_role].state is OrderState.FILLED:
-            return self._exit_role
-        return None
+        """The one exit leg that completely filled (`S` or `T`), else None."""
+        done = [r for r in _EXITS if r in self._legs and self._legs[r].state is OrderState.FILLED]
+        return done[0] if len(done) == 1 else None
+
+    def _stop_protects(self) -> int:
+        stop = self._legs[STOP]
+        if not stop.is_live or STOP in self._sent_cancel:
+            return 0
+        return stop.remaining
 
     @property
     def unprotected(self) -> bool:
-        """A position is open but the stop is gone."""
-        return self.position_qty > 0 and self.legs[STOP].is_terminal
+        return self.held > 0 and self._stop_protects() < self.held
+
+    @property
+    def needs_protection(self) -> int:
+        """Quantity to protect anew (new stop or flatten, the caller's choice); 0 if the stop is live."""
+        if self.held > 0 and self._stop_protects() == 0:
+            return self.held
+        return 0
 
     @property
     def is_closed(self) -> bool:
-        return (self.entry.is_terminal and self.position_qty == 0
-                and all(leg.is_terminal for leg in self.legs.values()))
+        return (self.entry.is_terminal and self.held == 0
+                and all(leg.is_terminal for leg in self._legs.values()))
 
-    def _entry_dead_unfilled(self) -> bool:
-        return self.entry.is_terminal and self.entry_filled_qty == 0
+    @property
+    def pending_cancels(self) -> tuple[str, ...]:
+        """Legs that should be cancelled; each stays here until its status says it is terminal."""
+        held, entry = self.held, self.entry
+        wanted: list[str] = []
+        if held == 0 and entry.is_terminal:
+            wanted = list(_EXITS)
+        elif (held == 0 and entry.filled_qty > 0 and not self.exit_ahead_of_entry
+              and any(self._legs[r].state is OrderState.FILLED for r in _EXITS if r in self._legs)):
+            wanted = [ENTRY, *_EXITS]
+        return tuple(r for r in _LEG_ORDER if r in wanted and r in self._legs
+                     and not self._legs[r].is_terminal)
+
+    @property
+    def pending_resizes(self) -> tuple[tuple[str, int], ...]:
+        """(role, new total quantity) so that each live protective leg's remainder equals `held`."""
+        if self.held == 0 or self.fatal is not None:
+            return ()
+        cancelling = set(self.pending_cancels) | self._sent_cancel
+        found = []
+        for role in _EXITS:
+            leg = self._legs.get(role)
+            if leg is None or not leg.is_live or role in cancelling:
+                continue
+            want = leg.filled_qty + self.held
+            if leg.quantity != want:
+                found.append((role, want))
+        return tuple(found)
 
     def cancel_requests(self) -> list[str]:
-        """Roles whose broker order should be cancelled now (each is listed until marked sent)."""
-        wanted: list[str] = []
-        if self._entry_dead_unfilled():  # rejected or cancelled parent: no children
-            wanted = [r for r in _EXITS if r in self.legs]
-        elif self._exit_role is not None:  # one exit has executed: the other one must go
-            wanted = [r for r in _EXITS if r in self.legs and r != self._exit_role]
-        elif self.entry.is_terminal and self.position_qty == 0:
-            wanted = [r for r in _EXITS if r in self.legs]
-        return [r for r in wanted
-                if not self.legs[r].is_terminal and r not in self._cancel_sent]
-
-    def mark_cancel_sent(self, role: str) -> None:
-        self._cancel_sent.add(role)
+        """`pending_cancels` minus those marked as sent."""
+        return [r for r in self.pending_cancels if r not in self._sent_cancel]
 
     def resize_requests(self) -> list[tuple[str, int]]:
-        """(role, quantity) of live protective legs whose size differs from the filled quantity."""
-        want = self.desired_protection_qty
-        if want == 0 or self.fatal is not None:
-            return []
-        return [(r, want) for r in _EXITS
-                if r in self.legs and not self.legs[r].is_terminal and self.legs[r].quantity != want
-                and r not in self._cancel_sent and self._exit_role is None]
+        """`pending_resizes` minus those marked as sent for the same quantity."""
+        return [(r, q) for r, q in self.pending_resizes if self._sent_resize.get(r) != q]
 
-    def mark_resized(self, role: str, quantity: int) -> None:
-        self.legs[role].resize(quantity)
+    @property
+    def anomalies(self) -> tuple[str, ...]:
+        found = set(self._anomalies)
+        for role in _LEG_ORDER:
+            if role in self._legs:
+                found.update(f"leg {role}: {a}" for a in self._legs[role].anomalies)
+        return tuple(sorted(found))
+
+    def snapshot(self) -> BracketSnapshot:
+        return BracketSnapshot(
+            tuple((r, self._legs[r].snapshot()) for r in _LEG_ORDER if r in self._legs),
+            self.held, self.fatal, self.unprotected, self.needs_protection,
+            self.exit_ahead_of_entry, self.pending_cancels, self.pending_resizes,
+            self.terminal_exit, self.is_closed, self.anomalies, self.connection)
