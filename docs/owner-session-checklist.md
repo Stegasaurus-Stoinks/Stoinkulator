@@ -20,7 +20,7 @@ Global Configuration, API, Settings:
 - Trusted IPs and "Allow connections from localhost only" (TWS itself): the commands connect to
   127.0.0.1 only, so 127.0.0.1 must be allowed.
 - Master API client id (TWS itself): leave it empty. The commands use client id 21 (`fetch-bars`,
-  `probe-data`) and 22 (the watcher). If another program uses one, pass another `--client-id`; 0 and
+  `probe-data`), 22 (the watcher) and 20 (`run`). If another program uses one, pass another `--client-id`; 0 and
   123 are refused.
 - Which login: the paper login for `--paper` runs; the live login for a live-account data session.
   In the owner's sessions of 2026-11-24 the paper account got market data only once the live
@@ -49,6 +49,21 @@ Start TWS on the paper login, then, from the repository root:
 account check: nothing is requested unless every account TWS reports looks like a paper account. You
 type `7497` when asked. Add `--no-prompt` only for an unattended run (the watcher then also needs
 `--minutes`).
+
+## Paper session with `run` (algos on live bars, simulated fills)
+
+`run` takes the watcher's live bars into the engine and runs the algos on the paper broker. No order
+is sent. It is paper only: it needs `--paper` and refuses everything else. The whole procedure
+(the evening before, the pre-flight, the start at about 09:25, the dashboard, how to stop, the
+checks afterwards and what to do for each exit code) is `docs/live-session-runbook.md`. In short,
+from the repository root, with TWS on the paper login and Read-Only API ON:
+
+    .venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS_FILE --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\runs.db" --stop-file "$env:USERPROFILE\Stoinkulator\stop-run" --paper --no-prompt --minutes 415
+
+Every algo in the file needs `"mode": "paper"`. Back up the runs database before the first start
+(the new schema is a one-way migration). Without `--no-prompt` you type `7497` when asked. After the
+session: `report RUN --db ...` and `report RUN --verify --bars ... --db ...`. Never run it on a live
+port, and never turn Read-Only API off.
 
 ## Live account (data only)
 
@@ -83,7 +98,11 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
   is listed as provisional: run the command again after that time and it is fetched again. Running the same command again fetches
   nothing and also ends with exit 0.
 - Watcher: one line per closed bar, the offsets, then a summary with every symbol `streaming`. A
-  symbol that shows no bars at all is not a success even if the exit code is 0 (issue 174).
+  symbol that shows no bars at all is `no data received` and the exit code is 6.
+- `run`: after the paper-mode line and the description, `live: run N begun (paper-live, realistic
+  fills) ...`, one line per closed bar, and at the end `Live session: completed, end reason
+  session_end (exit 0)` (or `minutes_elapsed`, `stop_file`), with the check `live: verify:
+  VERIFIED` above it.
 - Last lines of every command: `Recording: <file>` with the scan findings, `Result: ... (exit N)`.
 
 ## Exit codes
@@ -91,11 +110,13 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
 | code | meaning | what to do |
 |------|---------|------------|
 | 0 | done | nothing |
-| 1 | finished with problems (`fetch-bars`: a day failed or a symbol was not fetched; `probe-data`: a step failed or a symbol has NO data; watcher: a symbol stopped or delivered no bars) | read the lines above the result; run `fetch-bars` again to retry failed days; for NO data check the market data subscriptions and code 10197 |
+| 1 | finished with problems (`fetch-bars`: a day failed or a symbol was not fetched; `probe-data`: a step failed or a symbol has NO data; watcher: a symbol stopped or delivered no bars; `run`: a symbol stopped, the run is stored `failed`) | read the lines above the result; run `fetch-bars` again to retry failed days; for NO data check the market data subscriptions and code 10197 |
 | 2 | refused, nothing started (gate, port guard, arguments, path, `--paper` conditions) | read the message; it says which check |
 | 3 | could not connect | TWS running and logged in, API enabled, the right port, 127.0.0.1 trusted, no dialog waiting in TWS |
-| 4 | `fetch-bars`: stopped early (connection lost, pacing violation twice, a fault). Watcher: connection lost or closed, or an unexpected error. `probe-data`: not a paper account (`--paper` only) | `fetch-bars`: what was finished is on disk; check TWS is running and logged in, run the same command again to resume; after a pacing stop wait at least 10 minutes first. Watcher: check TWS, start a new watch (files of the day are appended, only later bars). `probe-data`: log TWS into the paper account, do not retry in a loop |
-| 5 | `--paper` only, `fetch-bars` and watcher: the account TWS is signed into is not a paper account; nothing was requested | log TWS into the paper account; do not retry in a loop |
+| 4 | `fetch-bars`: stopped early (connection lost, pacing violation twice, a fault). Watcher: connection lost or closed, or an unexpected error. `probe-data`: not a paper account (`--paper` only). `run`: connection lost or closed, or an error; the run is stored `failed` | `fetch-bars`: what was finished is on disk; check TWS is running and logged in, run the same command again to resume; after a pacing stop wait at least 10 minutes first. Watcher: check TWS, start a new watch (files of the day are appended, only later bars). `probe-data`: log TWS into the paper account, do not retry in a loop. `run`: a restart is a new run (an earlier run is never resumed) |
+| 5 | `--paper` only, `fetch-bars`, watcher and `run`: the account TWS is signed into is not a paper account; nothing was requested | log TWS into the paper account; do not retry in a loop |
+| 6 | watcher: a symbol received no data (`no data received`). `run`: no data received for a symbol; the run is stored `failed` | check the market data subscription of the paper account and code 10197; a weekday holiday gives the same (the code does not know holidays) |
+| 7 | `run` only: the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step over 60 s) | read the `live: FAULT` line; see `docs/live-session-runbook.md` |
 | 130 | Ctrl-C | the connection and the recording were closed. `fetch-bars`: run the same command to resume. `probe-data` and watcher: nothing to resume, start again if needed |
 
 ## Recordings
