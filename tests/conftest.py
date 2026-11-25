@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,73 @@ def pytest_configure_broker_blocked_variable(config):
 @pytest.hookimpl(specname="pytest_unconfigure")
 def pytest_unconfigure_broker_blocked_variable(config):
     _restore_broker_blocked_variable(config)
+
+
+# Third guard (issue 229): no order frame can leave a process during a pytest run.
+IB_PORTS_REFUSED = frozenset({7496, 7497, 4001, 4002})
+
+
+class OrderFrameBlockedUnderPytest(BrokerConnectionBlockedUnderPytest):
+    """Raised when a real ibapi Connection is asked to send any frame under pytest."""
+
+
+_ORDER_BLOCK_PATCH = pytest.StashKey[pytest.MonkeyPatch]()
+
+
+def _blocked_send_msg(self, *args, **kwargs):
+    raise OrderFrameBlockedUnderPytest(
+        "Refusing to send a frame through a real ibapi Connection: tests must never "
+        "send anything to a broker. Use tests/fake_ib.py."
+    )
+
+
+def _refuse_ib_port(address):
+    if not (isinstance(address, tuple) and len(address) >= 2):
+        return
+    try:
+        port = int(address[1])
+    except (TypeError, ValueError):
+        return
+    if port in IB_PORTS_REFUSED:
+        raise BrokerConnectionBlockedUnderPytest(
+            f"Refusing a socket connect to port {port}: tests must never reach a "
+            "broker port (7496, 7497, 4001, 4002)."
+        )
+
+
+@pytest.hookimpl(specname="pytest_configure")
+def pytest_configure_order_frame_block(config):
+    mp = pytest.MonkeyPatch()
+    mp.setattr(ibapi_connection.Connection, "sendMsg", _blocked_send_msg)
+
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_create_connection = socket.create_connection
+
+    def guarded_connect(self, address, *args, **kwargs):
+        _refuse_ib_port(address)
+        return real_connect(self, address, *args, **kwargs)
+
+    def guarded_connect_ex(self, address, *args, **kwargs):
+        _refuse_ib_port(address)
+        return real_connect_ex(self, address, *args, **kwargs)
+
+    def guarded_create_connection(address, *args, **kwargs):
+        _refuse_ib_port(address)
+        return real_create_connection(address, *args, **kwargs)
+
+    mp.setattr(socket.socket, "connect", guarded_connect)
+    mp.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    mp.setattr(socket, "create_connection", guarded_create_connection)
+    config.stash[_ORDER_BLOCK_PATCH] = mp
+
+
+@pytest.hookimpl(specname="pytest_unconfigure")
+def pytest_unconfigure_order_frame_block(config):
+    mp = config.stash.get(_ORDER_BLOCK_PATCH, None)
+    if mp is not None:
+        mp.undo()
+        del config.stash[_ORDER_BLOCK_PATCH]
 
 
 def pytest_addoption(parser):
