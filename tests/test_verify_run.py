@@ -34,7 +34,13 @@ from MainStoinker.engine.live_store import LiveRunWriter, describe_today_bars
 from MainStoinker.engine.modes import build_router
 from MainStoinker.engine.paper_broker import CostModel
 from MainStoinker.engine.stats import fmt4
-from MainStoinker.engine.store import AlgoMeta, DataMeta, SqliteStore, open_store_readonly
+from MainStoinker.engine.store import (
+    AlgoMeta,
+    DataMeta,
+    SqliteStore,
+    StoreBusyError,
+    open_store_readonly,
+)
 from MainStoinker.engine.verify import (
     EXIT_MISMATCH,
     EXIT_REFUSED,
@@ -53,6 +59,22 @@ EMA = {"idname": "{s}-10/30EMA", "ticker": "{s}", "short": "10", "long": "30"}
 COSTS = CostModel(Decimal("0.005"), Decimal("1.00"), Decimal("0"))
 CAPITAL = Decimal("10000")
 NO_ENV: dict[str, str] = {}
+
+
+class BusyFinishStore(SqliteStore):
+    """A store whose counts and data writes report a busy database once `busy` is set."""
+
+    busy = False
+
+    def set_counts(self, run_id: int, counts: Any, *, replace: bool = False) -> None:
+        if self.busy:
+            raise StoreBusyError("database is locked")
+        super().set_counts(run_id, counts, replace=replace)
+
+    def update_run_data(self, run_id: int, data: DataMeta) -> None:
+        if self.busy:
+            raise StoreBusyError("database is locked")
+        super().update_run_data(run_id, data)
 
 
 def ema_entries(symbols: list[str]) -> list[dict[str, Any]]:
@@ -101,7 +123,7 @@ def build_session(
     drop: dict[str, range] | None = None, fail_at: int | None = None,
     stop_after: int | None = None, record_bars_dir: bool = True,
     kill_after: int | None = None, reverse_algos: bool = False, backfill: int = 0,
-    heartbeat_every: int | None = None,
+    heartbeat_every: int | None = None, busy_finish: bool = False,
 ) -> Session:
     """Drive a live session to its end (or its failure) and return what it stored.
 
@@ -148,7 +170,7 @@ def build_session(
     ledger = Ledger()
     router = build_router(entries, fills=fills, costs=COSTS, capital=CAPITAL, ledger=ledger)
     algos: list = []
-    store = SqliteStore(db, env=NO_ENV)
+    store = (BusyFinishStore if busy_finish else SqliteStore)(db, env=NO_ENV)
     writer: LiveRunWriter | None = None
     positions: tuple = ()
     failed = False
@@ -164,7 +186,8 @@ def build_session(
                 return real(frame)
 
             algos[0].update = update
-        writer = LiveRunWriter(store, ledger, engine.algos)
+        writer = LiveRunWriter(store, ledger, engine.algos, **(
+            {"sleep": lambda _s: None} if busy_finish else {}))
         metas = [AlgoMeta(cfg["idname"], entry["ID"], cfg["ticker"], router.modes[cfg["idname"]],
                           CAPITAL, cfg) for entry in entries for cfg in entry["data"]]
         config = {
@@ -208,10 +231,12 @@ def build_session(
                              missing_minutes=(), uncovered_minutes=0, warnings=())
         status = "failed" if failed or stop_after is not None else "completed"
         reason = ("error" if failed else "interrupted") if status == "failed" else "session_end"
+        if busy_finish:  # `finish` cannot write its counts and data, but `end_run` works
+            store.busy = True  # type: ignore[attr-defined]
         outcome = writer.finish(status, reason,  # type: ignore[arg-type]
                                 {(s, "fed", None): sum(1 for _, b in ordered[:done] if s in b)
                                  for s in symbols}, data_meta, engine.gap_report)
-        assert outcome.ok, outcome
+        assert outcome.ok or busy_finish, outcome
         gap_bars = engine.gap_report.total_bars_after_gap
     close_algo_logs(algos)
     store.close()
@@ -245,6 +270,12 @@ def sessions(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Session]:
         "provisional": build_session(
             base / "provisional", ["AAPL", "MSFT"], "realistic", rows=700, heartbeat_every=40,
             drop={"AAPL": range(100, 104), "MSFT": range(300, 302)}),
+        "killed-late-gap": build_session(
+            base / "killed-late-gap", ["AAPL", "MSFT"], "realistic", kill_after=450,
+            heartbeat_every=40, drop={"AAPL": range(445, 447)}),
+        "busy-finish": build_session(
+            base / "busy-finish", ["AAPL", "MSFT"], "realistic", rows=450, heartbeat_every=40,
+            drop={"AAPL": range(445, 447)}, busy_finish=True),
         "killed-provisional": build_session(
             base / "killed-provisional", ["AAPL", "MSFT"], "realistic", kill_after=450,
             heartbeat_every=40, drop={"AAPL": range(100, 104)}),
@@ -1016,3 +1047,55 @@ def test_verify_does_not_compare_the_provisional_counts_of_a_run_left_running(
     assert run.summary.data.gap_rule is not None
     code, out, err = verify(session, capsys)
     assert code == EXIT_VERIFIED, out + err
+
+
+def _set_status(db: Path, status: str, reason: str | None) -> None:
+    sql(db, "UPDATE runs SET status=?, end_reason=?, ended_at=? WHERE id=1",
+        status, reason, "2025-03-03T21:00:00+00:00" if status != "running" else None)
+
+
+def test_verify_a_killed_run_closed_as_abandoned_does_not_compare_its_provisional_gap_rule(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    killed = sessions["killed-late-gap"]
+    assert json.loads(_data_json(killed.db)).get("provisional") is True
+    assert verify(killed, capsys)[0] == EXIT_VERIFIED  # still running: not compared
+    closed = killed.copy(tmp_path / "abandoned")  # the next session closes it
+    _set_status(closed.db, "failed", "abandoned")
+    code, out, err = verify(closed, capsys)
+    assert code == EXIT_VERIFIED, out + err  # the gap after the last heartbeat is not a mismatch
+    assert "gap rule not compared: stored counts are provisional" in out
+
+
+def test_verify_a_run_whose_finish_could_not_write_counts_and_data_keeps_its_provisional_mark(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str]
+) -> None:
+    busy = sessions["busy-finish"]
+    run = stored_run(busy.db)
+    assert (run.summary.status, run.summary.end_reason) == ("failed", "error")
+    assert run.summary.data.provisional is True  # the heartbeat's record was never replaced
+    code, out, err = verify(busy, capsys)
+    assert code == EXIT_VERIFIED, out + err
+    assert "gap rule not compared: stored counts are provisional" in out
+
+
+def _tamper_gap_rule(db: Path) -> None:
+    raw = json.loads(_data_json(db))
+    first = next(iter(raw["gap_rule"]["bars_after_gap"]))
+    raw["gap_rule"]["bars_after_gap"][first] += 1
+    sql(db, "UPDATE runs SET data_json=? WHERE id=1", json.dumps(raw))
+
+
+@pytest.mark.parametrize("status", ["completed", "running"])
+def test_verify_still_compares_the_gap_rule_of_a_run_with_final_data(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path, status: str
+) -> None:
+    final = sessions["provisional"]
+    assert "provisional" not in json.loads(_data_json(final.db))  # `finish` cleared the mark
+    tampered = final.copy(tmp_path / f"tampered-{status}")
+    _tamper_gap_rule(tampered.db)
+    if status == "running":  # a completed run edited to look unfinished: its data is still final
+        _set_status(tampered.db, "running", None)
+    code, out, _ = verify(tampered, capsys)
+    assert code == EXIT_MISMATCH, out
+    assert "gap_rule" in out and "bars_after_gap[" in out

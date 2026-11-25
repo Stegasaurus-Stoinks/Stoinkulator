@@ -3,14 +3,18 @@ and the data record, the API marks them `provisional`, `finish` still writes the
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from MainStoinker.engine.store import DataMeta, SqliteStore, StoreBusyError
 from tests.api_support import make_client
-from tests.test_live_store import NO_ENV, Clock, Synth, finish, synth
+from tests.test_live_store import NO_ENV, Clock, Holder, Synth, finish, synth
 
 COUNTS: Any = {("AAA", "fed", None): 2, ("AAA", "late", None): 1,
                ("AAA", "dropped", "farm_break"): 3}
@@ -67,17 +71,24 @@ def test_the_counts_of_a_finished_run_are_final_and_not_provisional(tmp_path: Pa
 
 
 class BusyForProvisional(SqliteStore):
-    """A store whose count and data-record writes report a busy database on demand."""
+    """A store whose provisional write (and, with `busy_final`, the final counts and data
+    writes) report a busy database on demand."""
 
     busy = False
+    busy_final = False
 
-    def set_counts(self, run_id: int, counts: Any) -> None:
+    def write_provisional(self, run_id: int, counts: Any, data: Any) -> None:
         if self.busy:
             raise StoreBusyError("database is locked")
-        super().set_counts(run_id, counts)
+        super().write_provisional(run_id, counts, data)
+
+    def set_counts(self, run_id: int, counts: Any, *, replace: bool = False) -> None:
+        if self.busy_final:
+            raise StoreBusyError("database is locked")
+        super().set_counts(run_id, counts, replace=replace)
 
     def update_run_data(self, run_id: int, data: DataMeta) -> None:
-        if self.busy:
+        if self.busy_final:
             raise StoreBusyError("database is locked")
         super().update_run_data(run_id, data)
 
@@ -93,17 +104,79 @@ def test_a_busy_database_at_a_heartbeat_skips_the_provisional_write_and_fails_no
     store.busy = True
     clock.now += timedelta(seconds=20)
     s.writer.heartbeat(COUNTS, meta_so_far(1))  # no exception
-    assert s.writer.provisional_skipped == 2 and s.writer.error is None
+    assert s.writer.provisional_skipped == 1 and s.writer.error is None
     assert pauses == []  # no waiting inside a heartbeat
     assert store.load_counts(1) == {}
     assert store.list_runs()[0].last_write_at == clock.now  # the plain heartbeat still happened
     s.step(1)  # the step is not affected
     store.busy = False
     s.writer.heartbeat(COUNTS, meta_so_far(2))  # the next heartbeat stores it
-    assert s.writer.provisional_skipped == 2
+    assert s.writer.provisional_skipped == 1
     assert store.load_counts(1)["symbol"]["AAA:fed"] == 2
     assert finish(s, counts={("AAA", "fed", None): 2}).ok
     store.close()
+
+
+def test_the_provisional_write_never_waits_for_a_database_another_writer_holds(
+    tmp_path: Path
+) -> None:
+    store = SqliteStore(tmp_path / "synth.db", env=NO_ENV, busy_timeout=2.0)  # LIVE_BUSY_TIMEOUT
+    s = synth(tmp_path, store=store)
+    s.step(0)
+    holder = Holder(tmp_path / "synth.db")
+    holder.hold()
+    try:
+        started = time.monotonic()
+        s.writer._write_provisional(1, COUNTS, meta_so_far(1))  # noqa: SLF001
+        waited = time.monotonic() - started
+        with pytest.raises(StoreBusyError):
+            store.write_provisional(1, {}, None)
+    finally:
+        holder.close()
+    assert waited < 0.5, waited  # the store's own wait would be 2 s per attempt
+    assert s.writer.provisional_skipped == 1 and s.writer.error is None
+    # the store's wait is back to what it was for every other write
+    assert store._db().execute("PRAGMA busy_timeout").fetchone() == (2000,)  # noqa: SLF001
+    store.close()
+
+
+def test_the_data_record_is_marked_provisional_until_finish_clears_the_mark(tmp_path: Path) -> None:
+    s = synth(tmp_path)
+    s.step(0)
+    assert "provisional" not in json.loads(table(s.db, "SELECT data_json FROM runs")[0][0])
+    s.writer.heartbeat(COUNTS, meta_so_far(1))
+    assert json.loads(table(s.db, "SELECT data_json FROM runs")[0][0])["provisional"] is True
+    assert s.store.load_run(1).summary.data.provisional is True
+    assert finish(s, counts={("AAA", "fed", None): 1}).ok
+    assert "provisional" not in json.loads(table(s.db, "SELECT data_json FROM runs")[0][0])
+    assert s.store.load_run(1).summary.data.provisional is False
+    s.store.close()
+
+
+def test_the_mark_stays_when_finish_could_not_write_its_counts_and_data(tmp_path: Path) -> None:
+    store = BusyForProvisional(tmp_path / "synth.db", env=NO_ENV)
+    s = synth(tmp_path, store=store)
+    s.step(0)
+    s.writer.heartbeat(COUNTS, meta_so_far(1))
+    store.busy_final = True
+    outcome = finish(s, counts={("AAA", "fed", None): 1})
+    assert outcome.status == "failed" and outcome.busy  # `end_run` was written
+    assert store.load_run(1).summary.data.provisional is True
+    assert store.load_counts(1)["symbol"]["AAA:fed"] == 2  # still the heartbeat's counts
+    document = make_client(s.db).get("/api/runs/1").json()
+    assert document["live_counts"]["provisional"] is True  # the API reads the same mark
+    store.close()
+
+
+def test_the_final_counts_replace_what_only_a_heartbeat_stored(tmp_path: Path) -> None:
+    s = synth(tmp_path)
+    s.step(0)
+    s.writer.heartbeat({("AAA", "fed", None): 1, ("AAA", "dropped", "stalled"): 4},
+                       meta_so_far(1))
+    assert "AAA:dropped:stalled" in s.store.load_counts(1)["symbol"]
+    assert finish(s, counts={("AAA", "fed", None): 1}).ok
+    assert s.store.load_counts(1) == {"symbol": {"AAA:fed": 1}}
+    s.store.close()
 
 
 def test_a_completed_run_is_stored_exactly_as_without_provisional_writes(tmp_path: Path) -> None:

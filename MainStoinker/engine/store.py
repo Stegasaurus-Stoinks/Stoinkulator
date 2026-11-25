@@ -53,7 +53,7 @@ import sqlite3
 import time
 from bisect import bisect_right
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -140,6 +140,11 @@ class DataMeta:
     # (key "gap_rule"). None for a run stored before it existed, or one that has
     # not yet recorded it; `write_gap_rule` sets it when the replay is done.
     gap_rule: GapRuleReport | None = None
+    # True while the record (and the run's counts) were stored mid-session by a live writer's
+    # heartbeat and not yet by its `finish`: they are as of some earlier moment, so a reader
+    # must not treat them as final. Kept in `data_json` under "provisional" only when True,
+    # so every other run stores exactly what it stored before.
+    provisional: bool = False
 
 
 def gap_rule_to_json(report: GapRuleReport) -> dict[str, Any]:
@@ -359,9 +364,13 @@ class Store(Protocol):
 
     def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None: ...
 
-    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None: ...
+    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]], *,
+                   replace: bool = False) -> None: ...
 
     def update_run_data(self, run_id: int, data: DataMeta) -> None: ...
+
+    def write_provisional(self, run_id: int, counts: Mapping[str, Mapping[str, int]],
+                          data: DataMeta | None) -> None: ...
 
     def end_run(self, run_id: int, status: RunStatus, reason: str | None = None) -> None: ...
 
@@ -429,10 +438,15 @@ class NullStore:
     def write_bars(self, run_id: int, bars: Iterable[StoredBar]) -> None:
         return None
 
-    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None:
+    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]], *,
+                   replace: bool = False) -> None:
         return None
 
     def update_run_data(self, run_id: int, data: DataMeta) -> None:
+        return None
+
+    def write_provisional(self, run_id: int, counts: Mapping[str, Mapping[str, int]],
+                          data: DataMeta | None) -> None:
         return None
 
     def end_run(self, run_id: int, status: RunStatus, reason: str | None = None) -> None:
@@ -819,6 +833,7 @@ def _data_json_dict(data: DataMeta) -> dict[str, Any]:
         "uncovered_minutes": data.uncovered_minutes,
         "warnings": list(data.warnings),
         "gap_rule": None if data.gap_rule is None else gap_rule_to_json(data.gap_rule),
+        **({"provisional": True} if data.provisional else {}),
     }
 
 
@@ -885,6 +900,7 @@ class SqliteStore:
                  readonly: bool = False) -> None:
         self._clock = clock
         self._readonly = readonly
+        self._busy_ms = int(busy_timeout * 1000)
         self._schema_version = 0
         self._equity_state: dict[tuple[int, str | None], _EquityState] = {}
         # run id -> (time, last equity seq before it, compressor states before it) of the
@@ -1196,19 +1212,28 @@ class SqliteStore:
                                  ) from exc
             self._stamp(conn, run_id)
 
-    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]]) -> None:
+    def set_counts(self, run_id: int, counts: Mapping[str, Mapping[str, int]], *,
+                   replace: bool = False) -> None:
         """Upsert live counts: `{scope: {key: value}}`, scope "symbol" or "algo".
 
-        A (scope, key) already stored is overwritten, others are kept. Also
-        sets `last_write_at`.
+        A (scope, key) already stored is overwritten, others are kept, unless `replace` is
+        true: then every count of the run is deleted first, in the same transaction, so
+        nothing stored earlier survives (the final counts of a run replace its provisional
+        ones). Also sets `last_write_at`.
         """
         rows = _count_rows(run_id, counts)
         with self._tx() as conn:
             self._require_run(conn, run_id, running=True)
-            conn.executemany(
-                "INSERT INTO run_counts (run_id, scope, key, value) VALUES (?,?,?,?)"
-                " ON CONFLICT (run_id, scope, key) DO UPDATE SET value=excluded.value", rows)
+            if replace:
+                conn.execute("DELETE FROM run_counts WHERE run_id=?", (run_id,))
+            self._upsert_counts(conn, rows)
             self._stamp(conn, run_id)
+
+    @staticmethod
+    def _upsert_counts(conn: sqlite3.Connection, rows: list[tuple[Any, ...]]) -> None:
+        conn.executemany(
+            "INSERT INTO run_counts (run_id, scope, key, value) VALUES (?,?,?,?)"
+            " ON CONFLICT (run_id, scope, key) DO UPDATE SET value=excluded.value", rows)
 
     def update_run_data(self, run_id: int, data: DataMeta) -> None:
         """Replace the run's `DataMeta` (the last bar, minute counts, warnings) in `data_json`.
@@ -1216,14 +1241,41 @@ class SqliteStore:
         A `gap_rule` of None keeps the one `write_gap_rule` recorded. Also sets
         `last_write_at`.
         """
-        fresh = _data_json_dict(data)
         with self._tx() as conn:
             self._require_run(conn, run_id, running=True)
-            if data.gap_rule is None:
-                row = conn.execute("SELECT data_json FROM runs WHERE id=?", (run_id,)).fetchone()
-                fresh["gap_rule"] = json.loads(row[0]).get("gap_rule")
-            conn.execute("UPDATE runs SET data_json=? WHERE id=?", (_dumps(fresh, "data"), run_id))
+            self._replace_data(conn, run_id, data)
             self._stamp(conn, run_id)
+
+    @staticmethod
+    def _replace_data(conn: sqlite3.Connection, run_id: int, data: DataMeta) -> None:
+        fresh = _data_json_dict(data)
+        if data.gap_rule is None:
+            row = conn.execute("SELECT data_json FROM runs WHERE id=?", (run_id,)).fetchone()
+            fresh["gap_rule"] = json.loads(row[0]).get("gap_rule")
+        conn.execute("UPDATE runs SET data_json=? WHERE id=?", (_dumps(fresh, "data"), run_id))
+
+    def write_provisional(self, run_id: int, counts: Mapping[str, Mapping[str, int]],
+                          data: DataMeta | None) -> None:
+        """A running writer's mid-session counts and data record, in ONE transaction that
+        does not wait for a busy database: when another writer holds it the call raises
+        `StoreBusyError` at once and stores nothing. `data` should have `provisional` set.
+        Also sets `last_write_at`."""
+        rows = _count_rows(run_id, counts)
+        conn = self._db()
+        try:
+            conn.execute("PRAGMA busy_timeout=0")
+        except sqlite3.Error as exc:
+            raise _store_error(str(exc), exc) from exc
+        try:
+            with self._tx() as tx:
+                self._require_run(tx, run_id, running=True)
+                self._upsert_counts(tx, rows)
+                if data is not None:
+                    self._replace_data(tx, run_id, data)
+                self._stamp(tx, run_id)
+        finally:
+            with suppress(sqlite3.Error):
+                conn.execute(f"PRAGMA busy_timeout={self._busy_ms}")
 
     def end_run(self, run_id: int, status: RunStatus, reason: str | None = None) -> None:
         """Flush the last equity point of every series and close the run.
@@ -1556,7 +1608,8 @@ class SqliteStore:
                         else tuple((s, int(n)) for s, n in d["missing_minutes"].items()),
                         d.get("uncovered_minutes"),
                         tuple(d.get("warnings") or ()),
-                        gap_rule_from_json(d.get("gap_rule")))
+                        gap_rule_from_json(d.get("gap_rule")),
+                        d.get("provisional") is True)
         last_write, reason = (r[8], r[9]) if len(r) >= 10 else (None, None)
         return RunSummary(r[0], _dt(r[1]), _opt_dt(r[2]), r[3], r[4], r[5], r[6], data,
                           _opt_dt(last_write), reason)

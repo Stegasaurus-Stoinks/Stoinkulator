@@ -58,9 +58,11 @@ the returned `FinishOutcome` (the first error ever seen is also `writer.error`).
 
 Provisional counts: `heartbeat(counts, data_meta)` also stores the counts and the data record as
 they stand (first and last bar, minute counts, warnings, gap rule), so a dashboard shows them while
-the run is running. A busy database skips that part until the next heartbeat (`provisional_skipped`
-counts them) and never fails a step or the session. `finish` overwrites both with the final values;
-a run that completed holds exactly what it would hold without any provisional write.
+the run is running. The data record carries `provisional: true` until `finish` replaces it and
+the counts with the final values (the counts are replaced, not upserted, so a key stored only
+mid-session cannot survive). A busy database skips the write at once until the next heartbeat
+(`provisional_skipped` counts them) and never fails a step or the session. A run that completed
+holds exactly what it would hold without any provisional write.
 
 Marker delay (decision of issue 192): every indicator series of an algo is held back
 by the tracker's `settle` bars (its `order`: 10 for Elliot, 2 for FunctionTest), so
@@ -340,9 +342,12 @@ class LiveRunWriter:
         dashboard sees them while the run is still running. These are PROVISIONAL: `finish`
         writes the final values over them, and `report --verify` ignores them for a run that
         did not complete. A provisional write is best effort: when the database is busy (or the
-        write fails otherwise) it is skipped, counted in `provisional_skipped`, and tried again
-        with the next heartbeat; it never fails the writer or the session. The plain touch
-        keeps its busy retries and its failure behaviour.
+        write fails otherwise) it is skipped at once, counted in `provisional_skipped`, and
+        tried again with the next heartbeat; it never fails the writer or the session and adds
+        no waiting. The plain touch then runs with its busy retries and its failure behaviour
+        as before. Both parts go in ONE transaction, and the data record is stored with its
+        `provisional` mark, which `finish` clears: a reader (`report --verify`, the API) treats
+        a marked record and the counts beside it as not final.
         """
         run_id = self._require_run()
         stamped = self._write_provisional(run_id, counts, data_meta)
@@ -361,27 +366,20 @@ class LiveRunWriter:
 
     def _write_provisional(self, run_id: int, counts: Mapping[CountSpec, int] | None,
                            data_meta: DataMeta | None) -> bool:
-        """Best-effort provisional counts and data record; True when every part asked for
-        was stored (and so the run was stamped). Single attempt: no pause inside a heartbeat."""
-        stored = False
-        complete = True
-        if counts is not None:
-            try:
-                rows = {count_key(*spec): int(value) for spec, value in counts.items()}
-                if rows:
-                    self._store.set_counts(run_id, {COUNT_SCOPE_SYMBOL: rows})
-                    stored = True
-            except Exception:  # noqa: BLE001 - provisional data never fails the run
-                self._provisional_skipped += 1
-                complete = False
-        if data_meta is not None:
-            try:
-                self._store.update_run_data(run_id, data_meta)
-                stored = True
-            except Exception:  # noqa: BLE001
-                self._provisional_skipped += 1
-                complete = False
-        return stored and complete
+        """Best-effort provisional counts and data record in one transaction that does not
+        wait for a busy database; True when it was stored (and so the run was stamped).
+        The data record is marked `provisional`; `finish` clears the mark."""
+        try:
+            rows = {count_key(*spec): int(value) for spec, value in (counts or {}).items()}
+            data = None if data_meta is None else replace(data_meta, provisional=True)
+            if not rows and data is None:
+                return False
+            self._store.write_provisional(
+                run_id, {COUNT_SCOPE_SYMBOL: rows} if rows else {}, data)
+            return True
+        except Exception:  # noqa: BLE001 - provisional data never fails the run
+            self._provisional_skipped += 1
+            return False
 
     # --- internals -----------------------------------------------------------
 
@@ -541,6 +539,7 @@ class LiveRunWriter:
         if absent:
             errors.append(f"counts: no fed count for {', '.join(absent)}: the run cannot be "
                           "verified without them")
+        counts_ok = False
         # Each part is tried on its own: a failed tail must not stop the run being ended.
         try:
             self._collect_series(None, final=True)
@@ -552,13 +551,16 @@ class LiveRunWriter:
         try:
             rows = {count_key(*spec): int(value) for spec, value in counts.items()}
             self._retried(lambda: self._store.set_counts(
-                run_id, {COUNT_SCOPE_SYMBOL: rows} if rows else {}), retries=retries())
+                run_id, {COUNT_SCOPE_SYMBOL: rows} if rows else {}, replace=True),
+                retries=retries())
+            counts_ok = True
         except Exception as exc:
             busy = busy or isinstance(exc, StoreBusyError)
             self._fail(exc)
             errors.append(f"counts: {_describe(exc)}")
         try:
-            full = replace(data_meta, gap_rule=gap_rule)
+            # the mark stays when the final counts were not stored: the record is then not final either
+            full = replace(data_meta, gap_rule=gap_rule, provisional=not counts_ok)
             self._retried(lambda: self._store.update_run_data(run_id, full), retries=retries())
         except Exception as exc:
             busy = busy or isinstance(exc, StoreBusyError)

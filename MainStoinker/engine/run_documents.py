@@ -24,8 +24,8 @@ they were before, with no new key:
   `last_write_at` (UTC ISO or null);
 - `report --json` top level: `open_positions` (always for a live run) and
   `live_counts` (when the counts were passed in; `provisional: true` while the run is
-  running, stale or was closed as abandoned: the writer stores counts with its heartbeats,
-  and only `finish` stores the final ones).
+  running or stale, or its data record is marked provisional: the writer stores counts with
+  its heartbeats, and only `finish` stores the final ones).
 
 Stale: a `running` run whose last write (`last_write_at`, else `started_at`)
 is more than `stale_after` (default `STALE_AFTER`) before `now`.
@@ -298,10 +298,11 @@ def report_document(run: RunData, *, data_directory: str, now: datetime | None =
         document["open_positions"] = open_positions(run, last_bars)
         if counts is not None:
             record = live_counts_record(counts, run.summary.data.gap_rule)
-            # The writer stores counts with its heartbeats while the run runs (also when it is
-            # stale: its writer is probably dead) and `finish` the final ones. A run closed as
-            # abandoned never got them. Only such a document carries the key.
-            if run.summary.status == "running" or run.summary.end_reason == "abandoned":
+            # The writer stores counts with its heartbeats while the run runs (a stale run too:
+            # its writer is probably dead) and marks the data record `provisional` until
+            # `finish` stores the final ones; `report --verify` reads the same mark. Only such
+            # a document carries the key.
+            if run.summary.status == "running" or run.summary.data.provisional:
                 record["provisional"] = True
             document["live_counts"] = record
     return document
