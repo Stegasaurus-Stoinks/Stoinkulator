@@ -644,6 +644,41 @@ def test_a_late_bar_of_a_requested_backfill_is_counted_and_not_a_fault(
     assert given.aligner.late_after_decided_counts() == dict.fromkeys(SYMBOLS, 0)
 
 
+def test_decided_before_the_bar_and_the_bar_before_decided_are_both_accepted(
+        tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """The aligner takes the two call orders alike (review of #202/#207); the driver sees no refusal."""
+    write_warmup_files(tmp_path / "bars")
+    given = UnitSession(tmp_path, stores).session
+    first = Bar(pd.Timestamp(2024, 8, 16, 9, 30), FIRST, 1.0, 1.5, 0.5, 1.2, 1)
+    second = Bar(pd.Timestamp(2024, 8, 16, 9, 31), FIRST + 60, 1.0, 1.5, 0.5, 1.2, 1)
+    given.decided("AAPL", FIRST)  # decided first, then the bar of that minute
+    given.on_bar("AAPL", first, "later")
+    given.on_bar("AAPL", second, "later")  # the bar first, then decided
+    given.decided("AAPL", FIRST + 60)
+    assert given.aligner.refused_counts()["AAPL"] == 0
+    assert given.aligner.late_counts()["AAPL"] == 0 == given.aligner.late_after_decided_counts()["AAPL"]
+    assert given.aligner.pending_minutes() == 2
+
+
+def test_a_bar_the_aligner_refuses_is_a_fault(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A duplicate that reaches the aligner (the driver's own overlap check bypassed) is refused there;
+    any refusal ends the session with a data fault."""
+    real = live_run._Session.on_bar  # noqa: SLF001
+
+    def twice(self: Any, symbol: str, bar: Bar, how: str) -> None:
+        real(self, symbol, bar, how)
+        if symbol == "MSFT" and bar.time == FIRST + 180 and how == "later":
+            self.aligner.bar(symbol, bar)
+
+    monkeypatch.setattr(live_run._Session, "on_bar", twice)  # noqa: SLF001
+    standard_script(rig, last=9, minutes=12)
+    result = session(rig, tmp_path, stores, minutes=12)
+    assert result.code == 7, rig.text
+    assert result.store.list_runs()[0].end_reason == "data_fault"
+    assert "the aligner refused bars: {'MSFT': 1}" in rig.text
+
+
 # -- (i) delayed data --------------------------------------------------------------------
 
 

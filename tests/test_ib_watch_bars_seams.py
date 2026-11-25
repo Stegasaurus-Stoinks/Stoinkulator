@@ -1287,3 +1287,150 @@ def test_a_sink_that_raises_in_close_after_a_recorder_failure_is_one_line_too(
     assert rig.text.count("Closing the bar sinks raised RuntimeError: close boom") == 1
     assert "Traceback" not in rig.text
     assert not rig.connections
+
+
+# -- F1, the early stop and the end cause (issue 197) ---------------------------------------------------
+
+
+def test_f1_stream_now_stays_none_while_a_running_symbol_has_no_measured_lag(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AAPL is live from the open; MSFT's backfill holds only the previous session and its first bar of
+    today shows 15 minutes late. Its lag is unmeasured until then: the stream clock must wait (None), or
+    minutes would be released without MSFT and its bars would arrive late."""
+    rig.server_epoch = ep(9, 30, 10)
+    rig.backfills = {
+        "AAPL": [[(ep(9, 30), 99.0, 99.5, 98.8, 99.2, 100)]],
+        "MSFT": [[(ep(9, 30) - 86400 + 60 * k, 400.0, 400.5, 399.5, 400.2, 100) for k in range(3)]]}
+    for m in range(30, 38):
+        _update_at(rig, "AAPL", ep(9, m), ep(9, m, 4), (99.0, 99.5, 98.8, 99.2, 100 + m))
+    _update_at(rig, "MSFT", ep(9, 30), ep(9, 45, 4), (400.0, 400.5, 399.5, 400.2, 100))
+    _update_at(rig, "MSFT", ep(9, 31), ep(9, 46, 4), (400.2, 400.7, 400.1, 400.5, 100))
+    for when in range(ep(9, 31), ep(9, 47), 30):  # the watcher looks every 30 s
+        _at(rig, when, lambda: None)
+    rig.end_at(17, symbols=2)
+    h = Harness(rig, ("AAPL", "MSFT"))
+    run_with(rig, monkeypatch, h.seams(), minutes=17, log=h)
+    h.finish()
+    unmeasured = [c for c in h.clocks if c.server_now < ep(9, 45, 4)]
+    assert len(unmeasured) > 20 and all(c.stream_now is None for c in unmeasured)
+    assert any(c.stream_now is not None for c in h.clocks if c.server_now > ep(9, 45, 6))
+    assert h.aligner is not None
+    zeros = {"AAPL": 0, "MSFT": 0}
+    assert h.aligner.late_counts() == zeros and h.aligner.refused_counts() == zeros
+    assert h.aligner.released_without_counts() == zeros
+    assert h.release and min(h.release.values()) >= ep(9, 45)  # nothing was released before MSFT was heard
+
+
+def test_request_stop_from_the_hook_ends_the_watch_at_once_and_closes_everything_once(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.standard()
+    h = Harness(rig, ("AAPL", "MSFT"), align=False)
+
+    def hook(clock: Any) -> None:
+        h.on_pass(clock)
+        if clock.server_now >= ep(9, 35):
+            h.watcher.request_stop("enough")
+            h.watcher.request_stop("again")  # the first reason stays
+
+    seams = watch_bars.WatchSeams(extra_sinks=(h,), listener=h, on_pass=hook, on_watcher=h.set_watcher)
+    code = run_with(rig, monkeypatch, seams, minutes=5, log=h)
+    text = rig.text
+    assert code == watch_bars.EXIT_OK, text
+    assert "Stopped on the driver's request (enough)." in text and "(again)" not in text
+    assert "Watch time over" not in text and "No symbol is streaming" not in text
+    assert h.watcher.stop_requested and h.watcher.end_cause == "stop_requested"
+    assert h.closed == 1  # the sink is closed once
+    assert all(c.state is ConnState.CLOSED for c in rig.connections)
+    cancelled = [c for f in rig.fakes for c in f.calls if c.name == "cancelHistoricalData"]
+    assert len(cancelled) == 2  # both requests were cancelled
+    assert rig.t < rig.tt(36, 0.0)  # prompt: it did not wait for the watch time (5 minutes)
+    assert "Summary" in text and "Result: " in text
+    assert [r[0][11:16] for r in rig.rows("AAPL")][:2] == ["09:30", "09:31"]  # what was closed stays
+
+
+def _end_cause(rig: Rig, mp: pytest.MonkeyPatch, symbols: str, minutes: int, **kw: Any) -> tuple[int, str]:
+    h = Harness(rig, tuple(symbols.split(",")), align=False)
+    code = run_with(rig, mp, h.seams(), symbols=symbols, minutes=minutes, **kw)
+    return code, h.watcher.end_cause
+
+
+def _one_symbol(rig: Rig) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.3, 1800))
+    rig.upd("AAPL", 34, (34, 2.0), (100.3, 100.3, 100.3, 100.3, 5))
+
+
+def test_end_cause_says_why_the_watch_ended(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    causes: dict[str, str] = {}
+    rigs: list[Rig] = []
+
+    def fresh(name: str) -> Rig:
+        r = Rig(tmp_path / name, ("AAPL", "MSFT"))
+        r.tmp.mkdir()
+        rigs.append(r)
+        return r
+
+    try:
+        r = fresh("deadline")
+        r.standard()
+        causes["deadline"] = _end_cause(r, monkeypatch, "AAPL,MSFT", 5)[1]
+        r = fresh("closed")
+        _one_symbol(r)
+        r.drop((34, 20.0), "connectionClosed")
+        r.at(r.tt(34, 40.0), lambda: None)
+        code, causes["closed"] = _end_cause(r, monkeypatch, "AAPL", 5)
+        assert code == watch_bars.EXIT_STOPPED
+        r = fresh("lost")
+        _one_symbol(r)
+        r.drop((33, 40.0), 1100)
+        r.end_at(2, symbols=1)
+        code, causes["lost"] = _end_cause(r, monkeypatch, "AAPL", 2)
+        assert code == watch_bars.EXIT_STOPPED
+        r = fresh("not_paper")
+        _one_symbol(r)
+        r.at(r.tt(34, 10.0), lambda: r.fakes[-1].push("managedAccounts", "U7654321"))
+        r.expected = 0
+        r.end_at(4, symbols=1)
+        code, causes["not_paper"] = _end_cause(r, monkeypatch, "AAPL", 4, paper=True)
+        assert code == watch_bars.EXIT_NOT_PAPER
+        r = fresh("interrupted")
+        r.standard()
+        r.interrupt_after = 3
+        code, causes["interrupted"] = _end_cause(r, monkeypatch, "AAPL,MSFT", 5)
+        assert code == watch_bars.EXIT_INTERRUPTED
+        r = fresh("idle")
+        r.history_error = {"AAPL": (162, "Historical Market Data Service error message: pacing")}
+        r.end_at(2, symbols=1)
+        code, causes["idle"] = _end_cause(r, monkeypatch, "AAPL", 2)
+        assert code == watch_bars.EXIT_FAILED
+    finally:
+        for r in rigs:
+            for conn in r.connections:
+                conn.close()
+            for fake in r.fakes:
+                fake.close()
+    assert causes == {"deadline": "deadline", "closed": "closed", "lost": "lost", "not_paper": "not_paper",
+                      "interrupted": "interrupted", "idle": "idle"}
+
+
+def test_is_down_is_true_while_the_connection_is_lost(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.backfills = {"AAPL": [AAPL_BACKFILL]}
+    rig.upd("AAPL", 33, (33, 30.0), (100.0, 100.5, 99.9, 100.2, 1000))
+    rig.drop((33, 40.0), 1100)
+    rig.at(rig.tt(35, 35.0), lambda: None, ready=lambda: "connectivity LOST" in rig.text)
+    rig.drop((35, 40.0), 1102)
+    rig.at(rig.tt(35, 42.0), lambda: None, ready=lambda: "connectivity restored" in rig.text)
+    rig.end_at(4, symbols=1)
+    h = Harness(rig, ("AAPL",), align=False)
+    seen: list[tuple[float, bool]] = []
+
+    def hook(clock: Any) -> None:
+        h.on_pass(clock)
+        seen.append((clock.server_now, h.watcher.is_down()))
+
+    seams = watch_bars.WatchSeams(extra_sinks=(h,), listener=h, on_pass=hook, on_watcher=h.set_watcher)
+    run_with(rig, monkeypatch, seams, symbols="AAPL", minutes=4, log=h)
+    assert not any(down for at, down in seen if at < ep(9, 33, 40))
+    assert any(down for at, down in seen if ep(9, 33, 40) <= at < ep(9, 35, 30))
+    assert not any(down for at, down in seen if at > ep(9, 35, 45))
