@@ -8,10 +8,12 @@ import os
 import socket
 import subprocess
 import sys
+import types
 
 import pytest
 from ibapi import connection as ibapi_connection
 
+from tests import conftest
 from tests.conftest import (
     IB_PORTS_REFUSED,
     BrokerConnectionBlockedUnderPytest,
@@ -51,19 +53,81 @@ def test_child_process_inherits_the_broker_blocked_mark():
     assert out.stdout.strip() == "1"
 
 
+def test_refused_port_set_is_exactly_the_four_ib_ports():
+    assert IB_PORTS_REFUSED == frozenset(IB_PORTS)
+
+
 @pytest.mark.parametrize("port", IB_PORTS)
-def test_ib_ports_refused_at_socket_level(port):
-    assert port in IB_PORTS_REFUSED
-    s = socket.socket()
-    try:
-        with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
-            s.connect(("127.0.0.1", port))
-        with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
-            s.connect_ex(("127.0.0.1", port))
-    finally:
-        s.close()
+def test_ib_ports_refused_by_the_decision_function(port):
+    # The guard's own decision function: no socket is touched.
     with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
-        socket.create_connection(("127.0.0.1", port), timeout=0.01)
+        conftest._refuse_ib_port(("127.0.0.1", port))
+    with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
+        conftest._refuse_ib_port(("localhost", str(port)))
+
+
+@pytest.mark.parametrize("address", [("127.0.0.1", 0), ("127.0.0.1", 8750), "/tmp/sock", None])
+def test_decision_function_lets_other_addresses_through(address):
+    conftest._refuse_ib_port(address)
+
+
+def test_ib_ports_refused_at_socket_level(monkeypatch):
+    """The patched connect, connect_ex and create_connection, end to end.
+
+    A stand-in port (a local port-0 listener) is added to the refused set, so no
+    connect is ever made to a real broker port.
+    """
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        listener.setblocking(False)
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(conftest, "IB_PORTS_REFUSED", frozenset({port}))
+        s = socket.socket()
+        try:
+            with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
+                s.connect(("127.0.0.1", port))
+            with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
+                s.connect_ex(("127.0.0.1", port))
+        finally:
+            s.close()
+        with pytest.raises(BrokerConnectionBlockedUnderPytest, match=str(port)):
+            socket.create_connection(("127.0.0.1", port), timeout=0.01)
+        with pytest.raises(BlockingIOError):
+            listener.accept()  # the listener saw no connection
+    finally:
+        listener.close()
+
+
+def test_unconfigure_restores_the_originals():
+    """Configure then unconfigure on a throwaway config leaves the session block as it was."""
+    before = (
+        ibapi_connection.Connection.sendMsg,
+        socket.socket.connect,
+        socket.socket.connect_ex,
+        socket.create_connection,
+    )
+    config = types.SimpleNamespace(stash=pytest.Stash())
+    conftest.pytest_configure_order_frame_block(config)
+    try:
+        during = (
+            ibapi_connection.Connection.sendMsg,
+            socket.socket.connect,
+            socket.socket.connect_ex,
+            socket.create_connection,
+        )
+        assert during[1:] != before[1:]  # wrapped again on top of the session block
+    finally:
+        conftest.pytest_unconfigure_order_frame_block(config)
+    after = (
+        ibapi_connection.Connection.sendMsg,
+        socket.socket.connect,
+        socket.socket.connect_ex,
+        socket.create_connection,
+    )
+    assert after == before
+    assert after[0] is conftest._blocked_send_msg
 
 
 def test_port_zero_still_allowed():
