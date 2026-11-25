@@ -110,8 +110,10 @@ driver calls `run_watch` with a `WatchSeams`; this module sends no request it di
   snapshot rule), so with delayed data server time is far ahead of what it has decided. `stream_now`
   is the MINIMUM over the running symbols of (server time - lag bound), the clock under which every
   running symbol's "closed by time" decisions are already past: it is what a driver passes to an
-  aligner's `poll`. It is `None` until some running symbol has a measured lag bound (do not poll
-  yet) and `server_now` when no symbol is running. The watcher closes a bar by time at minute end
+  aligner's `poll`. It is `None` while ANY running symbol has no measured lag bound (do not poll
+  yet: a delayed symbol whose backfill holds only the previous session is unmeasured until its
+  first update, and minutes would be released without it) and `server_now` when no symbol is
+  running. The watcher closes a bar by time at minute end
   + 90 s on the stream clock, an aligner releases by time at end + 100 s on the clock it is
   polled with: polled with `stream_now` both are on one clock and the 10 s margin holds for any
   lag; polled with `server_now` it does not. `Watcher.stream_states()` gives per symbol the lag
@@ -121,8 +123,14 @@ driver calls `run_watch` with a `WatchSeams`; this module sends no request it di
   `MAX_SINCE_OPEN_MINUTES`, 390 = the whole session) or `backfill_since_open` (the duration asks for
   today's bars from 09:30, see `since_open_duration`; each re-request asks again the same way).
   `parse_args` keeps its limits.
-- `Watcher` is the public name of the class; `Watcher.drop_counts()` and
-  `Watcher.first_backfills_over()` are read-only.
+- `Watcher` is the public name of the class; `Watcher.drop_counts()`, `Watcher.first_backfills_over()`,
+  `Watcher.is_down()` and `Watcher.end_cause` are read-only.
+- Early stop: `Watcher.request_stop(reason)` (callable from the pass hook) ends the loop at the end of
+  the running pass; requests are cancelled, the sinks and the connection closed as at the end of the
+  watch time, and the output says "Stopped on the driver's request (reason)." `Watcher.end_cause`
+  says afterwards why `run` ended: `deadline`, `stop_requested`, `idle` (no symbol streaming),
+  `lost` (connection still lost), `closed`, `not_paper`, `interrupted`, `error` (also the start-up
+  stops `no_farm` and `no_server_time`).
 
 What `decided(symbol, M)` promises. `M` is the START epoch of a minute. After it, no row of `symbol`
 is written, and no `write` call is made, for any minute at or before `M`; a late `decided` only
@@ -943,6 +951,8 @@ class Watcher:
         self.outages: list[list[Any]] = []
         self.last_request: float | None = None  # monotonic clock of the last history request
         self._general_seen: dict[int, events.IbError] = {}
+        self._stop_reason: str | None = None  # set by `request_stop`
+        self.end_cause = ""  # why `run` ended, set once it has (see `end_cause` in the module text)
 
     # -- time -----------------------------------------------------------------------------
 
@@ -967,17 +977,37 @@ class Watcher:
         the symbol has stopped: a driver that polls an aligner starts after this."""
         return all(not s.first_backfill or s.phase == "stopped" for s in self.syms)
 
+    def request_stop(self, reason: str = "") -> None:
+        """Ask the loop to end: it does so at the end of the pass that is running (when called from
+        the pass hook) or at the start of the next one. Requests are then cancelled, the sinks and
+        the connection closed, exactly as at the end of the watch time. Idempotent: the first
+        reason stays."""
+        if self._stop_reason is None:
+            self._stop_reason = reason or "stop requested"
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_reason is not None
+
+    def is_down(self) -> bool:
+        """True while the connection is reported lost or a data farm is reported broken (nothing is
+        closed by time then); read-only, any time."""
+        return self._down()
+
     def stream_clock(self) -> StreamClock:
         """Server time and the minimum over the running symbols of (server time - lag bound):
-        the clock every running symbol's closing by time has caught up with. A symbol whose lag
-        is not measured yet does not count; with none measured `stream_now` is None, and with no
-        symbol running it is the server time."""
+        the clock every running symbol's closing by time has caught up with. `stream_now` is None
+        while ANY running symbol has no measured lag bound (a symbol that is delayed and has shown
+        no bar of today yet would otherwise be left behind: minutes would be released without it
+        and its bars would arrive late); with no symbol running it is the server time."""
         now = self.server_now()
         running = [s for s in self.syms if s.phase != "stopped"]
         if not running:
             return StreamClock(now, now)
         bounds = [s.lag_bound for s in running if s.lag_bound is not None]
-        return StreamClock(now, now - max(bounds) if bounds else None)
+        if len(bounds) < len(running):
+            return StreamClock(now, None)
+        return StreamClock(now, now - max(bounds))
 
     def stream_states(self) -> dict[str, StreamState]:
         """Per symbol: lag bound, delayed flag, running or stopped (read-only, any time)."""
@@ -995,23 +1025,29 @@ class Watcher:
 
     def run(self) -> int:
         code = EXIT_STOPPED
+        self.end_cause = "error"  # until something says otherwise
         try:
             code = self._session()
         except KeyboardInterrupt:
             self.say()
             self.say("Interrupted (Ctrl-C). Requests are cancelled and the connection is closed.")
             code = EXIT_INTERRUPTED
+            self.end_cause = "interrupted"
         except _NotPaper:
             code = EXIT_NOT_PAPER  # said once, with the result, by `run_watch`
+            self.end_cause = "not_paper"
         except _Closed:
             if self._not_paper():
                 code = EXIT_NOT_PAPER  # the list failed and closed the connection: said by `run_watch`
+                self.end_cause = "not_paper"
             else:
                 self.say("STOPPED: the connection to TWS closed.")
                 code = EXIT_STOPPED
+                self.end_cause = "closed"
         except Exception as exc:  # noqa: BLE001 - reported, not a traceback
             self.say(f"Unexpected {type(exc).__name__}: {exc}")
             code = EXIT_STOPPED
+            self.end_cause = "error"
         finally:
             self._finish()
         self._summary()
@@ -1027,6 +1063,7 @@ class Watcher:
         if not historical:
             say("STOPPED: no historical data farm: TWS is not connected to IB's history service yet. "
                 "Wait a minute and retry.")
+            self.end_cause = "no_farm"
             return EXIT_STOPPED
         md.request_server_time()
         try:
@@ -1035,6 +1072,7 @@ class Watcher:
             server = None
         if server is None:
             say(f"STOPPED: no server time from IB within {SERVER_TIME_TIMEOUT:g} s.")
+            self.end_cause = "no_server_time"
             return EXIT_STOPPED
         self.server0 = int(server.timestamp())
         self.clock0 = self.clock()
@@ -1095,7 +1133,7 @@ class Watcher:
 
     def _loop(self) -> int:
         deadline = self.clock() + self.minutes * 60
-        while self.clock() < deadline:
+        while self.clock() < deadline and self._stop_reason is None:
             active = [s for s in self.syms if s.phase in ("backfill", "live")]
             if not active:
                 break
@@ -1112,13 +1150,23 @@ class Watcher:
                     self._settle(sym)
             if self.on_pass is not None:
                 self.on_pass(self.stream_clock())  # after this pass's bars and notifications
+            if self._stop_reason is not None:
+                break  # asked to stop by the hook: no idle sleep, the end is handled below
             if not progressed:
                 self.sleep(IDLE_SLEEP)
         self.lost_at_end = self.conn.state is ConnState.LOST
         self.say()
-        self.say(f"Watch time over ({self.minutes} minutes)." if self.clock() >= deadline
-                 else "No symbol is streaming any more.")
+        if self._stop_reason is not None:
+            self.say(f"Stopped on the driver's request ({self._stop_reason}).")
+            self.end_cause = "stop_requested"
+        elif self.clock() >= deadline:
+            self.say(f"Watch time over ({self.minutes} minutes).")
+            self.end_cause = "deadline"
+        else:
+            self.say("No symbol is streaming any more.")
+            self.end_cause = "idle"
         if self.lost_at_end:
+            self.end_cause = "lost"
             self.say("The connection to IB is still lost (code 1100).")
             return EXIT_STOPPED
         for sym in self.syms:  # the end of the watch may be what completes the 120 s

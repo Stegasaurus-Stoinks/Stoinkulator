@@ -267,8 +267,11 @@ def test_end_run_records_reason(db):
             ("completed", "session_end"), ("failed", "connection_closed"), ("completed", None)]
         assert store.load_run(ids[1]).summary.end_reason == "connection_closed"
         assert all(s.ended_at is not None for s in summaries)
-    assert END_REASONS == ("session_end", "minutes_elapsed", "stop_file", "connection_closed",
-                           "not_paper", "interrupted", "error", "abandoned")
+    assert END_REASONS[:8] == ("session_end", "minutes_elapsed", "stop_file", "connection_closed",
+                               "not_paper", "interrupted", "error", "abandoned")
+    # added by the live session driver (issue 197): faults that stop a run on purpose
+    assert END_REASONS[8:] == ("delayed_data", "data_fault", "symbol_stopped", "no_data",
+                               "step_too_slow")
 
 
 def test_end_run_refuses_an_unknown_reason_and_keeps_the_run_running(db):
