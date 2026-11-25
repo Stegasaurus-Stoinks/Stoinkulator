@@ -31,6 +31,7 @@ from MainStoinker.engine.order_limits import (
 )
 
 NOON = datetime(2026, 11, 24, 12, 0, 0)
+DAY = date(2026, 11, 24)
 
 
 def limits(**over: object) -> OrderLimits:
@@ -348,12 +349,12 @@ def test_daily_count_seeded() -> None:
     sent = [datetime(2026, 11, 24, 10, i) for i in range(20)]
     sent += [datetime(2026, 11, 23, 10, 0)] * 5  # yesterday does not count
     assert entries_sent_today(sent, today) == 20
-    log = SentLog(sent)
+    log = SentLog(sent, trading_day=DAY)
     g = guard()
     assert log.view(NOON).entries_today == 20
     assert not g.check(entry(), OrderState(sent=log.view(NOON)), NOON).allowed
     assert guard().check(
-        entry(), OrderState(sent=SentLog(sent[:19]).view(NOON)), NOON
+        entry(), OrderState(sent=SentLog(sent[:19], trading_day=DAY).view(NOON)), NOON
     ).allowed
 
 
@@ -362,11 +363,11 @@ def test_entries_sent_today_converts_aware_times_to_new_york() -> None:
     evening = datetime(2026, 11, 24, 1, 30, tzinfo=timezone.utc)
     assert entries_sent_today([evening], date(2026, 11, 23)) == 1
     assert entries_sent_today([evening], date(2026, 11, 24)) == 0
-    assert SentLog([evening]).view(datetime(2026, 11, 23, 12, 0)).entries_today == 1
+    assert SentLog([evening], trading_day=DAY).view(datetime(2026, 11, 23, 12, 0)).entries_today == 1
 
 
 def test_sent_log_counts_what_is_recorded_only() -> None:
-    log = SentLog()
+    log = SentLog(trading_day=DAY)
     g = guard()
     for i in range(3):
         now = datetime(2026, 11, 24, 12, 0, i)
@@ -701,7 +702,7 @@ def test_first_session_limits_is_read_only() -> None:
 
 
 def test_sent_log_has_no_public_mutable_attributes() -> None:
-    log = SentLog()
+    log = SentLog(trading_day=DAY)
     public = [n for n in dir(log) if not n.startswith("_")]
     assert sorted(public) == ["latch", "note_latch", "record_sent", "view"]
     with pytest.raises(AttributeError):
@@ -712,7 +713,9 @@ def test_sent_log_has_no_public_mutable_attributes() -> None:
 
 def test_sent_log_seeded_for_a_restart_on_the_same_day() -> None:
     earlier = datetime(2026, 11, 24, 11, 59, 40)
-    log = SentLog([], session_orders=60, message_times=[earlier] * 3, latch=KillLevel.FLATTEN)
+    log = SentLog(
+        [], trading_day=DAY, session_orders=60, message_times=[earlier] * 3, latch=KillLevel.FLATTEN
+    )
     view = log.view(NOON)
     assert (view.session_orders, len(view.message_times), view.latch) == (
         60,
@@ -722,16 +725,16 @@ def test_sent_log_seeded_for_a_restart_on_the_same_day() -> None:
     g = guard()
     assert not g.check(entry(), OrderState(sent=view), NOON).allowed
     assert g.kill_level(OrderState()) is KillLevel.FLATTEN  # the carried latch engaged
-    log2 = SentLog(session_orders=59)
+    log2 = SentLog(trading_day=DAY, session_orders=59)
     log2.record_sent(entry(), NOON)
     assert log2.view(NOON).session_orders == 60
     for bad in (-1, True, 1.5):
         with pytest.raises(LimitsConfigError):
-            SentLog(session_orders=bad)  # type: ignore[arg-type]
+            SentLog(trading_day=DAY, session_orders=bad)  # type: ignore[arg-type]
     with pytest.raises(LimitsConfigError):
-        SentLog(latch="flatten")  # type: ignore[arg-type]
+        SentLog(trading_day=DAY, latch="flatten")  # type: ignore[arg-type]
     with pytest.raises(LimitsConfigError):
-        SentLog(message_times=["noon"])  # type: ignore[list-item]
+        SentLog(trading_day=DAY, message_times=["noon"])  # type: ignore[list-item]
 
 
 def test_kill_switch_seeded_latch_never_unengages() -> None:
@@ -750,7 +753,7 @@ def test_kill_switch_seeded_latch_never_unengages() -> None:
 
 
 def test_record_sent_always_counts() -> None:
-    log = SentLog()
+    log = SentLog(trading_day=DAY)
     log.record_sent(entry(), NOON)
     log.record_sent(entry(), None)  # type: ignore[arg-type]
     log.record_sent("junk", "noon")  # type: ignore[arg-type]
@@ -758,10 +761,119 @@ def test_record_sent_always_counts() -> None:
     assert view.session_orders == 3
     assert view.latch is KillLevel.STOP_ENTRIES
     assert view.entries_today == 1 + 1  # the second entry uses the latest known time
-    fresh = SentLog()
+    fresh = SentLog(trading_day=DAY)
     fresh.record_sent(entry(), None)  # type: ignore[arg-type]
     assert fresh.view(NOON).session_orders == 1
     assert fresh.view(NOON).latch is KillLevel.STOP_ENTRIES
     log.note_latch(KillLevel.FLATTEN)
     log.note_latch(KillLevel.STOP_ENTRIES)
     assert log.latch is KillLevel.FLATTEN
+
+
+# -- third review round ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("junk", ["junk", None, 5, WorkingExit("x", None, 1), WorkingExit("x", "msft", 1)])  # type: ignore[arg-type]
+def test_exit_refused_when_a_working_exit_has_no_readable_symbol(junk: object) -> None:
+    state = OrderState(open_positions=LONG10, working_exits=(junk,))  # type: ignore[arg-type]
+    d = guard().check(exit_(10), state, NOON)
+    assert not d.allowed
+
+
+def test_exit_skips_a_malformed_exit_only_when_it_names_another_valid_symbol() -> None:
+    state = OrderState(
+        open_positions=LONG10, working_exits=(WorkingExit("x", "MSFT", float("nan")),)
+    )
+    assert guard().check(exit_(10), state, NOON).allowed
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"side": "sell"},
+        {"quantity": 5},
+        {"quantity": float("nan")},
+        {"price": 1.0},
+        {"oca_group": "g"},
+        {"parent_ref": "p"},
+        {"replaces_order": "s1"},
+        {"old_price": 1.0},
+        {"new_price": 1.0},
+    ],
+)
+def test_cancel_carrying_order_fields_is_refused(extra: dict) -> None:
+    d = guard().check(OrderIntent(IntentKind.CANCEL, "AAPL", order_ref="o1", **extra), OrderState(), NOON)
+    assert not d.allowed and "carries order fields" in d.reason
+
+
+def test_cancel_symbol_is_optional_but_valid_when_given() -> None:
+    g = guard()
+    assert g.check(OrderIntent(IntentKind.CANCEL, "", order_ref="o1"), OrderState(), NOON).allowed
+    assert not g.check(
+        OrderIntent(IntentKind.CANCEL, "  ", order_ref="o1"), OrderState(), NOON
+    ).allowed
+    assert not g.check(
+        OrderIntent(IntentKind.CANCEL, 5, order_ref="o1"), OrderState(), NOON  # type: ignore[arg-type]
+    ).allowed
+
+
+@pytest.mark.parametrize("bad", ["flatten", 0, False, object(), []])
+def test_note_latch_with_unknown_value_is_a_config_error(bad: object) -> None:
+    log = SentLog(trading_day=DAY)
+    with pytest.raises(LimitsConfigError):
+        log.note_latch(bad)  # type: ignore[arg-type]
+    assert log.latch is None
+    log.note_latch(None)
+    assert log.latch is None
+
+
+def test_entry_with_unusable_time_still_counts_for_the_trading_day() -> None:
+    log = SentLog(trading_day=DAY)
+    log.record_sent(entry(), None)  # type: ignore[arg-type]
+    view = log.view(NOON)
+    assert view.entries_today == 1 and view.session_orders == 1
+    assert view.latch is KillLevel.STOP_ENTRIES
+    with pytest.raises(LimitsConfigError):
+        SentLog(trading_day="2026-11-24")  # type: ignore[arg-type]
+    with pytest.raises(LimitsConfigError):
+        SentLog(trading_day=NOON)  # type: ignore[arg-type]
+
+
+def test_message_dated_another_day_counts_and_latches() -> None:
+    log = SentLog(trading_day=DAY)
+    log.record_sent(entry(), datetime(2026, 11, 23, 12, 0))
+    view = log.view(NOON)
+    assert view.session_orders == 1 and view.entries_today == 1
+    assert view.latch is KillLevel.STOP_ENTRIES
+    same = SentLog(trading_day=DAY)
+    same.record_sent(entry(), NOON)
+    assert same.view(NOON).latch is None
+
+
+def test_guard_records_its_latches_in_the_log() -> None:
+    log = SentLog(trading_day=DAY)
+    g = guard()
+    state = OrderState(sent=log.view(NOON), session_pnl=-250.0)
+    assert not g.check(entry(), state, NOON, log).allowed
+    assert log.latch is KillLevel.FLATTEN
+    # a later check with a healthy state keeps it in the log, and a restart re-seeds from it
+    assert not g.check(entry(), OrderState(sent=log.view(NOON)), NOON, log).allowed
+    view = log.view(NOON)
+    restarted = SentLog(
+        trading_day=DAY,
+        session_orders=view.session_orders,
+        message_times=view.message_times,
+        latch=view.latch,
+    )
+    fresh = guard()
+    d = fresh.check(entry(), OrderState(sent=restarted.view(NOON)), NOON, restarted)
+    assert not d.allowed
+    assert fresh.kill_level(OrderState()) is KillLevel.FLATTEN
+    # without the log nothing is recorded; a refusal for any other reason records nothing
+    other = SentLog(trading_day=DAY)
+    guard().check(entry("TSLA"), OrderState(), NOON, other)
+    assert other.latch is None
+    # a rate overrun seen with an exit is recorded too
+    rate_log = SentLog(trading_day=DAY)
+    guard().check(exit_(10), st(open_positions=LONG10, times=msgs(6)), NOON, rate_log)
+    assert rate_log.latch is KillLevel.STOP_ENTRIES

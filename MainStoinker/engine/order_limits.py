@@ -65,6 +65,10 @@ Contract for the callers (the real broker, issues 238 and 242):
   that day's order count, message times and engaged latch (`KillSwitch` takes `seeded_latch`
   and never un-engages).
 
+Out of scope: in-process bypasses (`object.__setattr__`, private attributes, monkeypatching).
+The freezing here stops accidents and honest mistakes in code that is reviewed; code that can run
+arbitrary Python in the process can already send an order without this module.
+
 Times are naive New York wall-clock times (the repository convention); an aware time is
 converted to New York time.
 
@@ -506,18 +510,23 @@ class SentLog:
     the 60-order cap and an engaged latch survive. It has no public mutable attributes.
     """
 
-    __slots__ = ("_entries", "_latch", "_orders", "_times")
+    __slots__ = ("_day", "_entries", "_latch", "_orders", "_times")
     _KEEP = timedelta(minutes=2)
 
     def __init__(
         self,
         earlier_entry_times: Iterable[datetime] = (),
         *,
+        trading_day: date,
         session_orders: int = 0,
         message_times: Iterable[datetime] = (),
         latch: KillLevel | None = None,
     ) -> None:
-        """`earlier_entry_times`: entries this program already sent (any day; used for today)."""
+        """`trading_day`: the New York day of this session (entries whose time is unusable
+        count for it). `earlier_entry_times`: entries this program already sent (any day)."""
+        if not isinstance(trading_day, date) or isinstance(trading_day, datetime):
+            raise LimitsConfigError("trading_day must be a date")
+        self._day = trading_day
         if isinstance(session_orders, bool) or not isinstance(session_orders, int) or (
             session_orders < 0
         ):
@@ -543,12 +552,15 @@ class SentLog:
 
     def note_latch(self, level: KillLevel | None) -> None:
         """Keep the strongest latch seen (never lowers)."""
+        if level is not None and not isinstance(level, KillLevel):
+            raise LimitsConfigError("a latch must be a KillLevel or None")
         if level is not None and _RANK[level] > _RANK[self._latch]:
             self._latch = level
 
     def record_sent(self, intent: OrderIntent, now: datetime) -> None:
-        """Count one message really sent. It always counts: with an unusable `now` it uses the
-        latest known time and latches `stop_entries`."""
+        """Count one message really sent. It always counts. With an unusable `now` it uses the
+        latest known time; a message dated another day than the trading day counts for the
+        trading day. Both latch `stop_entries`."""
         self._orders += 1
         try:
             local: datetime | None = _new_york_naive(now)
@@ -556,12 +568,13 @@ class SentLog:
         except Exception:  # noqa: BLE001 - count first, then latch
             local = max(self._times) if self._times else None
             self.note_latch(KillLevel.STOP_ENTRIES)
-        if local is None:
-            return
-        self._times = [t for t in self._times if local - t < self._KEEP]
-        self._times.append(local)
+        day = self._day
+        if local is not None:
+            self._times = [t for t in self._times if local - t < self._KEEP]
+            self._times.append(local)
+            if local.date() != self._day:
+                self.note_latch(KillLevel.STOP_ENTRIES)
         if getattr(intent, "kind", None) is IntentKind.ENTRY:
-            day = local.date()
             self._entries[day] = self._entries.get(day, 0) + 1
 
     def view(self, now: datetime) -> SentView:
@@ -594,14 +607,23 @@ class OrderGuard(_Frozen):
         """The engaged kill level, or None. `FLATTEN` tells the caller to flatten."""
         return self.kill_switch.level(state)[0]
 
-    def check(self, intent: OrderIntent, state: OrderState, now: datetime) -> Decision:
-        """Allow or refuse one order message. Never raises: an error refuses."""
+    def check(
+        self, intent: OrderIntent, state: OrderState, now: datetime, log: SentLog | None = None
+    ) -> Decision:
+        """Allow or refuse one order message. Never raises: an error refuses.
+
+        Pass the `SentLog` as `log`: any latch this guard has engaged (by this call or an
+        earlier one) is then recorded in it, so it survives a restart seeded from the log.
+        """
         try:
             return self._check(intent, state, now)
         except LimitsConfigError as exc:
             return _refuse(f"configuration error, order refused ({exc})")
         except Exception as exc:  # noqa: BLE001 - fail closed
             return _refuse(f"check failed, order refused ({type(exc).__name__})")
+        finally:
+            if log is not None:
+                log.note_latch(self.kill_switch.latched)
 
     # -- internals ---------------------------------------------------------------------------
 
@@ -633,6 +655,21 @@ class OrderGuard(_Frozen):
         ref = intent.order_ref
         if not isinstance(ref, str) or not ref.strip():
             return _refuse("a cancel needs an order ref")
+        if (
+            intent.side != ""
+            or intent.quantity != 0.0
+            or intent.price != 0.0
+            or intent.parent_ref != ""
+            or intent.oca_group != ""
+            or intent.replaces_order != ""
+            or intent.old_price is not None
+            or intent.new_price is not None
+        ):
+            return _refuse("a cancel is only a kind and an order ref: it carries order fields")
+        if not isinstance(intent.symbol, str) or (
+            intent.symbol != "" and not normalise_symbol(intent.symbol)
+        ):
+            return _refuse("a cancel's symbol, when given, must be a valid symbol")
         errors: list[str] = []
         over = self._rate(state, now, errors, True)  # type: ignore[arg-type]
         if over:
@@ -732,16 +769,17 @@ class OrderGuard(_Frozen):
                 held = qty
         own: list[WorkingExit] = []
         for w in state.working_exits:
-            try:
-                valid = self._valid_exit(w)
-            except LimitsConfigError:
-                name = getattr(w, "symbol", None)
-                if isinstance(name, str) and normalise_symbol(name) == symbol:
-                    raise
-                errors.append("a working exit of another symbol is malformed")
+            # skipped only when it clearly names ANOTHER valid, normalised symbol
+            if not isinstance(w, WorkingExit):
+                raise LimitsConfigError("a working exit has no readable symbol")
+            self._valid_symbol_key(w.symbol)
+            if w.symbol == symbol:
+                own.append(self._valid_exit(w))
                 continue
-            if valid.symbol == symbol:
-                own.append(valid)
+            try:
+                self._valid_exit(w)
+            except LimitsConfigError:
+                errors.append("a working exit of another symbol is malformed")
         return held, own
 
     def _check_reducing(
