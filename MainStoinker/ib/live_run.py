@@ -198,6 +198,9 @@ STEP_HARD_SECONDS = 60.0  # a step slower than this ends the run (`step_too_slow
 STALE_BATCH_AGE = 300.0  # a batch released this long after its minute ended is history: not stepped
 HEARTBEAT_EVERY = 20.0  # wall seconds without a write before the run is touched (< HEARTBEAT_INTERVAL)
 SESSION_END_MARGIN = 60.0  # seconds after 16:20 server time at which a session ends anyway
+LAST_BARS_MARGIN = 10.0  # seconds after 16:20 server time before the last two minutes may go by time
+LAST_BARS_HOLD = 30.0  # seconds past 16:00 to which the clock given to the aligner is held until then
+# (10 s short of the 40 s at which the aligner's 160 s deadline reaches the minute 15:58)
 STREAM_WAIT_LIMIT = 900.0  # session seconds with `stream_now` unmeasured before `no_data`
 # (a delayed opening or a halt of several minutes must not end a healthy session)
 SILENT_LIMIT = 600.0  # session seconds a symbol may be without any bar or decision
@@ -522,7 +525,7 @@ class _Session:
             if self.fatal is not None or not self.engine_started:
                 return
         if clock.stream_now is not None:
-            self._poll(clock.stream_now)
+            self._poll(clock.stream_now, self._aligner_clock(clock.stream_now, clock.server_now))
         if self.fatal is not None or self.engine_dead:
             return
         self._check_faults(clock, states)
@@ -627,9 +630,28 @@ class _Session:
 
     # -- polling and stepping ---------------------------------------------------------------
 
-    def _poll(self, stream_now: float) -> None:
+    def _aligner_clock(self, stream_now: float, server_now: float) -> float:
+        """The clock to poll the aligner with: `stream_now`, except that the last two minutes of the
+        session are not released by time before the watcher is done with them (issue 271).
+
+        The watcher holds the last two bars of a session until 16:20 server time (D7), far past the
+        aligner's deadline of 100 s after a minute's end. Polled with the plain clock, the aligner
+        released 15:59 as soon as the first symbol's bar arrived (after a quiet stretch its clock
+        is clamped to 180 s past the newest bar, which is already past that deadline) and the other
+        symbol's bar, closed a moment later in the same instant, came late. Until
+        `LAST_BARS_MARGIN` s after the watcher's own deferral ends the clock is held where those
+        minutes are not yet due; they are released at once when every symbol has decided them, or by
+        time after that. Every other minute is polled as before."""
+        if self.today is None:
+            return stream_now
+        end = float(_session_end(self.today))
+        if server_now < end + SESSION_GRACE + LAST_BARS_MARGIN:
+            return min(stream_now, end + LAST_BARS_HOLD)
+        return stream_now
+
+    def _poll(self, stream_now: float, aligner_clock: float) -> None:
         try:
-            batches = self.aligner.poll(stream_now)
+            batches = self.aligner.poll(aligner_clock)
         except ValueError as exc:  # a clock that cannot be seconds: loud, never skipped
             self._fatal(exc)
             return
@@ -795,7 +817,7 @@ class _Session:
             clock = watcher.stream_clock()
             if clock.stream_now is None:
                 return
-            batches = self.aligner.poll(clock.stream_now)
+            batches = self.aligner.poll(self._aligner_clock(clock.stream_now, clock.server_now))
         except ValueError as exc:
             self._fatal(exc)
             return

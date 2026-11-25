@@ -1113,6 +1113,81 @@ def test_the_session_ends_when_the_last_bar_is_decided_at_16_20(
     assert "Stopped on the driver's request (session_end)." in text
 
 
+@pytest.mark.parametrize("phase", [0.0, 0.1, 0.2])
+def test_the_last_minute_closed_by_time_for_two_symbols_is_one_batch_and_the_run_completes(
+        rig: Rig, tmp_path: Path, stores: list[SqliteStore], monkeypatch: pytest.MonkeyPatch,
+        phase: float) -> None:
+    """Issue 271. Two symbols, 15:59 closed by time for both at 16:20 (D7), one a moment after the
+    other. Server time moves a little with every read near 16:20 (as it does in a real pass, where
+    serving a symbol takes real time), so a symbol's check can fall just before 16:20:00 and the
+    other's just after; `phase` shifts where that happens. The aligner used to release 15:59 with
+    the first symbol alone (its clock was clamped past the deadline), the second symbol's bar came
+    late and the run ended `data_fault` (exit 7). Without the fix `phase` 0.0 and 0.2 failed."""
+    two = SYMBOLS[:2]
+
+    def tick(self: Rig) -> float:
+        if self.server_epoch + self.t >= ep(16, 19, 58) + phase:
+            self.t += 0.02
+        return self.t
+
+    monkeypatch.setattr(Rig, "__call__", tick)
+    rig.symbols = two
+    rig.run_symbols = list(two)
+    rig.server_epoch = ep(15, 57, 0)
+    set_backfills(rig, symbols=two, last_closed=386)
+    script_minutes(rig, two, 387, 389)
+    ticks(rig, ep(16, 0, 10), ep(16, 19, 55), 30)
+    for k in range(80):  # fine steps across 16:20:00
+        rig.at(ep(16, 19, 58) + k * 0.05 - rig.server_epoch, lambda: None)
+    ticks(rig, ep(16, 20, 5), ep(16, 25, 0), 30)
+    rig.end_at(30, symbols=2)
+    result = session(rig, tmp_path, stores, minutes=30, entries=ema_entries(two), symbols=list(two))
+    text = rig.text
+    assert result.code == 0, text
+    summary = result.store.list_runs()[0]
+    assert (summary.status, summary.end_reason) == ("completed", "session_end")
+    for symbol in two:
+        assert result.times(symbol) == ["15:57", "15:58", "15:59"], text
+        assert result.counts()[(symbol, "late", None)] == 0
+    assert text.count("closed by time") >= 2 + 2  # the bars' lines and the summaries
+    assert "late bars" not in text and "FAULT" not in text
+
+
+def test_the_last_two_minutes_are_not_released_by_time_until_the_watcher_is_done_with_them(
+        tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """The clock given to the aligner is held short of the deadline of 15:58 until 10 s after the
+    watcher's own deferral (16:20) ends; before and after that, and for every other minute, it is
+    the stream clock unchanged (a bar that is really late mid-session is still a data fault)."""
+    write_warmup_files(tmp_path / "bars")
+    given = UnitSession(tmp_path, stores).session
+    end = ep(16, 0)
+    assert given._aligner_clock(end + 5000.0, end + 5000.0) == end + 5000.0  # noqa: SLF001  (no engine yet)
+    given.today = date(2024, 8, 16)
+    grace = live_run.SESSION_GRACE
+    margin = live_run.LAST_BARS_MARGIN
+    held = given._aligner_clock(end + 900.0, end + 900.0)  # noqa: SLF001
+    assert held == end + live_run.LAST_BARS_HOLD
+    assert held - 60 - 100 < end - 120  # the minute 15:58 is not due on the held clock
+    assert given._aligner_clock(end - 3000.0, end - 3000.0) == end - 3000.0  # noqa: SLF001  (mid-session)
+    assert given._aligner_clock(end + 10.0, end + 900.0) == end + 10.0  # noqa: SLF001  (never raised)
+    assert given._aligner_clock(end + grace + margin - 0.5, end + grace + margin - 0.5) == held  # noqa: SLF001
+    after = end + grace + margin
+    assert given._aligner_clock(after, after) == after  # noqa: SLF001
+    # on the held clock one symbol's 15:59 alone is not released; with every symbol decided it is,
+    # in one batch
+    bar = Bar(pd.Timestamp(2024, 8, 16, 15, 59), end - 60, 1.0, 1.5, 0.5, 1.2, 1)
+    given.on_bar("AAPL", bar, "time")
+    given.decided("AAPL", end - 60)
+    assert given.aligner.poll(held) == []
+    given.on_bar("MSFT", bar, "time")
+    given.decided("MSFT", end - 60)
+    given.on_bar("TSLA", bar, "time")
+    given.decided("TSLA", end - 60)
+    released = given.aligner.poll(held)
+    assert [list(b) for _, b in released] == [["AAPL", "MSFT", "TSLA"]]
+    assert not any(given.counts.late_other.values())
+
+
 # -- refusals before anything is built ------------------------------------------------------------------
 
 
