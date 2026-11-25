@@ -944,8 +944,9 @@ def _resize_chain(rng: random.Random) -> BracketState:
     """The entry fills in parts; after each part the stop and target are resized up and IB confirms."""
     b = bracket()
     b.apply(Ack(1))
-    b.apply(Ack(2, 10))
-    b.apply(Ack(3, 10))
+    for leg in (2, 3):
+        b.apply(Ack(leg, 10))
+        b.apply(Status(leg, "PreSubmitted", quantity=10))
     cuts = sorted(rng.sample(range(1, 10), rng.randint(1, 4))) + [10]
     done = 0
     for i, cut in enumerate(cuts):
@@ -954,7 +955,7 @@ def _resize_chain(rng: random.Random) -> BracketState:
         phase: list = [Commission(f"e{i}", 0.1)]
         for role, total in b.pending_resizes:
             b.mark_resized(role, total)
-            phase.append(Status({"S": 2, "T": 3}[role], "Submitted", quantity=total))
+            phase.append(Status({"S": 2, "T": 3}[role], "PreSubmitted", quantity=total))
         rng.shuffle(phase)
         for event in phase + phase:  # the second pass is a redelivery
             b.apply(event)
@@ -982,6 +983,25 @@ def test_resize_confirmation_flow_from_the_review():
     assert b.resize_requests() == [("T", 7)]
     b.apply(Status(2, "Submitted", quantity=7))
     assert b.legs["S"].quantity == 7 and not b.unprotected and b.anomalies == ()
+
+
+def test_c1_resize_back_to_an_earlier_reported_quantity_is_confirmed():
+    b = bracket()
+    first = [Ack(2, 10), Status(2, "PreSubmitted", quantity=10)]
+    for event in first:
+        b.apply(event)
+    b.apply(ex("e1", 4, order_id=1))
+    b.mark_resized("S", 4)
+    b.apply(Status(2, "Submitted", quantity=4))
+    assert b.legs["S"].quantity == 4 and not b.unprotected
+    b.apply(ex("e2", 6, order_id=1))
+    b.mark_resized("S", 10)
+    assert b.unprotected  # not confirmed yet
+    b.apply(first[1])  # IB answers with the identical line as at the start
+    assert b.legs["S"].quantity == 10 and not b.unprotected and b.anomalies == ()
+    assert b.pending_resizes == ()
+    b.apply(first[1])  # a redelivery in the same period changes nothing
+    assert b.anomalies == ()
 
 
 def test_stale_smaller_report_after_the_mark_is_flagged_in_either_order():

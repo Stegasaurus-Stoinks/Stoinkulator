@@ -24,7 +24,11 @@ Rules (decisions issue 230, task 226, planner rulings on the PR 261 reviews):
   equals the requested total confirms it and supersedes only those earlier reports, so an entry
   that fills in parts stays protected with no anomaly; a stale report first seen after the mark
   still lowers the quantity (`quantity_conflict`), whatever its order against the confirmation.
-  Reports are deduplicated by event (a re-delivered one changes nothing).
+  Reports are deduplicated by event only within the period since the last resize of that leg
+  was marked sent: a line identical to an earlier one that arrives after a mark is a new report
+  and can confirm that resize. ACCEPTED LIMITATION (C2): reports carry no sequence number, so a
+  report delayed across two modifies could confirm a resize early; IB's single ordered stream
+  should not produce it; to be checked against recordings (issue 253).
   `confirm_live` is a statement about now, from the same ordered stream (after the broker's
   end-of-open-orders marker); it refuses a leg that was never bound, and it keeps a sent cancel
   (the leg stays not protecting until a terminal status or a refusal of the cancel).
@@ -217,10 +221,10 @@ class OrderLifecycle:
         self.symbol = symbol
         self.order_id = order_id
         self._ordered = quantity
-        # Ack/Status events that report a quantity (deduped by event), the resizes marked sent
-        # (total, reports seen before the mark) and quantities fixed by `confirm_live`.
-        self._reports: set[Ack | Status] = set()
-        self._marks: list[tuple[int, frozenset[Ack | Status]]] = []
+        # (period, event) of Ack/Status events that report a quantity, the totals of the resizes
+        # marked sent (each starts a new period) and quantities fixed by `confirm_live`.
+        self._reports: set[tuple[int, Ack | Status]] = set()
+        self._marks: list[int] = []
         self._synthetic: set[int] = set()
         self._quantities = {quantity}
         self._by_base: dict[str, tuple[int, Execution]] = {}
@@ -278,23 +282,26 @@ class OrderLifecycle:
 
     def _confirm(self, event: Ack | Status) -> None:
         if event.quantity is not None and event.quantity > 0:
-            self._reports.add(event)
+            # deduplicated only within the period since the last resize was marked sent, so an
+            # identical line after a mark is a new report (it can confirm that resize)
+            self._reports.add((len(self._marks), event))
             self._quantities.add(event.quantity)
 
     def mark_resize(self, total: int) -> None:
-        """A modify to this total quantity was sent: the reports seen so far are remembered. A report
-        first seen afterwards that equals `total` confirms it and supersedes exactly those earlier
-        reports; any other report first seen afterwards still counts (and can raise a conflict)."""
-        self._marks.append((total, frozenset(self._reports)))
+        """A modify to this total quantity was sent, which starts a new period of reports. A report
+        first seen in a later period that equals `total` confirms it and supersedes exactly the
+        reports of the earlier periods; any other report of a later period still counts (and can
+        raise a conflict). Within one period reports are a set, so their order does not matter."""
+        self._marks.append(total)
 
     @property
     def reported_quantities(self) -> tuple[int, ...]:
         """The reported quantities that still count (superseded ones left out), sorted."""
-        superseded: set[Ack | Status] = set()
-        for total, before in self._marks:
-            if any(e.quantity == total for e in self._reports if e not in before):
-                superseded |= before
-        counted = {e.quantity for e in self._reports if e not in superseded and e.quantity}
+        superseded_through = -1
+        for index, total in enumerate(self._marks):
+            if any(p > index and e.quantity == total for p, e in self._reports):
+                superseded_through = max(superseded_through, index)
+        counted = {e.quantity for p, e in self._reports if p > superseded_through and e.quantity}
         return tuple(sorted(counted | self._synthetic))
 
     @property
