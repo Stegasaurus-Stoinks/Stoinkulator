@@ -273,11 +273,33 @@ def test_filled_by_executions_beats_a_terminal_status():
     assert order.state is OrderState.FILLED
 
 
-def test_inactive_is_not_final():
-    order = run([Status(1, "Submitted"), Status(1, "Inactive")])
-    assert order.state is OrderState.INACTIVE and not order.is_terminal and not order.is_live
-    order.apply(Status(1, "Submitted"))
-    assert order.state is OrderState.WORKING and order.is_live
+def test_inactive_is_not_final_and_order_independent():
+    for events in ([Status(1, "Submitted"), Status(1, "Inactive")],
+                   [Status(1, "Inactive"), Status(1, "Submitted")]):
+        order = run(events)
+        assert order.state is OrderState.INACTIVE and not order.is_terminal and not order.is_live
+        assert "inactive_seen" in order.anomalies
+    order.confirm_live(10)  # reconciliation: the open-orders snapshot shows it working
+    assert order.state is OrderState.WORKING and order.is_live and order.anomalies == ()
+    order.apply(Status(1, "Cancelled"))
+    assert order.state is OrderState.CANCELLED
+    with pytest.raises(ValueError):
+        order.confirm_live(10)  # terminal
+
+
+def test_inactive_then_terminal_status_clears_inactive_seen():
+    order = run([Status(1, "Inactive"), Status(1, "Cancelled")])
+    assert order.state is OrderState.CANCELLED
+    assert "inactive_seen" not in order.anomalies
+
+
+def test_quantity_conflict_takes_the_smallest_until_confirmed():
+    for events in ([Ack(1, 10), Status(1, "Submitted", quantity=4)],
+                   [Status(1, "Submitted", quantity=4), Ack(1, 10)]):
+        order = run(events)
+        assert order.quantity == 4 and any(a.startswith("quantity_conflict") for a in order.anomalies)
+    order.confirm_live(10)
+    assert order.quantity == 10 and order.anomalies == ()
 
 
 # ------------------------------------------------------------------ F1 exec id corrections
@@ -358,9 +380,7 @@ def bracket(qty: int = 10, has_target: bool = True) -> BracketState:
 
 
 def view(b: BracketState) -> tuple:
-    s = b.snapshot()
-    return (s.legs, s.held, s.fatal, s.unprotected, s.needs_protection, s.exit_ahead_of_entry,
-            s.pending_cancels, s.pending_resizes, s.terminal_exit, s.is_closed, s.anomalies)
+    return dataclasses.astuple(b.snapshot())
 
 
 def run_bracket(events: list, **kw) -> BracketState:
@@ -533,8 +553,9 @@ def test_b3_cancelled_entry_that_later_fills_is_unprotected():
     b.mark_cancel_sent("T")
     b.apply(ex("e1", 10, order_id=1))
     assert b.entry.state is OrderState.FILLED and b.held == 10
-    assert b.unprotected and b.needs_protection == 10
-    assert b.resize_requests() == [] or all(r != "S" for r, _ in b.resize_requests())
+    assert b.unprotected and b.awaiting_stop_resolution and b.needs_protection == 0
+    b.apply(Status(2, "Cancelled"))  # the old stop is gone: now new protection is wanted
+    assert b.unprotected and not b.awaiting_stop_resolution and b.needs_protection == 10
 
 
 def test_b3_unprotected_is_derived_from_the_stop():
@@ -559,11 +580,127 @@ def test_f2_inactive_stop_is_unprotected_but_still_cancelled():
     b.apply(Status(2, "Submitted"))
     assert not b.unprotected
     b.apply(Status(2, "Inactive"))
-    assert b.unprotected and b.needs_protection == 10
+    assert b.unprotected and b.awaiting_stop_resolution and b.needs_protection == 0
     b.apply(ex("x1", 10, order_id=3))  # the target closes the position
     assert b.pending_cancels == ("S",)  # the Inactive stop still gets cancelled
-    b.apply(Status(2, "Submitted"))  # IB brings it back
-    assert b.legs["S"].is_live and b.pending_cancels == ("S",)
+    b.apply(Status(2, "Submitted"))  # a later Submitted does not make it count as live again
+    assert not b.legs["S"].is_live and b.pending_cancels == ("S",)
+    assert any("inactive_seen" in a for a in b.anomalies)
+
+
+def test_n4_inactive_either_order_same_snapshot():
+    snaps = set()
+    for events in ([Status(2, "Submitted"), Status(2, "Inactive")],
+                   [Status(2, "Inactive"), Status(2, "Submitted")]):
+        b = bracket()
+        b.apply(ex("e1", 10, order_id=1))
+        for e in events:
+            b.apply(e)
+        assert b.unprotected and b.awaiting_stop_resolution
+        snaps.add(view(b))
+    assert len(snaps) == 1
+    b.confirm_live("S", 10)
+    assert not b.unprotected and not b.awaiting_stop_resolution and b.anomalies == ()
+
+
+def test_n4_stale_quantity_report_is_conservative_both_ways():
+    for events in ([Status(2, "Submitted", quantity=10), Status(2, "Submitted", quantity=4)],
+                   [Status(2, "Submitted", quantity=4), Status(2, "Submitted", quantity=10)]):
+        b = bracket()
+        b.apply(ex("e1", 10, order_id=1))
+        for e in events:
+            b.apply(e)
+        assert b.legs["S"].quantity == 4
+        assert b.unprotected and b.pending_resizes[0] == ("S", 10)
+        assert any("quantity_conflict" in a for a in b.anomalies)
+    b.confirm_live("S", 10)
+    assert not b.unprotected and b.pending_resizes == () and b.anomalies == ()
+
+
+# ------------------------------------------------------------------ N1 uncertain legs, N2 short, N3 two stops
+
+
+def test_n1_rejected_with_request_outstanding_is_uncertain():
+    b = bracket()
+    b.apply(ex("e1", 4, order_id=1))
+    b.apply(Status(2, "Submitted"))
+    b.mark_resized("S", 4)
+    b.apply(Rejected(2, 201, "Order rejected"))
+    assert b.uncertain == ("S",) and b.unprotected and b.awaiting_stop_resolution
+    assert b.legs["S"].state is OrderState.WORKING  # not interpreted: neither rejected nor protected
+    assert b.needs_protection == 0
+    assert ("S", 4) in b.resize_requests()  # the request is back
+    assert any(a.startswith("request_or_leg_rejected") for a in b.anomalies)
+    b.confirm_live("S", 4)
+    assert b.uncertain == () and not b.unprotected and b.anomalies == ()
+
+
+def test_n1_ack_and_rejected_either_order_same_snapshot():
+    snaps = set()
+    for events in ([Ack(2), Rejected(2, 1, "x")], [Rejected(2, 1, "x"), Ack(2)]):
+        b = bracket()
+        b.apply(ex("e1", 10, order_id=1))
+        b.mark_cancel_sent("S")
+        for e in events:
+            b.apply(e)
+        assert b.uncertain == ("S",) and b.unprotected
+        assert b.legs["S"].state is OrderState.WORKING
+        snaps.add(view(b))
+    assert len(snaps) == 1
+
+
+def test_n1_rejected_without_request_is_a_real_rejection():
+    b = bracket()
+    b.apply(ex("e1", 10, order_id=1))
+    b.apply(Rejected(2, 1, "no"))
+    assert b.legs["S"].state is OrderState.REJECTED and b.uncertain == ()
+    assert b.unprotected and b.needs_protection == 10
+
+
+def test_n1_terminal_status_ends_uncertainty():
+    b = bracket()
+    b.apply(ex("e1", 10, order_id=1))
+    b.mark_cancel_sent("S")
+    b.apply(Rejected(2, 1, "x"))
+    assert b.uncertain == ("S",)
+    b.apply(Status(2, "Cancelled"))
+    assert b.uncertain == () and b.needs_protection == 10
+    assert not any("request_or_leg_rejected" in a for a in b.anomalies)
+
+
+def test_n2_short_by_when_entry_finished():
+    b = bracket()
+    b.apply(ex("e1", 4, order_id=1))
+    b.apply(Status(1, "Cancelled"))
+    b.apply(ex("x1", 10, order_id=2))
+    b.apply(Status(3, "Cancelled"))
+    assert b.held == 0 and b.short_by == 6 and b.fatal is None
+    s = b.snapshot()
+    assert s.exits_exceed_entry and s.short_by == 6 and not s.is_closed and not b.is_closed
+    assert not b.exit_ahead_of_entry
+    b.apply(ex("e2", 6, order_id=1))  # a late entry execution clears it
+    assert b.short_by == 0 and b.entry.state is OrderState.FILLED and b.is_closed
+
+
+def test_n2_entry_live_is_only_exit_ahead():
+    b = bracket()
+    b.apply(ex("x1", 3, order_id=2))
+    assert b.exit_ahead_of_entry and b.short_by == 0 and not b.snapshot().exits_exceed_entry
+
+
+def test_n3_two_stops_scenario():
+    b = bracket()
+    b.apply(Ack(2))
+    b.apply(Status(1, "Cancelled"))
+    b.mark_cancel_sent("S")
+    b.mark_cancel_sent("T")
+    b.apply(ex("e1", 10, order_id=1))  # a late entry fill
+    assert b.unprotected and b.awaiting_stop_resolution and b.needs_protection == 0
+    b.apply(Rejected(2, 161, "x"))  # the old stop's cancel was refused (or it was rejected)
+    assert b.legs["S"].state is OrderState.WORKING
+    assert b.unprotected and b.awaiting_stop_resolution and b.needs_protection == 0
+    b.apply(Status(2, "Cancelled"))
+    assert b.needs_protection == 10 and not b.awaiting_stop_resolution
 
 
 # ------------------------------------------------------------------ S2 input validation and requests
@@ -592,27 +729,6 @@ def test_bind_and_mark_validate():
         b.mark_cancel_sent("Z")
     b.mark_resized("S", 4)
     assert b.entry.quantity == 10 and b.entry.state is OrderState.PARTIALLY_FILLED
-
-
-def test_rejected_modify_puts_request_back():
-    b = bracket()
-    b.apply(ex("e1", 4, order_id=1))
-    b.apply(Status(2, "Submitted"))
-    b.mark_resized("S", 4)
-    assert ("S", 4) not in b.resize_requests()
-    b.apply(Rejected(2, 105, "modify refused"))
-    assert b.legs["S"].state is OrderState.WORKING  # the order itself is alive
-    assert ("S", 4) in b.resize_requests()
-    assert any("request refused" in a for a in b.anomalies)
-
-    c = bracket()
-    c.apply(Rejected(1))
-    c.apply(Status(3, "Submitted"))
-    c.mark_cancel_sent("T")
-    assert "T" not in c.cancel_requests()
-    c.apply(Rejected(3, 202, "cancel refused"))
-    assert "T" in c.cancel_requests()
-
 
 def test_unknown_order_id_execution_is_an_anomaly():
     b = bracket()
@@ -685,12 +801,97 @@ def test_all_permutations_of_bracket_events_same_final_state(script):
         assert got == expected, perm
         count += 1
     assert count > 0
-    legs, held, fatal, unprotected, needs, ahead, cancels, resizes, term, closed, anomalies = expected
+    snap = dict(zip((f.name for f in dataclasses.fields(type(run_bracket([]).snapshot()))), expected,
+                    strict=True))
     if script is STOP_OUT:
-        assert (held, fatal, unprotected, closed, term) == (0, None, False, True, "S")
-        assert cancels == () and resizes == () and not ahead
+        assert (snap["held"], snap["fatal"], snap["unprotected"], snap["is_closed"],
+                snap["terminal_exit"]) == (0, None, False, True, "S")
+        assert snap["pending_cancels"] == () and snap["pending_resizes"] == ()
+        assert not snap["exit_ahead_of_entry"]
     elif script is PARTIAL:
-        assert (held, fatal, unprotected, closed) == (3, None, False, False)
-        assert cancels == () and resizes == (("S", 3), ("T", 4))
+        assert (snap["held"], snap["fatal"], snap["unprotected"], snap["is_closed"]) == (
+            3, None, False, False)
+        assert snap["pending_cancels"] == () and snap["pending_resizes"] == (("S", 3), ("T", 4))
     else:
-        assert (held, fatal, unprotected, needs) == (10, None, True, 10)
+        assert (snap["held"], snap["fatal"], snap["unprotected"], snap["needs_protection"]) == (
+            10, None, True, 10)
+
+
+# ------------------------------------------------------------------ seeded random brackets (N1-N4)
+
+
+def _random_bracket_case(rng: random.Random):
+    """(entry fill, caller marks, events): marks are caller actions, applied before the shuffled events."""
+    filled = rng.choice([0, 3, 5, 10])
+    marks = []
+    if rng.random() < 0.4:
+        marks.append(("cancel", rng.choice("ST")))
+    if filled and rng.random() < 0.4:
+        marks.append(("resize", "S", rng.randint(1, filled)))
+    counter = itertools.count(1)
+    events: list = []
+    for _ in range(rng.randint(3, 8)):
+        kind = rng.choice(["ack", "status", "status", "entry", "exit", "reject", "cancel_entry", "comm"])
+        leg = rng.choice([2, 3])
+        qty = rng.choice([None, None, 4, 6, 10])
+        if kind == "ack":
+            events.append(Ack(rng.choice([1, 2, 3]), qty))
+        elif kind == "status":
+            name = rng.choice(["Submitted", "Inactive", "PreSubmitted", "Cancelled", "Filled"])
+            events.append(Status(leg, name, quantity=qty))
+        elif kind == "entry":
+            events.append(ex(f"e{next(counter)}", rng.randint(1, 5), order_id=1))
+        elif kind == "exit":
+            events.append(ex(f"x{next(counter)}", rng.randint(1, 4), order_id=leg))
+        elif kind == "reject":
+            events.append(Rejected(rng.choice([1, 2, 3]), rng.randint(1, 300)))
+        elif kind == "cancel_entry":
+            events.append(Status(1, rng.choice(["Cancelled", "Submitted"])))
+        else:
+            events.append(Commission(f"e{rng.randint(1, 4)}", 1.0))
+    events += rng.sample(events, k=min(2, len(events)))  # duplicates
+    return filled, marks, events
+
+
+def _build(filled: int, marks: list, events: list) -> BracketState:
+    b = bracket()
+    if filled:
+        b.apply(ex("e0", filled, order_id=1))
+    for mark in marks:
+        if mark[0] == "cancel":
+            b.mark_cancel_sent(mark[1])
+        else:
+            b.mark_resized(mark[1], mark[2])
+    for event in events:
+        b.apply(event)
+    return b
+
+
+def _check_invariants(b: BracketState, marks: list) -> None:
+    cancel_sent = {m[1] for m in marks if m[0] == "cancel"}
+    s = b.snapshot()
+    for role, quantity in s.pending_resizes:
+        assert quantity - b.legs[role].filled_qty <= s.held  # requested protection never exceeds held
+    stop = b.legs["S"]
+    certain = (stop.is_live and "S" not in cancel_sent and "S" not in s.uncertain
+               and stop.remaining >= s.held)
+    if s.held > 0 and not certain:
+        assert s.unprotected
+    if s.is_closed:
+        assert s.held == 0 and s.short_by == 0
+    if s.needs_protection:
+        assert not s.awaiting_stop_resolution and not stop.is_live
+
+
+def test_random_brackets_order_independent_and_invariants():
+    rng = random.Random(2261)
+    for _ in range(1200):
+        filled, marks, events = _random_bracket_case(rng)
+        base = _build(filled, marks, events)
+        _check_invariants(base, marks)
+        expected = view(base)
+        for _ in range(4):
+            shuffled = list(events)
+            rng.shuffle(shuffled)
+            other = _build(filled, marks, shuffled)
+            assert view(other) == expected, (filled, marks, events, shuffled)

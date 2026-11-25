@@ -3,17 +3,29 @@
 Pure logic with no broker, socket or `ibapi` import. A transport turns what the broker
 says into the event dataclasses below and feeds them in; nothing here sends anything.
 
-Rules (decisions issue 230, task 226, planner rulings on the PR 261 review):
+GUIDING PRINCIPLE: where event order cannot be known, the state takes the conservative reading
+(the position is treated as less protected, never more), flags it as an anomaly, and only an
+explicit reconciliation call clears it: `BracketState.confirm_live(role, quantity)`, fed by the
+caller from an open-orders snapshot (or a terminal status for the leg).
+
+Rules (decisions issue 230, task 226, planner rulings on the PR 261 reviews):
 
 * Quantities come only from executions keyed by `exec_id`. A status never changes a
   quantity: it decides only working or terminal. A `Filled` status without the executions
   to back it is a hint (`fill_unconfirmed`), not a fill.
 * Everything is derived from the set of events seen, so duplicates and reordering change
-  nothing. The only arrival-ordered inputs are (a) the Inactive/working axis of one order
-  (an Inactive order may return to Submitted; statuses carry no sequence number) and (b) the
-  confirmed quantity of an order (the last status or ack that reports one).
+  nothing; no input is arrival-ordered. Statuses carry no sequence number, so (N4):
+  once `Inactive` has been seen the leg counts as not protecting whatever came before or after
+  (anomaly `inactive_seen`); when statuses or acks report different quantities the smallest
+  counts (anomaly `quantity_conflict`). Both last until `confirm_live` or a terminal status.
+  A legitimate resize upwards therefore raises `quantity_conflict` until the caller confirms.
 * Terminal statuses: Filled (by executions) > Rejected > Cancelled; a contradictory pair is
   kept deterministic and recorded as a `status_conflict` anomaly. Inactive is NOT final.
+* The exec-id correction format (`X.NN`, highest suffix wins) is an ASSUMPTION to check against
+  the first recordings (issue 253): if separate partial fills of one order differ only in the
+  last segment they would be collapsed and shares under-counted.
+* The caller owns the deadline of an unconfirmed request: `pending_cancels` / `pending_resizes`
+  say a request is not yet confirmed, with no clock here (issue 238).
 * An execution is a fact and is counted even on an order that is already terminal (a cancel
   that lost a race), and then reported as `LATE`. Executions are validated (positive whole
   shares, finite positive price, matching symbol and side when both are known); anything
@@ -23,18 +35,24 @@ Rules (decisions issue 230, task 226, planner rulings on the PR 261 review):
 * B1. A fatal flag latches only when an order's executions exceed the largest quantity it was
   ever ordered for, or exit executions exceed the entry's ORDERED quantity. Exits ahead of the
   entry's reported fills but within the ordered quantity are `exit_ahead_of_entry`, derived
-  and not latched; it clears when the entry's executions arrive.
+  and not latched; it clears when the entry's executions arrive. Once the entry is terminal the
+  same excess is `short_by` (N2): the account is short, `exits_exceed_entry` is raised and
+  `is_closed` stays False (not latched: a late entry execution can still clear it).
 * B2. Protection follows the position held (entry filled minus exits executed). Every live
   protective leg should have a remaining quantity of `held` (resize request). The other exit
   is cancelled only when held is 0 and the entry can fill no more, or when an exit has
   completely filled for the held quantity.
-* B3. `unprotected` is derived: held > 0 and the live stop (not Inactive, no cancel sent) has
-  less remaining than held. `needs_protection` is then the quantity held when the stop is not
-  live at all; the caller decides between a new stop and a flatten.
-* S2. Requests are a pure function of state: `pending_cancels` and `pending_resizes` stay set
+* B3/N3. `unprotected` is derived: held > 0 and the stop that certainly covers (live, not
+  Inactive, no cancel sent, not uncertain) has less remaining than held. `needs_protection`
+  (the quantity held; new stop or flatten is the caller's choice) is non-zero only when no
+  stop could still fill. While an old stop is cancel-pending, Inactive or uncertain,
+  `unprotected` and `awaiting_stop_resolution` are True and `needs_protection` is 0.
+* S2/N1. Requests are a pure function of state: `pending_cancels` and `pending_resizes` stay set
   until the broker confirms (a status for a cancel, a status or ack reporting the new quantity
   for a resize). `cancel_requests()` / `resize_requests()` are those minus what the caller has
-  marked as sent; an error for that order id while a request is outstanding puts it back.
+  marked as sent. A `Rejected` for a stop or target with a request outstanding makes the leg
+  `uncertain` (request refused or order rejected: error codes are not interpreted here): it
+  counts as not protecting, the request goes back to pending, anomaly `request_or_leg_rejected`.
   A resize means: new TOTAL quantity of the leg, so its remainder equals `held`.
 * `orderRef` uniqueness across databases and resets is the caller's job (the shared sequence
   of issue 227); this module only checks the shape.
@@ -190,7 +208,7 @@ class OrderLifecycle:
         self.symbol = symbol
         self.order_id = order_id
         self._ordered = quantity
-        self._confirmed: int | None = None
+        self._reported: set[int] = set()  # quantities the broker has reported; the smallest counts
         self._quantities = {quantity}
         self._by_base: dict[str, tuple[int, Execution]] = {}
         self._exec_ids: set[str] = set()
@@ -201,8 +219,7 @@ class OrderLifecycle:
         self._status_fill_seen = False
         self._submitted = False
         self._working_seen = False
-        self._inactive = False
-        self._inactive_ever = False
+        self._inactive_ever = False  # sticky until confirm_live or a terminal status
         self._terminals: set[OrderState] = set()
 
     # -- inputs
@@ -231,7 +248,7 @@ class OrderLifecycle:
                 return Applied.DUPLICATE
             self._seen.add(event)
             return self._execution(event, was_terminal)
-        before = (self._working_seen, self._inactive, self._inactive_ever, self._confirmed,
+        before = (self._working_seen, self._inactive_ever, frozenset(self._reported),
                   frozenset(self._terminals), self._status_fill_seen)
         if isinstance(event, Rejected):
             self._terminals.add(OrderState.REJECTED)
@@ -240,7 +257,7 @@ class OrderLifecycle:
             self._confirm(event.quantity)
         elif self._status(event) is Applied.IGNORED:
             return Applied.IGNORED
-        after = (self._working_seen, self._inactive, self._inactive_ever, self._confirmed,
+        after = (self._working_seen, self._inactive_ever, frozenset(self._reported),
                  frozenset(self._terminals), self._status_fill_seen)
         if was_terminal:
             return Applied.LATE
@@ -248,19 +265,32 @@ class OrderLifecycle:
 
     def _confirm(self, quantity: int | None) -> None:
         if quantity is not None and quantity > 0:
-            self._confirmed = quantity
+            self._reported.add(quantity)
             self._quantities.add(quantity)
+
+    def confirm_live(self, quantity: int) -> None:
+        """Reconciliation: an open-orders snapshot shows this order working with this total quantity.
+
+        The only way (besides a terminal status) to clear `inactive_seen` and `quantity_conflict`.
+        """
+        if quantity <= 0:
+            raise ValueError("quantity must be positive")
+        if self.is_terminal:
+            raise ValueError(f"order {self.order_ref} is {self.state.value}, not live")
+        self._reported = {quantity}
+        self._quantities.add(quantity)
+        self._inactive_ever = False
+        self._working_seen = True
 
     def _status(self, event: Status) -> Applied:
         name = event.status
         if name in _WORKING_STATUSES:
             self._working_seen = True
-            self._inactive = False
             self._confirm(event.quantity)
         elif name in _CANCELLED_STATUSES:
             self._terminals.add(OrderState.CANCELLED)
         elif name == "Inactive":
-            self._inactive = self._inactive_ever = True
+            self._inactive_ever = True
         elif name == "Filled":
             self._status_fill_seen = True  # a hint only; executions decide
         else:
@@ -317,8 +347,8 @@ class OrderLifecycle:
 
     @property
     def quantity(self) -> int:
-        """The quantity as last confirmed by the broker, else as ordered."""
-        return self._confirmed if self._confirmed is not None else self._ordered
+        """The smallest quantity the broker has reported (the conservative one), else as ordered."""
+        return min(self._reported) if self._reported else self._ordered
 
     @property
     def max_quantity(self) -> int:
@@ -371,6 +401,10 @@ class OrderLifecycle:
             kinds.add(OrderState.INACTIVE)
         if len(kinds) > 1:
             found.add("status_conflict: " + ", ".join(sorted(k.value for k in kinds)))
+        if self._inactive_ever and not self._terminals:
+            found.add("inactive_seen")
+        if len(self._reported) > 1:
+            found.add("quantity_conflict: " + ", ".join(str(q) for q in sorted(self._reported)))
         return tuple(sorted(found))
 
     @property
@@ -382,7 +416,7 @@ class OrderLifecycle:
             return OrderState.REJECTED
         if OrderState.CANCELLED in self._terminals:
             return OrderState.CANCELLED
-        if self._inactive:
+        if self._inactive_ever:
             return OrderState.INACTIVE
         if filled > 0:
             return OrderState.PARTIALLY_FILLED
@@ -471,7 +505,11 @@ class BracketSnapshot:
     fatal: str | None
     unprotected: bool
     needs_protection: int
+    awaiting_stop_resolution: bool
     exit_ahead_of_entry: bool
+    short_by: int
+    exits_exceed_entry: bool  # alarm: the account is short (short_by > 0)
+    uncertain: tuple[str, ...]
     pending_cancels: tuple[str, ...]
     pending_resizes: tuple[tuple[str, int], ...]
     terminal_exit: str | None
@@ -501,7 +539,9 @@ class BracketState:
         self._orphans: dict[str, Commission] = {}
         self._anomalies: set[str] = set()
         self._sent_cancel: set[str] = set()
-        self._sent_resize: dict[str, int] = {}
+        self._sent_resize: dict[str, tuple[int, int]] = {}  # role: (wanted, leg quantity when sent)
+        self._uncertain: set[str] = set()
+        self._reject_notes: dict[str, set[str]] = {}
         self._fatal_latched = False
 
     # -- wiring
@@ -534,7 +574,22 @@ class BracketState:
         if quantity <= leg.filled_qty or quantity - leg.filled_qty > self.held:
             raise ValueError(
                 f"resize of {role} to {quantity} leaves {quantity - leg.filled_qty} against {self.held} held")
-        self._sent_resize[role] = quantity
+        self._sent_resize[role] = (quantity, leg.quantity)
+
+    def confirm_live(self, role: str, quantity: int) -> None:
+        """Reconciliation from an open-orders snapshot: this stop or target is working with this total
+        quantity. Clears `uncertain`, `inactive_seen` and `quantity_conflict` for the leg and puts any
+        request that was marked as sent back to pending (the snapshot shows it did not take effect)."""
+        if role not in _EXITS or role not in self._legs:
+            raise ValueError(f"only a stop or target can be confirmed live, not {role!r}")
+        leg = self._legs[role]
+        if quantity <= leg.filled_qty:
+            raise ValueError(f"quantity {quantity} does not exceed the {leg.filled_qty} already filled")
+        leg.confirm_live(quantity)
+        self._uncertain.discard(role)
+        self._reject_notes.pop(role, None)
+        self._sent_cancel.discard(role)
+        self._sent_resize.pop(role, None)
 
     # -- events
 
@@ -551,21 +606,22 @@ class BracketState:
             return Applied.IGNORED
         leg = self._legs[role]
         if (isinstance(event, Rejected) and role in _EXITS
-                and leg.state in (OrderState.WORKING, OrderState.PARTIALLY_FILLED)
                 and (role in self._sent_cancel or role in self._sent_resize)):
-            # an error for a live leg with a request outstanding is a refused cancel or modify
+            # An error for a stop or target with a request outstanding: was the request refused or
+            # the order rejected? Not decided here (error codes are mapped later). The leg is
+            # uncertain, counts as not protecting and the request goes back to pending, whatever
+            # else has arrived, until `confirm_live` or a terminal status.
             self._sent_cancel.discard(role)
             self._sent_resize.pop(role, None)
-            self._anomalies.add(f"request refused on leg {role}: code {event.code}")
+            self._uncertain.add(role)
+            self._reject_notes.setdefault(role, set()).add(
+                f"request_or_leg_rejected: leg {role} code {event.code}")
             return Applied.APPLIED
         outcome = leg.apply(event)
         if isinstance(event, Execution):
             orphan = self._orphans.pop(event.exec_id, None)
             if orphan is not None:
                 leg.apply(orphan)
-        for r, wanted in list(self._sent_resize.items()):
-            if self._legs[r].quantity == wanted:
-                del self._sent_resize[r]
         if self._fatal_conditions():
             self._fatal_latched = True
         return outcome
@@ -602,8 +658,22 @@ class BracketState:
 
     @property
     def exit_ahead_of_entry(self) -> bool:
-        """Exits executed beyond the entry's reported fills; not latched, clears when the entry reports."""
-        return self.exit_filled_qty > self.entry_filled_qty
+        """Exits executed beyond the entry's reported fills while the entry is still live; clears
+        when the entry's executions arrive."""
+        return self.exit_filled_qty > self.entry_filled_qty and not self.entry.is_terminal
+
+    @property
+    def short_by(self) -> int:
+        """Exits executed beyond the entry's fills once the entry can fill no more: the account is
+        short by this much (within the ordered quantity; beyond it the flag is fatal). Not latched."""
+        if not self.entry.is_terminal:
+            return 0
+        return max(self.exit_filled_qty - self.entry_filled_qty, 0)
+
+    @property
+    def uncertain(self) -> tuple[str, ...]:
+        """Stop or target legs whose state is in doubt after a rejection with a request outstanding."""
+        return tuple(r for r in _EXITS if r in self._uncertain and not self._legs[r].is_terminal)
 
     def _fatal_conditions(self) -> list[str]:
         found = [f"overfill: leg {r} executed {leg.filled_qty} of {leg.max_quantity}"
@@ -627,25 +697,37 @@ class BracketState:
         return done[0] if len(done) == 1 else None
 
     def _stop_protects(self) -> int:
+        """Shares the stop certainly covers: nothing while it is cancel-pending, Inactive or uncertain."""
         stop = self._legs[STOP]
-        if not stop.is_live or STOP in self._sent_cancel:
+        if not stop.is_live or STOP in self._sent_cancel or STOP in self.uncertain:
             return 0
         return stop.remaining
+
+    def _stop_may_fill(self) -> bool:
+        """A stop that could still execute (live or Inactive), so a second stop would double up."""
+        return self._legs[STOP].state in LIVE_STATES or self._legs[STOP].state is OrderState.INACTIVE
 
     @property
     def unprotected(self) -> bool:
         return self.held > 0 and self._stop_protects() < self.held
 
     @property
+    def awaiting_stop_resolution(self) -> bool:
+        """Held shares, and a stop that may still fill but certainly covers nothing (cancel pending,
+        Inactive or uncertain): do not place another stop yet."""
+        return self.held > 0 and self._stop_may_fill() and self._stop_protects() == 0
+
+    @property
     def needs_protection(self) -> int:
-        """Quantity to protect anew (new stop or flatten, the caller's choice); 0 if the stop is live."""
-        if self.held > 0 and self._stop_protects() == 0:
+        """Quantity to protect anew (new stop or flatten, the caller's choice). Non-zero only when no
+        stop could still fill; while one might, see `awaiting_stop_resolution`."""
+        if self.held > 0 and not self._stop_may_fill():
             return self.held
         return 0
 
     @property
     def is_closed(self) -> bool:
-        return (self.entry.is_terminal and self.held == 0
+        return (self.entry.is_terminal and self.held == 0 and self.short_by == 0
                 and all(leg.is_terminal for leg in self._legs.values()))
 
     @property
@@ -683,11 +765,14 @@ class BracketState:
 
     def resize_requests(self) -> list[tuple[str, int]]:
         """`pending_resizes` minus those marked as sent for the same quantity."""
-        return [(r, q) for r, q in self.pending_resizes if self._sent_resize.get(r) != q]
+        return [(r, q) for r, q in self.pending_resizes
+                if self._sent_resize.get(r) != (q, self._legs[r].quantity)]
 
     @property
     def anomalies(self) -> tuple[str, ...]:
         found = set(self._anomalies)
+        for role in self.uncertain:
+            found.update(self._reject_notes.get(role, ()))
         for role in _LEG_ORDER:
             if role in self._legs:
                 found.update(f"leg {role}: {a}" for a in self._legs[role].anomalies)
@@ -697,5 +782,6 @@ class BracketState:
         return BracketSnapshot(
             tuple((r, self._legs[r].snapshot()) for r in _LEG_ORDER if r in self._legs),
             self.held, self.fatal, self.unprotected, self.needs_protection,
-            self.exit_ahead_of_entry, self.pending_cancels, self.pending_resizes,
+            self.awaiting_stop_resolution, self.exit_ahead_of_entry, self.short_by,
+            self.short_by > 0, self.uncertain, self.pending_cancels, self.pending_resizes,
             self.terminal_exit, self.is_closed, self.anomalies, self.connection)
