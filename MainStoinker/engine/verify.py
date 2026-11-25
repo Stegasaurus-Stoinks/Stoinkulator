@@ -6,7 +6,13 @@ and equity of the ledger, the gap-rule counts and the description of its warm-up
 `verify_run` proves that this record is what the engine does with those inputs:
 
 1. the warm-up is rebuilt from the month files the stored description names (only
-   the recorded days) and its digest compared with the stored `warmup_sha256`;
+   the recorded days) and its digest compared with the stored `warmup_sha256`. A session
+   that started after the open also stored today's closed backfill bars in the
+   description (`today_bars`, with `today_sha256`, the `warmup_digest` of those bars):
+   they are appended to the month-file days, after their own digest is checked. Bars
+   that do not match their digest, or are missing, make the run UNVERIFIABLE (the
+   record changed or is incomplete; the engine is not blamed). A description without
+   `today_bars` (a session before the open, or a run stored earlier) verifies as before;
 2. warm-up plus the stored bars are replayed through `Engine.start_live` / `step` /
    `end_live` (the API the session used: nothing is closed synthetically) with the
    stored algo config, fill model and costs (the replay is built by the caller,
@@ -65,6 +71,7 @@ from .feed import COLUMNS, Bar, BarFeed, read_offline_bars
 from .gaprule import GapRuleReport
 from .ledger import EquityPoint, Ledger
 from .live_counts import COUNT_FED, COUNT_SCOPE_SYMBOL, parse_count_key
+from .live_store import today_frame
 from .run_documents import is_live_run, open_positions
 from .stats import fmt4
 from .store import AlgoMeta, DataMeta, RunData, Store, StoredBar, expand_equity
@@ -301,6 +308,73 @@ def rebuild_warmup(
             continue
         frames[symbol] = frame
     return frames, problems
+
+
+def add_today_bars(
+    frames: Mapping[str, pd.DataFrame], description: Mapping[str, Any], symbols: Sequence[str]
+) -> tuple[dict[str, pd.DataFrame], list[Problem]]:
+    """The warm-up of a session that started after the open: the month-file frames plus
+    today's closed backfill bars stored in the description (`today_bars`, `today_sha256`).
+
+    A description without `today_bars` and without `today_sha256` (a session started
+    before the open, and every run stored before this existed) leaves the frames as they
+    are. Otherwise, per symbol: bars without a recorded digest, a digest without bars,
+    bars that are not dated on the session's day, or bars whose `warmup_digest` differs
+    from the recorded one are each a `Problem` naming the symbol and the digests: the
+    stored bars are not what the session started with, and nothing says which side is
+    right (UNVERIFIABLE, never MISMATCH). The returned frames are the month frames of the
+    symbols without a problem, today's bars appended where there are any.
+    """
+    stored_rows = description.get("today_bars")
+    stored_digests = description.get("today_sha256")
+    if stored_rows is None and stored_digests is None:
+        return dict(frames), []
+    rows_by_symbol = stored_rows if isinstance(stored_rows, Mapping) else {}
+    digests = stored_digests if isinstance(stored_digests, Mapping) else {}
+    out: dict[str, pd.DataFrame] = {}
+    problems: list[Problem] = []
+    for symbol in symbols:
+        if symbol not in frames:
+            continue
+        rows = rows_by_symbol.get(symbol)
+        expected = digests.get(symbol)
+        if not rows:
+            if expected is not None:
+                problems.append(Problem(
+                    "today's backfill bars are missing from the stored warm-up description "
+                    "(`today_bars`) but their digest is recorded", symbol, None,
+                    str(expected), None))
+            elif stored_rows is None or symbol not in rows_by_symbol:
+                problems.append(Problem(
+                    "the stored warm-up description has no `today_bars` for this symbol",
+                    symbol))
+            else:
+                out[symbol] = frames[symbol]  # no bars before the first live step: nothing to add
+            continue
+        if expected is None:
+            problems.append(Problem(
+                "today's backfill bars have no recorded digest (`today_sha256`)", symbol))
+            continue
+        try:
+            today = today_frame(rows)
+            actual = warmup_digest(today)
+        except ValueError as exc:
+            problems.append(Problem(f"today's backfill bars cannot be read: {exc}", symbol,
+                                    None, str(expected), None))
+            continue
+        if actual != str(expected):
+            problems.append(Problem(
+                "today's backfill bars digest differs: the bars stored in the run's warm-up "
+                "description are not those the session started with", symbol, None,
+                str(expected), actual))
+            continue
+        if set(today["date"].dt.strftime("%Y-%m-%d")) != {str(description.get("today"))}:
+            problems.append(Problem(
+                "today's backfill bars are not all dated on the session's day "
+                f"{description.get('today')}", symbol, None, None, None))
+            continue
+        out[symbol] = pd.concat([frames[symbol], today], ignore_index=True)[list(COLUMNS)]
+    return out, problems
 
 
 # --- replaying the stored bars ---------------------------------------------------------
@@ -671,6 +745,8 @@ def verify_run(store: Store, run: RunData, *, bars_dir: Path | None,
         return _unverifiable(run, [Problem("the run stores no warm-up description "
                                            "(config \"warmup\"); its warm-up cannot be rebuilt")])
     frames, problems = rebuild_warmup(bars_dir, description, symbols)
+    frames, today_problems = add_today_bars(frames, description, symbols)
+    problems.extend(today_problems)
     if problems:
         return _unverifiable(run, problems)
     feed = StoredBarsFeed({s: frames[s] for s in symbols},
