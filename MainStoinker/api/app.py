@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from importlib.resources import files
 
 from fastapi import FastAPI
@@ -62,8 +63,16 @@ class _StaticFiles(StaticFiles):
             return "", None
 
 
-def create_app(db_spec: str, env: Mapping[str, str], *, allow_remote: bool = False) -> FastAPI:
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def create_app(db_spec: str, env: Mapping[str, str], *, allow_remote: bool = False,
+               now: Callable[[], datetime] = utc_now) -> FastAPI:
     """Build the app for the database `db_spec`; `env` is what the OneDrive refusal judges by.
+
+    `now` is the clock (timezone-aware); a route that needs "now" (liveness of
+    live runs) reads it once per request, at the route, and passes the value on.
 
     Nothing is opened here: each request opens the database read-only itself.
     No CORS middleware is installed, and the interactive docs are off. Unless
@@ -78,6 +87,7 @@ def create_app(db_spec: str, env: Mapping[str, str], *, allow_remote: bool = Fal
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db_spec = db_spec
     app.state.env = env
+    app.state.clock = now
     install_error_handlers(app)
     for router in (health_router, runs_router, trades_router, bars_router,
                    series_router, compare_router):

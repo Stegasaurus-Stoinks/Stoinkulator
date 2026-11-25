@@ -348,6 +348,10 @@ class Store(Protocol):
 
     def load_last_bars(self, run_id: int) -> tuple[StoredBar, ...]: ...
 
+    def load_bars(self, run_id: int, symbol: str, start: datetime | None = None,
+                  end: datetime | None = None, limit: int | None = None
+                  ) -> tuple[StoredBar, ...]: ...
+
     def close(self) -> None: ...
 
 
@@ -420,6 +424,11 @@ class NullStore:
         return {}
 
     def load_last_bars(self, run_id: int) -> tuple[StoredBar, ...]:
+        return ()
+
+    def load_bars(self, run_id: int, symbol: str, start: datetime | None = None,
+                  end: datetime | None = None, limit: int | None = None
+                  ) -> tuple[StoredBar, ...]:
         return ()
 
     def close(self) -> None:
@@ -1470,6 +1479,39 @@ class SqliteStore:
                     " WHERE run_id=? GROUP BY symbol) m"
                     " ON b.symbol = m.symbol AND b.time = m.last"
                     " WHERE b.run_id=? ORDER BY b.symbol", (run_id, run_id)))
+        except sqlite3.Error as exc:
+            raise StoreError(str(exc)) from exc
+
+    def load_bars(self, run_id: int, symbol: str, start: datetime | None = None,
+                  end: datetime | None = None, limit: int | None = None
+                  ) -> tuple[StoredBar, ...]:
+        """The stored bars of one symbol of a run, oldest first.
+
+        `start` and `end` (both inclusive, either may be None) bound the data
+        time; `limit` (None: no limit) keeps the first `limit` bars of the window.
+        Empty for a symbol with no stored bars and for a database older than
+        schema 3 (`run_bars` is not queried). An unknown run raises `StoreError`.
+        """
+        sql = ("SELECT symbol, time, open, high, low, close, volume FROM run_bars"
+               " WHERE run_id=? AND symbol=?")
+        args: list[Any] = [run_id, symbol]
+        if start is not None:
+            sql += " AND time >= ?"
+            args.append(start.isoformat())
+        if end is not None:
+            sql += " AND time <= ?"
+            args.append(end.isoformat())
+        sql += " ORDER BY time"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(max(int(limit), 0))
+        conn = self._db()
+        try:
+            self._require_run(conn, run_id)
+            if self._schema_version < 3:
+                return ()
+            return tuple(StoredBar(r[0], _dt(r[1]), r[2], r[3], r[4], r[5], r[6])
+                         for r in conn.execute(sql, args))
         except sqlite3.Error as exc:
             raise StoreError(str(exc)) from exc
 

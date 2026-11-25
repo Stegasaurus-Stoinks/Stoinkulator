@@ -487,6 +487,63 @@ def test_null_store_readers_are_empty():
     assert store.load_counts(1) == {} and store.load_last_bars(1) == ()
 
 
+# --- load_bars (issue 194) -----------------------------------------------------------
+
+
+def test_load_bars_filters_by_symbol_window_and_limit(db):
+    with SqliteStore(db) as store:
+        run_id = running(store)
+        other = running(store)
+        assert store.load_bars(run_id, "AAPL") == ()
+        store.write_bars(run_id, [bar(3, "AAPL", 3.0), bar(0, "AAPL", 1.0), bar(1, "AAPL", 2.0),
+                                  bar(2, "MSFT", 50.0), bar(5, "AAPL", 5.0)])
+        store.write_bars(other, [bar(0, "AAPL", 9.0)])
+        assert store.load_bars(run_id, "AAPL") == (
+            bar(0, "AAPL", 1.0), bar(1, "AAPL", 2.0), bar(3, "AAPL", 3.0), bar(5, "AAPL", 5.0))
+        assert store.load_bars(run_id, "MSFT") == (bar(2, "MSFT", 50.0),)
+        assert store.load_bars(run_id, "NONE") == ()
+        # both bounds are inclusive
+        assert store.load_bars(run_id, "AAPL", T0 + timedelta(minutes=1),
+                               T0 + timedelta(minutes=3)) == (bar(1, "AAPL", 2.0),
+                                                              bar(3, "AAPL", 3.0))
+        assert store.load_bars(run_id, "AAPL", start=T0 + timedelta(minutes=3)) == (
+            bar(3, "AAPL", 3.0), bar(5, "AAPL", 5.0))
+        assert store.load_bars(run_id, "AAPL", end=T0) == (bar(0, "AAPL", 1.0),)
+        assert store.load_bars(run_id, "AAPL", limit=2) == (bar(0, "AAPL", 1.0),
+                                                            bar(1, "AAPL", 2.0))
+        assert store.load_bars(run_id, "AAPL", limit=0) == ()
+        with pytest.raises(StoreError):
+            store.load_bars(99, "AAPL")
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_load_bars_is_empty_on_older_schemas(tmp_path, version):
+    src = tmp_path / "src.db"
+    with SqliteStore(src) as w:
+        stored_run(w)
+    old = tmp_path / f"v{version}.db"
+    make_old_file(src, old, version)
+    store = open_store_readonly(str(old), env=NO_ENV)
+    try:
+        assert store.load_bars(1, "AAPL") == ()
+        with pytest.raises(StoreError):
+            store.load_bars(2, "AAPL")
+    finally:
+        store.close()
+
+
+def test_load_bars_works_on_a_readonly_current_database_and_null_store(db):
+    with SqliteStore(db) as store:
+        run_id = running(store)
+        store.write_bars(run_id, [bar(0), bar(1)])
+    store = open_store_readonly(str(db), env=NO_ENV)
+    try:
+        assert store.load_bars(run_id, "AAPL") == (bar(0), bar(1))
+    finally:
+        store.close()
+    assert NullStore().load_bars(1, "AAPL") == ()
+
+
 # --- write_live_step (issue 192) ---------------------------------------------------
 
 D = Decimal
