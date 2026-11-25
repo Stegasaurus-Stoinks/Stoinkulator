@@ -24,9 +24,10 @@ the driver owns the pace; the only sleep is the injected pause between busy retr
         positions = engine.end_live()                 # also after a failed step
         outcome = writer.finish(status, reason, counts, data_meta, engine.gap_report)
 
-A store call that fails because the database is busy (another connection holds it: the
-dashboard, a `report`) is repeated `BUSY_RETRIES` times with `BUSY_PAUSE` seconds of the
-injected `sleep` before each repeat, inside the step; each call is one transaction, so a
+A store call that fails because the database is busy (another WRITER holds it: in WAL mode
+readers, the dashboard and `report`, never block a write) is repeated `BUSY_RETRIES` times
+with `BUSY_PAUSE` seconds of the injected `sleep` before each repeat, inside the step; each
+call is one transaction, so a
 repeat can neither lose nor duplicate a record. After that the call fails as before.
 
 The bars hand-over: `on_step` receives only the timestamp and the present symbols,
@@ -100,8 +101,9 @@ EndStatus = Literal["completed", "failed"]
 CountSpec = tuple[str, str, str | None]  # (symbol, kind, reason) as `count_key` takes them
 T = TypeVar("T")
 
-# A store call that fails because another connection holds the database (a dashboard, a
-# `report`) is repeated this many times after the first attempt, with BUSY_PAUSE seconds
+# A store call that fails because another writer holds the database (in WAL mode readers, such
+# as the dashboard or a `report`, never block a write) is repeated this many times after the
+# first attempt, with BUSY_PAUSE seconds
 # (the injected sleep) before each repeat: 5 * 0.6 = 3 s of waiting added to the store's own
 # busy timeout of every attempt. A write that still fails then fails as it did before.
 BUSY_RETRIES = 5
