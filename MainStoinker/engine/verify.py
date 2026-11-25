@@ -7,17 +7,21 @@ and equity of the ledger, the gap-rule counts and the description of its warm-up
 
 1. the warm-up is rebuilt from the month files the stored description names (only
    the recorded days) and its digest compared with the stored `warmup_sha256`;
-2. warm-up plus the stored bars are replayed through `Engine.run_backtest` with the
-   stored algo config, fill model and costs (the replay itself is built by the
-   caller, `cli.replay_stored_run`, the same construction `backtest` uses);
+2. warm-up plus the stored bars are replayed through `Engine.start_live` / `step` /
+   `end_live` (the API the session used: nothing is closed synthetically) with the
+   stored algo config, fill model and costs (the replay is built by the caller,
+   `cli.replay_stored_run`, from the pieces `backtest` uses);
 3. the replay is compared with the stored run.
 
-What "the same" means (decision of issue 187, correction 9): the same NON-SYNTHETIC
-fills, order events, round trips and ignored events; the same open positions (the
-replay closes open positions synthetically at the end of the data; each synthetic
-close must correspond one to one to a position the stored run left open); the same
-equity at every mark before the last bar time (the last time's group is the ledger's
-final state, written separately); the same gap-rule counts. It is measured on the
+What "the same" means (decision of issue 187, correction 9): the same fills, order
+events, round trips and ignored events; the same open positions after `end_live`
+(account, symbol, side, quantity, entry price and time, and for a cleanly ended run
+the stop and target); the same equity at every mark before the last bar time; the
+same FINAL equity (the ledger's state after the session end, per algo and in total,
+against the last stored equity group); the same gap-rule counts; the stored `algos`
+table against the config the replay was built from; for a completed run the stored
+bars against the fed counts, `replayed_minutes` and `last_bar` (a completed run with
+no fed counts is UNVERIFIABLE: "bar counts not recorded"). It is measured on the
 bars the run consumed (`run_bars`), not on any file. Volumes come back from the store
 as floats: they go back into integers (they were integers); quantities and prices
 are compared as the ledger's own 4-decimal values.
@@ -56,13 +60,14 @@ from typing import Any, Literal
 
 import pandas as pd
 
+from .engine import LivePosition
 from .feed import COLUMNS, Bar, BarFeed, read_offline_bars
 from .gaprule import GapRuleReport
-from .ledger import Ledger
+from .ledger import EquityPoint, Ledger
 from .live_counts import COUNT_FED, COUNT_SCOPE_SYMBOL, parse_count_key
 from .run_documents import is_live_run, open_positions
 from .stats import fmt4
-from .store import RunData, Store, StoredBar, expand_equity
+from .store import AlgoMeta, DataMeta, RunData, Store, StoredBar, expand_equity
 from .warmup import _MONTH_FILE, warmup_digest
 
 EXIT_VERIFIED = 0
@@ -93,6 +98,8 @@ class Replayed:
 
     ledger: Ledger
     gap_report: GapRuleReport
+    positions: tuple[LivePosition, ...]  # what the session end left open
+    algos: tuple[AlgoMeta, ...]  # the algo records the replay's config implies
 
 
 Replayer = Callable[[RunData, BarFeed], Replayed]
@@ -192,9 +199,9 @@ class VerifyResult:
                     f"({c['fills']} fills, {c['round_trips']} round trips, "
                     f"{c['open_positions']} open positions compared; {c['bars']} bars replayed)")
         else:
-            head = ("verify: UNVERIFIABLE (the replay's input is no longer the run's: the bars on "
-                    "disk changed since the run or the run's record is incomplete; this says "
-                    "nothing about the engine)")
+            head = ("verify: UNVERIFIABLE (the run can be neither proven nor disproven: the bars "
+                    "on disk changed since the run, or the run's record is incomplete; this "
+                    "says nothing about the engine)")
         out = [head]
         if self.ended_early:
             reason = self.end_reason or "no reason stored"
@@ -378,10 +385,15 @@ def _compare_records(
 
 
 def _position_record(account: str, symbol: str, side: str, quantity: Any, price: Any,
-                     entry_time: Any) -> dict[str, str]:
-    return {"account": account, "symbol": symbol, "side": side, "quantity": _show(quantity),
-            "entry_price": _show(price),
-            "entry_time": "-" if entry_time is None else _show(entry_time)}
+                     entry_time: Any, stop: Any = None, target: Any = None, *,
+                     levels: bool = False) -> dict[str, str]:
+    record = {"account": account, "symbol": symbol, "side": side, "quantity": _show(quantity),
+              "entry_price": _show(price),
+              "entry_time": "-" if entry_time is None else _show(entry_time)}
+    if levels:
+        record["stop"] = "-" if stop is None else _show(stop)
+        record["target"] = "-" if target is None else _show(target)
+    return record
 
 
 def _compare_mappings(kind: str, stored: Sequence[Mapping[str, str]],
@@ -499,52 +511,119 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
         _compare_records("round_trips", stored_trips, replay_trips, lambda t: t.exit_time),
         _compare_records("ignored_events", stored_ignored, replay_ignored, lambda e: e.time),
     ]
-    # Open positions: the replay's synthetic closes against what the stored fills leave open.
+    # Open positions: what the replay's `end_live` leaves open against what the stored fills
+    # leave open. The protective levels are compared only for a run that ended cleanly: an
+    # early-ended run's session end ran on a bar the store never got.
     held = open_positions(dataclasses.replace(run, fills=tuple(stored_fills),
                                               order_events=tuple(stored_orders)))
+    levels = completed
     stored_open = sorted(
         (_position_record(p["account"], p["symbol"], p["side"], p["quantity"], p["entry_price"],
                           None if p["entry_time"] is None else
-                          datetime.fromisoformat(p["entry_time"]))
+                          datetime.fromisoformat(p["entry_time"]),
+                          p["stop"], p["target"], levels=levels)
          for p in held),
         key=lambda r: (r["account"], r["symbol"], r["entry_time"], r["quantity"]))
     replay_open = sorted(
-        (_position_record(t.account, t.symbol, t.side, t.quantity, t.entry_price, t.entry_time)
-         for t in ledger.round_trips if t.synthetic),
+        (_position_record(p.account, p.symbol, p.side, p.quantity, p.entry_price, p.entry_time,
+                          p.stop, p.target, levels=levels)
+         for p in replayed.positions),
         key=lambda r: (r["account"], r["symbol"], r["entry_time"], r["quantity"]))
     found.append(_compare_mappings("open_positions", stored_open, replay_open))
     equity_found, equity_compared = _compare_equity(run, ledger, last_time)
     found.append(equity_found)
+    # The headline result: the ledger's final state after the session end, against the last
+    # equity group the run stored. Not compared when the run did not finish between steps.
+    final_compared = 0
+    if summary.status == "running" or (not completed and summary.end_reason == "error"):
+        notes.append("the final equity was not compared: the run did not end between steps")
+    else:
+        stored_final, replay_final = _final_points(run, ledger, last_time)
+        found.append(_compare_records("final_equity", stored_final, replay_final,
+                                      lambda p: p.time))
+        final_compared = len(replay_final)
+    # The algos table (what the dashboard shows) against the config the replay was built from.
+    found.append(_compare_records("algos", list(run.algos), list(replayed.algos),
+                                  lambda a: a.idname))
     gap_found, gap_compared = _compare_gap_rule(summary.data.gap_rule, replayed.gap_report,
                                                 completed=completed)
     found.append(gap_found)
     if not gap_compared and not gap_found:
         notes.append("the run stored no gap-rule counts yet (they are written when it finishes); "
                      "not compared")
-    # The bars against the minutes the run counted as fed.
+    # The bars against what the run says about them.
     fed = {key.symbol: value for scope, rows in counts.items() for name, value in rows.items()
            if (key := parse_count_key(scope, name)) is not None and key.kind == COUNT_FED
            and scope == COUNT_SCOPE_SYMBOL}
-    if completed and fed:
-        found.append(_compare_records(
-            "bars", [_Count(s, len(bars.get(s, ()))) for s in fed],
-            [_Count(s, n) for s, n in fed.items()], lambda c: last_time, ["fed"]))
+    data = summary.data
+    no_counts = False
+    if completed:
+        if fed:
+            names = list(dict.fromkeys([*data.symbols, *fed]))
+            found.append(_compare_records(
+                "bars", [_Count(s, len(bars.get(s, ()))) for s in names],
+                [_Count(s, fed.get(s)) for s in names], lambda c: last_time, ["fed"]))
+        else:
+            no_counts = True
+        found.append(_compare_data(data, bars, last_time))
+    else:
+        notes.append("the fed counts and the stored bar range were not compared: the run did "
+                     "not complete")
     differences = tuple(d for d in found if d is not None)
     compared = {
         "fills": len(stored_fills), "order_events": len(stored_orders),
         "round_trips": len(stored_trips), "ignored_events": len(stored_ignored),
         "open_positions": len(stored_open), "equity_points": equity_compared,
+        "final_equity": final_compared,
         "bars": sum(len(rows) for rows in bars.values()),
     }
+    if not differences and no_counts:
+        # Decision: a completed run that stored no fed counts cannot show that its stored bars
+        # are complete, so it is reported unverifiable (never skipped silently).
+        problem = Problem("bar counts not recorded: the run stored no fed counts, so its stored "
+                          "bars cannot be checked for completeness (the driver passed none to "
+                          "`finish`)")
+        return VerifyResult("unverifiable", summary.run_id, summary.status, summary.end_reason,
+                            compared, (), (problem,), tuple(notes))
     return VerifyResult("mismatch" if differences else "verified", summary.run_id,
                         summary.status, summary.end_reason, compared, differences, (),
                         tuple(notes))
 
 
+def _final_points(run: RunData, ledger: Ledger, time: datetime
+                  ) -> tuple[list[EquityPoint], list[EquityPoint]]:
+    """The last stored point of each account and of the total, and the replay's final state."""
+    accounts: list[str | None] = [a.idname for a in ledger.accounts]
+    accounts.append(None)
+    stored: list[EquityPoint] = []
+    replayed: list[EquityPoint] = []
+    for account in accounts:
+        series = run.equity_series(account)
+        if series:
+            stored.append(series[-1])
+        cash, equity = ledger.cash(account), ledger.equity(account)
+        replayed.append(EquityPoint(time, account, cash, equity - cash,
+                                    ledger.realised_pnl(account),
+                                    ledger.unrealised_pnl(account), equity))
+    return stored, replayed
+
+
+def _compare_data(data: DataMeta, bars: Mapping[str, Sequence[StoredBar]], last_time: datetime
+                  ) -> KindDifferences | None:
+    """`replayed_minutes` and `last_bar` of the stored data record against the stored bars."""
+    shown: list[Difference] = []
+    stamps = {b.time for rows in bars.values() for b in rows}
+    for name, stored, actual in (("replayed_minutes", data.replayed_minutes, len(stamps)),
+                                 ("last_bar", data.last_bar, last_time)):
+        if stored is not None and stored != actual:
+            shown.append(Difference(None, None, name, _show(stored), _show(actual)))
+    return KindDifferences("data", len(shown), tuple(shown)) if shown else None
+
+
 @dataclass(frozen=True)
 class _Count:
     symbol: str
-    fed: int
+    fed: int | None
 
 
 # --- the check ---------------------------------------------------------------------------
@@ -571,7 +650,12 @@ def verify_run(store: Store, run: RunData, *, bars_dir: Path | None,
     if not is_live_run(summary):
         raise VerifyRefused(f"run {summary.run_id} is a {summary.kind} run: it stores no bars, "
                             f"so there is nothing to verify (only live runs can be verified)")
-    symbols = list(dict.fromkeys(a.ticker for a in run.algos))
+    tickers = list(dict.fromkeys(a.ticker for a in run.algos))
+    # The feed's symbol order is the run's own (`data.symbols`), not the algos' order.
+    symbols = list(summary.data.symbols) or tickers
+    if set(symbols) != set(tickers):
+        return _unverifiable(run, [Problem(
+            f"the stored symbols {symbols} are not the algos' symbols {tickers}")])
     bars = {s: store.load_bars(summary.run_id, s) for s in symbols}
     if not any(bars.values()):
         raise VerifyRefused(f"run {summary.run_id} has no stored bars (kind {summary.kind}, "

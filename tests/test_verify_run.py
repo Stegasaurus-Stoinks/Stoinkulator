@@ -97,12 +97,15 @@ def build_session(
     root: Path, symbols: list[str], fills: str, *, rows: int = ROWS,
     drop: dict[str, range] | None = None, fail_at: int | None = None,
     stop_after: int | None = None, record_bars_dir: bool = True,
+    kill_after: int | None = None, reverse_algos: bool = False,
 ) -> Session:
     """Drive a live session to its end (or its failure) and return what it stored.
 
     `drop` removes bars (by position among the replay bars of a symbol) to make gaps;
     `fail_at` makes the first algo raise at that step; `stop_after` ends the session early
-    as `failed` without an error.
+    as `failed` without an error; `kill_after` stops after that many steps without
+    `end_live` or `finish` (a killed process: the run stays `running`); `reverse_algos`
+    lists the algos in the opposite order of the feed's symbols.
     """
     harness.reset_runtime_state()
     root.mkdir(parents=True)
@@ -124,6 +127,8 @@ def build_session(
     ordered = [(stamp, {s: batches[stamp][s] for s in symbols if s in batches[stamp]})
                for stamp in sorted(batches)]
     entries = ema_entries(symbols)
+    if reverse_algos:
+        entries[0]["data"] = list(reversed(entries[0]["data"]))
     ledger = Ledger()
     router = build_router(entries, fills=fills, costs=COSTS, capital=CAPITAL, ledger=ledger)
     algos: list = []
@@ -160,13 +165,18 @@ def build_session(
         done = 0
         try:
             for stamp, bars in ordered:
-                if stop_after is not None and done >= stop_after:
+                if (stop_after is not None and done >= stop_after) or (
+                        kill_after is not None and done >= kill_after):
                     break
                 writer.fed(stamp, bars)
                 engine.step(stamp, bars)
                 done += 1
         except RuntimeError:
             failed = True
+        if kill_after is not None:  # the process dies here: no end_live, no finish
+            close_algo_logs(algos)
+            store.close()
+            return Session(root, db, bars_dir, (), done, 0, False, fills, list(symbols))
         positions = engine.end_live()
         data_meta = DataMeta(source="live", directory=str(bars_dir) if record_bars_dir else "",
                              symbols=tuple(symbols), first_bar=ordered[0][0],
@@ -200,6 +210,9 @@ def sessions(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Session]:
         "failed-algo": build_session(base / "failed-algo", ["AAPL", "MSFT"], "realistic",
                                      fail_at=500),
         "stopped": build_session(base / "stopped", ["AAPL"], "realistic", stop_after=400),
+        "killed": build_session(base / "killed", ["AAPL", "MSFT"], "realistic", kill_after=450),
+        "reordered": build_session(base / "reordered", SYMBOLS, "realistic", rows=600,
+                                   reverse_algos=True),
         "no-dir": build_session(base / "no-dir", ["AAPL"], "legacy", rows=300,
                                 record_bars_dir=False),
     }
@@ -608,3 +621,175 @@ def test_the_replay_leaves_no_file_in_the_starting_directory(
     monkeypatch.chdir(start)
     assert verify(sessions["one-realistic"], capsys)[0] == EXIT_VERIFIED
     assert list(start.iterdir()) == []
+
+
+# ------------------------------------------------------------------ early-ended runs
+
+
+def test_verify_compares_a_run_left_running_by_a_killed_process(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = sessions["killed"]
+    assert stored_run(session.db).summary.status == "running"
+    code, out, err = verify(session, capsys)
+    assert code == EXIT_VERIFIED, out + err
+    assert "the run ended early (status running" in out
+    assert "final equity was not compared" in out
+
+
+@pytest.mark.parametrize("name", ["failed-algo", "killed", "stopped"])
+def test_verify_detects_an_altered_fill_in_an_early_ended_run(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path, name: str
+) -> None:
+    altered = sessions[name].copy(tmp_path / f"early-{name}")
+    fill = stored_run(altered.db).fills[1]
+    sql(altered.db, "UPDATE fills SET price_e4=price_e4+1000 WHERE run_id=1 AND fill_id=?",
+        fill.fill_id)
+    code, out, _ = verify(altered, capsys)
+    assert code == EXIT_MISMATCH, out
+    assert "the run ended early" in out
+    assert "fills[1] at " in out and " price: stored " in out
+
+
+def test_records_after_the_last_stored_bar_are_left_out_of_an_early_ended_run_only(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    insert = ("INSERT INTO order_events(run_id, seq, order_id, algo, broker_ref, kind, time, "
+              "side, quantity_e4, order_type, price_e4) SELECT run_id, seq+100000, order_id, algo,"
+              " broker_ref, kind, '2024-08-30T10:00:00', side, quantity_e4, order_type, price_e4 "
+              "FROM order_events WHERE run_id=1 AND seq=(SELECT MAX(seq) FROM order_events "
+              "WHERE run_id=1)")
+    early = sessions["stopped"].copy(tmp_path / "cut-early")
+    sql(early.db, insert)
+    code, out, _ = verify(early, capsys)
+    assert code == EXIT_VERIFIED, out
+    assert "1 stored record(s) after the last stored bar" in out  # left out, and said so
+    # the same record in a COMPLETED run is compared, and is a difference
+    done = sessions["one-realistic"].copy(tmp_path / "cut-done")
+    sql(done.db, insert)
+    code, out, _ = verify(done, capsys)
+    assert code == EXIT_MISMATCH and "order_events[" in out
+    # a record at or before the last stored bar is always compared
+    inside = sessions["stopped"].copy(tmp_path / "cut-inside")
+    sql(inside.db, insert.replace("'2024-08-30T10:00:00'", "'2024-08-20T10:00:00'"))
+    assert verify(inside, capsys)[0] == EXIT_MISMATCH
+
+
+# ------------------------------------------------------------------ final equity, cross-checks
+
+
+@pytest.mark.parametrize("name", ["three-realistic", "one-legacy", "stopped"])
+def test_verify_detects_an_altered_final_equity_group(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path, name: str
+) -> None:
+    session = sessions[name]
+    assert verify(session, capsys)[0] == EXIT_VERIFIED
+    altered = session.copy(tmp_path / f"final-{name}")
+    sql(altered.db, "UPDATE equity SET equity_e4=equity_e4+10000 WHERE run_id=1 AND seq="
+        "(SELECT MAX(seq) FROM equity WHERE run_id=1 AND algo IS NULL)")
+    code, out, _ = verify(altered, capsys)
+    assert code == EXIT_MISMATCH
+    assert "final_equity" in out and " equity: stored " in out
+    document = json.loads(verify(session, capsys, "--json")[1])
+    assert document["verify"]["compared"]["final_equity"] == len(stored_run(session.db).algos) + 1
+
+
+def test_verify_detects_a_changed_algo_parameter_fill_mode_and_capital(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    base = sessions["three-realistic"]
+    config = json.loads(_config(base.db))
+    # an algo parameter in the config the replay uses
+    config["entries"][0]["data"][0]["short"] = "8"
+    changed = base.copy(tmp_path / "param-config")
+    sql(changed.db, "UPDATE runs SET config_json=? WHERE id=1", json.dumps(config))
+    code, out, _ = verify(changed, capsys)
+    assert code == EXIT_MISMATCH and "algos[0]" in out and " params: stored " in out
+    # the same parameter changed only in the algos table (what the dashboard shows)
+    shown = base.copy(tmp_path / "param-algos")
+    sql(shown.db, "UPDATE algos SET params_json=REPLACE(params_json, '\"10\"', '\"9\"') "
+        "WHERE run_id=1 AND rowid=(SELECT MIN(rowid) FROM algos WHERE run_id=1)")
+    code, out, _ = verify(shown, capsys)
+    assert code == EXIT_MISMATCH and " params: stored " in out
+    # the fill mode
+    mode = base.copy(tmp_path / "mode")
+    sql(mode.db, "UPDATE runs SET fills='legacy' WHERE id=1")
+    assert verify(mode, capsys)[0] == EXIT_MISMATCH
+    # the capital, in the config and in the algos table
+    capital = base.copy(tmp_path / "capital-config")
+    config = json.loads(_config(base.db))
+    config["capital"] = "20000.0000"
+    sql(capital.db, "UPDATE runs SET config_json=? WHERE id=1", json.dumps(config))
+    code, out, _ = verify(capital, capsys)
+    assert code == EXIT_MISMATCH and " capital: stored " in out
+    table = base.copy(tmp_path / "capital-table")
+    sql(table.db, "UPDATE algos SET capital_e4=capital_e4+10000 WHERE run_id=1")
+    code, out, _ = verify(table, capsys)
+    assert code == EXIT_MISMATCH and " capital: stored " in out
+
+
+def test_verify_detects_swapped_bars_and_a_deleted_last_exit_fill(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    base = sessions["three-realistic"]
+    fill = stored_run(base.db).fills[2]
+    swapped = base.copy(tmp_path / "swapped")
+    con = sqlite3.connect(swapped.db)
+    try:
+        rows = con.execute(
+            "SELECT time, open, high, low, close FROM run_bars WHERE run_id=1 AND symbol=? "
+            "AND time <= ? ORDER BY time DESC LIMIT 2", (fill.symbol, fill.time.isoformat())
+        ).fetchall()
+        (t1, *v1), (t2, *v2) = rows
+        for t, v in ((t1, v2), (t2, v1)):
+            con.execute("UPDATE run_bars SET open=?, high=?, low=?, close=? WHERE run_id=1 AND "
+                        "symbol=? AND time=?", (*v, fill.symbol, t))
+        con.commit()
+    finally:
+        con.close()
+    assert verify(swapped, capsys)[0] == EXIT_MISMATCH
+    deleted = base.copy(tmp_path / "no-last-exit")
+    sql(deleted.db, "DELETE FROM fills WHERE run_id=1 AND fill_id="
+        "(SELECT MAX(fill_id) FROM fills WHERE run_id=1 AND reason != 'entry')")
+    code, out, _ = verify(deleted, capsys)
+    assert code == EXIT_MISMATCH and "fills" in out
+
+
+def test_verify_cross_checks_the_stored_bars_against_the_run_record(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    base = sessions["three-realistic"]
+    counts = base.copy(tmp_path / "counts")
+    sql(counts.db, "UPDATE run_counts SET value=value+1 WHERE run_id=1")
+    code, out, _ = verify(counts, capsys)
+    assert code == EXIT_MISMATCH and "bars: " in out and " fed: stored " in out
+    # the minutes and the last bar the run says it replayed
+    for field_name, new in (("replayed_minutes", lambda v: v + 1),
+                            ("last_bar", lambda v: "2024-08-20T09:31:00")):
+        data_copy = base.copy(tmp_path / f"data-{field_name}")
+        con = sqlite3.connect(data_copy.db)
+        try:
+            data = json.loads(con.execute("SELECT data_json FROM runs WHERE id=1").fetchone()[0])
+            data[field_name] = new(data[field_name])
+            con.execute("UPDATE runs SET data_json=? WHERE id=1", (json.dumps(data),))
+            con.commit()
+        finally:
+            con.close()
+        code, out, _ = verify(data_copy, capsys)
+        assert code == EXIT_MISMATCH and f" {field_name}: stored " in out, field_name
+    # no fed counts at all on a completed run: stated, and not verified
+    none = base.copy(tmp_path / "no-counts")
+    sql(none.db, "DELETE FROM run_counts WHERE run_id=1")
+    code, out, _ = verify(none, capsys)
+    assert code == EXIT_UNVERIFIABLE and "bar counts not recorded" in out
+
+
+def test_the_replay_uses_the_feed_order_of_the_stored_symbols_not_the_algos_order(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = sessions["reordered"]
+    run = stored_run(session.db)
+    assert [a.ticker for a in run.algos] == ["TSLA", "MSFT", "AAPL"]  # algos listed backwards
+    assert list(run.summary.data.symbols) == ["AAPL", "MSFT", "TSLA"]  # the feed's order
+    code, out, err = verify(session, capsys)
+    assert code == EXIT_VERIFIED, out + err

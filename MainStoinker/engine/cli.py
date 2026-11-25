@@ -7,7 +7,8 @@
 `report --verify` replays a stored live run and compares it with what it stored (see
 `verify`); its replay is built by `replay_stored_run` from the same pieces `backtest`
 uses (`build_engine`). Exit codes: 0 verified, 1 mismatch, 2 usage, 4 not a live run with
-stored bars, 5 unverifiable (the warm-up files changed or are missing).
+stored bars, 5 unverifiable (the warm-up files changed or are missing, or the run's record is
+incomplete: no warm-up description, entries, costs or fed counts).
 
 `runs` and `report` only read a stored database (see `cli_report`): they need
 no algos or data, never create a database, and exit 2 with one line on any
@@ -431,8 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="machine-readable output (money as 4-decimal strings)")
     rep.add_argument("--verify", action="store_true",
                      help="live runs only: replay the stored bars and compare with the stored "
-                          "run (exit 0 verified, 1 mismatch, 4 not a live run with stored bars, "
-                          "5 unverifiable: the warm-up files changed or are missing)")
+                          "run. Exit codes: 0 verified; 1 mismatch; 2 usage error (no bars "
+                          "directory, --bars not a directory, --bars without --verify, unknown "
+                          "run or database); 4 not a live run with stored bars; 5 unverifiable: "
+                          "a warm-up file changed or is missing, or the run's record is "
+                          "incomplete (no warm-up description, no entries, no costs for realistic "
+                          "fills, no fed counts)")
     rep.add_argument("--bars", default=None, metavar="DIR",
                      help="with --verify: the directory holding the warm-up month files "
                           "(default: the directory recorded with the run, if any)")
@@ -989,10 +994,22 @@ def replay_stored_run(run: RunData, feed: BarFeed) -> Replayed:
         try:
             with _working_directory(Path(work)), _maybe_quiet(True):
                 engine = build_engine(entries, feed, router, ledger, algos)
-                engine.run_backtest()
+                # The very API the live session used: no synthetic closes, and the ledger's
+                # state after `end_live` is directly comparable with the stored final group.
+                engine.start_live({s: feed.warmup(s) for s in feed.symbols()})
+                try:
+                    for stamp, bars in feed:
+                        engine.step(stamp, bars)
+                except ValueError as exc:
+                    raise VerifyUnavailable(f"the stored bars cannot be replayed: {exc}") from exc
+                positions = engine.end_live()
         finally:
             close_algo_logs(algos)
-    return Replayed(ledger, engine.gap_report)
+    expected = tuple(
+        AlgoMeta(cfg["idname"], entry["ID"], cfg["ticker"], router.modes[cfg["idname"]],
+                 capital, cfg)
+        for entry in entries for cfg in entry["data"])
+    return Replayed(ledger, engine.gap_report, positions, expected)
 
 
 def make_verifier(bars: str | None) -> Callable[[Store, RunData], VerifyResult]:
