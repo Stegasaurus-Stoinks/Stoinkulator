@@ -901,6 +901,24 @@ def _describe_position(position: LivePosition) -> str:
             f"{position.quantity} at {position.entry_price} since {since}{extra}")
 
 
+@dataclass(frozen=True)
+class _AlreadyEnded:
+    """`writer.finish` was interrupted after `end_run` had committed: the run is ended."""
+
+    ok: bool  # the stored status is the one that was asked for
+
+
+def _stored_status(session: _Session) -> str | None:
+    """The stored status of this session's run when it is no longer `running`, else None."""
+    try:
+        for summary in session.store.list_runs():
+            if summary.run_id == session.run_id and summary.status != "running":
+                return summary.status
+    except Exception:  # noqa: BLE001 - unknown: the caller finishes the run again
+        return None
+    return None
+
+
 def _finish_run(session: _Session, status: str, reason: str | None, say: Callable[[str], None],
                 shield: _Shield) -> tuple[bool, tuple[LivePosition, ...]]:
     """Flush, `end_live`, `writer.finish`, each shielded from Ctrl-C. Returns (finished cleanly,
@@ -909,8 +927,21 @@ def _finish_run(session: _Session, status: str, reason: str | None, say: Callabl
     engine, writer = session.engine, session.writer
     shield.call(session.flush)
     if engine is not None and session.engine_started:
+        entered = False
+
         def end_live() -> None:
-            nonlocal positions
+            nonlocal positions, entered
+            if entered:  # a retry after an interrupt: the engine has ended, never end it twice
+                say("live: the end-of-session step may be incomplete: Ctrl-C reached it, so pending "
+                    "entries may not have been cancelled and requested exits may not have been "
+                    "filled; the open positions are read from the ledger")
+                if session.ledger is not None:
+                    positions = tuple(
+                        LivePosition(p.account, p.broker_ref, p.symbol, p.side, p.quantity,
+                                     p.average_price, None, None, None)
+                        for p in session.ledger.open_positions())
+                return
+            entered = True
             try:
                 with session._algo_env():  # noqa: SLF001
                     positions = engine.end_live()
@@ -920,12 +951,24 @@ def _finish_run(session: _Session, status: str, reason: str | None, say: Callabl
         shield.call(end_live)
     if writer is None or engine is None or session.run_id is None:
         return False, positions
-    outcome = shield.call(
-        lambda: writer.finish(status, reason, _counts_of(session),  # type: ignore[arg-type]
-                              _data_meta(session, engine)))
+    attempted = False
+
+    def finish() -> Any:
+        nonlocal attempted
+        if attempted:  # a retry: if the end of the run was committed, only its bookkeeping is missing
+            ended = _stored_status(session)
+            if ended is not None:
+                return _AlreadyEnded(ended == status)
+        attempted = True
+        return writer.finish(status, reason, _counts_of(session),  # type: ignore[arg-type]
+                             _data_meta(session, engine))
+
+    outcome = shield.call(finish)
     if outcome is None:  # interrupted again and again: the run may still be marked running
         say("live: the run could not be ended: it may still be marked running")
         return False, positions
+    if isinstance(outcome, _AlreadyEnded):
+        return outcome.ok, positions
     for line in outcome.errors:
         say(f"live: the run's record: {line}")
     return outcome.ok, positions
@@ -1028,8 +1071,10 @@ class _Shield:
 
     While active, SIGINT only counts (when this is the main thread), and a `KeyboardInterrupt`
     that still gets out of a step (a signal handler that was not ours, a test) is counted and the
-    step is run again: every step of the end is safe to repeat (`writer.finish` returns its first
-    outcome once it has finished). The count decides the exit code afterwards: 130."""
+    step is run again. Not every step can simply be repeated, so the steps handle a retry
+    themselves (`_finish_run`): `end_live` is never called twice (the open positions are then read
+    from the ledger and the output says the step may be incomplete), and `writer.finish` is not
+    repeated once the run is stored as ended. The count decides the exit code afterwards: 130."""
 
     ATTEMPTS = 5
 

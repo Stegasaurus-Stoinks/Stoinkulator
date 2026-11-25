@@ -23,11 +23,14 @@ from typing import Any
 import pytest
 
 from MainStoinker.engine.cli import main as engine_main
+from MainStoinker.engine.engine import Engine
 from MainStoinker.engine.live_store import LiveRunWriter
 from MainStoinker.engine.store import RunSummary, SqliteStore
 from MainStoinker.ib import run_cli
+from MainStoinker.ib.connection import IbConnection
 from tests import test_ib_live_run as live
 from tests.no_build import FACTORY_NAMES, forbid_building
+from tests.test_ib_cli_paper import LIVE_ID
 from tests.test_ib_live_run import (
     SYMBOLS,
     Rig,
@@ -78,8 +81,9 @@ def argv_of(tmp: Path, *, minutes: str = "8", paper: bool = True, no_prompt: boo
 
 
 def go(rig: Rig, argv: list[str], *, tty: bool = True, stdin: Any = None, recorder: bool = True,
-       entries: list[dict[str, Any]] | None = None) -> int:
-    """`run_cli.main` on the rig. The algos file is written unless one exists."""
+       entries: list[dict[str, Any]] | None = None, build: bool = True) -> int:
+    """`run_cli.main` on the rig. The algos file is written unless one exists. `build=False` leaves
+    the connection to the command's own wiring (a test patches `run_cli.IbConnection`)."""
     if not (rig.tmp / "algos.json").exists():
         write_algos(rig.tmp, entries)
 
@@ -87,10 +91,11 @@ def go(rig: Rig, argv: list[str], *, tty: bool = True, stdin: Any = None, record
         return SqliteStore(Path(spec), clock=rig.wall, env={})
 
     extra: dict[str, Any] = {"recorder_factory": rig.recorder_factory} if recorder else {}
+    if build:
+        extra["connection_factory"] = rig.connection_factory
     return run_cli.main(
         argv, env=rig.env, stdin=Tty(tty) if stdin is None else stdin, input_fn=rig.input_fn,
-        out=rig.out, connection_factory=rig.connection_factory,
-        market_data_factory=rig.market_data_factory, clock=rig, sleep=rig.sleep, wall=rig.wall,
+        out=rig.out, market_data_factory=rig.market_data_factory, clock=rig, sleep=rig.sleep, wall=rig.wall,
         today=DAY, store_opener=opener, **extra)
 
 
@@ -106,12 +111,13 @@ def last_line(rig: Rig) -> str:
     return rig.text.strip().splitlines()[-1]
 
 
-def refused(rig: Rig, argv: list[str], **kw: Any) -> str:
-    """Run `argv` with factories that raise: it must be refused (exit 2) before anything is built."""
+def refused(rig: Rig, argv: list[str], *, prompted: bool = False, **kw: Any) -> str:
+    """Run `argv` with factories that raise: it must be refused (exit 2) before anything is built.
+    `prompted`: the refusal is the console gate's, after the prompt was shown."""
     forbid_building(rig)
     assert go(rig, argv, **kw) == 2, rig.text
     nothing_built(rig)
-    assert not rig.prompts
+    assert bool(rig.prompts) is prompted
     return rig.text
 
 
@@ -229,6 +235,7 @@ def test_help_and_usage_errors_build_no_client() -> None:
     for word in ("--minutes", "--stop-file", "--no-record", "exit codes", "130", "09:25", "paper-live"):
         assert word in done.stdout, word
     assert "--orders" not in done.stdout
+    assert "hook-allowed" not in done.stdout and "hook" not in " ".join(done.stdout.lower().split())
     # a usage error (--no-prompt without --paper) exits 2 at the parser, before anything exists
     bad = subprocess.run([*base, "--algos", "a", "--bars", "b", "--port", "7497", "--no-prompt",
                           "--minutes", "5"], cwd=REPO, env=env, capture_output=True, text=True, timeout=120)
@@ -364,18 +371,161 @@ def test_abandoned_runs_closed_at_start(rig: Rig) -> None:
     assert "run 1 was still marked running but its last write is stale" in rig.text
 
 
-def test_another_running_paper_live_run_is_refused_after_the_stale_ones_are_closed(rig: Rig) -> None:
+def test_another_running_paper_live_run_is_refused_without_writing_to_the_database(rig: Rig) -> None:
     from datetime import UTC, datetime
 
     db = rig.tmp / "runs.db"
     old_run(db, kind="paper-live", touched=datetime(2024, 8, 16, 12, 0, tzinfo=UTC))  # stale
     old_run(db, kind="paper-live", touched=datetime(2024, 8, 16, 13, 29, 30, tzinfo=UTC))  # recent
+    before = db.read_bytes()
+    text = refused(rig, argv_of(rig.tmp))
+    assert "another paper-live run is marked running" in text and "run 2" in text
+    assert db.read_bytes() == before  # closing the stale run is a write: it waits for the gate
+    runs = runs_of(rig.tmp)
+    assert runs[1].status == "running" and runs[2].status == "running" and 3 not in runs
+
+
+def test_the_drivers_own_check_closes_stale_runs_first_and_then_refuses(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second session that started between the command's read and the driver's start."""
+    from datetime import UTC, datetime
+
+    monkeypatch.setattr(run_cli, "_running_runs", lambda *args: [])  # the command's check saw nothing
+    db = rig.tmp / "runs.db"
+    old_run(db, kind="paper-live", touched=datetime(2024, 8, 16, 12, 0, tzinfo=UTC))  # stale
+    old_run(db, kind="paper-live", touched=datetime(2024, 8, 16, 13, 29, 30, tzinfo=UTC))  # recent
     text = refused(rig, argv_of(rig.tmp))
     runs = runs_of(rig.tmp)
-    assert (runs[1].status, runs[1].end_reason) == ("failed", "abandoned")  # closed first
-    assert runs[2].status == "running" and 3 not in runs  # left alone, no new run
-    assert "another paper-live run is marked running" in text and "run 2" in text
-    assert "run 1 was still marked running but its last write is stale" in text
+    assert (runs[1].status, runs[1].end_reason) == ("failed", "abandoned")
+    assert runs[2].status == "running" and 3 not in runs
+    assert "another paper-live run is marked running" in text
+
+
+# -- nothing is written to the database before the gate and the refusals --------------------------
+
+
+def make_schema_2(path: Path) -> bytes:
+    """A database file at schema version 2: a current store, then what migration 3 added is taken
+    away again (the `run_bars` and `run_counts` tables and the two `runs` columns) and
+    `user_version` set back to 2, in the rollback-journal mode. Returns the file's bytes."""
+    import sqlite3
+
+    SqliteStore(path, env={}).close()
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("DROP TABLE run_bars")
+    conn.execute("DROP TABLE run_counts")
+    conn.execute("ALTER TABLE runs DROP COLUMN last_write_at")
+    conn.execute("ALTER TABLE runs DROP COLUMN end_reason")
+    conn.execute("PRAGMA user_version=2")
+    conn.close()
+    return path.read_bytes()
+
+
+def schema_of(path: Path) -> int:
+    import sqlite3
+
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("how", ["no_tty", "wrong_port", "mode", "legacy", "other_port", "bars_missing",
+                                 "stop_file"])
+def test_a_refused_run_leaves_an_existing_schema_2_database_byte_identical(rig: Rig, how: str) -> None:
+    db = rig.tmp / "runs.db"
+    before = make_schema_2(db)
+    argv = argv_of(rig.tmp, no_prompt=how in ("mode", "legacy", "other_port", "stop_file"))
+    kw: dict[str, Any] = {}
+    if how == "no_tty":
+        kw["tty"] = False
+    elif how == "wrong_port":
+        rig.typed = "7496"
+        kw["prompted"] = True
+    elif how == "mode":
+        write_algos(rig.tmp, ema_entries(mode="backtest"))
+    elif how == "legacy":
+        argv += ["--fills", "legacy"]
+    elif how == "other_port":
+        argv += ["--port", "7496"]
+    elif how == "bars_missing":
+        argv = argv_of(rig.tmp, bars=str(rig.tmp / "nope"))
+    else:
+        (rig.tmp / "STOP").write_text("x", encoding="utf-8")
+    refused(rig, argv, **kw)
+    assert db.read_bytes() == before
+    assert schema_of(db) == 2  # not migrated
+    assert not (rig.tmp / "runs.db-wal").exists() and not (rig.tmp / "runs.db-shm").exists()
+
+
+def test_a_schema_2_database_is_only_migrated_by_a_run_that_goes_ahead(rig: Rig) -> None:
+    """The control of the test above: the same database is migrated once the session starts."""
+    make_schema_2(rig.tmp / "runs.db")
+    quick_session(rig)
+    assert go(rig, argv_of(rig.tmp)) == 0, rig.text
+    assert schema_of(rig.tmp / "runs.db") == 3
+
+
+def test_a_refused_run_creates_no_database_and_no_folder_for_a_new_path(rig: Rig) -> None:
+    fresh = rig.tmp / "new-folder" / "fresh.db"
+    refused(rig, argv_of(rig.tmp, no_prompt=False, db=str(fresh)), tty=False)  # the gate refuses
+    assert not fresh.exists() and not fresh.parent.exists()
+    rig.typed = "nope"
+    allow_building(rig)
+    refused(rig, argv_of(rig.tmp, no_prompt=False, db=str(fresh)), prompted=True)
+    assert not fresh.exists() and not fresh.parent.exists()
+    rig.prompts.clear()
+    refused(rig, [*argv_of(rig.tmp, db=str(fresh)), "--fills", "legacy"])
+    assert not fresh.exists() and not fresh.parent.exists()
+
+
+def test_a_running_run_is_refused_before_the_gate_and_a_database_that_cannot_be_read_too(rig: Rig) -> None:
+    from datetime import UTC, datetime
+
+    old_run(rig.tmp / "runs.db", kind="paper-live", touched=datetime(2024, 8, 16, 13, 29, 30, tzinfo=UTC))
+    assert not rig.prompts
+    assert "another paper-live run" in refused(rig, argv_of(rig.tmp, no_prompt=False))  # no prompt asked
+    broken = rig.tmp / "broken.db"
+    broken.write_bytes(b"this is not a database" * 100)
+    allow_building(rig)
+    rig.out.truncate(0)
+    rig.out.seek(0)
+    assert "the run database cannot be used" in refused(rig, argv_of(rig.tmp, db=str(broken)))
+
+
+def test_tilde_in_db_means_the_home_of_the_environment_mapping(rig: Rig) -> None:
+    quick_session(rig)
+    assert go(rig, argv_of(rig.tmp, db="~/runs-in-home.db")) == 0, rig.text
+    assert (rig.tmp / "home" / "runs-in-home.db").exists()
+
+
+# -- the real wiring ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("no_prompt", [True, False])
+def test_the_real_connection_is_built_for_the_paper_port_with_require_paper(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch, no_prompt: bool) -> None:
+    seen: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def spy(*args: Any, **kw: Any) -> IbConnection:
+        seen.append((args, dict(kw)))
+        kw.update(client_factory=rig.client_factory, clock=rig.plumb, sleep=rig.plumb.sleep,
+                  poll_interval=0.002)
+        conn = IbConnection(*args, **kw)
+        rig.connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(run_cli, "IbConnection", spy)
+    rig.accounts = LIVE_ID  # the account check stops the session: nothing is requested
+    rig.typed = "7497"
+    code = go(rig, argv_of(rig.tmp, no_prompt=no_prompt), stdin=NoStdin() if no_prompt else None,
+              build=False)
+    assert code == 5, rig.text
+    (args, kw), = seen
+    assert args == ("127.0.0.1", 7497, 20) and kw["require_paper"] is True
+    assert rig.requests == [] and bool(rig.prompts) is (not no_prompt)
 
 
 # -- before the open --------------------------------------------------------------------------
@@ -563,11 +713,43 @@ def test_ctrl_c_inside_finish_does_not_leave_the_run_running(
     state = finish_interrupted(monkeypatch, after_work=after_work)
     quick_session(rig)
     assert go(rig, argv_of(rig.tmp)) == 130, rig.text
-    assert state["calls"] == 2  # the end was run again after the interrupt
+    # before the work: the end is run again; after it (the run is stored as ended): it is not
+    assert state["calls"] == (1 if after_work else 2)
     run = runs_of(rig.tmp)[1]
     assert (run.status, run.end_reason) == ("completed", "minutes_elapsed")  # not `running`
     assert "Ctrl-C while the run is being ended" in rig.text
+    assert "already completed" not in rig.text and "the run's record" not in rig.text
     assert last_line(rig) == "Live session: completed, end reason minutes_elapsed (exit 130)"
+
+
+@pytest.mark.parametrize("after_work", [False, True])
+def test_an_interrupt_in_the_engines_end_step_still_reports_the_open_positions(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch, after_work: bool) -> None:
+    real = Engine._end_bars  # noqa: SLF001
+    calls: dict[int, int] = {}  # per engine: `report --verify` replays on another one
+
+    def end_bars(self: Engine) -> None:
+        calls[id(self)] = calls.get(id(self), 0) + 1
+        if len(calls) == 1 and calls[id(self)] == 1:
+            if after_work:
+                real(self)
+            raise KeyboardInterrupt
+        real(self)
+
+    monkeypatch.setattr(Engine, "_end_bars", end_bars)
+    script_minutes(rig, SYMBOLS, 0, 20)  # three positions are entered at 09:40, never closed
+    rig.drop((45, 20.0), "connectionClosed")
+    rig.at(rig.tt(45, 40.0), lambda: None)
+    assert go(rig, argv_of(rig.tmp, minutes="20")) == 130, rig.text
+    text = rig.text
+    assert list(calls.values())[0] == 1  # the live engine's `end_live` is never run twice
+    assert "end_live raised" not in text and "has ended" not in text
+    assert text.count("OPEN POSITION (left open)") == 3 and "3 position(s) left OPEN" in text
+    assert "no position left open" not in text
+    assert "end-of-session step may be incomplete" in text
+    run = runs_of(rig.tmp)[1]
+    assert (run.status, run.end_reason) == ("failed", "connection_closed")
+    assert last_line(rig) == "Live session: failed, end reason connection_closed (exit 130)"
 
 
 def test_ctrl_c_inside_end_live_and_verify_does_not_leave_the_run_running(

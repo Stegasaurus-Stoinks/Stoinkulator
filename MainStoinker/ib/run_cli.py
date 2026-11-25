@@ -57,8 +57,10 @@ from MainStoinker.engine.cli import (
     parse_fill_options,
     read_algo_config,
 )
+from MainStoinker.engine.live_counts import LIVE_KINDS
 from MainStoinker.engine.modes import DEFAULT_MODE
-from MainStoinker.engine.store import Store, StoreError, open_store
+from MainStoinker.engine.run_documents import liveness
+from MainStoinker.engine.store import Store, StoreError, open_store, open_store_readonly
 from MainStoinker.ib.cli import (
     EXIT_REFUSED,
     PAPER_MODE_LINE,
@@ -89,6 +91,7 @@ from MainStoinker.ib.watch_bars import MAX_SYMBOLS
 from MainStoinker.Util.broker_guard import BrokerPortRefused, check_broker_port
 
 RUN = "run"
+RUN_KIND = LIVE_KINDS[0]  # "paper-live"
 MIN_MINUTES = 1
 MAX_MINUTES = 420  # a session from 09:25 to 16:20 is 415 minutes; the driver itself would take 600
 DEFAULT_WARMUP_DAYS = 2
@@ -125,7 +128,8 @@ def build_parser(paper: bool = False) -> argparse.ArgumentParser:
             "Run the algos of an algos file on live 1-minute bars from TWS or IB Gateway, in "
             "paper mode only: realistic simulated fills, no order is ever sent. The run is stored "
             "in the database (kind paper-live) and can be checked afterwards with `report RUN "
-            "--verify --bars DIR`. Only the owner or a hook-allowed unattended session runs it. "
+            "--verify --bars DIR`. Only the owner runs it for now (an unattended form for "
+            "agents is a separate decision). "
             "Every algo needs \"mode\": \"paper\".\n\n"
             "Start about 09:25 New York for a full session (it ends at about 16:20, 415 minutes). "
             "Ctrl-C does not interrupt the end of the session: the run is ended in the database "
@@ -202,9 +206,29 @@ def describe_run(args: argparse.Namespace) -> str:
     ])
 
 
-def _db_path(spec: str) -> Path | None:
+def _db_path(spec: str, home: Path) -> Path | None:
+    """The database file of `spec`; a leading `~` means `home` (from the environment mapping given
+    to `main`, never the process's own idea of home)."""
     path = spec[len("sqlite:///"):] if spec.startswith("sqlite:///") else spec
-    return None if path == ":memory:" else Path(path).expanduser()
+    if path == ":memory:":
+        return None
+    if path == "~" or path.startswith(("~/", "~\\")):
+        return home / path[2:] if len(path) > 2 else home
+    return Path(path)
+
+
+def _running_runs(db_file: Path, variables: Mapping[str, str], now: datetime) -> list[int]:
+    """Ids of the `paper-live` runs marked running whose last write is not stale. Reads the
+    database without writing to it (no folder, no WAL switch, no migration); a missing file holds
+    no run. `StoreError` when the file cannot be read."""
+    if not db_file.exists():
+        return []
+    store = open_store_readonly(str(db_file), env=variables)
+    try:
+        return [s.run_id for s in store.list_runs()
+                if s.kind == RUN_KIND and s.status == "running" and liveness(s, now) == "running"]
+    finally:
+        store.close()
 
 
 def _check_inputs(args: argparse.Namespace, variables: Mapping[str, str]) -> None:
@@ -249,14 +273,14 @@ def _check_inputs(args: argparse.Namespace, variables: Mapping[str, str]) -> Non
     spec = args.db if args.db is not None else (variables.get("STOINK_DB", "").strip() or None)
     if spec is None:
         raise CliError("--db is needed (a run database), or STOINK_DB in the environment")
-    db_file = _db_path(spec)
+    db_file = _db_path(spec, home)
     if db_file is None:
         raise CliError("--db :memory: would keep nothing once the command ends; give a database file")
     check_path(db_file, variables, "the run database")
     check_folder_usable(db_file.parent, "the run database's folder")
     if db_file.is_dir():
         raise PathRefused(f"the run database {db_file} is a folder; give a database file")
-    args.db = spec
+    args.db = str(db_file)
     args.out, args.run_out, args.stop_file = out, run_out, stop_file
 
 
@@ -306,6 +330,17 @@ def main(
     except (CliError, PathRefused) as exc:
         say(f"Refused: {exc}")
         return EXIT_REFUSED
+    # Nothing is written to the database before the console gate: this only reads it. Closing the
+    # stale runs of an earlier session is a write, and the driver does it after the gate.
+    try:
+        running = _running_runs(Path(args.db), variables, wall_clock())
+    except StoreError as exc:
+        say(f"Refused: the run database cannot be used: {exc}")
+        return EXIT_REFUSED
+    if running:
+        say(f"Refused: another {RUN_KIND} run is marked running and was written recently (run "
+            f"{', '.join(str(r) for r in running)}): wait until it ends or its last write is stale")
+        return EXIT_REFUSED
     folders = [args.out, args.run_out] + ([args.record.parent] if args.record is not None else [])
     try:
         created = make_folders(folders)  # the last refusal before the store: the folders must be creatable
@@ -314,11 +349,6 @@ def main(
         return EXIT_REFUSED
     store: Store | None = None
     try:
-        try:
-            store = (store_opener or (lambda spec, e: open_store(spec, env=e)))(args.db, variables)
-        except StoreError as exc:
-            say(f"Refused: the run database cannot be used: {exc}")
-            return EXIT_REFUSED
         if args.no_prompt:  # `parse_args` accepted it only with --paper; nothing is read from stdin
             say(describe_run(args))
         else:
@@ -326,6 +356,11 @@ def main(
             ask = input if input_fn is None else input_fn
             if not gate(args, tty, ask, say, describe_run):
                 return EXIT_REFUSED
+        try:  # the first writable open of the database: every refusal and the gate are behind us
+            store = (store_opener or (lambda spec, e: open_store(spec, env=e)))(args.db, variables)
+        except StoreError as exc:
+            say(f"Refused: the run database cannot be used: {exc}")
+            return EXIT_REFUSED
         logging.getLogger("ibapi").setLevel(logging.WARNING)
         now = clock or time.monotonic
 
