@@ -554,6 +554,10 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
     """Compare a stored live run with its replay; see the module text for what counts."""
     summary = run.summary
     completed = summary.status == "completed"
+    if completed and summary.data.provisional:
+        # `finish` clears the mark before it ends a run as completed: such a record was edited.
+        return VerifyResult("unverifiable", summary.run_id, summary.status, summary.end_reason,
+                            {}, (), (Problem("a completed run cannot hold a provisional record"),))
     last_time = max(b.time for rows in bars.values() for b in rows)
     ledger = replayed.ledger
     notes: list[str] = []
@@ -641,7 +645,7 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
            and scope == COUNT_SCOPE_SYMBOL}
     data = summary.data
     no_counts = False
-    if completed and not provisional:
+    if completed:
         if fed:
             names = list(dict.fromkeys([*data.symbols, *fed]))
             found.append(_compare_records(
@@ -652,9 +656,7 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
         found.append(_compare_data(data, bars, last_time))
     else:
         notes.append("the fed counts and the stored bar range were not compared: the run did "
-                     "not complete" if not completed else
-                     "the fed counts and the stored bar range were not compared: they are "
-                     "provisional")
+                     "not complete")
     differences = tuple(d for d in found if d is not None)
     compared = {
         "fills": len(stored_fills), "order_events": len(stored_orders),

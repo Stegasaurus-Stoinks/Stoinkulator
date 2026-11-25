@@ -1099,3 +1099,34 @@ def test_verify_still_compares_the_gap_rule_of_a_run_with_final_data(
     code, out, _ = verify(tampered, capsys)
     assert code == EXIT_MISMATCH, out
     assert "gap_rule" in out and "bars_after_gap[" in out
+
+
+def _set_mark(db: Path) -> None:
+    raw = json.loads(_data_json(db))
+    raw["provisional"] = True
+    sql(db, "UPDATE runs SET data_json=? WHERE id=1", json.dumps(raw))
+
+
+@pytest.mark.parametrize("change", ["gap_rule", "fed_count"])
+def test_verify_a_completed_run_with_the_provisional_mark_is_unverifiable(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], tmp_path: Path, change: str
+) -> None:
+    edited = sessions["provisional"].copy(tmp_path / f"marked-{change}")
+    if change == "gap_rule":
+        _tamper_gap_rule(edited.db)
+    else:
+        sql(edited.db, "UPDATE run_counts SET value=value+1 WHERE run_id=1 AND key LIKE '%:fed'")
+    _set_mark(edited.db)
+    assert stored_run(edited.db).summary.status == "completed"
+    code, out, _ = verify(edited, capsys)
+    assert code == EXIT_UNVERIFIABLE, out
+    assert "a completed run cannot hold a provisional record" in out
+
+
+@pytest.mark.parametrize("name", ["killed-late-gap", "busy-finish"])
+def test_verify_failed_and_running_runs_with_the_mark_stay_verified_with_the_note(
+    sessions: dict[str, Session], capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    code, out, err = verify(sessions[name], capsys)
+    assert code == EXIT_VERIFIED, out + err
+    assert "gap rule not compared: stored counts are provisional" in out
