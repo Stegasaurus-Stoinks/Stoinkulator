@@ -41,6 +41,30 @@ Definitions the caller must follow:
 - Quantities are whole positive numbers. Symbols are normalised (strip, upper-case); a state
   key or an allowed symbol that would change under normalisation is a configuration error.
 
+Contract for the callers (the real broker, issues 238 and 242):
+
+- A REPLACEMENT is sent under the same broker order id as the working order it names
+  (`replaces_order`); the guard checks that name against `working_exits` (same symbol, same
+  side, a stop or target, same kind). In IB a placeOrder with an unknown id is a NEW order.
+- Replacement is "strictly reducing risk" for STOPS only. A target replacement over the rate is
+  refused (targets are never urgent).
+- `parent_ref` (bracket child) is refused when the symbol already holds a position, and the
+  pending quantity of the parent must be the full REMAINING entry: reduce `PendingEntry.quantity`
+  as the entry fills (or drop the entry once filled).
+- An OCA group belongs to one symbol; a state with a group spanning symbols is a configuration
+  error and an intent joining another symbol's group is refused.
+- Over the rate, cancels and risk-reducing protective orders have no ceiling BY DESIGN (they
+  must never be trapped). The caller MUST treat `Decision.rate_exceeded` as "protect, then end
+  the session" (issue 238), or a runaway loop is unbounded.
+- A cancel needs only a valid `order_ref` and is allowed whatever the state or the time look
+  like. An EXIT depends only on its own symbol's position and working exits plus the kill
+  switch: malformed unrelated state does not refuse it, but is reported in
+  `Decision.state_errors` and latches `stop_entries`. Entries and protective orders are fully
+  fail-closed. An EXIT may not carry `oca_group`, `replaces_order` or `parent_ref`.
+- A session is one New York trading day. After a restart on the same day seed `SentLog` with
+  that day's order count, message times and engaged latch (`KillSwitch` takes `seeded_latch`
+  and never un-engages).
+
 Times are naive New York wall-clock times (the repository convention); an aware time is
 converted to New York time.
 
@@ -57,6 +81,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -67,7 +92,7 @@ KILL_FILE_NAME = "STOP-ORDERS"
 
 #: Recommended values for the first order sessions (decision O2). The run configuration may use
 #: them; it must add `allowed_symbols`, which has no default. Every value is required.
-FIRST_SESSION_LIMITS: Mapping[str, Any] = {
+FIRST_SESSION_LIMITS: Mapping[str, Any] = MappingProxyType({
     "max_quantity": 10,  # FunctionTest hard-codes 10 shares
     "max_notional": 6000.0,  # USD per order
     "max_open_positions": 1,
@@ -76,7 +101,7 @@ FIRST_SESSION_LIMITS: Mapping[str, Any] = {
     "allowed_entry_sides": ("long",),  # no shorts before session C5 (decision O13)
     "entry_start": "09:35",
     "entry_end": "15:45",  # no new entries from this time on (decisions O3, O4)
-}
+})
 
 #: Hard caps of the kill switch (decision O2). They can be lowered, never raised.
 KILL_MAX_SESSION_ORDERS = 60
@@ -102,6 +127,12 @@ class KillLevel(Enum):
     FLATTEN = "flatten"  # stop entries and the caller flattens
 
 
+class ExitKind(Enum):
+    PLAIN = "plain"  # an exit order (market or limit) that is not a stop or target
+    STOP = "stop"
+    TARGET = "target"
+
+
 _RANK = {None: 0, KillLevel.STOP_ENTRIES: 1, KillLevel.FLATTEN: 2}
 
 
@@ -110,6 +141,7 @@ class Decision:
     allowed: bool
     reason: str
     rate_exceeded: bool = False
+    state_errors: tuple[str, ...] = ()
 
 
 def normalise_symbol(symbol: str) -> str:
@@ -140,6 +172,8 @@ class OrderIntent:
     replaces_order: str = ""
     old_price: float | None = None
     new_price: float | None = None
+    protective_kind: ExitKind = ExitKind.STOP  # STOP or TARGET, for PROTECTIVE intents
+    order_ref: str = ""  # the order a CANCEL cancels
 
 
 @dataclass(frozen=True)
@@ -150,6 +184,8 @@ class WorkingExit:
     symbol: str
     quantity: float
     oca_group: str = ""
+    kind: ExitKind = ExitKind.PLAIN
+    side: str = ""  # "buy" or "sell"
 
 
 @dataclass(frozen=True)
@@ -167,6 +203,7 @@ class SentView:
     message_times: tuple[datetime, ...] = ()
     entries_today: int = 0
     session_orders: int = 0
+    latch: KillLevel | None = None  # engaged latch carried over (seeded) from `SentLog`
 
 
 @dataclass(frozen=True)
@@ -377,6 +414,7 @@ class KillSwitch(_Frozen):
         *,
         max_session_orders: int = KILL_MAX_SESSION_ORDERS,
         max_session_loss: float = KILL_MAX_SESSION_LOSS,
+        seeded_latch: KillLevel | None = None,
     ) -> None:
         if not callable(file_check):
             raise LimitsConfigError("the kill switch needs a file check")
@@ -388,6 +426,10 @@ class KillSwitch(_Frozen):
         if self.max_session_loss > KILL_MAX_SESSION_LOSS:
             raise LimitsConfigError(f"max_session_loss may not exceed {KILL_MAX_SESSION_LOSS:g}")
         self._latch: dict[str, Any] = {"level": None, "why": ""}
+        if seeded_latch is not None:
+            if not isinstance(seeded_latch, KillLevel):
+                raise LimitsConfigError("a seeded latch must be a KillLevel or None")
+            self.engage(seeded_latch, "latch carried over from earlier today")
         self._seal()
 
     @classmethod
@@ -401,9 +443,20 @@ class KillSwitch(_Frozen):
             self._latch["level"] = level
             self._latch["why"] = why
 
+    @property
+    def latched(self) -> KillLevel | None:
+        """The latched level (the file is not part of it); persist it with `SentLog`."""
+        return self._latch["level"]  # type: ignore[no-any-return]
+
     def level(self, state: OrderState) -> tuple[KillLevel | None, str]:
         """The engaged level (None when not engaged) and why."""
         try:
+            carried = state.sent.latch
+            if carried is not None:
+                if isinstance(carried, KillLevel):
+                    self.engage(carried, "latch carried over from earlier today")
+                else:
+                    self.engage(KillLevel.STOP_ENTRIES, "carried latch unreadable")
             pnl = state.session_pnl
             if _bad_number(pnl) or pnl <= -self.max_session_loss:
                 self.engage(
@@ -444,30 +497,70 @@ def _new_york_naive(now: datetime) -> datetime:
 
 
 class SentLog:
-    """Owns what was really sent: message times, entries per day, session order count.
+    """Owns what was really sent: message times, entries per day, session order count, latch.
 
     The broker calls `record_sent` once per message it actually sends; the guard only reads
-    `view`. A refused order is never recorded, so it consumes nothing. The latches live in the
-    `KillSwitch` (same lifetime as the guard).
+    `view`. A refused order is never recorded, so it consumes nothing. A session is one New York
+    trading day: after a restart build the log with that day's session order count, message
+    times and latch (`KillSwitch.latched` is what to persist; `note_latch` copies it here), so
+    the 60-order cap and an engaged latch survive. It has no public mutable attributes.
     """
 
+    __slots__ = ("_entries", "_latch", "_orders", "_times")
     _KEEP = timedelta(minutes=2)
 
-    def __init__(self, earlier_entry_times: Iterable[datetime] = ()) -> None:
+    def __init__(
+        self,
+        earlier_entry_times: Iterable[datetime] = (),
+        *,
+        session_orders: int = 0,
+        message_times: Iterable[datetime] = (),
+        latch: KillLevel | None = None,
+    ) -> None:
         """`earlier_entry_times`: entries this program already sent (any day; used for today)."""
+        if isinstance(session_orders, bool) or not isinstance(session_orders, int) or (
+            session_orders < 0
+        ):
+            raise LimitsConfigError("seeded session_orders must be a non-negative integer")
+        if latch is not None and not isinstance(latch, KillLevel):
+            raise LimitsConfigError("a seeded latch must be a KillLevel or None")
         self._times: list[datetime] = []
         self._entries: dict[date, int] = {}
-        self._orders = 0
-        for t in earlier_entry_times:
-            day = _new_york_naive(t).date()
-            self._entries[day] = self._entries.get(day, 0) + 1
+        self._orders = session_orders
+        self._latch = latch
+        try:
+            for t in message_times:
+                self._times.append(_new_york_naive(t))
+            for t in earlier_entry_times:
+                day = _new_york_naive(t).date()
+                self._entries[day] = self._entries.get(day, 0) + 1
+        except (AttributeError, TypeError) as exc:
+            raise LimitsConfigError("seeded times must be datetimes") from exc
+
+    @property
+    def latch(self) -> KillLevel | None:
+        return self._latch
+
+    def note_latch(self, level: KillLevel | None) -> None:
+        """Keep the strongest latch seen (never lowers)."""
+        if level is not None and _RANK[level] > _RANK[self._latch]:
+            self._latch = level
 
     def record_sent(self, intent: OrderIntent, now: datetime) -> None:
-        local = _new_york_naive(now)
+        """Count one message really sent. It always counts: with an unusable `now` it uses the
+        latest known time and latches `stop_entries`."""
+        self._orders += 1
+        try:
+            local: datetime | None = _new_york_naive(now)
+            local - timedelta(0)  # type: ignore[operator]  # raises for anything but a datetime
+        except Exception:  # noqa: BLE001 - count first, then latch
+            local = max(self._times) if self._times else None
+            self.note_latch(KillLevel.STOP_ENTRIES)
+        if local is None:
+            return
         self._times = [t for t in self._times if local - t < self._KEEP]
         self._times.append(local)
-        self._orders += 1
-        if intent.kind is IntentKind.ENTRY:
+        if getattr(intent, "kind", None) is IntentKind.ENTRY:
             day = local.date()
             self._entries[day] = self._entries.get(day, 0) + 1
 
@@ -477,11 +570,12 @@ class SentLog:
             message_times=tuple(self._times),
             entries_today=self._entries.get(local.date(), 0),
             session_orders=self._orders,
+            latch=self._latch,
         )
 
 
-def _refuse(reason: str, rate: bool = False) -> Decision:
-    return Decision(False, reason, rate)
+def _refuse(reason: str, rate: bool = False, errors: tuple[str, ...] = ()) -> Decision:
+    return Decision(False, reason, rate, errors)
 
 
 class OrderGuard(_Frozen):
@@ -514,28 +608,61 @@ class OrderGuard(_Frozen):
     def _check(self, intent: OrderIntent, state: OrderState, now: datetime) -> Decision:
         if not isinstance(intent, OrderIntent) or not isinstance(intent.kind, IntentKind):
             return _refuse("malformed intent")
+        if intent.kind is IntentKind.CANCEL:
+            return self._check_cancel(intent, state, now)
         if not isinstance(intent.symbol, str) or not normalise_symbol(intent.symbol):
             return _refuse("malformed intent: no symbol")
         symbol = normalise_symbol(intent.symbol)
-        if not isinstance(state, OrderState):
-            return _refuse("malformed state")
-        local = _new_york_naive(now)
-        over = self._rate_exceeded(state, local)
+        errors: list[str] = []
+        lenient = intent.kind is IntentKind.EXIT
+        over = self._rate(state, now, errors, lenient)
         if over:
             self.kill_switch.engage(KillLevel.STOP_ENTRIES, over)
-        self.kill_switch.level(state)  # latches the hard caps on every message
-        if intent.kind is IntentKind.CANCEL:
-            return Decision(True, "ok", bool(over))
+        self._level(state, errors, lenient)
+        flag = bool(over)
         if intent.side not in ("buy", "sell"):
-            return _refuse(f"malformed intent: side {intent.side!r}", bool(over))
+            return _refuse(f"malformed intent: side {intent.side!r}", flag, tuple(errors))
         if not _whole_positive(intent.quantity):
-            return _refuse(f"malformed intent: quantity {intent.quantity!r}", bool(over))
+            return _refuse(f"malformed intent: quantity {intent.quantity!r}", flag, tuple(errors))
         if intent.kind is IntentKind.ENTRY:
-            return self._check_entry(intent, symbol, state, local, bool(over))
-        return self._check_reducing(intent, symbol, state, bool(over))
+            return self._check_entry(intent, symbol, state, _new_york_naive(now), flag)
+        return self._check_reducing(intent, symbol, state, flag, errors, lenient)
+
+    def _check_cancel(self, intent: OrderIntent, state: object, now: object) -> Decision:
+        """A cancel needs only a valid order ref; nothing else can refuse it."""
+        ref = intent.order_ref
+        if not isinstance(ref, str) or not ref.strip():
+            return _refuse("a cancel needs an order ref")
+        errors: list[str] = []
+        over = self._rate(state, now, errors, True)  # type: ignore[arg-type]
+        if over:
+            self.kill_switch.engage(KillLevel.STOP_ENTRIES, over)
+        self._level(state, errors, True)  # type: ignore[arg-type]
+        return Decision(True, "ok", bool(over), tuple(errors))
+
+    def _level(self, state: OrderState, errors: list[str], lenient: bool) -> None:
+        """Latch the hard caps; unreadable state is reported (and fails closed unless lenient)."""
+        try:
+            self.kill_switch.level(state)
+        except Exception as exc:  # noqa: BLE001
+            if not lenient:
+                raise
+            errors.append(f"kill switch state unreadable ({type(exc).__name__})")
+        if errors:
+            self.kill_switch.engage(KillLevel.STOP_ENTRIES, "malformed state: " + errors[0])
+
+    def _rate(self, state: OrderState, now: datetime, errors: list[str], lenient: bool) -> str:
+        """Why the message rate is over (empty when it is not). When the data is unreadable:
+        raise (fail closed) or, for exits and cancels, count it as over and report it."""
+        try:
+            return self._rate_exceeded(state, _new_york_naive(now))
+        except Exception as exc:  # noqa: BLE001
+            if not lenient:
+                raise
+            errors.append(f"rate data unreadable ({type(exc).__name__})")
+            return "order rate data unreadable"
 
     def _rate_exceeded(self, state: OrderState, local: datetime) -> str:
-        """Why the message rate is over (empty when it is not)."""
         limit = self.limits.max_messages_per_minute
         window = timedelta(seconds=60)
         # a message stamped in the future still counts: fail closed
@@ -543,96 +670,210 @@ class OrderGuard(_Frozen):
         if recent >= limit:
             return f"{recent} order messages in the last minute, the maximum is {limit}"
         count = state.sent.session_orders
-        if isinstance(count, int) and not isinstance(count, bool) and (
-            count >= self.kill_switch.max_session_orders
+        if (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= self.kill_switch.max_session_orders
         ):
             return f"session order cap of {self.kill_switch.max_session_orders} reached"
         return ""
 
-    def _normalised(self, state: OrderState) -> tuple[dict[str, float], dict[str, PendingEntry]]:
+    @staticmethod
+    def _valid_symbol_key(key: object) -> str:
+        if not isinstance(key, str) or not key or normalise_symbol(key) != key:
+            raise LimitsConfigError(f"state symbol {key!r} is not normalised")
+        return key
+
+    def _normalised(
+        self, state: OrderState
+    ) -> tuple[dict[str, float], dict[str, PendingEntry], list[WorkingExit]]:
+        """Strict reading of the whole state: anything odd is a configuration error."""
         positions: dict[str, float] = {}
         for key, qty in state.open_positions.items():
-            if not isinstance(key, str) or normalise_symbol(key) != key or not key:
-                raise LimitsConfigError(f"state symbol {key!r} is not normalised")
-            positions[key] = qty
+            positions[self._valid_symbol_key(key)] = qty
         pendings: dict[str, PendingEntry] = {}
         for ref, entry in state.pending_entries.items():
-            if not isinstance(entry, PendingEntry) or not isinstance(entry.symbol, str):
+            if not isinstance(entry, PendingEntry):
                 raise LimitsConfigError("pending entry is malformed")
-            if normalise_symbol(entry.symbol) != entry.symbol or not entry.symbol:
-                raise LimitsConfigError(f"state symbol {entry.symbol!r} is not normalised")
+            self._valid_symbol_key(entry.symbol)
             pendings[ref] = entry
-        return positions, pendings
+        exits = [self._valid_exit(w) for w in state.working_exits]
+        groups: dict[str, set[str]] = {}
+        for w in exits:
+            if w.oca_group:
+                groups.setdefault(w.oca_group, set()).add(w.symbol)
+        if any(len(symbols) > 1 for symbols in groups.values()):
+            raise LimitsConfigError("an OCA group spans more than one symbol")
+        return positions, pendings, exits
+
+    def _valid_exit(self, w: object) -> WorkingExit:
+        if not isinstance(w, WorkingExit) or not isinstance(w.kind, ExitKind):
+            raise LimitsConfigError("working exit is malformed")
+        self._valid_symbol_key(w.symbol)
+        if _bad_number(w.quantity) or w.quantity <= 0:
+            raise LimitsConfigError("working exit quantity unreadable")
+        return w
+
+    def _lenient_view(
+        self, state: OrderState, symbol: str, errors: list[str]
+    ) -> tuple[float, list[WorkingExit]]:
+        """An exit's view of the state: its own symbol's position and working exits. Problems
+        in other symbols' entries are reported, not fatal; problems in its own refuse."""
+        held = 0.0
+        for key, qty in state.open_positions.items():
+            try:
+                self._valid_symbol_key(key)
+            except LimitsConfigError:
+                if isinstance(key, str) and normalise_symbol(key) == symbol:
+                    raise
+                errors.append(f"state key {key!r} is not normalised")
+                continue
+            if key == symbol:
+                held = qty
+        own: list[WorkingExit] = []
+        for w in state.working_exits:
+            try:
+                valid = self._valid_exit(w)
+            except LimitsConfigError:
+                name = getattr(w, "symbol", None)
+                if isinstance(name, str) and normalise_symbol(name) == symbol:
+                    raise
+                errors.append("a working exit of another symbol is malformed")
+                continue
+            if valid.symbol == symbol:
+                own.append(valid)
+        return held, own
 
     def _check_reducing(
-        self, intent: OrderIntent, symbol: str, state: OrderState, over: bool
+        self,
+        intent: OrderIntent,
+        symbol: str,
+        state: OrderState,
+        over: bool,
+        errors: list[str],
+        lenient: bool,
     ) -> Decision:
         """Exits and protective orders: never blocked by limits or the kill switch, but they
-        must neither flip the position nor exceed it, and past the rate a replacement must
+        must neither flip the position nor exceed it, and past the rate a stop replacement must
         strictly reduce risk."""
-        positions, pendings = self._normalised(state)
-        held = positions.get(symbol, 0.0)
+        exit_ = intent.kind is IntentKind.EXIT
+        pendings: dict[str, PendingEntry] = {}
+        if lenient:
+            held, own = self._lenient_view(state, symbol, errors)
+            everyone = own
+            if errors:
+                self.kill_switch.engage(KillLevel.STOP_ENTRIES, "malformed state: " + errors[0])
+        else:
+            positions, pendings, everyone = self._normalised(state)
+            held = positions.get(symbol, 0.0)
+            own = [w for w in everyone if w.symbol == symbol]
+        err = tuple(errors)
+        if exit_ and (intent.oca_group or intent.replaces_order or intent.parent_ref):
+            return _refuse("an exit may not carry an OCA group, a replacement or a parent", over, err)
         if _bad_number(held):
-            return _refuse("position state unreadable", over)
+            return _refuse("position state unreadable", over, err)
         net = held
-        if intent.kind is IntentKind.PROTECTIVE and intent.parent_ref:
-            parent = pendings.get(intent.parent_ref)
-            if parent is None or parent.symbol != symbol or _bad_number(parent.quantity):
-                return _refuse("the named parent entry is not pending for this symbol", over)
-            if parent.quantity == 0 or (held != 0 and (held > 0) != (parent.quantity > 0)):
-                return _refuse("parent entry conflicts with the open position", over)
-            net = held + parent.quantity
+        if not exit_:
+            refusal = self._protective_refusal(intent, symbol, held, pendings, everyone)
+            if refusal is not None:
+                return _refuse(refusal, over, err)
+            if intent.parent_ref:
+                net = pendings[intent.parent_ref].quantity
         if net == 0:
-            return _refuse("no open position to reduce: would open a position", over)
+            return _refuse("no open position to reduce: would open a position", over, err)
         reduces_with = "sell" if net > 0 else "buy"
         if intent.side != reduces_with:
-            return _refuse("wrong direction: would add to or flip the position", over)
-        in_flight = self._in_flight(intent, symbol, state)
+            return _refuse("wrong direction: would add to or flip the position", over, err)
+        in_flight = self._in_flight(intent, own)
         available = abs(net) - in_flight
         if intent.quantity > available:
             return _refuse(
                 f"order of {intent.quantity:g} exceeds the position {abs(net):g} "
                 f"minus {in_flight:g} in flight",
                 over,
+                err,
             )
-        if intent.kind is IntentKind.PROTECTIVE and intent.replaces_order:
+        if not exit_ and intent.replaces_order:
             reducing = self._replacement_reduces_risk(intent, net)
             if reducing is None:
-                return _refuse("replacement needs old_price and new_price", over)
+                return _refuse("replacement needs old_price and new_price", over, err)
             if over and not reducing:
-                return _refuse("order rate exceeded and the replacement does not reduce risk", True)
-        return Decision(True, "ok", over)
+                return _refuse(
+                    "order rate exceeded and the replacement does not reduce risk", True, err
+                )
+        return Decision(True, "ok", over, err)
 
     @staticmethod
-    def _in_flight(intent: OrderIntent, symbol: str, state: OrderState) -> float:
+    def _protective_refusal(
+        intent: OrderIntent,
+        symbol: str,
+        held: float,
+        pendings: dict[str, PendingEntry],
+        everyone: list[WorkingExit],
+    ) -> str | None:
+        """Why a protective intent is malformed for this state, or None."""
+        if intent.protective_kind not in (ExitKind.STOP, ExitKind.TARGET):
+            return "a protective order is a stop or a target"
+        if intent.parent_ref:
+            if held != 0:
+                return (
+                    "a bracket child is only sent with its entry: the symbol already holds "
+                    "a position"
+                )
+            parent = pendings.get(intent.parent_ref)
+            if parent is None or parent.symbol != symbol or _bad_number(parent.quantity):
+                return "the named parent entry is not pending for this symbol"
+            if parent.quantity == 0:
+                return "the parent entry has nothing pending"
+        if intent.oca_group and any(
+            w.oca_group == intent.oca_group and w.symbol != symbol for w in everyone
+        ):
+            return "the OCA group belongs to another symbol"
+        if intent.replaces_order:
+            target = next((w for w in everyone if w.order_id == intent.replaces_order), None)
+            if (
+                target is None
+                or target.symbol != symbol
+                or target.kind not in (ExitKind.STOP, ExitKind.TARGET)
+                or target.kind is not intent.protective_kind
+                or target.side != intent.side
+            ):
+                return (
+                    "replaces_order must name a working stop or target of this symbol, "
+                    "same side and kind"
+                )
+        return None
+
+    @staticmethod
+    def _in_flight(intent: OrderIntent, own: list[WorkingExit]) -> float:
+        """Reducing quantity already working for the symbol: plain orders in full, one OCA
+        group once (its largest leg). Only a protective intent leaves out the order it
+        replaces and its own OCA group."""
+        protective = intent.kind is IntentKind.PROTECTIVE
         plain = 0.0
         groups: dict[str, float] = {}
-        for working in state.working_exits:
-            if not isinstance(working, WorkingExit) or not isinstance(working.symbol, str):
-                raise LimitsConfigError("working exit is malformed")
-            if normalise_symbol(working.symbol) != working.symbol:
-                raise LimitsConfigError(f"state symbol {working.symbol!r} is not normalised")
-            if working.symbol != symbol:
+        for w in own:
+            if protective and intent.replaces_order and w.order_id == intent.replaces_order:
                 continue
-            if _bad_number(working.quantity) or working.quantity <= 0:
-                raise LimitsConfigError("working exit quantity unreadable")
-            if intent.replaces_order and working.order_id == intent.replaces_order:
+            if protective and intent.oca_group and w.oca_group == intent.oca_group:
                 continue
-            if intent.oca_group and working.oca_group == intent.oca_group:
-                continue
-            if working.oca_group:
-                groups[working.oca_group] = max(groups.get(working.oca_group, 0.0), working.quantity)
+            if w.oca_group:
+                groups[w.oca_group] = max(groups.get(w.oca_group, 0.0), w.quantity)
             else:
-                plain += working.quantity
+                plain += w.quantity
         return plain + sum(groups.values())
 
     @staticmethod
     def _replacement_reduces_risk(intent: OrderIntent, net: float) -> bool | None:
+        """Stops only: True when the stop does not move away from the price and covers the
+        position; None when prices are missing; a target replacement never reduces risk."""
         old, new = intent.old_price, intent.new_price
         if old is None or new is None or _bad_number(old) or _bad_number(new):
             return None
         if old <= 0 or new <= 0:
             return None
+        if intent.protective_kind is not ExitKind.STOP:
+            return False
         away = new < old if intent.side == "sell" else new > old
         return not away and intent.quantity >= abs(net)
 
@@ -659,7 +900,7 @@ class OrderGuard(_Frozen):
         notional = intent.quantity * intent.price
         if notional > lim.max_notional:
             return _refuse(f"notional {notional:.2f} exceeds the maximum {lim.max_notional:g}")
-        positions, pendings = self._normalised(state)
+        positions, pendings, _exits = self._normalised(state)
         held = positions.get(symbol, 0.0)
         if _bad_number(held):
             return _refuse("position state unreadable")

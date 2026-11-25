@@ -11,6 +11,7 @@ from MainStoinker.engine.order_limits import (
     FIRST_SESSION_LIMITS,
     KILL_FILE_NAME,
     Decision,
+    ExitKind,
     IntentKind,
     KillLevel,
     KillSwitch,
@@ -56,6 +57,15 @@ def entry(symbol: str = "AAPL", side: str = "buy", qty: float = 10, price: float
 
 def exit_(qty: float, side: str = "sell", symbol: str = "AAPL") -> OrderIntent:
     return OrderIntent(IntentKind.EXIT, symbol, side, qty)
+
+
+def cancel(ref: str = "o1") -> OrderIntent:
+    return OrderIntent(IntentKind.CANCEL, "AAPL", order_ref=ref)
+
+
+def stop(order_id: str = "s1", qty: float = 10, oca: str = "", symbol: str = "AAPL",
+         side: str = "sell") -> WorkingExit:
+    return WorkingExit(order_id, symbol, qty, oca, ExitKind.STOP, side)
 
 
 def prot(qty: float = 10, side: str = "sell", **kw: object) -> OrderIntent:
@@ -202,7 +212,7 @@ def test_risk_reducing_always_allowed_even_when_killed() -> None:
     assert not engaged.check(entry("MSFT"), state, late).allowed
     assert engaged.check(exit_(10), state, late).allowed
     assert engaged.check(prot(10), state, late).allowed
-    assert engaged.check(OrderIntent(IntentKind.CANCEL, "AAPL"), state, late).allowed
+    assert engaged.check(cancel(), state, late).allowed
     short = OrderState(open_positions={"AAPL": -4})
     assert engaged.check(exit_(4, side="buy"), short, late).allowed
 
@@ -254,10 +264,11 @@ def test_protective_counts_against_exits_in_flight() -> None:
     assert g.check(prot(10, oca_group="oca1"), bracket, NOON).allowed  # joins its own group
     # a replacement leaves out the order it replaces
     replace = prot(10, replaces_order="s1", old_price=95.0, new_price=96.0)
+    one_stop = OrderState(working_exits=(stop("s1", 10),), **held)
     assert g.check(replace, one_stop, NOON).allowed
     # ... but not another working order
     mixed = OrderState(
-        working_exits=(WorkingExit("s1", "AAPL", 10), WorkingExit("x", "AAPL", 4)), **held
+        working_exits=(stop("s1", 10), WorkingExit("x", "AAPL", 4)), **held
     )
     assert not g.check(replace, mixed, NOON).allowed
 
@@ -292,13 +303,13 @@ def test_every_message_counts_toward_the_rate_and_latches_stop_entries() -> None
     assert d.allowed and d.rate_exceeded
     assert g.kill_level(OrderState()) is KillLevel.STOP_ENTRIES  # latched, state is quiet now
     assert not g.check(entry("MSFT"), OrderState(), NOON).allowed
-    assert g.check(OrderIntent(IntentKind.CANCEL, "AAPL"), state, NOON).rate_exceeded
+    assert g.check(cancel(), state, NOON).rate_exceeded
     assert g.check(prot(10), state, NOON).rate_exceeded
     assert not guard().check(exit_(10), st(open_positions=LONG10, times=msgs(5)), NOON).rate_exceeded
 
 
 def test_replacement_that_does_not_reduce_risk_is_refused_over_the_rate() -> None:
-    state = st(open_positions=LONG10, times=msgs(6))
+    state = st(open_positions=LONG10, times=msgs(6), working_exits=(stop(),))
     tighter = prot(10, replaces_order="s1", old_price=95.0, new_price=96.0)
     assert guard().check(tighter, state, NOON).allowed
     wider = prot(10, replaces_order="s1", old_price=95.0, new_price=94.0)
@@ -306,15 +317,23 @@ def test_replacement_that_does_not_reduce_risk_is_refused_over_the_rate() -> Non
     smaller = prot(5, replaces_order="s1", old_price=95.0, new_price=96.0)
     assert not guard().check(smaller, state, NOON).allowed
     no_prices = prot(10, replaces_order="s1")
-    assert not guard().check(no_prices, st(open_positions=LONG10), NOON).allowed
+    assert not guard().check(
+        no_prices, st(open_positions=LONG10, working_exits=(stop(),)), NOON
+    ).allowed
     # a buy stop (short position) moves away when it goes up
-    short = st(open_positions={"AAPL": -10}, times=msgs(6))
+    short = st(
+        open_positions={"AAPL": -10},
+        times=msgs(6),
+        working_exits=(stop(side="buy"),),
+    )
     up = prot(10, side="buy", replaces_order="s1", old_price=105.0, new_price=106.0)
     down = prot(10, side="buy", replaces_order="s1", old_price=105.0, new_price=104.0)
     assert not guard().check(up, short, NOON).allowed
     assert guard().check(down, short, NOON).allowed
     # under the rate a wider replacement is allowed
-    assert guard().check(wider, st(open_positions=LONG10), NOON).allowed
+    assert guard().check(
+        wider, st(open_positions=LONG10, working_exits=(stop(),)), NOON
+    ).allowed
 
 
 def test_session_cap_counts_all_messages() -> None:
@@ -351,7 +370,7 @@ def test_sent_log_counts_what_is_recorded_only() -> None:
     g = guard()
     for i in range(3):
         now = datetime(2026, 11, 24, 12, 0, i)
-        intent = entry() if i < 2 else OrderIntent(IntentKind.CANCEL, "AAPL")
+        intent = entry() if i < 2 else cancel()
         assert g.check(intent, OrderState(sent=log.view(now)), now).allowed
         assert log.view(now).session_orders == i  # a check consumes nothing
         log.record_sent(intent, now)
@@ -558,4 +577,191 @@ def test_malformed_intent_and_state_refuse() -> None:
     assert not g.check(entry(), st(entries="3"), NOON).allowed  # type: ignore[arg-type]
     assert not g.check(entry(), OrderState(), "noon").allowed  # type: ignore[arg-type]
     assert not g.check(entry(), None, NOON).allowed  # type: ignore[arg-type]
-    assert g.check(OrderIntent(IntentKind.CANCEL, "AAPL"), OrderState(), NOON).allowed
+    assert g.check(cancel(), OrderState(), NOON).allowed
+
+
+# -- second review round ---------------------------------------------------------------------
+
+
+def test_exit_may_not_carry_oca_replacement_or_parent() -> None:
+    g = guard()
+    target = WorkingExit("t1", "AAPL", 10, "B1", ExitKind.TARGET, "sell")
+    bracket = OrderState(
+        open_positions=LONG10,
+        working_exits=(stop("s1", 10, "B1"), target),
+        pending_entries={"p1": PendingEntry("AAPL", 10)},
+    )
+    assert not g.check(exit_(10), bracket, NOON).allowed  # the group already covers 10
+    for extra in ({"oca_group": "B1"}, {"replaces_order": "s1"}, {"parent_ref": "p1"}):
+        intent = OrderIntent(IntentKind.EXIT, "AAPL", "sell", 10, **extra)  # type: ignore[arg-type]
+        d = g.check(intent, bracket, NOON)
+        assert not d.allowed and "may not carry" in d.reason
+
+
+def test_replacement_must_name_a_working_stop_or_target_of_the_same_symbol() -> None:
+    g = guard(max_open_positions=2)
+    base = {"open_positions": {"AAPL": 10, "MSFT": 10}}
+    plain = OrderState(working_exits=(WorkingExit("x", "AAPL", 10),), **base)
+    sized = {"old_price": 95.0, "new_price": 96.0, "replaces_order": "x"}
+    assert not g.check(prot(10, **sized), plain, NOON).allowed  # a plain exit is no stop
+    assert not g.check(prot(10, **{**sized, "replaces_order": "ghost"}), plain, NOON).allowed
+    other = OrderState(working_exits=(stop("s9", 10, symbol="MSFT"),), **base)
+    assert not g.check(prot(10, **{**sized, "replaces_order": "s9"}), other, NOON).allowed
+    ok = OrderState(working_exits=(stop("s1", 10),), **base)
+    assert g.check(prot(10, **{**sized, "replaces_order": "s1"}), ok, NOON).allowed
+    # a replacement keeps the kind and the side
+    as_target = prot(10, protective_kind=ExitKind.TARGET, **{**sized, "replaces_order": "s1"})
+    assert not g.check(as_target, ok, NOON).allowed
+    wrong_side = OrderState(working_exits=(stop("s1", 10, side="buy"),), **base)
+    assert not g.check(prot(10, **{**sized, "replaces_order": "s1"}), wrong_side, NOON).allowed
+
+
+def test_oca_group_is_per_symbol() -> None:
+    g = guard(max_open_positions=2)
+    base = {"open_positions": {"AAPL": 10, "MSFT": 10}}
+    state = OrderState(working_exits=(stop("m1", 10, "G", "MSFT"),), **base)
+    d = g.check(prot(10, oca_group="G"), state, NOON)
+    assert not d.allowed and "another symbol" in d.reason
+    assert g.check(prot(10, oca_group="H"), state, NOON).allowed
+    spanning = OrderState(
+        working_exits=(stop("m1", 10, "G", "MSFT"), stop("a1", 10, "G", "AAPL")), **base
+    )
+    d = g.check(prot(10), spanning, NOON)
+    assert not d.allowed and "configuration" in d.reason
+
+
+def test_bracket_child_refused_when_the_symbol_holds_a_position() -> None:
+    g = guard()
+    filled = OrderState(open_positions=LONG10, pending_entries={"p1": PendingEntry("AAPL", 10)})
+    d = g.check(prot(20, parent_ref="p1"), filled, NOON)
+    assert not d.allowed and "already holds" in d.reason
+    # held 10 against a pending short parent of -5: no child gets through either way
+    conflict = OrderState(open_positions=LONG10, pending_entries={"p1": PendingEntry("AAPL", -5)})
+    assert not g.check(prot(5, parent_ref="p1"), conflict, NOON).allowed
+    assert not g.check(prot(5, side="buy", parent_ref="p1"), conflict, NOON).allowed
+
+
+def test_target_replacement_over_the_rate_is_refused() -> None:
+    target = WorkingExit("t1", "AAPL", 10, "", ExitKind.TARGET, "sell")
+    state = st(open_positions=LONG10, times=msgs(6), working_exits=(target,))
+    for new in (105.0, 150.0):  # toward and away from the price
+        move = prot(
+            10, protective_kind=ExitKind.TARGET, replaces_order="t1", old_price=110.0, new_price=new
+        )
+        assert not guard().check(move, state, NOON).allowed
+    calm = st(open_positions=LONG10, working_exits=(target,))
+    far = prot(
+        10, protective_kind=ExitKind.TARGET, replaces_order="t1", old_price=110.0, new_price=150.0
+    )
+    assert guard().check(far, calm, NOON).allowed
+
+
+def test_cancel_needs_only_an_order_ref() -> None:
+    g = guard()
+    junk = OrderState(
+        open_positions={"msft": float("nan")},
+        sent=SentView(message_times=(None,)),  # type: ignore[arg-type]
+    )
+    d = g.check(cancel(), junk, None)  # type: ignore[arg-type]
+    assert d.allowed and d.state_errors
+    assert g.check(cancel(), None, "noon").allowed  # type: ignore[arg-type]
+    assert not g.check(OrderIntent(IntentKind.CANCEL, "AAPL"), OrderState(), NOON).allowed
+    assert not g.check(cancel(" "), OrderState(), NOON).allowed
+    assert g.kill_level(OrderState()) is KillLevel.STOP_ENTRIES  # the bad state latched
+
+
+def test_exit_depends_only_on_its_own_symbol_and_reports_the_rest() -> None:
+    base = {"open_positions": {"AAPL": 10, "msft": 0}}
+    g = guard()
+    d = g.check(exit_(10), OrderState(**base), NOON)
+    assert d.allowed and d.state_errors
+    assert g.kill_level(OrderState()) is KillLevel.STOP_ENTRIES
+    bad_exit = OrderState(
+        open_positions=LONG10, working_exits=(WorkingExit("x", "MSFT", float("nan")),)
+    )
+    d = guard().check(exit_(10), bad_exit, NOON)
+    assert d.allowed and d.state_errors
+    bad_times = st(open_positions=LONG10, times=(None,))  # type: ignore[arg-type]
+    d = guard().check(exit_(10), bad_times, NOON)
+    assert d.allowed and d.state_errors and d.rate_exceeded
+    # problems in its OWN symbol still refuse
+    own = OrderState(open_positions={"aapl": 10})
+    assert not guard().check(exit_(10), own, NOON).allowed
+    own_exit = OrderState(open_positions=LONG10, working_exits=(WorkingExit("x", "aapl", 1),))
+    assert not guard().check(exit_(10), own_exit, NOON).allowed
+    # entries and protective orders stay fully fail-closed
+    assert not guard().check(entry("MSFT"), OrderState(**base), NOON).allowed
+    assert not guard().check(prot(10), OrderState(**base), NOON).allowed
+    assert not guard().check(prot(10), bad_times, NOON).allowed
+
+
+def test_first_session_limits_is_read_only() -> None:
+    with pytest.raises(TypeError):
+        FIRST_SESSION_LIMITS["max_quantity"] = 1000  # type: ignore[index]
+
+
+def test_sent_log_has_no_public_mutable_attributes() -> None:
+    log = SentLog()
+    public = [n for n in dir(log) if not n.startswith("_")]
+    assert sorted(public) == ["latch", "note_latch", "record_sent", "view"]
+    with pytest.raises(AttributeError):
+        log.surprise = 1  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        log.latch = None  # type: ignore[misc]
+
+
+def test_sent_log_seeded_for_a_restart_on_the_same_day() -> None:
+    earlier = datetime(2026, 11, 24, 11, 59, 40)
+    log = SentLog([], session_orders=60, message_times=[earlier] * 3, latch=KillLevel.FLATTEN)
+    view = log.view(NOON)
+    assert (view.session_orders, len(view.message_times), view.latch) == (
+        60,
+        3,
+        KillLevel.FLATTEN,
+    )
+    g = guard()
+    assert not g.check(entry(), OrderState(sent=view), NOON).allowed
+    assert g.kill_level(OrderState()) is KillLevel.FLATTEN  # the carried latch engaged
+    log2 = SentLog(session_orders=59)
+    log2.record_sent(entry(), NOON)
+    assert log2.view(NOON).session_orders == 60
+    for bad in (-1, True, 1.5):
+        with pytest.raises(LimitsConfigError):
+            SentLog(session_orders=bad)  # type: ignore[arg-type]
+    with pytest.raises(LimitsConfigError):
+        SentLog(latch="flatten")  # type: ignore[arg-type]
+    with pytest.raises(LimitsConfigError):
+        SentLog(message_times=["noon"])  # type: ignore[list-item]
+
+
+def test_kill_switch_seeded_latch_never_unengages() -> None:
+    kill = KillSwitch(never_engaged, seeded_latch=KillLevel.STOP_ENTRIES)
+    assert kill.latched is KillLevel.STOP_ENTRIES
+    assert kill.level(OrderState())[0] is KillLevel.STOP_ENTRIES
+    kill.engage(KillLevel.FLATTEN, "x")
+    kill.engage(KillLevel.STOP_ENTRIES, "y")  # cannot lower
+    assert kill.level(OrderState())[0] is KillLevel.FLATTEN
+    assert KillSwitch(never_engaged, seeded_latch=None).level(OrderState())[0] is None
+    for bad in ("flatten", False, 0):
+        with pytest.raises(LimitsConfigError):
+            KillSwitch(never_engaged, seeded_latch=bad)  # type: ignore[arg-type]
+    # a view without the latch cannot clear one that is engaged
+    assert kill.level(OrderState(sent=SentView(latch=None)))[0] is KillLevel.FLATTEN
+
+
+def test_record_sent_always_counts() -> None:
+    log = SentLog()
+    log.record_sent(entry(), NOON)
+    log.record_sent(entry(), None)  # type: ignore[arg-type]
+    log.record_sent("junk", "noon")  # type: ignore[arg-type]
+    view = log.view(NOON)
+    assert view.session_orders == 3
+    assert view.latch is KillLevel.STOP_ENTRIES
+    assert view.entries_today == 1 + 1  # the second entry uses the latest known time
+    fresh = SentLog()
+    fresh.record_sent(entry(), None)  # type: ignore[arg-type]
+    assert fresh.view(NOON).session_orders == 1
+    assert fresh.view(NOON).latch is KillLevel.STOP_ENTRIES
+    log.note_latch(KillLevel.FLATTEN)
+    log.note_latch(KillLevel.STOP_ENTRIES)
+    assert log.latch is KillLevel.FLATTEN
