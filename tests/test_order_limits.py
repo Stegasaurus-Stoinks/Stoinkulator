@@ -19,6 +19,11 @@ from MainStoinker.engine.order_limits import (
     OrderIntent,
     OrderLimits,
     OrderState,
+    PendingEntry,
+    SentLog,
+    SentView,
+    WorkingExit,
+    decode_kill_text,
     default_kill_path,
     entries_sent_today,
     file_kill_check,
@@ -40,12 +45,28 @@ def guard(kill=never_engaged, **over: object) -> OrderGuard:
     return OrderGuard(limits(**over), KillSwitch(kill))
 
 
+def st(*, entries: int = 0, times: tuple = (), orders: int = 0, pnl: float = 0.0, **kw) -> OrderState:
+    sent = SentView(message_times=times, entries_today=entries, session_orders=orders)
+    return OrderState(sent=sent, session_pnl=pnl, **kw)
+
+
 def entry(symbol: str = "AAPL", side: str = "buy", qty: float = 10, price: float = 100.0):
     return OrderIntent(IntentKind.ENTRY, symbol, side, qty, price)
 
 
 def exit_(qty: float, side: str = "sell", symbol: str = "AAPL") -> OrderIntent:
     return OrderIntent(IntentKind.EXIT, symbol, side, qty)
+
+
+def prot(qty: float = 10, side: str = "sell", **kw: object) -> OrderIntent:
+    return OrderIntent(IntentKind.PROTECTIVE, "AAPL", side, qty, **kw)  # type: ignore[arg-type]
+
+
+LONG10 = {"AAPL": 10}
+
+
+def msgs(n: int, second: int = 30) -> tuple[datetime, ...]:
+    return tuple(datetime(2026, 11, 24, 11, 59, second) for _ in range(n))
 
 
 def test_refuses_nothing_when_all_is_in_order() -> None:
@@ -76,28 +97,27 @@ def test_refuses_max_open_positions() -> None:
     held = OrderState(open_positions={"MSFT": 10})
     d = g.check(entry("AAPL"), held, NOON)
     assert not d.allowed and "open position" in d.reason
-    pending = OrderState(pending_entries={"MSFT": 10})
+    pending = OrderState(pending_entries={"r1": PendingEntry("MSFT", 10)})
     assert not g.check(entry("AAPL"), pending, NOON).allowed
     assert guard(max_open_positions=2).check(entry("AAPL"), held, NOON).allowed
 
 
 def test_refuses_max_entries_per_day() -> None:
     g = guard()
-    assert g.check(entry(), OrderState(entries_today=19), NOON).allowed
-    d = g.check(entry(), OrderState(entries_today=20), NOON)
+    assert g.check(entry(), st(entries=19), NOON).allowed
+    d = g.check(entry(), st(entries=20), NOON)
     assert not d.allowed and "daily" in d.reason
 
 
 def test_refuses_max_messages_per_minute() -> None:
+    assert guard().check(entry(), st(times=msgs(5)), NOON).allowed
     g = guard()
-    sent = tuple(datetime(2026, 11, 24, 11, 59, 10 + i) for i in range(6))
-    assert g.check(entry(), OrderState(message_times=sent[:5]), NOON).allowed
-    d = g.check(entry(), OrderState(message_times=sent), NOON)
-    assert not d.allowed and "minute" in d.reason
-    old = tuple(datetime(2026, 11, 24, 11, 58, 59) for _ in range(9))
-    assert g.check(entry(), OrderState(message_times=old), NOON).allowed
+    d = g.check(entry(), st(times=msgs(6)), NOON)
+    assert not d.allowed and "minute" in d.reason and d.rate_exceeded
+    # messages a minute old drop out; future ones count
+    assert guard().check(entry(), st(times=msgs(9, second=0)), NOON).allowed
     future = tuple(datetime(2026, 11, 24, 12, 0, 30) for _ in range(6))
-    assert not g.check(entry(), OrderState(message_times=future), NOON).allowed
+    assert not guard().check(entry(), st(times=future), NOON).allowed
 
 
 def test_refuses_symbol_not_allowed() -> None:
@@ -106,10 +126,9 @@ def test_refuses_symbol_not_allowed() -> None:
 
 
 def test_refuses_entry_side_not_allowed() -> None:
-    assert guard(allowed_entry_sides=["short"]).check(entry(), OrderState(), NOON).allowed is False
-    assert guard(allowed_entry_sides=["short"]).check(
-        entry(side="sell"), OrderState(), NOON
-    ).allowed
+    short_only = guard(allowed_entry_sides=["short"])
+    assert not short_only.check(entry(), OrderState(), NOON).allowed
+    assert short_only.check(entry(side="sell"), OrderState(), NOON).allowed
 
 
 def test_shorts_refused_by_default_limits() -> None:
@@ -150,62 +169,200 @@ def test_refuses_entry_that_would_flip_or_double_up() -> None:
     assert not again.allowed and "already open" in again.reason
 
 
+def test_refuses_second_entry_on_a_pending_symbol() -> None:
+    g = guard(max_open_positions=3)
+    pending = OrderState(pending_entries={"r1": PendingEntry("AAPL", 10)})
+    d = g.check(entry("AAPL"), pending, NOON)
+    assert not d.allowed and "pending" in d.reason
+    assert g.check(entry("MSFT"), pending, NOON).allowed
+
+
+def test_symbols_are_normalised_everywhere() -> None:
+    g = guard(max_open_positions=3)
+    assert g.check(entry(" aapl "), OrderState(), NOON).allowed
+    # an unnormalised state key or allowed symbol is a configuration error, never accepted
+    assert not g.check(entry("AAPL"), OrderState(open_positions={"aapl": 10}), NOON).allowed
+    bad = OrderState(pending_entries={"r": PendingEntry("aapl", 10)})
+    assert "configuration" in g.check(entry("AAPL"), bad, NOON).reason
+    for name in (" AAPL ", "aapl"):
+        with pytest.raises(LimitsConfigError):
+            limits(allowed_symbols=[name])
+
+
 def test_risk_reducing_always_allowed_even_when_killed() -> None:
     engaged = guard(kill=lambda: KillLevel.FLATTEN)
-    state = OrderState(
-        open_positions={"AAPL": 10},
-        entries_today=99,
-        session_orders=999,
-        session_pnl=-10_000.0,
-        message_times=tuple(datetime(2026, 11, 24, 11, 59, 59) for _ in range(50)),
+    state = st(
+        open_positions=LONG10,
+        entries=99,
+        orders=999,
+        pnl=-10_000.0,
+        times=msgs(5),
     )
     late = datetime(2026, 11, 24, 23, 0)
     assert not engaged.check(entry("MSFT"), state, late).allowed
     assert engaged.check(exit_(10), state, late).allowed
-    assert engaged.check(OrderIntent(IntentKind.PROTECTIVE, "AAPL", "sell", 10), state, late).allowed
+    assert engaged.check(prot(10), state, late).allowed
     assert engaged.check(OrderIntent(IntentKind.CANCEL, "AAPL"), state, late).allowed
-    # a protective order may go out with an entry that is not filled yet
-    pending = OrderState(pending_entries={"AAPL": 10})
-    assert engaged.check(
-        OrderIntent(IntentKind.PROTECTIVE, "AAPL", "sell", 10), pending, late
-    ).allowed
-    # a short position is reduced with a buy
     short = OrderState(open_positions={"AAPL": -4})
     assert engaged.check(exit_(4, side="buy"), short, late).allowed
 
 
 def test_no_flip_no_oversized_exit() -> None:
     g = guard()
-    long_ = OrderState(open_positions={"AAPL": 10})
+    long_ = OrderState(open_positions=LONG10)
     assert g.check(exit_(10), long_, NOON).allowed
     over = g.check(exit_(11), long_, NOON)
     assert not over.allowed and "exceeds" in over.reason
-    # exits in flight reduce what may still be sent
-    busy = OrderState(open_positions={"AAPL": 10}, exits_in_flight={"AAPL": 6})
+    busy = OrderState(
+        open_positions=LONG10, working_exits=(WorkingExit("e1", "AAPL", 6),)
+    )
     assert g.check(exit_(4), busy, NOON).allowed
     assert not g.check(exit_(5), busy, NOON).allowed
-    # flat: a sell would open a short
-    assert not g.check(exit_(1), OrderState(), NOON).allowed
-    # wrong direction: a buy would add to a long
-    assert not g.check(exit_(1, side="buy"), long_, NOON).allowed
-    # a protective order larger than the position is refused too
-    prot = OrderIntent(IntentKind.PROTECTIVE, "AAPL", "sell", 11)
-    assert not g.check(prot, long_, NOON).allowed
-    # malformed quantities
+    assert not g.check(exit_(1), OrderState(), NOON).allowed  # flat: would open a short
+    assert not g.check(exit_(1, side="buy"), long_, NOON).allowed  # would add to the long
+    assert not g.check(prot(11), long_, NOON).allowed
     for qty in (0, -1, float("nan")):
         assert not g.check(exit_(qty), long_, NOON).allowed
     assert not g.check(exit_(1, side=""), long_, NOON).allowed
+
+
+def test_nan_position_refuses_exit() -> None:
+    nan = OrderState(open_positions={"AAPL": float("nan")})
+    for intent in (exit_(1), exit_(1, side="buy"), prot(1)):
+        assert not guard().check(intent, nan, NOON).allowed
+    d = guard().check(exit_(1, side="buy"), nan, NOON)
+    assert "unreadable" in d.reason
+
+
+def test_protective_counts_against_exits_in_flight() -> None:
+    g = guard()
+    held = {"open_positions": LONG10}
+    market_exit = OrderState(working_exits=(WorkingExit("x", "AAPL", 10),), **held)
+    assert not g.check(prot(10), market_exit, NOON).allowed
+    # two plain stops of 10 may not both be placed
+    one_stop = OrderState(working_exits=(WorkingExit("s1", "AAPL", 10),), **held)
+    assert not g.check(prot(10), one_stop, NOON).allowed
+    # a stop and a target in one OCA group count once (the largest leg)
+    bracket = OrderState(
+        working_exits=(
+            WorkingExit("s1", "AAPL", 10, "oca1"),
+            WorkingExit("t1", "AAPL", 8, "oca1"),
+        ),
+        **held,
+    )
+    assert not g.check(exit_(1), bracket, NOON).allowed  # the group already covers 10
+    assert g.check(prot(10, oca_group="oca1"), bracket, NOON).allowed  # joins its own group
+    # a replacement leaves out the order it replaces
+    replace = prot(10, replaces_order="s1", old_price=95.0, new_price=96.0)
+    assert g.check(replace, one_stop, NOON).allowed
+    # ... but not another working order
+    mixed = OrderState(
+        working_exits=(WorkingExit("s1", "AAPL", 10), WorkingExit("x", "AAPL", 4)), **held
+    )
+    assert not g.check(replace, mixed, NOON).allowed
+
+
+def test_protective_bracket_child_sized_against_named_pending_parent() -> None:
+    g = guard()
+    pending = OrderState(pending_entries={"p1": PendingEntry("AAPL", 10)})
+    assert g.check(prot(10, parent_ref="p1"), pending, NOON).allowed
+    assert not g.check(prot(11, parent_ref="p1"), pending, NOON).allowed
+    # standalone: never sized against a pending entry
+    assert not g.check(prot(10), pending, NOON).allowed
+    # unknown parent, or a parent of another symbol
+    assert not g.check(prot(10, parent_ref="nope"), pending, NOON).allowed
+    other = OrderState(pending_entries={"p1": PendingEntry("MSFT", 10)})
+    assert not g.check(prot(10, parent_ref="p1"), other, NOON).allowed
+
+
+def test_protective_against_pending_short_is_side_aware() -> None:
+    g = guard()
+    short = OrderState(pending_entries={"p1": PendingEntry("AAPL", -10)})
+    assert g.check(prot(10, side="buy", parent_ref="p1"), short, NOON).allowed
+    assert not g.check(prot(10, side="sell", parent_ref="p1"), short, NOON).allowed
+    long_ = OrderState(pending_entries={"p1": PendingEntry("AAPL", 10)})
+    assert not g.check(prot(10, side="buy", parent_ref="p1"), long_, NOON).allowed
+
+
+def test_every_message_counts_toward_the_rate_and_latches_stop_entries() -> None:
+    g = guard()
+    state = st(open_positions=LONG10, times=msgs(6))
+    # pure exit, cancel and a new protective order are allowed, flagged, and latch stop_entries
+    d = g.check(exit_(10), state, NOON)
+    assert d.allowed and d.rate_exceeded
+    assert g.kill_level(OrderState()) is KillLevel.STOP_ENTRIES  # latched, state is quiet now
+    assert not g.check(entry("MSFT"), OrderState(), NOON).allowed
+    assert g.check(OrderIntent(IntentKind.CANCEL, "AAPL"), state, NOON).rate_exceeded
+    assert g.check(prot(10), state, NOON).rate_exceeded
+    assert not guard().check(exit_(10), st(open_positions=LONG10, times=msgs(5)), NOON).rate_exceeded
+
+
+def test_replacement_that_does_not_reduce_risk_is_refused_over_the_rate() -> None:
+    state = st(open_positions=LONG10, times=msgs(6))
+    tighter = prot(10, replaces_order="s1", old_price=95.0, new_price=96.0)
+    assert guard().check(tighter, state, NOON).allowed
+    wider = prot(10, replaces_order="s1", old_price=95.0, new_price=94.0)
+    assert not guard().check(wider, state, NOON).allowed
+    smaller = prot(5, replaces_order="s1", old_price=95.0, new_price=96.0)
+    assert not guard().check(smaller, state, NOON).allowed
+    no_prices = prot(10, replaces_order="s1")
+    assert not guard().check(no_prices, st(open_positions=LONG10), NOON).allowed
+    # a buy stop (short position) moves away when it goes up
+    short = st(open_positions={"AAPL": -10}, times=msgs(6))
+    up = prot(10, side="buy", replaces_order="s1", old_price=105.0, new_price=106.0)
+    down = prot(10, side="buy", replaces_order="s1", old_price=105.0, new_price=104.0)
+    assert not guard().check(up, short, NOON).allowed
+    assert guard().check(down, short, NOON).allowed
+    # under the rate a wider replacement is allowed
+    assert guard().check(wider, st(open_positions=LONG10), NOON).allowed
+
+
+def test_session_cap_counts_all_messages() -> None:
+    g = guard()
+    d = g.check(exit_(10), st(open_positions=LONG10, orders=60), NOON)
+    assert d.allowed and d.rate_exceeded
+    assert not g.check(entry("MSFT"), OrderState(), NOON).allowed  # latched
 
 
 def test_daily_count_seeded() -> None:
     today = date(2026, 11, 24)
     sent = [datetime(2026, 11, 24, 10, i) for i in range(20)]
     sent += [datetime(2026, 11, 23, 10, 0)] * 5  # yesterday does not count
-    seed = entries_sent_today(sent, today)
-    assert seed == 20
+    assert entries_sent_today(sent, today) == 20
+    log = SentLog(sent)
     g = guard()
-    assert not g.check(entry(), OrderState(entries_today=seed), NOON).allowed
-    assert g.check(entry(), OrderState(entries_today=entries_sent_today(sent[:19], today)), NOON).allowed
+    assert log.view(NOON).entries_today == 20
+    assert not g.check(entry(), OrderState(sent=log.view(NOON)), NOON).allowed
+    assert guard().check(
+        entry(), OrderState(sent=SentLog(sent[:19]).view(NOON)), NOON
+    ).allowed
+
+
+def test_entries_sent_today_converts_aware_times_to_new_york() -> None:
+    # 20:30 New York on 11-23 is 01:30 UTC on 11-24
+    evening = datetime(2026, 11, 24, 1, 30, tzinfo=timezone.utc)
+    assert entries_sent_today([evening], date(2026, 11, 23)) == 1
+    assert entries_sent_today([evening], date(2026, 11, 24)) == 0
+    assert SentLog([evening]).view(datetime(2026, 11, 23, 12, 0)).entries_today == 1
+
+
+def test_sent_log_counts_what_is_recorded_only() -> None:
+    log = SentLog()
+    g = guard()
+    for i in range(3):
+        now = datetime(2026, 11, 24, 12, 0, i)
+        intent = entry() if i < 2 else OrderIntent(IntentKind.CANCEL, "AAPL")
+        assert g.check(intent, OrderState(sent=log.view(now)), now).allowed
+        assert log.view(now).session_orders == i  # a check consumes nothing
+        log.record_sent(intent, now)
+    view = log.view(datetime(2026, 11, 24, 12, 0, 5))
+    assert (view.session_orders, view.entries_today, len(view.message_times)) == (3, 2, 3)
+    assert log.view(datetime(2026, 11, 25, 12, 0)).entries_today == 0
+    # six messages in the minute: the next entry is refused through the log alone
+    for i in range(3):
+        log.record_sent(exit_(1), datetime(2026, 11, 24, 12, 0, 6 + i))
+    later = datetime(2026, 11, 24, 12, 0, 20)
+    assert not g.check(entry(), OrderState(sent=log.view(later)), later).allowed
 
 
 def test_kill_file_checked_each_call(tmp_path: Path) -> None:
@@ -223,34 +380,114 @@ def test_kill_file_checked_each_call(tmp_path: Path) -> None:
     assert g.kill_level(OrderState()) is None
 
 
+@pytest.mark.parametrize(
+    ("raw", "level"),
+    [
+        (b"flatten", KillLevel.FLATTEN),
+        (b"  FlAtTeN \r\n", KillLevel.FLATTEN),
+        (b"\xef\xbb\xbfflatten\r\n", KillLevel.FLATTEN),
+        ("flatten\r\n".encode("utf-16"), KillLevel.FLATTEN),  # PowerShell 5.1: LE with BOM
+        (b"\xfe\xff\x00f\x00l\x00a\x00t\x00t\x00e\x00n", KillLevel.FLATTEN),  # BE with BOM
+        (b"f\x00l\x00a\x00t\x00t\x00e\x00n\x00", KillLevel.FLATTEN),  # NULs, no BOM
+        (b"", KillLevel.STOP_ENTRIES),
+        (b"stop", KillLevel.STOP_ENTRIES),
+        (b"flatten now", KillLevel.STOP_ENTRIES),
+        (b"\xff\xfe\xfa", KillLevel.STOP_ENTRIES),  # undecodable
+        (b"\x80\x81\x82", KillLevel.STOP_ENTRIES),
+        (b"flatten" + b" " * 5000, KillLevel.STOP_ENTRIES),  # oversized
+    ],
+)
+def test_kill_text_variants(raw: bytes, level: KillLevel) -> None:
+    assert decode_kill_text(raw) is level
+
+
+def test_kill_file_flatten_written_by_powershell(tmp_path: Path) -> None:
+    kill = tmp_path / KILL_FILE_NAME
+    kill.write_bytes("flatten\r\n".encode("utf-16"))
+    assert file_kill_check(kill)() is KillLevel.FLATTEN
+
+
 def test_kill_file_unreadable_path_refuses(tmp_path: Path) -> None:
-    # a file where the folder should be: the path cannot be examined as "not there"
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
     g = OrderGuard(limits(), KillSwitch.from_path(blocker / KILL_FILE_NAME))
     assert not g.check(entry(), OrderState(), NOON).allowed
-    # a directory in place of the file cannot be read
     folder = tmp_path / "dir"
     folder.mkdir()
     assert file_kill_check(folder)() is KillLevel.STOP_ENTRIES
-    # a check that raises
+
     def boom() -> KillLevel | None:
         raise RuntimeError("disk gone")
 
     assert not guard(kill=boom).check(entry(), OrderState(), NOON).allowed
-    # a check that returns rubbish
     assert not guard(kill=lambda: "go").check(entry(), OrderState(), NOON).allowed  # type: ignore[arg-type,return-value]
 
 
 def test_kill_hard_caps() -> None:
+    assert guard().check(entry(), st(orders=59, pnl=-199.99), NOON).allowed
     g = guard()
-    assert g.check(entry(), OrderState(session_orders=59, session_pnl=-199.99), NOON).allowed
-    d = g.check(entry(), OrderState(session_orders=60), NOON)
+    d = g.check(entry(), st(orders=60), NOON)
     assert not d.allowed and "cap" in d.reason
-    assert g.kill_level(OrderState(session_orders=60)) is KillLevel.STOP_ENTRIES
-    assert not g.check(entry(), OrderState(session_pnl=-200.0), NOON).allowed
-    assert g.kill_level(OrderState(session_pnl=-200.0)) is KillLevel.FLATTEN
-    assert not g.check(entry(), OrderState(session_pnl=float("nan")), NOON).allowed
+    assert g.kill_level(OrderState()) is KillLevel.STOP_ENTRIES
+    g2 = guard()
+    assert not g2.check(entry(), st(pnl=-200.0), NOON).allowed
+    assert g2.kill_level(OrderState()) is KillLevel.FLATTEN
+    assert not guard().check(entry(), st(pnl=float("nan")), NOON).allowed
+
+
+def test_loss_and_order_caps_latch() -> None:
+    g = guard()
+    assert not g.check(entry(), st(pnl=-250.0), NOON).allowed
+    # the loss recovers: still engaged for the life of the guard
+    assert not g.check(entry(), st(pnl=-150.0), NOON).allowed
+    assert g.kill_level(st(pnl=0.0)) is KillLevel.FLATTEN
+    g2 = guard()
+    assert not g2.check(entry(), st(orders=61), NOON).allowed
+    assert not g2.check(entry(), st(orders=0), NOON).allowed
+    # the file is not latched: removing it clears it
+    flag = {"on": True}
+    g3 = guard(kill=lambda: KillLevel.STOP_ENTRIES if flag["on"] else None)
+    assert not g3.check(entry(), OrderState(), NOON).allowed
+    flag["on"] = False
+    assert g3.check(entry(), OrderState(), NOON).allowed
+
+
+def test_caps_cannot_be_raised_and_objects_are_frozen() -> None:
+    for caps in (
+        {"max_session_orders": 61},
+        {"max_session_loss": 200.01},
+        {"max_session_loss": float("nan")},
+        {"max_session_loss": float("inf")},
+        {"max_session_loss": 0},
+        {"max_session_orders": 0},
+        {"max_session_orders": True},
+    ):
+        with pytest.raises(LimitsConfigError):
+            KillSwitch(never_engaged, **caps)
+    KillSwitch(never_engaged, max_session_orders=10, max_session_loss=50.0)
+    kill = KillSwitch(never_engaged)
+    g = OrderGuard(limits(), kill)
+    with pytest.raises(AttributeError):
+        kill.max_session_loss = float("nan")  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        kill.max_session_orders = 10_000  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        g.limits = limits(max_quantity=1000)  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        g.kill_switch = KillSwitch(never_engaged)  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        limits().max_quantity = 5  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("qty", [0.5, 9.99, 0, -1, True, float("nan"), "3"])
+def test_quantities_must_be_whole_positive(qty: object) -> None:
+    g = guard()
+    assert not g.check(entry(qty=qty, price=1.0), OrderState(), NOON).allowed  # type: ignore[arg-type]
+    assert not g.check(exit_(qty), OrderState(open_positions=LONG10), NOON).allowed  # type: ignore[arg-type]
+
+
+def test_integral_float_quantity_is_accepted() -> None:
+    assert guard().check(entry(qty=10.0), OrderState(), NOON).allowed
 
 
 def test_default_kill_path_follows_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -318,8 +555,7 @@ def test_malformed_intent_and_state_refuse() -> None:
     assert not g.check(OrderIntent(IntentKind.ENTRY, "", "buy", 1, 1.0), OrderState(), NOON).allowed
     assert not g.check(entry(side="long"), OrderState(), NOON).allowed
     assert not g.check(entry(qty=float("nan")), OrderState(), NOON).allowed
-    assert not g.check(entry(), OrderState(entries_today="3"), NOON).allowed  # type: ignore[arg-type]
+    assert not g.check(entry(), st(entries="3"), NOON).allowed  # type: ignore[arg-type]
     assert not g.check(entry(), OrderState(), "noon").allowed  # type: ignore[arg-type]
     assert not g.check(entry(), None, NOON).allowed  # type: ignore[arg-type]
-    # a cancel needs nothing else
     assert g.check(OrderIntent(IntentKind.CANCEL, "AAPL"), OrderState(), NOON).allowed
