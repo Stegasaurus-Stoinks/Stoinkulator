@@ -554,6 +554,10 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
     """Compare a stored live run with its replay; see the module text for what counts."""
     summary = run.summary
     completed = summary.status == "completed"
+    if completed and summary.data.provisional:
+        # `finish` clears the mark before it ends a run as completed: such a record was edited.
+        return VerifyResult("unverifiable", summary.run_id, summary.status, summary.end_reason,
+                            {}, (), (Problem("a completed run cannot hold a provisional record"),))
     last_time = max(b.time for rows in bars.values() for b in rows)
     ledger = replayed.ledger
     notes: list[str] = []
@@ -619,10 +623,20 @@ def compare_runs(run: RunData, bars: Mapping[str, Sequence[StoredBar]],
     # The algos table (what the dashboard shows) against the config the replay was built from.
     found.append(_compare_records("algos", list(run.algos), list(replayed.algos),
                                   lambda a: a.idname))
-    gap_found, gap_compared = _compare_gap_rule(summary.data.gap_rule, replayed.gap_report,
-                                                completed=completed)
+    # A data record the live writer stored mid-session (its heartbeat) carries the provisional
+    # mark until `finish` replaces it: its gap rule is as of an earlier moment, so it is not
+    # compared, whatever the run's status or end reason (a run killed after a heartbeat and
+    # closed as abandoned, or one whose `finish` could not write its data). A run without the
+    # mark is compared as before.
+    provisional = summary.data.provisional
+    if provisional:
+        gap_found, gap_compared = None, False
+        notes.append("gap rule not compared: stored counts are provisional")
+    else:
+        gap_found, gap_compared = _compare_gap_rule(summary.data.gap_rule, replayed.gap_report,
+                                                    completed=completed)
     found.append(gap_found)
-    if not gap_compared and not gap_found:
+    if not provisional and not gap_compared and not gap_found:
         notes.append("the run stored no gap-rule counts yet (they are written when it finishes); "
                      "not compared")
     # The bars against what the run says about them.

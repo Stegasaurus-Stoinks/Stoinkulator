@@ -56,6 +56,14 @@ and ends the run. It is best effort after an earlier store error: it tries to en
 the run as `failed`, never raises for a store problem, and reports the problems in
 the returned `FinishOutcome` (the first error ever seen is also `writer.error`).
 
+Provisional counts: `heartbeat(counts, data_meta)` also stores the counts and the data record as
+they stand (first and last bar, minute counts, warnings, gap rule), so a dashboard shows them while
+the run is running. The data record carries `provisional: true` until `finish` replaces it and
+the counts with the final values (the counts are replaced, not upserted, so a key stored only
+mid-session cannot survive). A busy database skips the write at once until the next heartbeat
+(`provisional_skipped` counts them) and never fails a step or the session. A run that completed
+holds exactly what it would hold without any provisional write.
+
 Marker delay (decision of issue 192): every indicator series of an algo is held back
 by the tracker's `settle` bars (its `order`: 10 for Elliot, 2 for FunctionTest), so
 stop and trade markers of such an algo reach the store that many bars late although
@@ -208,6 +216,7 @@ class LiveRunWriter:
         self._buffer_bars: list[StoredBar] = []
         self._pending: tuple[Hashable, dict[str, Bar]] | None = None
         self._last_equity_time: datetime | None = None
+        self._provisional_skipped = 0
 
     # --- state -------------------------------------------------------------
 
@@ -323,15 +332,54 @@ class LiveRunWriter:
             self._fail(exc)
             raise
 
-    def heartbeat(self) -> None:
+    def heartbeat(self, counts: Mapping[CountSpec, int] | None = None,
+                  data_meta: DataMeta | None = None) -> None:
         """Touch the run without data (a driver calls it at least every
-        `HEARTBEAT_INTERVAL`, also during an outage)."""
+        `HEARTBEAT_INTERVAL`, also during an outage).
+
+        With `counts` (as for `finish`) and/or `data_meta` (the full `DataMeta` as it stands,
+        gap report included) the run's counts and data record are also refreshed, so a
+        dashboard sees them while the run is still running. These are PROVISIONAL: `finish`
+        writes the final values over them, and `report --verify` ignores them for a run that
+        did not complete. A provisional write is best effort: when the database is busy (or the
+        write fails otherwise) it is skipped at once, counted in `provisional_skipped`, and
+        tried again with the next heartbeat; it never fails the writer or the session and adds
+        no waiting. The plain touch then runs with its busy retries and its failure behaviour
+        as before. Both parts go in ONE transaction, and the data record is stored with its
+        `provisional` mark, which `finish` clears: a reader (`report --verify`, the API) treats
+        a marked record and the counts beside it as not final.
+        """
         run_id = self._require_run()
+        stamped = self._write_provisional(run_id, counts, data_meta)
+        if stamped:
+            return  # each provisional write stamps `last_write_at` itself
         try:
             self._retried(lambda: self._store.touch(run_id))
         except BaseException as exc:
             self._fail(exc)
             raise
+
+    @property
+    def provisional_skipped(self) -> int:
+        """How many provisional writes (counts or data record) a heartbeat gave up on."""
+        return self._provisional_skipped
+
+    def _write_provisional(self, run_id: int, counts: Mapping[CountSpec, int] | None,
+                           data_meta: DataMeta | None) -> bool:
+        """Best-effort provisional counts and data record in one transaction that does not
+        wait for a busy database; True when it was stored (and so the run was stamped).
+        The data record is marked `provisional`; `finish` clears the mark."""
+        try:
+            rows = {count_key(*spec): int(value) for spec, value in (counts or {}).items()}
+            data = None if data_meta is None else replace(data_meta, provisional=True)
+            if not rows and data is None:
+                return False
+            self._store.write_provisional(
+                run_id, {COUNT_SCOPE_SYMBOL: rows} if rows else {}, data)
+            return True
+        except Exception:  # noqa: BLE001 - provisional data never fails the run
+            self._provisional_skipped += 1
+            return False
 
     # --- internals -----------------------------------------------------------
 
@@ -491,6 +539,7 @@ class LiveRunWriter:
         if absent:
             errors.append(f"counts: no fed count for {', '.join(absent)}: the run cannot be "
                           "verified without them")
+        counts_ok = False
         # Each part is tried on its own: a failed tail must not stop the run being ended.
         try:
             self._collect_series(None, final=True)
@@ -502,13 +551,16 @@ class LiveRunWriter:
         try:
             rows = {count_key(*spec): int(value) for spec, value in counts.items()}
             self._retried(lambda: self._store.set_counts(
-                run_id, {COUNT_SCOPE_SYMBOL: rows} if rows else {}), retries=retries())
+                run_id, {COUNT_SCOPE_SYMBOL: rows} if rows else {}, replace=True),
+                retries=retries())
+            counts_ok = True
         except Exception as exc:
             busy = busy or isinstance(exc, StoreBusyError)
             self._fail(exc)
             errors.append(f"counts: {_describe(exc)}")
         try:
-            full = replace(data_meta, gap_rule=gap_rule)
+            # the mark stays when the final counts were not stored: the record is then not final either
+            full = replace(data_meta, gap_rule=gap_rule, provisional=not counts_ok)
             self._retried(lambda: self._store.update_run_data(run_id, full), retries=retries())
         except Exception as exc:
             busy = busy or isinstance(exc, StoreBusyError)

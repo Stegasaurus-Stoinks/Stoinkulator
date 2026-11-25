@@ -767,7 +767,9 @@ class _Session:
         assert self.writer is not None
         now = self.wall()
         if self.last_stamp is None or (now - self.last_stamp).total_seconds() >= HEARTBEAT_EVERY:
-            self.writer.heartbeat()
+            # the counts and the data record as they stand: provisional, `finish` writes the final ones
+            self.writer.heartbeat(_counts_of(self),
+                                  _data_meta(self, self.engine) if self.engine is not None else None)
             self.last_stamp = now
 
     def _check_session_end(self, clock: StreamClock, states: Mapping[str, Any]) -> None:

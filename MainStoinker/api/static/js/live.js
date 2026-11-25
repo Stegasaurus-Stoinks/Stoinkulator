@@ -7,7 +7,7 @@
 //
 // Exports: RUNS_REFRESH_MS, OVERVIEW_REFRESH_MS, ALGO_REFRESH_MS, DROP_LABELS, isLiveRun, isRunning,
 // livenessBadge, liveStatusPanel, liveHealthItems, positionRows, positionsPanel, dropLabel, countRows, gapRuleLines,
-// liveCountsPanel, createPoller, createRefreshNote. All server text is shown as text nodes.
+// liveCountsPanel, suppressedCount, createPoller, createRefreshNote. All server text is shown as text nodes.
 import { h } from "./dom.js";
 import { chartTimeToDataTime, dataTimeToChartTime, formatUtc, trimDecimal } from "./format.js";
 import { dataTable, netCell } from "./table.js";
@@ -135,6 +135,11 @@ export function countRows(counts) {
   });
 }
 
+// The number of refused entries from either shape the API sends: a plain number, or {count, by_algo}.
+export function suppressedCount(value) {
+  return counted(value && typeof value === "object" ? value.count : value);
+}
+
 // The gap-rule sentences, worded like the overview's notes: bars that follow a gap per symbol, entries refused.
 export function gapRuleLines(rule) {
   const record = rule && typeof rule === "object" ? rule : {};
@@ -145,7 +150,8 @@ export function gapRuleLines(rule) {
     lines.push("Bars that follow a gap (entries signalled on them were refused): "
       + gapped.map(([symbol, n]) => symbol + " " + counted(n)).join(", ") + ".");
   }
-  const refused = counted(record.suppressed_entries);
+  // `live_counts.gap_rule.suppressed_entries` is a number, `run.gap_rule.suppressed_entries` an object with `count`.
+  const refused = suppressedCount(record.suppressed_entries);
   if (refused > 0) {
     lines.push(refused + (refused === 1 ? " entry" : " entries") + " refused on bars that follow a gap.");
   }
@@ -163,6 +169,9 @@ export function liveCountsPanel(counts) {
     if (pairs.length > 0) lines.push("Other counts (" + scope + "): " + pairs.map(([k, n]) => k + " " + n).join(", ") + ".");
   }
   const parts = [h("h3", {}, "Live counts")];
+  if (record.provisional === true) {
+    parts.push(h("p", { class: "muted so-far" }, "So far: the run is not finished, these counts are updated while it runs."));
+  }
   if (rows.length === 0) {
     parts.push(h("p", { class: "empty" }, "No minutes counted yet."));
   } else {

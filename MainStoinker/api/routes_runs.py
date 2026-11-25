@@ -8,8 +8,15 @@ is shown as its last folder name only (`-` if it has none), never as a path.
 
 Live runs (kind `paper-live` / `live`, or written by a live writer) also carry
 `liveness`, `end_reason` and `last_write_at`; the detail document adds
-`open_positions` (marked at the last stored bars) and `live_counts`. "Now" is
-read once per request, here at the route; `run_documents` has no clock. In the
+`open_positions` (marked at the last stored bars) and `live_counts`. The `live_counts` of a
+running or stale run (and of one whose data record is marked provisional) has `provisional: true`: the writer
+refreshes the counts with its heartbeats, so they are the counts so far.
+
+Two shapes of the refused-entries count, both kept as stored: `run.gap_rule.suppressed_entries`
+is an object (`{"count": N, "by_algo": [...]}`), `live_counts.gap_rule.suppressed_entries` is a
+plain number (the total). The dashboard reads both.
+
+"Now" is read once per request, here at the route; `run_documents` has no clock. In the
 list, running live runs come first, then stale ones, then the rest, each group
 newest first. A backtest's response is exactly what it was before.
 """

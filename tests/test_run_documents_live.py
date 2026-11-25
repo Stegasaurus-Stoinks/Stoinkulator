@@ -372,6 +372,7 @@ def test_report_shows_live_counts_and_open_positions(db, capsys):
         "late": {"MSFT": 1},
         "gap_rule": {"bars_after_gap": {"AAPL": 2, "MSFT": 0}, "suppressed_entries": 0},
         "other": {"algo": {"a1": 5}},
+        "provisional": True,  # the run is still running: its counts are the counts so far
     }
 
 

@@ -23,7 +23,9 @@ they were before, with no new key:
   `completed` or `failed`; only when `now` is given), `end_reason`,
   `last_write_at` (UTC ISO or null);
 - `report --json` top level: `open_positions` (always for a live run) and
-  `live_counts` (when the counts were passed in).
+  `live_counts` (when the counts were passed in; `provisional: true` while the run is
+  running or stale, or its data record is marked provisional: the writer stores counts with
+  its heartbeats, and only `finish` stores the final ones).
 
 Stale: a `running` run whose last write (`last_write_at`, else `started_at`)
 is more than `stale_after` (default `STALE_AFTER`) before `now`.
@@ -295,5 +297,12 @@ def report_document(run: RunData, *, data_directory: str, now: datetime | None =
     if is_live_run(run.summary):
         document["open_positions"] = open_positions(run, last_bars)
         if counts is not None:
-            document["live_counts"] = live_counts_record(counts, run.summary.data.gap_rule)
+            record = live_counts_record(counts, run.summary.data.gap_rule)
+            # The writer stores counts with its heartbeats while the run runs (a stale run too:
+            # its writer is probably dead) and marks the data record `provisional` until
+            # `finish` stores the final ones; `report --verify` reads the same mark. Only such
+            # a document carries the key.
+            if run.summary.status == "running" or run.summary.data.provisional:
+                record["provisional"] = True
+            document["live_counts"] = record
     return document
