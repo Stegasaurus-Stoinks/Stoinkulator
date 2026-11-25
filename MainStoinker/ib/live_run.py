@@ -120,6 +120,7 @@ import argparse
 import contextlib
 import math
 import os
+import signal
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -900,21 +901,31 @@ def _describe_position(position: LivePosition) -> str:
             f"{position.quantity} at {position.entry_price} since {since}{extra}")
 
 
-def _finish_run(session: _Session, status: str, reason: str | None, say: Callable[[str], None]
-                ) -> tuple[bool, tuple[LivePosition, ...]]:
-    """Flush, `end_live`, `writer.finish`. Returns (finished cleanly, open positions)."""
+def _finish_run(session: _Session, status: str, reason: str | None, say: Callable[[str], None],
+                shield: _Shield) -> tuple[bool, tuple[LivePosition, ...]]:
+    """Flush, `end_live`, `writer.finish`, each shielded from Ctrl-C. Returns (finished cleanly,
+    open positions)."""
     positions: tuple[LivePosition, ...] = ()
     engine, writer = session.engine, session.writer
-    session.flush()
+    shield.call(session.flush)
     if engine is not None and session.engine_started:
-        try:
-            with session._algo_env():  # noqa: SLF001
-                positions = engine.end_live()
-        except Exception as exc:  # noqa: BLE001
-            say(f"live: end_live raised {type(exc).__name__}: {exc}")
+        def end_live() -> None:
+            nonlocal positions
+            try:
+                with session._algo_env():  # noqa: SLF001
+                    positions = engine.end_live()
+            except Exception as exc:  # noqa: BLE001
+                say(f"live: end_live raised {type(exc).__name__}: {exc}")
+
+        shield.call(end_live)
     if writer is None or engine is None or session.run_id is None:
         return False, positions
-    outcome = writer.finish(status, reason, _counts_of(session), _data_meta(session, engine))  # type: ignore[arg-type]
+    outcome = shield.call(
+        lambda: writer.finish(status, reason, _counts_of(session),  # type: ignore[arg-type]
+                              _data_meta(session, engine)))
+    if outcome is None:  # interrupted again and again: the run may still be marked running
+        say("live: the run could not be ended: it may still be marked running")
+        return False, positions
     for line in outcome.errors:
         say(f"live: the run's record: {line}")
     return outcome.ok, positions
@@ -975,6 +986,16 @@ def run_live_session(
         return EXIT_REFUSED
     try:
         close_abandoned_runs(store, wall(), say)
+        # the command sets this: stale runs are closed above, so a run still marked running now was
+        # written recently and may be another live session: two sessions must not run at once
+        if getattr(args, "refuse_if_running", False) is True:
+            running = [s.run_id for s in store.list_runs()
+                       if s.kind == RUN_KIND and s.status == "running"]
+            if running:
+                say(f"Refused: another {RUN_KIND} run is marked running and was written recently "
+                    f"(run {', '.join(str(r) for r in running)}): wait until it ends or its last write "
+                    "is stale")
+                return EXIT_REFUSED
     except (StoreError, ValueError) as exc:
         say(f"Refused: the run store cannot be read or written: {exc}")
         return EXIT_REFUSED
@@ -1002,16 +1023,72 @@ def run_live_session(
         return result
 
 
+class _Shield:
+    """Ctrl-C does not interrupt the end of a session: the run must be ended in the store first.
+
+    While active, SIGINT only counts (when this is the main thread), and a `KeyboardInterrupt`
+    that still gets out of a step (a signal handler that was not ours, a test) is counted and the
+    step is run again: every step of the end is safe to repeat (`writer.finish` returns its first
+    outcome once it has finished). The count decides the exit code afterwards: 130."""
+
+    ATTEMPTS = 5
+
+    def __init__(self, say: Callable[[str], None]) -> None:
+        self._say = say
+        self.hits = 0
+        self._previous: Any = None
+        self._installed = False
+
+    def _on_signal(self, signum: int, frame: Any) -> None:
+        self.hits += 1
+
+    def __enter__(self) -> _Shield:
+        try:
+            self._previous = signal.signal(signal.SIGINT, self._on_signal)
+            self._installed = True
+        except (ValueError, OSError):  # not the main thread: the retry below is what shields
+            self._installed = False
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._installed:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signal.SIGINT, self._previous)
+
+    def call(self, step: Callable[[], Any], default: Any = None) -> Any:
+        for _ in range(self.ATTEMPTS):
+            try:
+                return step()
+            except KeyboardInterrupt:
+                self.hits += 1
+                self._say("live: Ctrl-C while the run is being ended: the run is finished first, "
+                          "then the session exits with 130")
+        self._say("live: Ctrl-C again and again: a step of the end could not be completed")
+        return default
+
+
 def _end(session: _Session, watcher_code: int, store: Store, say: Callable[[str], None]) -> int:
-    """Everything after the watcher returned (module text, step 6); returns the exit code."""
+    """Everything after the watcher returned (module text, step 6); returns the exit code.
+
+    The whole of it is shielded from Ctrl-C (`_Shield`); an interrupt that came during it is
+    answered with exit 130 once the run is ended."""
+    with _Shield(say) as shield:
+        code = _end_run(session, watcher_code, store, say, shield)
+    return EXIT_INTERRUPTED if shield.hits else code
+
+
+def _end_run(session: _Session, watcher_code: int, store: Store, say: Callable[[str], None],
+             shield: _Shield) -> int:
     status, reason, code = _outcome(session, watcher_code)
     if session.run_id is None:
-        close_algo_logs(session.algos)
+        shield.call(lambda: close_algo_logs(session.algos))
         say(f"live: no run was stored ({reason}): nothing was fed")
         return code
-    clean, positions = _finish_run(session, status, reason, say)
-    close_algo_logs(session.algos)
-    if not clean:
+    clean, positions = _finish_run(session, status, reason, say, shield)
+    shield.call(lambda: close_algo_logs(session.algos))
+    if shield.hits:
+        code = EXIT_INTERRUPTED
+    elif not clean:
         code = code if status == "failed" else EXIT_STOPPED
     say(f"live: run {session.run_id} {status} ({reason}): {sum(session.counts.fed.values())} bar(s) "
         f"fed in {len(session.stamps)} minute(s); fed {_nonzero(session.counts.fed)}, late "
@@ -1029,7 +1106,9 @@ def _end(session: _Session, watcher_code: int, store: Store, say: Callable[[str]
             say(_describe_position(position))
     else:
         say("live: no position left open")
-    _verify(session, store, say)
+    shield.call(lambda: _verify(session, store, say))  # read-only: the run is ended already
+    if shield.hits:
+        code = EXIT_INTERRUPTED
     say(f"Live session: {status}, end reason {reason} (exit {code})")
     return code
 
