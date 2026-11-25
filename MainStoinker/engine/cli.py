@@ -2,7 +2,12 @@
 
     python -m MainStoinker backtest --algos ALGOS.json --data DIR --out DIR
     python -m MainStoinker runs --db SPEC [--json]
-    python -m MainStoinker report RUN --db SPEC [--json]
+    python -m MainStoinker report RUN --db SPEC [--json] [--verify [--bars DIR]]
+
+`report --verify` replays a stored live run and compares it with what it stored (see
+`verify`); its replay is built by `replay_stored_run` from the same pieces `backtest`
+uses (`build_engine`). Exit codes: 0 verified, 1 mismatch, 2 usage, 4 not a live run with
+stored bars, 5 unverifiable (the warm-up files changed or are missing).
 
 `runs` and `report` only read a stored database (see `cli_report`): they need
 no algos or data, never create a database, and exit 2 with one line on any
@@ -125,7 +130,7 @@ from .algos import close_algo_logs, load_algo
 from .cli_report import ReportError, gap_rule_lines, run_report_command, run_runs_command
 from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
-from .feed import _SYMBOL, CsvBarFeed, file_fingerprint, symbol_fingerprint
+from .feed import _SYMBOL, BarFeed, CsvBarFeed, file_fingerprint, symbol_fingerprint
 from .gaprule import GapRuleReport
 from .ledger import Ledger
 from .modes import DEFAULT_MODE, ModeError, build_router, parse_mode
@@ -134,7 +139,16 @@ from .report import ledger_document, ledger_trade_records, trade_records
 from .series import extract_series
 from .sink import NullSink
 from .stats import fmt4
-from .store import AlgoMeta, DataMeta, RunMeta, StoreError, open_store
+from .store import AlgoMeta, DataMeta, RunData, RunMeta, Store, StoreError, open_store
+from .verify import (
+    EXIT_REFUSED,
+    Replayed,
+    VerifyRefused,
+    VerifyResult,
+    VerifyUnavailable,
+    VerifyUsageError,
+    verify_run,
+)
 
 _NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _MONEY = re.compile(_NUMBER)
@@ -415,6 +429,13 @@ def build_parser() -> argparse.ArgumentParser:
                           "Defaults to the STOINK_DB environment variable")
     rep.add_argument("--json", action="store_true",
                      help="machine-readable output (money as 4-decimal strings)")
+    rep.add_argument("--verify", action="store_true",
+                     help="live runs only: replay the stored bars and compare with the stored "
+                          "run (exit 0 verified, 1 mismatch, 4 not a live run with stored bars, "
+                          "5 unverifiable: the warm-up files changed or are missing)")
+    rep.add_argument("--bars", default=None, metavar="DIR",
+                     help="with --verify: the directory holding the warm-up month files "
+                          "(default: the directory recorded with the run, if any)")
     return parser
 
 
@@ -463,6 +484,25 @@ def _load_algos(entries: Sequence[Mapping[str, Any]], log_path: Path | None, alg
                 if exc.__cause__ is not None or str(exc).startswith("invalid algo id"):
                     raise CliError(str(exc)) from exc
                 raise
+
+
+def build_engine(
+    entries: Sequence[Mapping[str, Any]],
+    feed: BarFeed,
+    router: Any,
+    ledger: Ledger | None,
+    algos: list,
+    log_path: Path | None = None,
+) -> Engine:
+    """Load the algos into `algos` and build the engine over `feed` (not yet run).
+
+    The one construction shared by `backtest` and the replay of `report --verify`. The
+    caller changes to the directory legacy side files may go to first. `router` is
+    what `build_router` returned (it also supplies the end-of-data commission).
+    """
+    _load_algos(entries, log_path, algos)
+    return Engine(EngineConfig(), feed, router, NullSink(), algos, ledger=ledger,
+                  end_commission=router.end_commission)
 
 
 def check_algos_importable(entries: Sequence[Mapping[str, Any]]) -> None:
@@ -792,9 +832,7 @@ def run_backtest_command(
             engine_started = True
             try:
                 with _working_directory(out_dir), _maybe_quiet(args.quiet):
-                    _load_algos(entries, log_path, algos)
-                    engine = Engine(EngineConfig(), feed, router, NullSink(), algos,
-                                    ledger=ledger, end_commission=router.end_commission)
+                    engine = build_engine(entries, feed, router, ledger, algos, log_path)
                     engine.run_backtest()
                     engine_done = True
                     gap_report = engine.gap_report
@@ -895,6 +933,82 @@ def run_backtest_command(
     return 0
 
 
+def _stored_costs_and_capital(run: RunData) -> tuple[CostModel, Decimal]:
+    """The cost model and capital a stored run was made with, from its config and algos.
+
+    Legacy fills have no costs (the defaults are only placeholders `build_router` ignores).
+    Realistic fills need the stored costs: an absent value is never guessed.
+    """
+    config = run.config
+    try:
+        if config.get("capital") is not None:
+            capital = Decimal(str(config["capital"]))
+        elif run.algos:
+            capital = run.algos[0].capital
+        else:
+            raise VerifyUnavailable("the run stores neither a capital nor any algo")
+        if run.summary.fills == "legacy":
+            return (CostModel(Decimal(DEFAULT_COMMISSION_PER_SHARE),
+                              Decimal(DEFAULT_COMMISSION_MIN),
+                              Decimal(DEFAULT_SLIPPAGE_PER_SHARE)), capital)
+        costs = config.get("costs")
+        if not isinstance(costs, Mapping):
+            raise VerifyUnavailable("the run used realistic fills but its config stores no costs")
+        return (CostModel(Decimal(str(costs["commission_per_share"])),
+                          Decimal(str(costs["commission_minimum"])),
+                          Decimal(str(costs["slippage_per_share"]))), capital)
+    except (InvalidOperation, KeyError) as exc:
+        raise VerifyUnavailable(f"the stored capital or costs cannot be read: {exc!r}") from exc
+
+
+def replay_stored_run(run: RunData, feed: BarFeed) -> Replayed:
+    """Replay `feed` through `run_backtest` built from a stored run's config.
+
+    The same construction `backtest` uses (`validate_algo_config`, `build_router`,
+    `build_engine`) with the stored algo entries, fill model, capital and costs, in a
+    temporary working directory (legacy side files land there and go with it), the
+    algos' output silenced. Raises `VerifyUnavailable` when the stored config cannot be
+    rebuilt.
+    """
+    entries_raw = run.config.get("entries")
+    if not isinstance(entries_raw, list):
+        raise VerifyUnavailable("the run's config stores no algo entries (config \"entries\")")
+    fills = run.summary.fills
+    if fills not in ("legacy", "realistic"):
+        raise VerifyUnavailable(f"unknown fill model {fills!r}")
+    costs, capital = _stored_costs_and_capital(run)
+    try:
+        entries = validate_algo_config(entries_raw)
+        check_algos_importable(entries)
+        ledger = Ledger()
+        router = build_router(entries, fills=fills, costs=costs, capital=capital, ledger=ledger)
+    except (CliError, ModeError) as exc:
+        raise VerifyUnavailable(f"the stored algo config cannot be rebuilt: {exc}") from exc
+    algos: list = []
+    with tempfile.TemporaryDirectory(prefix="stoink-verify-", ignore_cleanup_errors=True) as work:
+        try:
+            with _working_directory(Path(work)), _maybe_quiet(True):
+                engine = build_engine(entries, feed, router, ledger, algos)
+                engine.run_backtest()
+        finally:
+            close_algo_logs(algos)
+    return Replayed(ledger, engine.gap_report)
+
+
+def make_verifier(bars: str | None) -> Callable[[Store, RunData], VerifyResult]:
+    """The `verifier` of `cli_report.run_report_command` for `report --verify [--bars DIR]`."""
+    explicit: Path | None = None
+    if bars is not None:
+        explicit = Path(bars).expanduser().resolve()
+        if not explicit.is_dir():
+            raise CliError(f"--bars {explicit} is not a directory")
+
+    def verifier(store: Store, run: RunData) -> VerifyResult:
+        return verify_run(store, run, bars_dir=explicit, replayer=replay_stored_run)
+
+    return verifier
+
+
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     """Entry point. Returns the exit code; argparse errors and `--help` raise `SystemExit`.
 
@@ -911,10 +1025,17 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         if args.command == "runs":
             return run_runs_command(args.db, as_json=args.json, env=env)
         if args.command == "report":
-            return run_report_command(args.db, args.run, as_json=args.json, env=env)
-    except (CliError, ReportError) as exc:
+            if args.bars is not None and not args.verify:
+                raise CliError("--bars only applies with --verify")
+            verifier = make_verifier(args.bars) if args.verify else None
+            return run_report_command(args.db, args.run, as_json=args.json, env=env,
+                                      verifier=verifier)
+    except (CliError, ReportError, VerifyUsageError) as exc:
         _report("error: " + str(exc))
         return 2
+    except VerifyRefused as exc:
+        _report("error: " + str(exc))
+        return EXIT_REFUSED
     except RunStoreError as exc:
         what = ("run finished but could not be stored" if exc.finished
                 else "could not record the run")
