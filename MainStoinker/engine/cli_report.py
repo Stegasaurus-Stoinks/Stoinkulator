@@ -47,7 +47,7 @@ import os
 import re
 import sqlite3
 import sys
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -69,6 +69,7 @@ from .run_documents import (
 )
 from .stats import fmt4, run_statistics
 from .store import RunData, RunSummary, Store, StoredBar, StoreError, open_store_readonly
+from .verify import VerifyResult
 
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 _RUN_ID = re.compile(r"[0-9]+")
@@ -253,11 +254,16 @@ def run_runs_command(spec: str | None, *, as_json: bool,
 
 def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
                        env: Mapping[str, str] | None = None, now: datetime | None = None,
-                       stale_after: timedelta = STALE_AFTER) -> int:
+                       stale_after: timedelta = STALE_AFTER,
+                       verifier: Callable[[Store, RunData], VerifyResult] | None = None) -> int:
+    """Print one stored run. With a `verifier` (`report --verify`) the verdict is printed
+    with it (a `verify` object in `--json`) and the exit code is the verdict's; a
+    `VerifyRefused` / `VerifyUsageError` from it propagates before anything is printed."""
     run_id = _parse_run_id(run_text)
     store = _open_existing(spec, env)
     counts: dict[str, dict[str, int]] | None = None
     last_bars: dict[str, StoredBar] | None = None
+    verdict: VerifyResult | None = None
     try:
         if run_id > _INT64_MAX:
             raise ReportError(f"no run {run_id}")
@@ -265,15 +271,24 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
         if is_live_run(run.summary):
             counts = _read(lambda: store.load_counts(run_id))
             last_bars = _read(lambda: {b.symbol: b for b in store.load_last_bars(run_id)})
+        if verifier is not None:
+            try:
+                verdict = verifier(store, run)
+            except StoreError as exc:
+                raise ReportError(str(exc)) from exc
+            except sqlite3.Error as exc:
+                raise ReportError(f"database error: {exc}") from exc
     finally:
         store.close()
     now = _now(now)
     data_directory = _data_directory(run.summary.data.directory)
     if as_json:
-        _write([json.dumps(report_document(run, data_directory=data_directory, now=now,
-                                           stale_after=stale_after, counts=counts,
-                                           last_bars=last_bars), indent=1)])
-        return 0
+        document = report_document(run, data_directory=data_directory, now=now,
+                                   stale_after=stale_after, counts=counts, last_bars=last_bars)
+        if verdict is not None:
+            document["verify"] = verdict.to_json()
+        _write([json.dumps(document, indent=1)])
+        return 0 if verdict is None else verdict.exit_code
 
     stats = run_statistics(run, IGNORED_KINDS)
     header = run_header(run, data_directory=data_directory)
@@ -335,8 +350,11 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
                  f"trades), {ignored} ignored events, {total['cancelled_entries']} cancelled entries")
     if live:
         lines.extend(open_position_lines(open_positions(run, last_bars)))
+    if verdict is not None:
+        lines.append("")
+        lines.extend(verdict.lines())
     _write(lines)
-    return 0
+    return 0 if verdict is None else verdict.exit_code
 
 
 def _liveness_lines(s: RunSummary, now: datetime, stale_after: timedelta) -> list[str]:
