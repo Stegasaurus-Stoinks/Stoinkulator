@@ -20,12 +20,23 @@ bar that follows a gap is refused. `close_position`, `modify_stop` and
 `set_take_profit` of positions that exist are never refused; a reversal's exit
 leg goes through and only its entry leg is refused, whatever their order.
 
-Known limit: the rule judges the bar on which the signal was made, not the bar
-on which the order fills. Under realistic fills (`PaperBroker`) a market entry
-ordered on the bar BEFORE a gap fills on the gap bar (at its open, after the
-missing minutes); it is not refused and not counted. Under `SimBroker` the
-same order fills at the request bar. Whether to cancel such a pending entry is
-undecided (a follow-up issue).
+Pending entries (issue 206, owner decision "cancel and count"). The refusal
+above judges the bar on which the signal was made. Under realistic fills
+(`PaperBroker`) a market entry ordered on the bar BEFORE a gap would fill on the
+gap bar, at its open, minutes away from the signal. So `PaperBroker` cancels
+such a pending entry instead of filling it: it never fills, its entry and stop
+orders are recorded as cancelled exactly as for an entry cancelled at a session
+end (the algo learns the same way: `stop_is_working` is False), and the
+cancellation is counted in `GapRuleReport.cancelled` (per algo and symbol, with
+the time of the gap bar), beside the refused entries. An entry signalled ON the
+gap bar is refused (counted there only), so it is never pending and never
+counted twice. Stops, targets and algo closes of open positions still fill on a
+gap bar. `SimBroker` fills at the request bar and has no pending entries.
+`GapGuardBroker` tells a broker that has `set_gap_watch` (`PaperBroker`) which
+bars follow a gap and where to report a cancellation; the broker imports
+nothing of this module. Known limit: a broker shared by several algos (one
+`PaperBroker` serves one algo) would report cancellations to the last algo
+wrapped.
 
 Where it is enforced: `GapGuardBroker` wraps the broker of each algo while
 `Engine.run_backtest` runs, so it holds for every algo and every broker, and no
@@ -88,9 +99,10 @@ class RefusedEntry:
 
 @dataclass(frozen=True)
 class SuppressedEntries:
-    """Refused entries of one algo on one symbol.
+    """Refused entries (or cancelled pending entries) of one algo on one symbol.
 
-    `count` is the total; `times` holds the first `MAX_TIMES` of them, in order.
+    `count` is the total; `times` holds the first `MAX_TIMES` of them, in order
+    (for a cancelled pending entry, the time of the gap bar).
     """
 
     algo: str
@@ -105,11 +117,13 @@ class GapRuleReport:
 
     `bars_after_gap` has every replayed symbol (feed order), 0 when none of its
     bars follows a gap. `suppressed` lists (algo, symbol) pairs that had a
-    refusal, in order of first refusal.
+    refusal, in order of first refusal. `cancelled` lists the pairs that had a
+    pending entry cancelled because its fill bar followed a gap (issue 206).
     """
 
     bars_after_gap: tuple[tuple[str, int], ...] = ()
     suppressed: tuple[SuppressedEntries, ...] = ()
+    cancelled: tuple[SuppressedEntries, ...] = ()
 
     @property
     def total_bars_after_gap(self) -> int:
@@ -120,8 +134,13 @@ class GapRuleReport:
         return sum(s.count for s in self.suppressed)
 
     @property
+    def total_cancelled(self) -> int:
+        return sum(s.count for s in self.cancelled)
+
+    @property
     def empty(self) -> bool:
-        return self.total_bars_after_gap == 0 and self.total_suppressed == 0
+        return (self.total_bars_after_gap == 0 and self.total_suppressed == 0
+                and self.total_cancelled == 0)
 
 
 class GapRule:
@@ -139,6 +158,8 @@ class GapRule:
         self._suppressed: dict[tuple[str, str], list[datetime]] = {}
         self._totals: dict[tuple[str, str], int] = {}
         self._refusals = 0
+        self._cancelled: dict[tuple[str, str], list[datetime]] = {}
+        self._cancel_totals: dict[tuple[str, str], int] = {}
 
     def start(self, last_times: Mapping[str, datetime | None]) -> None:
         """Begin a replay: the last warm-up bar time of each symbol (None: no warm-up)."""
@@ -172,11 +193,22 @@ class GapRule:
         self._refusals += 1
         return RefusedEntry(algo, symbol, time, self._refusals)
 
+    def cancel_pending(self, algo: str, symbol: str) -> None:
+        """Record a pending entry cancelled because the current bar of `symbol` follows a gap."""
+        time = self._current[symbol]
+        key = (algo, symbol)
+        times = self._cancelled.setdefault(key, [])
+        self._cancel_totals[key] = self._cancel_totals.get(key, 0) + 1
+        if len(times) < MAX_TIMES:
+            times.append(time)
+
     def report(self) -> GapRuleReport:
         return GapRuleReport(
             tuple(self._counts.items()),
             tuple(SuppressedEntries(a, s, self._totals[(a, s)], tuple(t))
                   for (a, s), t in self._suppressed.items()),
+            tuple(SuppressedEntries(a, s, self._cancel_totals[(a, s)], tuple(t))
+                  for (a, s), t in self._cancelled.items()),
         )
 
 
@@ -190,6 +222,11 @@ class GapGuardBroker:
         self._inner = inner
         self._algo = algo
         self._rule = rule
+        # A broker with pending entries (PaperBroker) is told which of its bars follow a
+        # gap and where to report a pending entry it cancels because of one.
+        watch = getattr(inner, "set_gap_watch", None)
+        if callable(watch):
+            watch(rule.blocked,lambda symbol: rule.cancel_pending(algo, symbol))
 
     @property
     def inner(self) -> Broker:

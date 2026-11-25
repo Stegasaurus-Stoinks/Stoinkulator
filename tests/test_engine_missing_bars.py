@@ -425,18 +425,21 @@ def paper_engine(
     return brokers
 
 
-def test_pending_paper_entry_fills_at_next_bar_of_its_symbol(tmp_path: Path) -> None:
-    # AAA opens at its update on minute 1; its next bars are minutes 4 (2, 3 missing)
+def test_pending_paper_entry_waits_for_next_bar_of_its_symbol_and_is_cancelled_by_the_gap(
+    tmp_path: Path,
+) -> None:
+    # AAA opens at its update on minute 1; its next bar is minute 4 (2, 3 missing), which
+    # follows a gap: since the gap rule's pending-entry cancellation (issue 206) the entry
+    # is cancelled there instead of filling at minute 4's open. BBB's bars at minutes 2 and
+    # 3 neither fill nor cancel it.
     feed = make_feed(tmp_path, AAA=without(2, 3), BBB=ALL)
     ledger = Ledger()
     algo = Scripted("a", "AAA", open_at=2)
     brokers = paper_engine(feed, [algo, Scripted("b", "BBB", open_at=None)], ledger)
-    entry = next(f for f in ledger.fills if f.reason == "entry")
-    assert entry.time == minute(4)
-    assert entry.price == Decimal("104")  # AAA's open at minute 4, not BBB's or a stale one
-    assert algo.ref is not None and brokers["a"].position_state(algo.ref) == "open"
-    # nothing filled while AAA had no bar (the update at minute 4 is its third)
-    assert algo.seen_fills[2] == 1 and algo.seen_fills[1] == 0
+    assert ledger.fills == ()
+    assert algo.ref is not None and brokers["a"].position_state(algo.ref) == "cancelled"
+    cancelled = [e for e in ledger.orders if e.kind == "cancelled"]
+    assert cancelled and all(e.time == minute(4) for e in cancelled)
 
 
 def test_pending_paper_entry_across_a_missing_day_start_is_cancelled(tmp_path: Path) -> None:

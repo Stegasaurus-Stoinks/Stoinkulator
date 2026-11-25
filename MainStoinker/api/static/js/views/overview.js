@@ -127,6 +127,17 @@ export function runNotes(doc) {
         ? " (" + byAlgo.map((e) => String(e.algo) + " " + String(e.symbol) + ": " + String(e.count)).join(", ") + ")"
         : "") + ".");
   }
+  const pending = rule.cancelled_pending_entries && typeof rule.cancelled_pending_entries === "object"
+    ? rule.cancelled_pending_entries : {};
+  const pendingCount = numberOrNull(pending.count) || 0;
+  if (pendingCount > 0) {
+    const byAlgo = Array.isArray(pending.by_algo) ? pending.by_algo : [];
+    notes.push(pendingCount + (pendingCount === 1 ? " pending entry" : " pending entries")
+      + " cancelled because the fill bar follows a gap"
+      + (byAlgo.length > 0
+        ? " (" + byAlgo.map((e) => String(e.algo) + " " + String(e.symbol) + ": " + String(e.count)).join(", ") + ")"
+        : "") + ".");
+  }
   if (Array.isArray(run.data_warnings)) {
     for (const warning of run.data_warnings) notes.push("Data warning: " + String(warning) + ".");
   }

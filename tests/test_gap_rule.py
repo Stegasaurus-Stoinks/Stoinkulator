@@ -344,6 +344,126 @@ def test_a_stop_or_take_profit_on_a_gap_bar_still_fills(tmp_path: Path, which: s
     assert trip.exit_price == (Decimal("9.0") if which == "stop" else Decimal("11.0"))
 
 
+# ------------------------- a pending entry whose fill bar follows a gap (issue 206)
+
+
+def cancelled_events(result: Result) -> list[tuple[str, str | None, pd.Timestamp]]:
+    """(account, type of the order placed earlier, time) of each cancel event."""
+    placed = {o.order_id: o.order_type for o in result.ledger.orders if o.kind == "placed"}
+    return [(o.account, placed[o.order_id], o.time)
+            for o in result.ledger.orders if o.kind == "cancelled"]
+
+
+def test_a_pending_entry_whose_fill_bar_follows_a_gap_is_cancelled_and_counted(tmp_path: Path) -> None:
+    algo = Probe("a", "AAA", {3: opener()})  # signalled at 09:32; the next bar is 09:34 (09:33 missing)
+    result = run(tmp_path, {"AAA": quiet_rows(*GAPPED)}, [algo], "paper")
+    assert len(result.ledger.fills) == 0 and len(result.ledger.round_trips) == 0
+    assert not isinstance(algo.refs[0], RefusedEntry)  # it was a real order, cancelled later
+    assert result.brokers["a"].position_state(algo.refs[0]) == "cancelled"  # type: ignore[attr-defined]
+    assert result.brokers["a"].cancelled_entries == 1  # type: ignore[attr-defined]
+    # recorded like any broker-side cancellation of an entry: the entry and its stop
+    assert cancelled_events(result) == [("a", "entry", at("09:34")), ("a", "stop", at("09:34"))]
+    assert result.report.cancelled == (SuppressedEntries("a", "AAA", 1, (at("09:34"),)),)
+    assert result.report.total_cancelled == 1
+    assert result.report.suppressed == () and not result.report.empty
+
+
+def test_the_same_pending_entry_without_a_gap_fills_as_before(tmp_path: Path) -> None:
+    algo = Probe("a", "AAA", {3: opener()})
+    result = run(tmp_path, {"AAA": quiet_rows("09:30", "09:31", "09:32", "09:33", "09:34")}, [algo], "paper")
+    (fill,) = [f for f in result.ledger.fills if f.reason == "entry"]
+    assert fill.time == at("09:33")
+    assert result.report == GapRuleReport((("AAA", 0),), ())
+    assert result.report.empty and cancelled_events(result) == []
+
+
+def test_simbroker_has_no_pending_entries_so_nothing_is_cancelled(tmp_path: Path) -> None:
+    algo = Probe("a", "AAA", {3: opener()})
+    result = run(tmp_path, {"AAA": quiet_rows(*GAPPED)}, [algo], "sim")
+    assert result.entry_requests == [at("09:32")]
+    assert result.report.cancelled == () and result.report.suppressed == ()
+
+
+def test_a_gap_in_another_symbol_does_not_cancel_a_pending_entry(tmp_path: Path) -> None:
+    both = quiet_rows("09:30", "09:31", "09:32", "09:33", "09:34", "09:35")
+    only_a = [r for r in both if r[0] != at("09:33")]  # BBB's 09:34 bar follows a gap, AAA's does not
+    algos = [Probe("a", "AAA", {4: opener()}),  # signalled at 09:33; fills at 09:34
+             Probe("b", "BBB", {3: opener()})]  # signalled at 09:32; BBB's next bar is 09:34, a gap
+    result = run(tmp_path, {"AAA": both, "BBB": only_a}, algos, "paper")
+    assert [(f.account, f.time) for f in result.ledger.fills if f.reason == "entry"] == [("a", at("09:34"))]
+    assert result.report.cancelled == (SuppressedEntries("b", "BBB", 1, (at("09:34"),)),)
+    assert result.brokers["a"].cancelled_entries == 0  # type: ignore[attr-defined]
+
+
+def test_the_stop_of_an_open_position_and_an_algo_exit_still_fill_on_a_gap_bar(tmp_path: Path) -> None:
+    rows = [*quiet_rows("09:30", "09:31", "09:32"),
+            (at("09:34"), 10.0, 10.05, 8.0, 10.0), *quiet_rows("09:35", "09:36")]
+    # one position stopped on the gap bar, a second one closed by its algo on it
+    algos = [Probe("s", "AAA", {2: lambda a, r: a.open(r, stop=9.0)}),
+             Probe("x", "AAA", {2: opener(), 4: lambda a, r: a.close(a.refs[0], r)})]
+    result = run(tmp_path, {"AAA": rows}, algos, "paper")
+    exits = sorted((t.account, t.exit_reason, t.exit_time) for t in result.ledger.round_trips)
+    # the algo's close, requested on the gap bar, fills at the next open as always
+    assert exits == [("s", "stop", at("09:34")), ("x", "algo_exit", at("09:35"))]
+    assert result.report.cancelled == ()
+
+
+def test_an_entry_signalled_on_the_gap_bar_is_refused_and_counted_only_there(tmp_path: Path) -> None:
+    # update 3 (09:32): pending, cancelled by the gap bar 09:34; update 4 (09:34): refused
+    algo = Probe("a", "AAA", {3: opener(), 4: opener()})
+    result = run(tmp_path, {"AAA": quiet_rows(*GAPPED)}, [algo], "paper")
+    assert result.report.suppressed == (SuppressedEntries("a", "AAA", 1, (at("09:34"),)),)
+    assert result.report.cancelled == (SuppressedEntries("a", "AAA", 1, (at("09:34"),)),)
+    assert isinstance(algo.refs[1], RefusedEntry)
+    only_refused = Probe("r", "AAA", {4: opener()})
+    (tmp_path / "r").mkdir()
+    again = run(tmp_path / "r", {"AAA": quiet_rows(*GAPPED)}, [only_refused], "paper")
+    assert again.report.total_suppressed == 1 and again.report.total_cancelled == 0
+
+
+def test_a_pending_entry_cancelled_at_a_session_start_gap_is_counted_once_as_a_session_cancel(
+    tmp_path: Path,
+) -> None:
+    rows = [*quiet_rows("15:58", "15:59"), *quiet_rows("09:31", "09:32", day_="2024-01-05")]
+    algo = Probe("a", "AAA", {2: opener()})  # signalled at 15:59; next bar is on another date
+    result = run(tmp_path, {"AAA": rows}, [algo], "paper")
+    assert result.brokers["a"].cancelled_entries == 1  # type: ignore[attr-defined]
+    assert result.report.cancelled == ()  # the session rule got there first: not counted twice
+
+
+def test_the_algo_is_not_left_in_a_trade_after_its_pending_entry_is_cancelled(tmp_path: Path) -> None:
+    algo = TradeProbe("p", "AAA", {3, 6})
+    result = run(tmp_path, {"AAA": quiet_rows(*GAPPED, "09:37")}, [algo], "paper")
+    # update 3 enters; the gap bar (update 4) cancels it before the algo looks: it is flat again
+    assert algo.history == [False, False, True, False, False, True, True]
+    assert result.report.cancelled == (SuppressedEntries("p", "AAA", 1, (at("09:34"),)),)
+    # the cancelled Trade object stays in algo.trades (as for any broker-side cancel)
+    assert [r["openTime"] for r in trade_records(algo)] == [str(at("09:32")), str(at("09:36"))]
+    assert [f.time for f in result.ledger.fills if f.reason == "entry"] == [at("09:37")]
+
+
+def test_every_cancellation_is_counted_and_the_timestamps_are_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gaprule, "MAX_TIMES", 3)
+    rule = GapRule({"A": datetime(2024, 1, 4, 9, 30)})
+    for minute in range(35, 45, 2):
+        assert rule.on_bar("A", datetime(2024, 1, 4, 9, minute))
+        rule.cancel_pending("x", "A")
+        rule.end_bar("A")
+    (entry,) = rule.report().cancelled
+    assert entry.count == 5 and len(entry.times) == 3
+    assert rule.report().total_cancelled == 5 and rule.report().total_suppressed == 0
+    doc = gap_rule_to_json(rule.report())["cancelled_pending_entries"]
+    assert doc["count"] == 5 and doc["by_algo"][0]["times_truncated"] is True
+
+
+def test_a_broker_without_a_gap_watch_is_wrapped_as_before() -> None:
+    inner = SimBroker()
+    assert not hasattr(inner, "set_gap_watch")
+    GapGuardBroker(inner, "a", GapRule({"A": None}))  # nothing to attach: no error
+
+
 # ------------------------------------------- per symbol, per algo, the record
 
 
@@ -633,6 +753,64 @@ def test_backtest_summary_report_json_and_api_show_the_gap_rule(
         store.close()
 
 
+PENDING_LINES = [
+    "bars that follow a gap (entries signalled on them were refused): AAA 1",
+    "pending entries cancelled because their fill bar follows a gap: 1",
+    "  AAA-ft AAA: 1 at 2024-01-04 09:33:00",
+]
+
+
+def test_backtest_summary_report_json_and_api_show_a_cancelled_pending_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 09:32 is missing: the entry signalled on the second bar (09:31) would fill at 09:33
+    env = gapped_env(tmp_path, monkeypatch, [t for t in MINUTES if t != "09:32"])
+    db = tmp_path / "store" / "runs.db"
+    assert env.run("--db", str(db), "--fills", "realistic") == 0
+    out = capsys.readouterr().out.splitlines()
+    assert [line for line in out if "gap" in line] == PENDING_LINES[:2]
+    assert out[out.index(PENDING_LINES[0]):][:3] == PENDING_LINES
+
+    assert main(["report", "1", "--db", str(db)]) == 0
+    text = capsys.readouterr().out.splitlines()
+    assert all(line in text for line in PENDING_LINES)
+
+    assert main(["report", "1", "--db", str(db), "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["run"]["gap_rule"] == {
+        "bars_after_gap": {"AAA": 1},
+        "suppressed_entries": {"count": 0, "by_algo": []},
+        "cancelled_pending_entries": {"count": 1, "by_algo": [{
+            "algo": "AAA-ft", "symbol": "AAA", "count": 1,
+            "times": ["2024-01-04T09:33:00"], "times_truncated": False}]},
+    }
+    response = make_client(db).get("/api/runs/1")
+    assert response.status_code == 200
+    assert response.json()["run"]["gap_rule"] == doc["run"]["gap_rule"]
+    store = open_store(str(db), env={})
+    try:
+        report = store.load_run(1).summary.data.gap_rule
+        assert report is not None and report.total_cancelled == 1
+    finally:
+        store.close()
+
+
+def test_cancelled_pending_entries_round_trip_and_older_documents_read_without_them() -> None:
+    report = GapRuleReport(
+        (("AAA", 2),), (),
+        (SuppressedEntries("a", "AAA", 2, (datetime(2024, 1, 4, 9, 34), datetime(2024, 1, 4, 9, 40))),))
+    assert gap_rule_from_json(gap_rule_to_json(report)) == report
+    older = gap_rule_to_json(sample_report())  # no cancelled category: the key is absent
+    assert "cancelled_pending_entries" not in older
+    assert gap_rule_from_json(older) == sample_report()
+    assert gap_rule_from_json(older).cancelled == ()  # type: ignore[union-attr]
+    # a stored zero reads back as none; a damaged category reads as not recorded
+    older["cancelled_pending_entries"] = {"count": 0, "by_algo": []}
+    assert gap_rule_from_json(older) == sample_report()
+    older["cancelled_pending_entries"] = {"count": 1}
+    assert gap_rule_from_json(older) is None
+
+
 def test_nothing_is_printed_or_shown_when_there_was_no_gap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -678,6 +856,10 @@ console.log(JSON.stringify({
   junk: runNotes({ run: { gap_rule: { bars_after_gap: "x", suppressed_entries: 5 } }, total }),
   shown: runNotes({ run: { gap_rule: rule }, total }),
   one: runNotes({ run: { gap_rule: { bars_after_gap: { AAA: 1 }, suppressed_entries: { count: 1, by_algo: [] } } }, total }),
+  pending: runNotes({ run: { gap_rule: { bars_after_gap: { AAA: 1 }, suppressed_entries: { count: 0, by_algo: [] }, cancelled_pending_entries: { count: 2, by_algo: [{ algo: "a", symbol: "AAA", count: 2, times: [], times_truncated: false }] } } }, total }),
+  pendingOne: runNotes({ run: { gap_rule: { bars_after_gap: {}, cancelled_pending_entries: { count: 1, by_algo: [] } } }, total }),
+  pendingZero: runNotes({ run: { gap_rule: { bars_after_gap: {}, cancelled_pending_entries: { count: 0, by_algo: [] } } }, total }),
+  pendingJunk: runNotes({ run: { gap_rule: { cancelled_pending_entries: "x" } }, total }),
 }));
 """)
     assert isinstance(out, dict)
@@ -688,6 +870,12 @@ console.log(JSON.stringify({
         "3 entries refused on bars that follow a gap (a AAA: 3).",
     ]
     assert out["one"][1] == "1 entry refused on bars that follow a gap."
+    assert out["pending"] == [
+        "Bars that follow a gap (entries signalled on them were refused): AAA 1.",
+        "2 pending entries cancelled because the fill bar follows a gap (a AAA: 2).",
+    ]
+    assert out["pendingOne"] == ["1 pending entry cancelled because the fill bar follows a gap."]
+    assert out["pendingZero"] == [] and out["pendingJunk"] == []
 
 
 # ------------------------------------------- the paper harness and a refusal
@@ -704,6 +892,45 @@ def test_view_problem_after_refusal_allows_only_the_refusal_bar() -> None:
     # without a refusal the old rules apply
     assert harness.view_problem_after_refusal(True, "closed", [], False)[0] is not None
     assert harness.view_problem_after_refusal(True, "open", ["open"], False) == (None, 1)
+
+
+def test_view_problem_accepts_a_cancelled_pending_entry_without_any_allowance() -> None:
+    """A pending entry cancelled on the gap bar is a broker-side cancel: the algo learns on that
+    same bar (the broker cancels before the algo updates), so the harness's plain check holds."""
+    from tests import harness
+    assert harness.view_problem_after_refusal(False, "cancelled", ["cancelled"], False)[0] is None
+    # and an algo still in a trade after the cancel is still a violation on every bar
+    assert harness.view_problem_after_refusal(True, "cancelled", ["cancelled"], False)[0] is not None
+
+
+def test_a_real_algo_run_checks_every_bar_across_a_cancelled_pending_entry(tmp_path: Path) -> None:
+    """The paper harness's per-bar consistency check on a run in which an entry was cancelled."""
+    import contextlib
+
+    from tests import harness
+    harness.stage_offline_data(tmp_path, ["TSLA"])
+    cfg = {"idname": "TSLA-ff", "ticker": "TSLA", "RRRatio": 3}
+    path = tmp_path / "OfflineData" / "_TSLA_offlinedata_"
+    with contextlib.chdir(tmp_path):
+        try:
+            base = harness.run_paper_backtest("FridayFrenzy", cfg)
+        finally:
+            harness.reset_runtime_state()
+    entries = [t.openTime for t in base.algo.trades]
+    assert entries  # the clean run enters; remove the bar after the first entry's signal bar
+    signal = pd.Timestamp(entries[0])
+    frame = pd.read_csv(path, index_col=0)
+    frame = frame[frame["date"] != str(signal + pd.Timedelta(minutes=1))]
+    frame.to_csv(path)
+    with contextlib.chdir(tmp_path):
+        try:
+            run = harness.run_paper_backtest("FridayFrenzy", cfg)
+        finally:
+            harness.reset_runtime_state()
+    states = {run.broker.position_state(t.brokerRef) for t in run.algo.trades
+              if not isinstance(t.brokerRef, RefusedEntry)}
+    assert "cancelled" in states
+    assert run.violations == [] and run.bars_checked > 0
 
 
 def test_paper_run_on_gapped_data_completes_and_still_checks_later_bars(tmp_path: Path) -> None:

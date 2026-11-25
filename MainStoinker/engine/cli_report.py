@@ -420,6 +420,13 @@ def gap_rule_lines(report: GapRuleReport | None) -> list[str]:
             shown = ", ".join(t.isoformat(sep=" ") for t in e.times[:5])
             more = f", ... ({e.count - 5} more)" if e.count > 5 else ""
             lines.append(f"  {e.algo} {e.symbol}: {e.count} at {shown}{more}")
+    if report.total_cancelled:
+        lines.append("pending entries cancelled because their fill bar follows a gap: "
+                     f"{report.total_cancelled}")
+        for e in report.cancelled:
+            shown = ", ".join(t.isoformat(sep=" ") for t in e.times[:5])
+            more = f", ... ({e.count - 5} more)" if e.count > 5 else ""
+            lines.append(f"  {e.algo} {e.symbol}: {e.count} at {shown}{more}")
     return lines
 
 

@@ -18,7 +18,10 @@ sees the bar; positions of other symbols are ignored):
 - Entry: a market entry requested during bar t fills at the open of bar t+1,
   plus slippage against the trader. If bar t+1 is on another calendar date,
   or there is none (`on_end`), the entry is cancelled and counted
-  (`cancelled_entries`). `limit=True` raises `NotImplementedError`.
+  (`cancelled_entries`). `limit=True` raises `NotImplementedError`. When the
+  gap rule is attached (`set_gap_watch`) and bar t+1 follows a gap for the
+  symbol, the entry is cancelled the same way (and reported to the gap rule);
+  stops, targets and exits are not affected by gaps.
 - Stops and targets rest from the fill bar on and are checked against the
   range of every bar, the fill bar included. A long stop triggers when
   `low <= stop` and fills at `min(open, stop)`, with slippage. A long target
@@ -57,7 +60,7 @@ This module must not import anything from `MainStoinker.*` outside
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -132,6 +135,20 @@ class PaperBroker:
         self._last_time: dict[str, datetime] = {}
         self._next_ref = 1
         self._cancelled_entries = 0
+        self._follows_gap: Callable[[str], bool] | None = None
+        self._on_gap_cancel: Callable[[str], None] | None = None
+
+    def set_gap_watch(self, follows_gap: Callable[[str], bool],
+                      on_cancel: Callable[[str], None]) -> None:
+        """Cancel a pending entry whose fill bar follows a gap (issue 206).
+
+        `follows_gap(symbol)` says whether the bar being processed for `symbol`
+        follows a gap; `on_cancel(symbol)` is called for each pending entry
+        cancelled because of it. Set by the gap rule's guard; without it nothing
+        changes.
+        """
+        self._follows_gap = follows_gap
+        self._on_gap_cancel = on_cancel
 
     @property
     def costs(self) -> CostModel:
@@ -292,6 +309,12 @@ class PaperBroker:
         if pos.state == "pending":
             if time.date() != pos.req_time.date():
                 self._cancel_entry(pos, time)
+                return
+            if self._follows_gap is not None and self._follows_gap(pos.symbol):
+                # Gap rule: the fill bar follows a gap, so the entry never fills.
+                self._cancel_entry(pos, time)
+                if self._on_gap_cancel is not None:
+                    self._on_gap_cancel(pos.symbol)
                 return
             price = self._price(bar.open, pos.entry_side, slippage=True)
             self._fill(pos, pos.entry_side, price, time, "entry", pos.entry_id)
