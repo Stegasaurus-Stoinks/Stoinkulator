@@ -5,11 +5,16 @@ import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
 import {
   formatDuration, formatUtc, shortVersion,
 } from "../format.js";
+import {
+  RUNS_REFRESH_MS, createPoller, createRefreshNote, isLiveRun, isRunning, livenessBadge,
+} from "../live.js";
 import { compareHash, runHash } from "../routes.js";
 import { dataTable, netCell } from "../table.js";
 
-// A run that never finished is shown as "incomplete", otherwise by its stored status.
+// A run that never finished is shown as "incomplete", otherwise by its stored status. A live run (the server
+// sent its liveness) is shown by its liveness: running, stale, completed or failed.
 export function displayStatus(run) {
+  if (isLiveRun(run)) return run.liveness;
   return run.incomplete ? "incomplete" : run.status;
 }
 
@@ -94,7 +99,9 @@ export async function render(container, params, ctx) {
     { label: "Duration", numeric: true, cell: (r) => formatDuration(r.run.duration_seconds) },
     {
       label: "Status",
-      cell: (r) => h("span", { class: "badge " + displayStatus(r.run) }, displayStatus(r.run)),
+      cell: (r) => (isLiveRun(r.run)
+        ? livenessBadge(r.run)
+        : h("span", { class: "badge " + displayStatus(r.run) }, displayStatus(r.run))),
     },
     { label: "Kind", cell: (r) => r.run.kind },
     { label: "Fill model", cell: (r) => r.run.fills },
@@ -150,31 +157,48 @@ export async function render(container, params, ctx) {
 
   // The refresh button keeps keyboard focus while loading: it is aria-disabled, not disabled,
   // and clicks are ignored until the load ends.
-  async function load(userRefresh) {
+  // A background load (the timer of a list with a running run) keeps the last good render while it runs and
+  // when it fails: no "Loading..." panel, no error panel, only the one "refresh failed" note.
+  async function load(userRefresh, background = false) {
     if (loading) return;
     loading = true;
-    state = "loading";
-    refresh.setAttribute("aria-disabled", "true");
-    draw();
+    let keepRender = false;
+    if (!background) {
+      state = "loading";
+      refresh.setAttribute("aria-disabled", "true");
+      draw();
+    }
     try {
       const data = await getJson("/api/runs", {}, { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
       if (!Array.isArray(data.runs)) throw new ApiError(200, "The server sent an unexpected response.", "unexpected");
-      runs = [...data.runs].sort((a, b) => b.run_id - a.run_id);
+      // Newest first. When the server sent live runs it has ordered the list (running, stale, the rest, each
+      // newest first) and that order is kept.
+      runs = data.runs.some(isLiveRun) ? [...data.runs] : [...data.runs].sort((a, b) => b.run_id - a.run_id);
       const known = new Set(runs.map((r) => r.run_id));
       for (const id of [...ticked]) if (!known.has(id)) ticked.delete(id);
       fillFilters();
       state = "ok";
+      note.ok();
     } catch (err) {
       if (isAbortError(err) || !ctx.isCurrent()) return;
-      error = err;
-      state = "error";
+      if (background) {
+        keepRender = true;
+        note.fail();
+      } else {
+        error = err;
+        state = "error";
+      }
     } finally {
       loading = false;
       if (ctx.isCurrent()) {
-        refresh.setAttribute("aria-disabled", "false");
-        draw();
-        if (userRefresh) window.dispatchEvent(new Event(HEALTH_EVENT)); // the router did the first health request
+        if (!background) refresh.setAttribute("aria-disabled", "false");
+        if (!keepRender) draw();
+        layout();
+        syncPoller();
+        if (userRefresh || (background && !keepRender)) {
+          window.dispatchEvent(new Event(HEALTH_EVENT)); // the router did the first health request
+        }
       }
     }
   }
@@ -190,7 +214,25 @@ export async function render(container, params, ctx) {
     window.location.hash = compareHash([...ticked].sort((a, b) => a - b));
   });
 
-  container.replaceChildren(viewHeading("Runs"), toolbar, body);
+  // The page: the "refresh failed" note (only after a failed background refresh) sits between toolbar and body.
+  const heading = viewHeading("Runs");
+  let placedNote = false; // re-placing nodes would drop keyboard focus, so only a change of the note does it
+  function layout(force = false) {
+    if (!force && note.failed === placedNote) return;
+    placedNote = note.failed;
+    container.replaceChildren(...[heading, toolbar, note.failed ? note.element : null, body].filter(Boolean));
+  }
+
+  // The list refreshes itself while at least one run is running. The timer is registered with the view's
+  // cleanup at once; it stops when no run is running any more (checked after each load).
+  const note = createRefreshNote();
+  const poller = createPoller(ctx, { intervalMs: RUNS_REFRESH_MS, tick: () => load(false, true) });
+  function syncPoller() {
+    if (state === "ok" && runs.some(isRunning)) poller.start();
+    else poller.stop();
+  }
+
+  layout(true);
   updateCompare();
   await load(false);
 }

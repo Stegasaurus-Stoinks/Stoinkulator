@@ -1,7 +1,7 @@
 // Pure formatting helpers. No DOM, no network, no clock.
 //
 // Exports: formatMoney, formatNet, netClass, formatPercent, formatDuration, formatUtc,
-// formatDataTime, shortVersion, dataTimeToChartTime, chartTimeToDataTime.
+// formatDataTime, shortVersion, dataTimeToChartTime, chartTimeToDataTime, trimDecimal.
 // Money and percentages are decimal strings from the API; they are rounded with integer (BigInt)
 // arithmetic, half away from zero (the CLI's ROUND_HALF_UP), never through floating point.
 
@@ -156,6 +156,18 @@ export function dataTimeToChartTime(text) {
   const check = new Date(ms);
   if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
   return ms / 1000;
+}
+
+// "100.0000" -> "100", "191.2350" -> "191.235", with at least `places` decimals kept ("190.0000" -> "190.00"
+// at places 2). Text that is not a plain decimal is returned as given, "-" when missing.
+export function trimDecimal(value, places = 0) {
+  if (value === null || value === undefined || value === "") return "-";
+  const m = /^([+-]?\d+)(?:\.(\d*))?$/.exec(String(value).trim());
+  if (!m) return String(value);
+  let fraction = m[2] || "";
+  while (fraction.length > places && fraction.endsWith("0")) fraction = fraction.slice(0, -1);
+  while (fraction.length < places) fraction += "0";
+  return fraction ? m[1] + "." + fraction : m[1];
 }
 
 // The reverse: chart seconds as "YYYY-MM-DD HH:MM:SS", read in UTC (the axis's clock). Anything that is
