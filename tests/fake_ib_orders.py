@@ -74,9 +74,16 @@ transmit=False held back silently until transmit=True   unverified
 Children PreSubmitted until the parent has a fill       unverified
 Parent Cancelled/Inactive/rejected cancels children     unverified
 Children's size after a partial parent, rest cancelled  unverified (configurable)
-OCA: first fill cancels working siblings (no 202)       unverified
+OCA ocaType 1: any fill cancels working siblings        unverified
+OCA ocaType 2/3: siblings shrink by the filled amount   unverified
+OCA ocaType 0 or other with an ocaGroup: refused here   (the fake does not model it)
+Bracket children implicitly OCA (flag, default off)     unverified
+Children live at full size while parent part-filled     unverified (not configurable yet)
+After a reconnect no orderStatus is pushed for open     unverified (safe direction)
+  orders
 Stop and target both fill before the cancel (overfill)  unverified
-1100: callbacks lost until 1101 (lost) or 1102 (kept)   unverified
+1100: callbacks lost; 1101, and 1102 by default, keep   unverified
+  them lost; 1102 replays them only when scripted
 Executions made during an outage replayed by reqExec    unverified
 Correction changes filled quantity and position         unverified
 Realised PnL UNSET on an opening fill                   unverified
@@ -136,6 +143,7 @@ ORDER_IMPLEMENTED = (
 # requests answer error(NO_VALID_ID, ...).
 _ORDER_ID_504 = frozenset({"placeOrder"})
 
+OCA_TYPES = frozenset({1, 2, 3})  # 1 cancel, 2 and 3 reduce (unverified; 0 is not modelled)
 DUPLICATE_ORDER_ID = 103
 WARNING_CODES = frozenset({399})  # delivered, and the order goes on
 
@@ -199,6 +207,7 @@ class _OrderRec:
         self.notional = 0.0
         self.last_price = 0.0
         self.fill_count = 0
+        self.orig_total = _dec(order.totalQuantity)
         self.held = False  # a child waiting for its parent's first fill
         self.sized = False  # the partial-parent size rule has been applied
 
@@ -284,6 +293,8 @@ class FakeOrderIbClient(FakeIbClient):
         self._held: list[tuple[int, Played]] = []
         self._untransmitted: dict[int, tuple[Contract, Order]] = {}
         self.child_size_on_partial_cancel = "keep"  # or "filled" (unverified: IB's rule)
+        # Unverified: do the children of one parent cancel each other without an ocaGroup?
+        self.implicit_bracket_oca = False
         self.lost_callbacks: list[Played] = []  # what the exchange said while nobody listened
         self._outage = False
         self._outage_buffer: list[Played] = []
@@ -439,15 +450,23 @@ class FakeOrderIbClient(FakeIbClient):
         with self._lock:
             self._outage = True
 
-    def end_outage(self, code: int = 1102) -> None:
-        """Error 1101 (data lost) or 1102 (data maintained: what was lost is replayed; unverified)."""
+    def end_outage(self, code: int = 1102, *, replay: bool = False) -> None:
+        """Error 1101 (data lost) or 1102 (data maintained).
+
+        What was lost stays lost unless ``replay=True`` is scripted with 1102 (unverified: that
+        IB redelivers order callbacks after 1102 is not known; the default is the strict side).
+        """
         if code not in (1101, 1102):
             raise ValueError(f"end_outage takes 1101 or 1102, not {code}")
+        if replay and code != 1102:
+            raise ValueError("replay needs 1102: 1101 means data lost")
+        replay_flag = replay
         with self._lock:
             self._outage = False
             replay, self._outage_buffer = self._outage_buffer, []
+        do_replay = replay_flag
         self.drop(code)
-        if code == 1102:
+        if code == 1102 and do_replay:
             for item in replay:
                 self.push(item[0], *item[1:])
 
@@ -518,6 +537,8 @@ class FakeOrderIbClient(FakeIbClient):
     # -- the order surface ---------------------------------------------------
     @_recorded_order
     def placeOrder(self, orderId: int, contract: Contract, order: Order):
+        if order.ocaGroup and order.ocaType not in OCA_TYPES:
+            raise ValueError(f"ocaType {order.ocaType} is not modelled: use one of {sorted(OCA_TYPES)}")
         with self._lock:
             # Strict side of two unknowns (unverified): an id that is used, or lower than the
             # highest id used, is 103; a whatIf request uses its id up like any other.
@@ -702,7 +723,11 @@ class FakeOrderIbClient(FakeIbClient):
         return state
 
     def _open_played(self, rec: _OrderRec) -> Played:
-        return ("openOrder", rec.order_id, rec.contract, rec.order, self._state(rec))
+        # Copies: a later change of the record must not rewrite a callback already queued.
+        return (
+            "openOrder", rec.order_id, copy.deepcopy(rec.contract), copy.deepcopy(rec.order),
+            self._state(rec),
+        )
 
     def _status_played(self, rec: _OrderRec) -> Played:
         return (
@@ -758,7 +783,7 @@ class FakeOrderIbClient(FakeIbClient):
     # -- brackets and OCA (everything here is unverified against real IB) ----
     def _after(self, rec: _OrderRec) -> list[Played]:
         """What follows a change of ``rec``: its children's fate, then its OCA siblings'."""
-        return self._settle_children(rec) + self._oca_cancel(rec)
+        return self._settle_children(rec) + self._oca(rec)
 
     def _settle_children(self, parent: _OrderRec) -> list[Played]:
         if self.child_size_on_partial_cancel not in ("keep", "filled"):
@@ -779,25 +804,49 @@ class FakeOrderIbClient(FakeIbClient):
                 partial_cancel = parent.status == "Cancelled" and parent.remaining > 0
                 if partial_cancel and not child.sized and self.child_size_on_partial_cancel == "filled":
                     child.sized = True
-                    child.order.totalQuantity = parent.filled
-                    played += [self._open_played(child), self._status_played(child)]
+                    played += self._shrink(child, parent.filled)
             elif parent.status in TERMINAL:
                 child.held = False
                 child.status = "Cancelled"
                 played.append(self._status_played(child))
         return played
 
-    def _oca_cancel(self, rec: _OrderRec) -> list[Played]:
-        group = rec.order.ocaGroup
+    def _shrink(self, rec: _OrderRec, size: Decimal) -> list[Played]:
+        """Resize a working order, never below what it has filled; nothing left ends it."""
+        size = max(_dec(size), rec.filled)
+        if size == rec.total and rec.remaining > 0:
+            return []
+        rec.order.totalQuantity = size
+        rec.held = False
+        if rec.remaining == 0:
+            rec.status = "Filled" if rec.filled > 0 else "Cancelled"
+        return [self._open_played(rec), self._status_played(rec)]
+
+    def _oca_group(self, rec: _OrderRec) -> str:
+        if rec.order.ocaGroup:
+            return rec.order.ocaGroup
+        if self.implicit_bracket_oca and rec.order.parentId:
+            return f"implicit-parent-{rec.order.parentId}"
+        return ""
+
+    def _oca(self, rec: _OrderRec) -> list[Played]:
+        group = self._oca_group(rec)
         if not group or rec.filled <= 0:
             return []
+        kind = rec.order.ocaType if rec.order.ocaGroup else 1
+        members = sorted(self._orders.values(), key=lambda r: r.order_id)
         played: list[Played] = []
-        for other in sorted(self._orders.values(), key=lambda r: r.order_id):
-            if other is rec or other.order.ocaGroup != group or other.status in TERMINAL:
+        for other in members:
+            if other is rec or self._oca_group(other) != group or other.status in TERMINAL:
                 continue
-            other.held = False
-            other.status = "Cancelled"
-            played.append(self._status_played(other))
+            if kind == 1:
+                other.held = False
+                other.status = "Cancelled"
+                played.append(self._status_played(other))
+            else:  # 2 and 3: it shrinks by what the others filled (unverified)
+                gone = sum((m.filled for m in members if m is not other and self._oca_group(m) == group),
+                           Decimal(0))
+                played += self._shrink(other, other.orig_total - gone)
         return played
 
     def _lifecycle(self, rec: _OrderRec, plan: FillPlan) -> tuple[list[Played], list[tuple[int, Played]]]:
