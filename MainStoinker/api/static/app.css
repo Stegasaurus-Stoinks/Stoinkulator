@@ -199,6 +199,15 @@ td.num { font-family: var(--mono); font-size: 13px; }
 }
 .badge.incomplete, .badge.failed { background: var(--warn-bg); color: var(--warn-text); }
 .badge.failed { background: var(--err-bg); color: var(--err-text); }
+.badge.running { color: var(--pos); font-weight: 600; }
+.badge.stale { background: var(--warn-bg); color: var(--warn-text); }
+
+/* Live runs */
+.health .live-state { font-weight: 600; }
+.health .live-state.running { color: var(--pos); }
+.health .live-state.stale { color: var(--warn-text); background: var(--warn-bg); padding: 0 6px; border-radius: 3px; }
+.refresh-note { margin: 8px 0; font-size: 13px; }
+.live-box { margin-bottom: 12px; }
 
 .params { margin: 8px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
 .params dt { color: var(--muted); }

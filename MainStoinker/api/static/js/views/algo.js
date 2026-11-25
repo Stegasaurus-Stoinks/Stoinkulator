@@ -15,12 +15,13 @@
 // Exports: render, TRADE_COLUMNS, dayOfTime, shiftDay, stepDay, stepWindow, nearestBarDay, exitNote, entryNote, initialDay,
 // dayWindow, barsState, buildTradeRows, selectLabel, summaryItems, trimDecimal. Everything but render is pure
 // (no DOM, no network) so node can test it.
-import { ApiError, getJson, isAbortError } from "../api.js";
+import { ApiError, HEALTH_EVENT, getJson, isAbortError } from "../api.js";
 import { createCandleChart } from "../charts/candles.js";
 import { createEquityChart } from "../charts/equity.js";
 import { createOverlays } from "../charts/overlays.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
-import { chartTimeToDataTime, dataTimeToChartTime, netClass } from "../format.js";
+import { chartTimeToDataTime, dataTimeToChartTime, netClass, trimDecimal } from "../format.js";
+import { ALGO_REFRESH_MS, createPoller, createRefreshNote, isLiveRun, isRunning, liveStatusPanel } from "../live.js";
 import { runHash, runsHash } from "../routes.js";
 import { dataTable, netCell } from "../table.js";
 import { ALGO_COLUMNS, displayStatus, statusNotes } from "./overview.js";
@@ -112,9 +113,11 @@ export function dayWindow(day) {
   return { start: day + " 00:00:00", end: day + " 23:59:59" };
 }
 
+export const NO_BARS_YET = "No bars yet.";
+
 // What the bars route's answer means for the chart: {candles, note, kind}. `candles` says whether to draw
 // the bars; `note` is the sentence to show above the chart ("" for none).
-export function barsState(data, symbol) {
+export function barsState(data, symbol, live = false) {
   const name = symbol || "this symbol";
   const bars = data && Array.isArray(data.bars) ? data.bars : [];
   if (!data || data.available !== true) {
@@ -143,22 +146,15 @@ export function barsState(data, symbol) {
     ? "These bars could not be checked against the data file the run used (no checksum was stored)."
     : "";
   if (bars.length === 0) {
+    // A live run that has stored no bar yet is not an error: its first bar has not arrived.
+    if (live) return { kind: "empty", candles: false, note: NO_BARS_YET };
     return { kind: "empty", candles: false, note: "No bars for " + name + " on this day." };
   }
   return { kind: unverified ? "unverified" : "ok", candles: true, note: unverified };
 }
 
-// "100.0000" -> "100", "191.2350" -> "191.235", with at least `places` decimals kept ("190.0000" -> "190.00"
-// at places 2). Text that is not a plain decimal is returned as given, "-" when missing.
-export function trimDecimal(value, places = 0) {
-  if (value === null || value === undefined || value === "") return DASH;
-  const m = /^([+-]?\d+)(?:\.(\d*))?$/.exec(String(value).trim());
-  if (!m) return String(value);
-  let fraction = m[2] || "";
-  while (fraction.length > places && fraction.endsWith("0")) fraction = fraction.slice(0, -1);
-  while (fraction.length < places) fraction += "0";
-  return fraction ? m[1] + "." + fraction : m[1];
-}
+// trimDecimal lives in format.js (the live panels use it too); re-exported here for the callers of this view.
+export { trimDecimal };
 
 function numberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -234,13 +230,17 @@ function validDocument(value) {
     && value.accounts && typeof value.accounts === "object";
 }
 
-function statusPanel(run) {
+function statusContent(run) {
   const status = displayStatus(run);
-  const warning = statusNotes(run);
-  return h("section", { class: "panel", "aria-label": "Run status" },
+  const warning = isRunning(run) ? "" : statusNotes(run); // a running live run is not "incomplete"
+  return [
     h("ul", { class: "status-line" },
       h("li", {}, h("span", { class: "muted" }, "Run status "), h("span", { class: "badge " + status }, status))),
-    warning ? h("p", { class: "warning", role: "note" }, warning) : null);
+    warning ? h("p", { class: "warning", role: "note" }, warning) : null].filter(Boolean);
+}
+
+function statusPanel(run) {
+  return h("section", { class: "panel", "aria-label": "Run status" }, ...statusContent(run));
 }
 
 function summaryPanel(stats) {
@@ -269,6 +269,12 @@ export async function render(container, params, ctx) {
   const idname = params.idname;
   const heading = () => viewHeading(idname + ", run " + runId);
   container.replaceChildren(heading(), backLinks(runId), loadingPanel("algo " + idname));
+
+  // The timer of a running live run (created, with its cleanup, once the page is drawn and the run is known to
+  // run). It reloads the bars, trades and indicators of the shown day: refreshLive, below.
+  let poller = null;
+  const refreshNote = createRefreshNote();
+  let liveBox = null; // the live status and the refresh note; only for a run that has a liveness
 
   const options = { signal: ctx.signal };
   const [docResult, tradesResult, equityResult] = await Promise.allSettled([
@@ -307,9 +313,15 @@ export async function render(container, params, ctx) {
 
   const run = doc.run;
   const symbol = typeof stats.symbol === "string" && stats.symbol ? stats.symbol : "";
-  const firstDay = dayOfTime(run.first_bar);
-  const lastDay = dayOfTime(run.last_bar);
-  const parts = [heading(), backLinks(runId), statusPanel(run), summaryPanel(stats)];
+  let firstDay = dayOfTime(run.first_bar); // a live run's last day grows: a refresh updates both
+  let lastDay = dayOfTime(run.last_bar);
+  const statusBox = statusPanel(run);
+  const parts = [heading(), backLinks(runId), statusBox];
+  if (isLiveRun(run)) {
+    liveBox = h("div", { class: "live-box" }, liveStatusPanel(run)); // replaced, with the note, on a refresh
+    parts.push(liveBox);
+  }
+  parts.push(summaryPanel(stats));
 
   // The equity curve.
   let equityBox = null;
@@ -335,7 +347,7 @@ export async function render(container, params, ctx) {
   } else {
     tradesFailed = true;
   }
-  const rowsByKey = new Map(rows.map((row) => [String(row.key), row]));
+  let rowsByKey = new Map(rows.map((row) => [String(row.key), row]));
 
   // The candle chart and its day control.
   const dayLabel = h("span", { class: "day-label", role: "status" });
@@ -363,20 +375,21 @@ export async function render(container, params, ctx) {
 
   // The trade table.
   let table = null;
+  const makeTable = () => dataTable({
+    columns: TRADE_COLUMNS, rows, caption: "Trades of " + idname, captionHidden: true,
+    sort: { column: 0, direction: "asc" }, rowKey: (row) => row.key, selectedKey: null,
+    onSelect: (row) => select(row.key), selectLabel,
+  });
+  const tradesSection = h("section", { "aria-label": "Trades" }, h("h3", {}, "Trades"));
   if (tradesFailed) {
-    parts.push(h("section", { "aria-label": "Trades" }, h("h3", {}, "Trades"),
-      errorPanel(tradesResult.status === "rejected" ? tradesResult.reason : unexpected())));
+    tradesSection.append(errorPanel(tradesResult.status === "rejected" ? tradesResult.reason : unexpected()));
   } else if (rows.length === 0) {
-    parts.push(h("section", { "aria-label": "Trades" }, h("h3", {}, "Trades"),
-      h("p", { class: "panel empty" }, "This algo made no trades in this run.")));
+    tradesSection.append(h("p", { class: "panel empty" }, "This algo made no trades in this run."));
   } else {
-    table = dataTable({
-      columns: TRADE_COLUMNS, rows, caption: "Trades of " + idname, captionHidden: true,
-      sort: { column: 0, direction: "asc" }, rowKey: (row) => row.key, selectedKey: null,
-      onSelect: (row) => select(row.key), selectLabel,
-    });
-    parts.push(h("section", { "aria-label": "Trades" }, h("h3", {}, "Trades"), table.element));
+    table = makeTable();
+    tradesSection.append(table.element);
   }
+  parts.push(tradesSection);
 
   container.replaceChildren(...parts);
 
@@ -415,9 +428,15 @@ export async function render(container, params, ctx) {
     ordersRequest.catch(() => {}); // awaited per day below; this keeps an unawaited failure from being unhandled
   }
 
-  let day = initialDay(rows, run.last_bar);
+  const live = isLiveRun(run);
+  let lastBar = run.last_bar; // the last bar the run header named; a refresh of a live run updates it
+  let day = initialDay(rows, lastBar);
   let selectedKey = null;
   let request = null;
+  let dayPending = false; // a day is loading: a refresh would only repeat that load
+  let refreshScope = null; // the request scope of a running refresh
+  let liveStatus = live ? liveStatusPanel(run) : null;
+  let noteShown = false;
   let stepSearch = null; // the scope of a running search for the previous / next day
 
   function paintDay() {
@@ -441,7 +460,8 @@ export async function render(container, params, ctx) {
     return selectedKey === null ? null : rowsByKey.get(String(selectedKey)) || null;
   }
 
-  function drawTrades() {
+  // `focus` false (a refresh of a live run) redraws the markers without moving the user's view to the trade.
+  function drawTrades(focus = true) {
     candles.setTrades(rows, selectedKey);
     const row = selectedRow();
     const exits = exitNote(row, day);
@@ -449,7 +469,7 @@ export async function render(container, params, ctx) {
     const other = exits || entered;
     if (other) setDayNote(other.text, { label: "Show " + other.day, run: () => loadDay(other.day) });
     else setDayNote("");
-    if (!row) return;
+    if (!row || !focus) return;
     if (row.entryDay === day && row.entryChart !== null) {
       if (row.exitDay === day && row.exitChart !== null) candles.focusSpan(row.entryChart, row.exitChart);
       else candles.focusTime(row.entryChart);
@@ -501,9 +521,11 @@ export async function render(container, params, ctx) {
   async function loadDay(next) {
     if (!candles) return;
     if (request) request.abort();
+    if (refreshScope) refreshScope.abort(); // a refresh of the day on show is moot once another day is shown
     if (stepSearch) stepSearch.abort(); // showing a day (by any route) ends a search for another
     stepSearch = null;
     const mine = request = ctx.child();
+    dayPending = true;
     day = next;
     paintDay();
     barsError.replaceChildren();
@@ -519,7 +541,7 @@ export async function render(container, params, ctx) {
       const data = await getJson("/api/runs/" + runId + "/bars",
         { symbol, start: window.start, end: window.end }, { signal: mine.signal });
       if (!mine.isCurrent()) return;
-      const state = barsState(data, symbol);
+      const state = barsState(data, symbol, live);
       candles.setBars(state.candles ? data.bars : []);
       candles.setNote(state.note);
       drawTrades();
@@ -535,7 +557,99 @@ export async function render(container, params, ctx) {
       candles.setNote("");
       if (overlays) overlays.clear();
       showError(err);
+    } finally {
+      if (request === mine) dayPending = false;
     }
+  }
+
+  // A live run that is running: every ALGO_REFRESH_MS the run, its trades and the bars, indicators and orders of
+  // the day on show are loaded again and drawn over the old ones. The user's zoom and scroll position are kept
+  // (setBars with keepView, markers redrawn without a focus). A part that fails keeps its last render; the one
+  // "refresh failed" note says so until the next success. The timer stops when the run is no longer running.
+  async function refreshLive() {
+    if (dayPending) return; // a day is loading: that load is as fresh as a refresh
+    if (refreshScope) refreshScope.abort();
+    const mine = refreshScope = ctx.child();
+    const options = { signal: mine.signal };
+    const shown = day;
+    const span = shown ? dayWindow(shown) : null;
+    const seriesRequest = shown && overlays
+      ? getJson("/api/runs/" + runId + "/series", { algo: idname, start: span.start, end: span.end }, options)
+      : null;
+    if (seriesRequest) seriesRequest.catch(() => {}); // awaited by drawOverlays
+    if (shown && overlays && realistic) {
+      // the orders change while the run goes on: asked again (on the view's signal, which a later refresh does not abort)
+      ordersRequest = getJson("/api/runs/" + runId + "/orders", { algo: idname }, { signal: ctx.signal });
+      ordersRequest.catch(() => {});
+    }
+    const [docNext, tradesNext, barsNext] = await Promise.allSettled([
+      getJson("/api/runs/" + runId, {}, options),
+      getJson("/api/runs/" + runId + "/trades", { algo: idname }, options),
+      shown && candles
+        ? getJson("/api/runs/" + runId + "/bars", { symbol, start: span.start, end: span.end }, options)
+        : Promise.resolve(null),
+    ]);
+    if (!mine.isCurrent()) return;
+    for (const result of [docNext, tradesNext, barsNext]) {
+      if (result.status === "rejected" && isAbortError(result.reason)) return;
+    }
+    let failed = false;
+    let ended = false;
+    const docOk = docNext.status === "fulfilled" && validDocument(docNext.value);
+    if (docOk) {
+      const next = docNext.value.run;
+      statusBox.replaceChildren(...statusContent(next));
+      firstDay = dayOfTime(next.first_bar);
+      lastDay = dayOfTime(next.last_bar);
+      lastBar = next.last_bar;
+      paintDay();
+      ended = !isRunning(next);
+      if (isLiveRun(next)) liveStatus = liveStatusPanel(next);
+    } else {
+      failed = true;
+    }
+    if (tradesNext.status === "fulfilled" && tradesNext.value && Array.isArray(tradesNext.value.trades)) {
+      rows = buildTradeRows(tradesNext.value.trades);
+      rowsByKey = new Map(rows.map((row) => [String(row.key), row]));
+      if (table) {
+        table.update({ rows });
+      } else if (rows.length > 0) {
+        table = makeTable();
+        tradesSection.replaceChildren(h("h3", {}, "Trades"), table.element);
+      }
+    } else {
+      failed = true;
+    }
+    if (candles && shown) {
+      if (barsNext.status === "fulfilled" && barsNext.value && Array.isArray(barsNext.value.bars)) {
+        const data = barsNext.value;
+        const state = barsState(data, symbol, true);
+        candles.setBars(state.candles ? data.bars : [], { keepView: true });
+        candles.setNote(state.note);
+        drawTrades(false);
+        if (overlays) {
+          if (state.candles) drawOverlays(mine, seriesRequest, data.bars);
+          else overlays.clear();
+        }
+      } else {
+        failed = true;
+      }
+    } else if (candles && !shown && docOk) {
+      // no bar was stored when the page opened: the first one may have arrived
+      const first = initialDay(rows, lastBar);
+      if (first) {
+        refreshScope = null;
+        await loadDay(first);
+      }
+    }
+    if (failed) refreshNote.fail();
+    else refreshNote.ok();
+    if (liveBox && (docOk || refreshNote.failed !== noteShown)) {
+      noteShown = refreshNote.failed;
+      liveBox.replaceChildren(liveStatus, ...(noteShown ? [refreshNote.element] : []));
+    }
+    if (ended) poller.stop(); // the run is no longer running: this was the last refresh
+    window.dispatchEvent(new Event(HEALTH_EVENT));
   }
 
   // Previous / next day: the nearest day that has bars. One bars request covers up to 7 calendar days that way.
@@ -590,7 +704,11 @@ export async function render(container, params, ctx) {
       await loadDay(day);
     } else {
       candles.setBars([]);
-      candles.setNote("This run stored no bars, so there is no day to show.");
+      candles.setNote(live ? NO_BARS_YET : "This run stored no bars, so there is no day to show.");
     }
+  }
+  if (isRunning(run)) {
+    poller = createPoller(ctx, { intervalMs: ALGO_REFRESH_MS, tick: refreshLive }); // its stop is registered now
+    poller.start();
   }
 }

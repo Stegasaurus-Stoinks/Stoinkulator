@@ -48,8 +48,10 @@
 //     Registers dispose with ctx.onCleanup right after createChart succeeds. dispose() removes the theme
 //     listener and the chart; it is safe to call twice, and after it nothing reaches the removed chart.
 //     handle methods:
-//       setBars(bars)                 draw the bars of the route's response (see convertBars) and fit them;
+//       setBars(bars, {keepView})     draw the bars of the route's response (see convertBars) and fit them;
 //                                     an empty list hides the canvas. Markers are rebuilt for the new bars.
+//                                     With keepView (a live refresh of the same day) a view the user zoomed or
+//                                     scrolled is restored (the visible logical range) instead of fitted.
 //       setTrades(trades, selectedKey) the trade records (with key and number, see buildMarkers) and the
 //                                     selected key (or null); redraws the markers.
 //       focusTime(time)               scroll and zoom the chart to `time` (chart seconds, or a data time
@@ -353,16 +355,39 @@ export function createCandleChart(element, { ctx, lib = globalThis.LightweightCh
     for (const fn of themeListeners.slice()) fn(theme);
   }, view);
 
-  function setBars(bars) {
+  // The visible logical range, or null when the library cannot say (nothing drawn yet, an older library).
+  function readView() {
+    try {
+      const timeScale = chart.timeScale();
+      return typeof timeScale.getVisibleLogicalRange === "function" ? timeScale.getVisibleLogicalRange() : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function setBars(bars, { keepView = false } = {}) {
     if (disposed) return;
     const converted = convertBars(bars);
+    // A refresh of the same day (keepView) must not undo what the user did: when they zoomed or scrolled
+    // (or a focus was applied), the visible range is put back after the data is replaced; bars only ever
+    // append within a day, so the logical indexes still point at the same bars. Without a user change the
+    // view is fitted to the new bars as before.
+    const kept = keepView && userZoomed && times.length > 0 && converted.length > 0 ? readView() : null;
     times = converted.map((bar) => bar.time);
     series.setData(converted);
     canvas.hidden = converted.length === 0;
     legend.hidden = converted.length === 0;
     paintMarkers();
-    userZoomed = false;
-    if (converted.length > 0) chart.timeScale().fitContent();
+    if (kept) {
+      try {
+        chart.timeScale().setVisibleLogicalRange(kept);
+      } catch (err) {
+        // the library refused the range: the chart stays where it is
+      }
+    } else {
+      userZoomed = false;
+      if (converted.length > 0) chart.timeScale().fitContent();
+    }
     for (const fn of barListeners.slice()) {
       try {
         fn(converted);

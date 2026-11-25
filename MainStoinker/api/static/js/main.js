@@ -70,6 +70,7 @@
 import { HEALTH_EVENT, ApiError, describeError, getJson, isAbortError } from "./api.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "./dom.js";
 import { createNavigator } from "./lifecycle.js";
+import { liveHealthItems } from "./live.js";
 import { parseRoute, routeTitle } from "./routes.js";
 import { render as renderAlgo } from "./views/algo.js";
 import { render as renderCompare } from "./views/compare.js";
@@ -163,6 +164,7 @@ async function refreshHealth() {
       h("span", {}, Number.isFinite(runCount) ? runCount + (runCount === 1 ? " run" : " runs") : "runs: -"),
       h("span", { class: incomplete.length ? "warn" : "" },
         incomplete.length ? incomplete.length + " incomplete" : "no incomplete runs"),
+      ...liveHealthItems(health), // nothing unless the server sent live_state
     );
   } catch (err) {
     if (isAbortError(err) || healthController !== controller) return;

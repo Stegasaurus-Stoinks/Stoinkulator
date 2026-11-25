@@ -3,13 +3,17 @@
 //
 // Exports: render, ALGO_COLUMNS, displayStatus, runDurationSeconds, buildRows, statusNotes, runNotes,
 // settingRows. The last five are pure (no DOM) so node can test them.
-import { ApiError, getJson, isAbortError } from "../api.js";
+import { ApiError, HEALTH_EVENT, getJson, isAbortError } from "../api.js";
 import { createEquityChart } from "../charts/equity.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
 import {
   chartTimeToDataTime, dataTimeToChartTime, formatDuration, formatMoney, formatNet, formatPercent, formatUtc,
   shortVersion,
 } from "../format.js";
+import {
+  OVERVIEW_REFRESH_MS, createPoller, createRefreshNote, isLiveRun, isRunning, liveCountsPanel, liveStatusPanel,
+  positionsPanel,
+} from "../live.js";
 import { algoHash, runsHash } from "../routes.js";
 import { dataTable, netCell } from "../table.js";
 
@@ -18,6 +22,7 @@ const DASH = "-";
 
 // A run that never finished is "incomplete", otherwise its stored status.
 export function displayStatus(run) {
+  if (isLiveRun(run)) return run.liveness; // a live run: running, stale, completed or failed
   return run.incomplete ? "incomplete" : run.status;
 }
 
@@ -233,12 +238,47 @@ function chartPanel(chartBox, equity) {
       "All algos together; times are data time, as stored." + thinned));
 }
 
+function validDocument(value) {
+  return Boolean(value) && typeof value === "object" && Boolean(value.run) && typeof value.run === "object"
+    && Boolean(value.accounts) && typeof value.accounts === "object"
+    && Boolean(value.total) && typeof value.total === "object";
+}
+
+// The status section's content: the status line and, for a run that did not complete normally, its note. A
+// live run that is running is not "incomplete": the live status panel says where it stands.
+function statusContent(run) {
+  const warning = isRunning(run) ? "" : statusNotes(run);
+  return [statusLine(run), warning ? h("p", { class: "warning", role: "note" }, warning) : null].filter(Boolean);
+}
+
+function notesSection(notes) {
+  return h("section", { class: "panel", "aria-label": "Notes" }, h("h3", {}, "Notes"),
+    h("ul", { class: "notes" }, notes.map((note) => h("li", {}, note))));
+}
+
+// What a live run adds under the status section, each part only when its key is present on the document.
+function liveContent(doc) {
+  return [
+    isLiveRun(doc.run) ? liveStatusPanel(doc.run) : null,
+    Array.isArray(doc.open_positions) ? positionsPanel(doc.open_positions) : null,
+    doc.live_counts && typeof doc.live_counts === "object" ? liveCountsPanel(doc.live_counts) : null,
+  ].filter(Boolean);
+}
+
 export async function render(container, params, ctx) {
   const runId = params.runId;
   container.replaceChildren(
     viewHeading("Run " + runId),
     h("p", {}, h("a", { href: runsHash() }, "Back to the runs list")),
     loadingPanel("run " + runId));
+
+  let poller = null; // the timer of a running live run: created, with its cleanup, once the run is known to run
+  const refreshNote = createRefreshNote();
+  let liveBox = null; // the live parts and the refresh note; only for a run that has live keys
+  let statusBox = null;
+  let notesSlot = null;
+  let table = null;
+  let chart = null;
 
   const options = { signal: ctx.signal };
   const [docResult, equityResult] = await Promise.allSettled([
@@ -258,8 +298,7 @@ export async function render(container, params, ctx) {
   let docError = null;
   if (docResult.status === "fulfilled") {
     const value = docResult.value;
-    if (value && value.run && typeof value.run === "object" && value.accounts && typeof value.accounts === "object"
-        && value.total && typeof value.total === "object") {
+    if (validDocument(value)) {
       doc = value;
     } else {
       docError = new ApiError(200, "The server sent an unexpected response.", "unexpected");
@@ -272,11 +311,14 @@ export async function render(container, params, ctx) {
     return;
   }
 
-  const warning = statusNotes(doc.run);
-  parts.push(
-    h("section", { class: "panel", "aria-label": "Run status" }, statusLine(doc.run),
-      warning ? h("p", { class: "warning", role: "note" }, warning) : null),
-    settingsPanel(doc.run));
+  statusBox = h("section", { class: "panel", "aria-label": "Run status" }, ...statusContent(doc.run));
+  parts.push(statusBox);
+  const live = liveContent(doc);
+  if (live.length > 0) {
+    liveBox = h("div", { class: "live-box" }, ...live);
+    parts.push(liveBox);
+  }
+  parts.push(settingsPanel(doc.run));
 
   let chartBox = null;
   let equity = null;
@@ -293,26 +335,71 @@ export async function render(container, params, ctx) {
     parts.push(errorPanel(equityResult.reason));
   }
 
-  const table = algoTable(doc, runId);
+  table = algoTable(doc, runId);
   parts.push(h("section", { "aria-label": "Per-algo results" }, h("h3", {}, "Algos"), table.element));
   const notes = runNotes(doc);
-  if (notes.length > 0) {
-    parts.push(h("section", { class: "panel", "aria-label": "Notes" }, h("h3", {}, "Notes"),
-      h("ul", { class: "notes" }, notes.map((note) => h("li", {}, note)))));
+  if (liveBox) {
+    // a live run's notes change while it runs: a slot that holds the section (or nothing)
+    notesSlot = h("div", { class: "live-notes" }, ...(notes.length > 0 ? [notesSection(notes)] : []));
+    parts.push(notesSlot);
+  } else if (notes.length > 0) {
+    parts.push(notesSection(notes));
   }
 
   container.replaceChildren(...parts);
 
   if (chartBox) {
     try {
-      const chart = createEquityChart(chartBox, { ctx }); // registers its own disposal at once
+      chart = createEquityChart(chartBox, { ctx }); // registers its own disposal at once
       chart.setSeries([{
         label: "Account equity",
         points: equity.points,
         capital: equity.capital,
       }]);
     } catch (err) {
+      chart = null;
       chartBox.replaceChildren(errorPanel(err));
     }
+  }
+
+  // A run that is running refreshes every OVERVIEW_REFRESH_MS: the status, the live parts, the algo table, the
+  // notes and the equity curve are replaced in place; a failed refresh keeps all of them and shows the one note.
+  let current = doc;
+  let liveNodes = live;
+  let noteShown = false;
+  async function refreshLive() {
+    const [docNext, equityNext] = await Promise.allSettled([
+      getJson("/api/runs/" + runId, {}, options),
+      getJson("/api/runs/" + runId + "/equity", {}, options),
+    ]);
+    if (!ctx.isCurrent()) return;
+    for (const result of [docNext, equityNext]) {
+      if (result.status === "rejected" && isAbortError(result.reason)) return;
+    }
+    const docOk = docNext.status === "fulfilled" && validDocument(docNext.value);
+    const equityOk = equityNext.status === "fulfilled" && equityNext.value && Array.isArray(equityNext.value.points);
+    if (docOk) {
+      current = docNext.value;
+      statusBox.replaceChildren(...statusContent(current.run));
+      table.update({ rows: buildRows(current) });
+      const next = runNotes(current);
+      notesSlot.replaceChildren(...(next.length > 0 ? [notesSection(next)] : []));
+    }
+    if (equityOk && chart) {
+      chart.setSeries([{ label: "Account equity", points: equityNext.value.points, capital: equityNext.value.capital }]);
+    }
+    if (docOk && equityOk) refreshNote.ok();
+    else refreshNote.fail();
+    if (docOk || refreshNote.failed !== noteShown) {
+      if (docOk) liveNodes = liveContent(current);
+      noteShown = refreshNote.failed;
+      liveBox.replaceChildren(...liveNodes, ...(noteShown ? [refreshNote.element] : []));
+    }
+    if (docOk && !isRunning(current.run)) poller.stop(); // the run ended: no more refreshes
+    window.dispatchEvent(new Event(HEALTH_EVENT));
+  }
+  if (liveBox && isRunning(doc.run)) {
+    poller = createPoller(ctx, { intervalMs: OVERVIEW_REFRESH_MS, tick: refreshLive }); // its stop is registered now
+    poller.start();
   }
 }
