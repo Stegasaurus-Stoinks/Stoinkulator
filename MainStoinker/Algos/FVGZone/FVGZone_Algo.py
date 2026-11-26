@@ -29,6 +29,7 @@ import pandas as pd
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 from MainStoinker.engine.gaprule import RefusedEntry
 from MainStoinker.indicators.fvg import Direction, FvgConfig, FvgDetector
+from MainStoinker.indicators.session import DailyRange, SlotVolume
 from MainStoinker.indicators.trend import TrendConfig, TrendIndicator
 
 SESSION_OPEN_MINUTE = 9 * 60 + 30  # 09:30
@@ -53,6 +54,10 @@ DEFAULTS: dict[str, Any] = {
     "min_size_atr": 0.25,
     "htf_minutes": 0,
     "htf_ema": 20,
+    "vol_slot_mult": 0,
+    "vol_slot_sessions": 20,
+    "trend_day_adr": 0,
+    "adr_sessions": 20,
 }
 
 # Series for the dashboard: (column, draw type). 'line' is drawn smooth, 'segment' stepped.
@@ -200,6 +205,21 @@ class Algo(ParentAlgo):
         if self.htf_minutes:
             self._htf = TrendIndicator(TrendConfig(bar_minutes=self.htf_minutes, ema_bars=self.htf_ema))
         self._series = SERIES + (HTF_SERIES if self._htf is not None else ())
+        self.vol_slot_mult = _number(who, cfg, "vol_slot_mult")
+        if self.vol_slot_mult < 0:
+            raise _fail(who, f"vol_slot_mult must be >= 0 (0 is off), got {cfg.get('vol_slot_mult')!r}")
+        self.vol_slot_sessions = _integer(who, cfg, "vol_slot_sessions", 1)
+        self.trend_day_adr = _number(who, cfg, "trend_day_adr")
+        if self.trend_day_adr < 0:
+            raise _fail(who, f"trend_day_adr must be >= 0 (0 is off), got {cfg.get('trend_day_adr')!r}")
+        self.adr_sessions = _integer(who, cfg, "adr_sessions", 1)
+        # Both stay None when off, so an algo without the filters does no extra work per bar.
+        self._slot_volume: SlotVolume | None = None
+        self._daily_range: DailyRange | None = None
+        if self.vol_slot_mult > 0:
+            self._slot_volume = SlotVolume(self.zone_minutes, self.vol_slot_sessions)
+        if self.trend_day_adr > 0:
+            self._daily_range = DailyRange(self.adr_sessions)
 
         super().__init__(algoConfigData)
 
@@ -319,6 +339,10 @@ class Algo(ParentAlgo):
         htf = self._htf
         if htf is not None:
             htf.update(when, o, h, lo, c)  # completed higher-timeframe bars only: no look-ahead
+        if self._slot_volume is not None:
+            self._slot_volume.update(when, volume)  # a session joins the history when the next begins
+        if self._daily_range is not None:
+            self._daily_range.update(when, o_t, h_t, l_t, c_t)
 
         zones = []
         for z in self._det.live_zones():
@@ -427,8 +451,29 @@ class Algo(ParentAlgo):
                     continue
                 stop_t = z.top_ticks + self.stop_buffer_ticks
                 risk_t = stop_t - c_t
+            if not self._session_filters_ok(z, c_t):
+                continue  # blocked: the zone is not used up, a later retest may pass
             self._enter(when, z, z.direction is Direction.UP, c_t, stop_t, risk_t)
             return  # the newest qualifying zone wins, even if its setup is then skipped
+
+    def _session_filters_ok(self, zone: Any, c_t: int) -> bool:
+        """The volume-by-slot and trend-day filters for a retest of `zone` closing at `c_t`.
+
+        Each is off at 0. An answer that is not known (history not warm, no 09:30 bar) blocks.
+        """
+        slot_volume = self._slot_volume
+        if slot_volume is not None and not slot_volume.at_least(zone.candle_times[1], self.vol_slot_mult):
+            return False  # False or None (not available): blocked
+        daily = self._daily_range
+        if daily is not None:
+            session_open = daily.session_open
+            if session_open is None:
+                return False
+            distance = c_t - session_open
+            signed = distance if zone.direction is Direction.UP else -distance
+            if not daily.distance_at_least(signed, self.trend_day_adr):
+                return False
+        return True
 
     def _trend_ok(self, c_t: int, *, long: bool) -> bool:
         if not self.trend_filter:

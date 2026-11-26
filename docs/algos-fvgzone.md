@@ -40,6 +40,10 @@ given as JSON numbers or numeric strings (like the other algos).
 | `min_size_atr` | 0.25 | the detector's `min_size_atr`; `null` switches it off |
 | `htf_minutes` | 0 | minutes per higher-timeframe trend bar: 0 switches the filter off, otherwise 2 to 390 |
 | `htf_ema` | 20 | EMA length over the completed higher-timeframe closes (1 or more) |
+| `vol_slot_mult` | 0 | volume-by-slot filter: 0 is off; above 0 the zone's middle candle needs a volume of at least this multiple of the slot mean (0 or more) |
+| `vol_slot_sessions` | 20 | sessions in the slot mean (1 or more) |
+| `trend_day_adr` | 0 | trend-day filter: 0 is off; above 0 an entry needs the move from the session open, in the side's direction, to be at least this multiple of the ADR (0 or more) |
+| `adr_sessions` | 20 | sessions in the ADR (1 or more) |
 
 Times are bar labels (the bar START, naive New York time, as in the data). Required:
 `09:30 <= first_entry <= last_entry < flat_time`. The detector runs with
@@ -89,6 +93,27 @@ a bucket still in progress does not). `none` (including a trend that is not read
 `trend_filter`; the two are independent. A retest blocked by the trend is handled like one blocked by
 `trend_filter`: nothing is sent, the zone is NOT used up and may be retested later, and nothing is put in
 `algo.skipped` (that list is for risk skips). The EMA runs on from session to session.
+
+**Volume-by-slot filter** (`vol_slot_mult` above 0; off by default, and then the algo behaves exactly as
+before: every golden file is unchanged). `MainStoinker.indicators.session.SlotVolume` (see
+`docs/indicators.md`) builds `zone_minutes` buckets aligned to 09:30 and keeps, for each time slot, the volumes
+of the last `vol_slot_sessions` sessions that HAVE that slot (a half day has no afternoon slots, so it is
+skipped for them). A zone may be traded only if the volume of its MIDDLE candle is at least `vol_slot_mult`
+times the mean of its slot: `volume * sessions >= mult * sum of the slot's history`, in exact arithmetic
+(the multiple read as the decimal it is written as). A session joins the history only when the next session
+starts, so today is never in its own mean. Not available (fewer than `vol_slot_sessions` earlier sessions have
+the slot) blocks.
+
+**Trend-day filter** (`trend_day_adr` above 0; off by default, same guarantee).
+`MainStoinker.indicators.session.DailyRange` gives the session open (the open of the 09:30 bar) and the ADR,
+the mean of high minus low over the previous `adr_sessions` sessions (a session joins when the next starts).
+With D = the entry bar's close minus the session open, an entry needs D, signed for the side (a long needs D,
+a short needs -D), to be at least `trend_day_adr` times the ADR, exactly as above. Blocks while fewer than
+`adr_sessions` sessions have completed, and on a day whose first bar is later than 09:30 (no session open).
+Both filters are independent of each other (when both are on, both must pass), of `trend_filter` and of
+`htf_minutes`. A retest blocked by either is handled like one blocked by `trend_filter`: nothing is sent, the
+zone is NOT used up and may be retested later, and nothing is put in `algo.skipped`. They reproduce the
+research variants V2b and T4b (`vol_slot_mult` 1.5 and `trend_day_adr` 0.3 are the values studied).
 
 **Entry, long** (short is the exact mirror, all in integer cents): a usable up zone is
 retested by a 1-minute bar with `low <= zone top` that CLOSES above the zone top. The
@@ -144,6 +169,16 @@ over days, so a longer history gives a steadier EMA). Until then it blocks every
 days of month-file bars (default 2, about 780 bars, enough for the defaults; see `docs/live-data.md`); for a
 longer trend ask for more days, or the algo does not trade until the live session has filled the gap.
 
+The two session filters need history too: `vol_slot_sessions` earlier sessions that have the zone's slot and
+`adr_sessions` completed earlier sessions (20 each by default), and until then they block every entry. The
+history comes from the same frame: the sessions of the warm-up bars count, and the last one joins when the next
+session's first bar arrives. `run` loads only 2 warm-up days by default, so with these filters on (defaults)
+the algo does not trade in a live session; start it with `--warmup-days 25` (20 sessions plus a margin for a
+half day that lacks a slot) and month files (`fetch-bars`) that cover that many trading days before today.
+The trend-day filter also needs the 09:30 bar of the session itself. A live run started after 09:30 still has
+it, because the warm-up frame holds today's closed bars since the open; the filter blocks for the day only when
+that 09:30 bar is missing from the data.
+
 A zone retested only during that history is not marked
 used (the algo cannot know whether another process traded it).
 
@@ -189,6 +224,7 @@ used (the algo cannot know whether another process traded it).
 
 `tests/test_fvgzone_algo.py` (rules on hand-built bars), `tests/test_fvgzone_engine.py`
 (engine, gap rule, batch-detector equality, series, per-bar cost),
-`tests/fvgzone_support.py` (builders, mirror helper). Goldens: cases `fvgzone_*` in
+`tests/fvgzone_support.py` (builders, mirror helper), `tests/test_fvgzone_htf.py` (trend filter),
+`tests/test_fvgzone_session_filters.py` (volume-by-slot and trend-day filters). Goldens: cases `fvgzone_*` in
 `tests/test_golden_backtests.py` (`tests/golden/`) and `tests/test_paper_goldens.py`
 (`tests/golden_paper/`, with the per-bar agreement check of algo and broker).
