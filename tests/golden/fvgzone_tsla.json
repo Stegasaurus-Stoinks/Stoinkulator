@@ -90,17 +90,6 @@
  {
   "id": "TSLA-fvgzone8",
   "symbol": "TSLA",
-  "volume": 172,
-  "direction": 1,
-  "openTime": "2024-08-21 14:37:00",
-  "openPrice": 223.5,
-  "closeTime": "2024-08-21 14:38:00",
-  "closePrice": 223.21,
-  "status": "Closed"
- },
- {
-  "id": "TSLA-fvgzone9",
-  "symbol": "TSLA",
   "volume": 56,
   "direction": 0,
   "openTime": "2024-08-22 10:56:00",
@@ -110,7 +99,7 @@
   "status": "Closed"
  },
  {
-  "id": "TSLA-fvgzone10",
+  "id": "TSLA-fvgzone9",
   "symbol": "TSLA",
   "volume": 68,
   "direction": 0,
@@ -121,7 +110,7 @@
   "status": "Closed"
  },
  {
-  "id": "TSLA-fvgzone11",
+  "id": "TSLA-fvgzone10",
   "symbol": "TSLA",
   "volume": 135,
   "direction": 0,
@@ -132,7 +121,7 @@
   "status": "Closed"
  },
  {
-  "id": "TSLA-fvgzone12",
+  "id": "TSLA-fvgzone11",
   "symbol": "TSLA",
   "volume": 178,
   "direction": 0,
@@ -143,7 +132,7 @@
   "status": "Closed"
  },
  {
-  "id": "TSLA-fvgzone13",
+  "id": "TSLA-fvgzone12",
   "symbol": "TSLA",
   "volume": 75,
   "direction": 0,
@@ -154,7 +143,7 @@
   "status": "Closed"
  },
  {
-  "id": "TSLA-fvgzone14",
+  "id": "TSLA-fvgzone13",
   "symbol": "TSLA",
   "volume": 78,
   "direction": 0,

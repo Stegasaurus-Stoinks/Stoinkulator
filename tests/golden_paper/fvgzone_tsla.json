@@ -7,21 +7,21 @@
   "slippage_per_share": "0.0000"
  },
  "equity_points": 2340,
- "equity_sha256": "f17390415375646d282b8f1c9babc799b463810ed673c1adf5db9d6b6209c12a",
+ "equity_sha256": "405623b9ab03546eddac099b6e49baa94f293b1210f2f73baab5e98f9faa8d30",
  "idname": "TSLA-fvgzone",
  "summary": {
   "cancelled_entries": 0,
-  "commission": "30.0000",
-  "final_equity": "10161.6800",
+  "commission": "28.0000",
+  "final_equity": "10211.8400",
   "ignored_events": {
    "close": 0,
    "modify_stop": 0,
    "take_profit": 0
   },
   "max_drawdown": "323.5800",
-  "net": "161.6800",
+  "net": "211.8400",
   "synthetic_closes": 0,
-  "trade_count": 15,
+  "trade_count": 14,
   "wins": 6
  },
  "ticker": "TSLA",
@@ -128,19 +128,6 @@
    "net": "-49.0400",
    "quantity": "49.0000",
    "side": "short",
-   "synthetic": false
-  },
-  {
-   "commission": "2.0000",
-   "entry_price": "223.4900",
-   "entry_time": "2024-08-21 14:38:00",
-   "exit_price": "223.2100",
-   "exit_reason": "stop",
-   "exit_time": "2024-08-21 14:38:00",
-   "gross": "-48.1600",
-   "net": "-50.1600",
-   "quantity": "172.0000",
-   "side": "long",
    "synthetic": false
   },
   {

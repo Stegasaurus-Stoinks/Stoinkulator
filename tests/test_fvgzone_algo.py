@@ -263,14 +263,58 @@ def test_zone_is_unusable_before_known_at():
 
 def test_five_minute_zone_formed_by_the_0940_bar_cannot_trigger_before_0945():
     # candle 3 labelled 09:40: the first possible entry bar is 09:45
-    ctx = []
     c1 = [(100.00, 100.10, 99.95, 100.05)] * 5  # 09:30
     c2 = [(100.05, 100.60, 100.05, 100.55)] * 5  # 09:35
     c3 = [(100.55, 100.70, 100.35, 100.65)] * 4 + [(100.60, 100.70, 100.30, 100.65)]  # 09:40
     cfg = {"zone_minutes": 5, "trend_filter": False, "first_entry": "09:30", "min_size_atr": None}
-    rig = Rig(**cfg).feed(run_of(D1, "09:30", [*ctx, *c1, *c2, *c3]))
+    # an earlier day makes the ATR ready, so only `known_at` can keep the 09:44 bar out
+    rig = Rig(**cfg).feed(run_of(D1, "09:30", quiet(60)))
+    rig.feed(run_of(D2, "09:30", [*c1, *c2, *c3]))
+    # the 09:44 bar dips to 100.30 and closes above it, but the zone exists only from 09:45
+    assert rig.trades == [] and rig.algo.skipped == []
+    assert [z.known_at for z in rig.algo._det.live_zones()] == [stamp(D2, "09:45")]
+    rig.feed(run_of(D2, "09:45", [(100.60, 100.62, 100.28, 100.55)]))
+    assert [summary(t)["at"] for t in rig.trades] == [stamp(D2, "09:45")]
+    assert rig.algo.skipped == []
+
+
+# ----- a 1-minute bar through the far edge ends the zone at once -----
+
+
+def far_edge_bars(wick_bar: tuple) -> list:
+    """The 5-minute zone [100.10, 100.30] (known 10:15), then a wick bar at 10:15 inside the
+    unfinished 10:15 zone bar, then a clean retest at 10:16."""
+    retest = (100.60, 100.62, 100.25, 100.55)
+    return run_of(D1, "09:30", [*zone5_bars(), wick_bar, retest])
+
+
+FAR = {"zone_minutes": 5, "trend_filter": False, "first_entry": "09:30"}
+
+
+@pytest.mark.parametrize("mirrored_bars", [False, True], ids=["long", "short"])
+@pytest.mark.parametrize(
+    "wick",
+    [
+        (100.40, 100.45, 100.05, 100.20),  # through the far edge, closes inside the zone
+        (100.60, 100.65, 100.05, 100.50),  # through the far edge, closes back above the top
+    ],
+    ids=["closes_inside", "closes_above_top"],
+)
+def test_a_bar_through_the_far_edge_ends_the_zone_for_this_and_later_bars(wick, mirrored_bars):
+    bars = far_edge_bars(wick)
+    bars = mirror(bars) if mirrored_bars else bars
+    rig = Rig(**FAR).feed(bars)
+    # the detector still has the zone live (its 10:15 zone bar is unfinished) ...
+    assert len(rig.algo._det.live_zones()) == 1
+    # ... but the algo takes no entry on the wick bar, nor on the clean retest after it
     assert rig.trades == []
-    assert [z.known_at for z in rig.algo._det.live_zones()] == [stamp(D1, "09:45")]
+
+
+@pytest.mark.parametrize("mirrored_bars", [False, True], ids=["long", "short"])
+def test_a_bar_that_stops_short_of_the_far_edge_leaves_the_zone_usable(mirrored_bars):
+    bars = far_edge_bars((100.40, 100.45, 100.11, 100.20))  # low 100.11 > bottom 100.10
+    rig = Rig(**FAR).feed(mirror(bars) if mirrored_bars else bars)
+    assert [summary(t)["side"] for t in rig.trades] == [0 if mirrored_bars else 1]
 
 
 def test_zones_do_not_survive_the_session():

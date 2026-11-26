@@ -27,6 +27,7 @@ from typing import Any
 import pandas as pd
 
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
+from MainStoinker.engine.gaprule import RefusedEntry
 from MainStoinker.indicators.fvg import Direction, FvgConfig, FvgDetector
 
 SESSION_OPEN_MINUTE = 9 * 60 + 30  # 09:30
@@ -231,6 +232,7 @@ class Algo(ParentAlgo):
         self._vwap_den = 0  # three times the sum of volume
         self._bucket: _Bucket | None = None
         self._traded: set[int] = set()
+        self._dead: set[int] = set()  # zones a 1-minute bar traded through to the far edge
 
     # ----- the engine's entry point -----
 
@@ -280,8 +282,13 @@ class Algo(ParentAlgo):
             if live and self.inTrade:
                 # A position left over from an earlier session (a half day, or bars that
                 # stopped before flat_time): the algo cannot know the close in advance.
-                self.logger.info("***position left from an earlier session, closing***")
-                self.close_trade()
+                # check_stoploss first: the broker may already have stopped it at this bar's
+                # open, and a close on a position it no longer holds would be an ignored event.
+                self.logger.info("***position left from an earlier session***")
+                if self.trade.check_stoploss(self.curStockData) != 0:
+                    self.close_trade()
+                else:
+                    self.inTrade = False
                 exited = True
             self._reset_session_state()
             self._day = day
@@ -295,8 +302,17 @@ class Algo(ParentAlgo):
 
         self._add_to_bucket(when, offset, o_t, h_t, l_t, c_t)
 
-        zones = [z for z in self._det.live_zones()
-                 if z.known_at <= when and z.formed_time.date() == day]
+        zones = []
+        for z in self._det.live_zones():
+            if z.known_at > when or z.formed_time.date() != day or z.id in self._dead:
+                continue
+            # A 1-minute bar that trades to or through the FAR edge ends the zone for the
+            # algo at once (this bar included), whatever the zone-timeframe detector says
+            # later: it learns of a fill only when the zone bar completes.
+            if (l_t <= z.bottom_ticks) if z.direction is Direction.UP else (h_t >= z.top_ticks):
+                self._dead.add(z.id)
+                continue
+            zones.append(z)
         values: dict[str, float] = {}
 
         if live:
@@ -304,7 +320,7 @@ class Algo(ParentAlgo):
                 exited = self._manage_trade(minute_of_day)
             if not self.inTrade and not exited and self.first_entry <= minute_of_day <= self.last_entry:
                 self._look_for_entry(when, zones, h_t, l_t, c_t)
-            if self.inTrade:
+            if self.inTrade and not isinstance(getattr(self.trade, "brokerRef", None), RefusedEntry):
                 values["StopPrice"] = float(self.trade.stopPrice)
                 values["tp"] = float(self.trade.tp)
 

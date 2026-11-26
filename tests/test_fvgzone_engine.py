@@ -92,6 +92,39 @@ def test_entry_cancelled_before_it_fills_is_not_retried(tmp_path):
     assert run.violations == []
 
 
+D3 = "2024-08-21"
+
+
+def overnight_run(tmp_path, next_day: list[tuple]):
+    """A long taken at the 09:51 open (stop 100.08) and still open when day 2's data stops, then
+    the bars `next_day` on day 3, through the PaperBroker."""
+    warm = run_of(D1, "09:30", quiet(60))
+    day2 = run_of(D2, "09:30", [*quiet(17), *up_setup(100.0), retest_up(100.0),
+                                (100.40, 100.50, 100.30, 100.40)])
+    write_bars(tmp_path, "AAPL", warm + day2 + run_of(D3, "09:30", next_day))
+    return harness.run_paper_backtest("FVGZone", {"idname": "o", "ticker": "AAPL", **PLAIN},
+                                      warmup_days=1)
+
+
+def test_position_left_overnight_is_closed_without_an_ignored_close_when_gapped_through(tmp_path):
+    # day 3 opens at 99.50, beyond the 100.08 stop: the broker stops it at that open, the algo
+    # must not also ask to close a position that is already gone
+    run = overnight_run(tmp_path, [(99.50, 99.60, 99.40, 99.55), (99.55, 99.60, 99.50, 99.55)])
+    assert len(run.ledger.round_trips) == 1
+    trip = run.ledger.round_trips[0]
+    assert (trip.exit_time, float(trip.exit_price)) == (pd.Timestamp(f"{D3} 09:30"), 99.5)
+    assert len(run.ledger.ignored_events) == 0
+    assert not run.algo.inTrade and run.violations == []
+
+
+def test_position_left_overnight_is_closed_by_the_algo_when_still_held(tmp_path):
+    run = overnight_run(tmp_path, [(100.40, 100.45, 100.35, 100.40), (100.42, 100.45, 100.40, 100.42)])
+    (trip,) = run.ledger.round_trips
+    assert trip.exit_time == pd.Timestamp(f"{D3} 09:31")  # the algo's close fills at the next open
+    assert len(run.ledger.ignored_events) == 0
+    assert not run.algo.inTrade and run.violations == []
+
+
 # ----- the detector and the 5-minute bars are exactly the batch tools -----
 
 
@@ -231,13 +264,48 @@ def python_calls_per_bar(tmp_path, rows: int) -> float:
     return count / rows
 
 
+def guard_algo_frame_calls(monkeypatch) -> list[int]:
+    """Forbid `DataFrame.copy` and `DataFrame(...)` calls made from the algo's file and count
+    the `.iloc[slice]` calls it makes. Returns the (one-element) list holding that count, which
+    keeps growing as the run goes on. The engine's own per-bar calls are not touched."""
+    count = [0]
+
+    def from_algo() -> bool:
+        return sys._getframe(2).f_code.co_filename.endswith("FVGZone_Algo.py")
+
+    def forbid(owner, name):
+        original = getattr(owner, name)
+
+        def wrapper(*args, **kwargs):
+            if from_algo():
+                raise AssertionError(f"the algo called {owner.__name__}.{name}")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    forbid(pd.DataFrame, "copy")
+    forbid(pd.DataFrame, "__init__")
+    iloc_getitem = pd.core.indexing._iLocIndexer.__getitem__
+
+    def counting_getitem(self, key):
+        if from_algo() and isinstance(key, slice):
+            count[0] += 1
+        return iloc_getitem(self, key)
+
+    monkeypatch.setattr(pd.core.indexing._iLocIndexer, "__getitem__", counting_getitem)
+    return count
+
+
 def test_work_per_bar_does_not_grow_with_history(tmp_path, monkeypatch):
     # structural: nothing concatenates frames, and no indicator frame is built per bar
     def no_concat(*_a, **_k):
         raise AssertionError("pd.concat called during an FVGZone run")
 
     monkeypatch.setattr(pd, "concat", no_concat)
+    slices = guard_algo_frame_calls(monkeypatch)
     small = python_calls_per_bar(tmp_path, 1170)
+    # the only frame slice the algo takes is the one-time walk over the warm-up history
+    assert slices == [1]
     big = python_calls_per_bar(tmp_path, 2730)  # 2.3 times the bars
     # per-bar calls stay flat (a per-bar cost that grew with history would grow by about 2.3x)
     assert big < small * 1.25

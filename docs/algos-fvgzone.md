@@ -61,6 +61,16 @@ candle is known at 09:45 and cannot trigger on any earlier bar, including the 09
 bar that completes it. A zone the detector reports filled, invalidated or expired is
 gone. One trade per zone: a zone is used up when an entry order is sent for it.
 
+**Far edge, watched every minute.** The detector learns of a fill or invalidation only
+when the zone-timeframe bar completes, up to `zone_minutes - 1` minutes late. So the algo
+itself watches each usable zone on every 1-minute bar: once a bar trades to or through the
+FAR edge (up zone: `low <= bottom`; down zone: `high >= top`) the zone is dead for the
+algo, for good, whatever the detector says later. The bar that itself reaches the far edge
+does NOT enter either, even if it closes back above the near edge: its stop distance
+(far edge +- buffer) was already traded through on that very bar. A bar that stops one
+cent short of the far edge leaves the zone usable. Dead zones are not drawn in the zone
+series. A zone only touched in the warm-up history is handled the same way.
+
 **Trend filter** (when on): session VWAP (typical price (high+low+close)/3, volume
 weighted, reset each session, exact integer arithmetic) and an EMA of 1-minute closes
 (`alpha = 2/(trend_ema+1)`, seeded with the first close, continuous across sessions,
@@ -70,7 +80,8 @@ or the session has no volume, the filter blocks every entry.
 
 **Entry, long** (short is the exact mirror, all in integer cents): a usable up zone is
 retested by a 1-minute bar with `low <= zone top` that CLOSES above the zone top. The
-newest qualifying zone wins when several qualify on a bar. One position at a time, and
+newest qualifying zone wins when several qualify on a bar; if its setup is then skipped
+for risk (below), older qualifying zones on that bar are NOT tried. One position at a time, and
 no new entry on the bar on which a trade ended. Entry is at market; the entry
 reference is the signal bar's close. The engine fills by its own rules (`SimBroker`:
 at that close; `PaperBroker`: at the next bar's open).
@@ -117,16 +128,31 @@ used (the algo cannot know whether another process traded it).
 
 ## Limits
 
-- **Half days.** The algo cannot know a session closes early. A position still open
-  when the data of its session ends (a half day closing at 13:00, a feed that stops)
-  is closed on the first bar of the next session, at that bar's close, which is an
-  overnight carry in the data. `flat_time` is the only scheduled exit. If a half day
-  matters, set `flat_time` / `last_entry` for it in the config.
-- **Retest geometry.** A retest bar that closes above the zone top qualifies even if
-  its low went through the whole zone; the stop is then already beyond reach of that
-  bar. Only the detector's zone state (set by zone-timeframe bars, so up to
-  `zone_minutes - 1` minutes late) invalidates a zone; the algo adds no 1-minute
-  invalidation.
+- **Half days and data that ends early.** The algo cannot know a session closes early
+  (it does not know the close; `flat_time` is its only scheduled exit). What happens to a
+  position still open when its session's data stops (a half day closing at 13:00, a feed
+  that stops) depends on where the algo runs:
+  - *Backtest, `SimBroker` (legacy fills).* The first bar of the next session closes the
+    position at that bar's close (an overnight carry in the data), after
+    `check_stoploss` has had its say (a close below the stop on that bar exits at the
+    stop price).
+  - *Backtest, `PaperBroker` (realistic fills).* On the first bar of the next session the
+    broker has already processed the bar: a stop beyond the open is filled at the open
+    (stop fill, no ignored event, because the algo asks `check_stoploss` first and only
+    closes a position the broker still holds). If the position is still held the algo
+    asks to close it and it fills at the next bar's open; the data's last bar leaves
+    it to the ledger's end-of-data close.
+  - *The live `run` command.* Each session builds the algo fresh, so the next-day logic
+    never runs there. As found by reading `MainStoinker/ib/live_run.py`: at the end of a
+    run (end of session, `--minutes` elapsing before `flat_time`, a half day, a stop file)
+    `engine.end_live()` is called, which does NOT close open positions; they are left open
+    at the end of the run and listed in the output ("position(s) left OPEN at the end of
+    the run (listed, never closed by the session)"). Nothing closes them afterwards.
+    Set `flat_time` / `last_entry` for a half day or a short `--minutes` yourself.
+- **Retest geometry.** A retest bar that closes above the zone top qualifies when its
+  low stays above the far edge (see "Far edge"); the far-edge watch is per 1-minute bar,
+  while the detector's own state (invalidation on a close beyond the far edge, fill) is
+  still set by zone-timeframe bars.
 - **Legacy fills (`SimBroker`).** Stops are checked on the close and fills happen at
   the signal close and at the exact stop or target price: optimistic. The realistic
   numbers are the `golden_paper` ones.

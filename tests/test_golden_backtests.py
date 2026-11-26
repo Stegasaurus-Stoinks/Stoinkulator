@@ -79,8 +79,9 @@ CASES = [
 ]
 
 
-# The four cheap cases stay in the fast suite (the same four as the realistic-fill goldens in
-# test_paper_goldens.py); FunctionTest and the three Elliot runs, each 7 to 14 s on its own, run
+# The cheap cases (the original four and the four fvgzone ones, the same as the realistic-fill
+# goldens in test_paper_goldens.py use) stay in the fast suite; FunctionTest and the three
+# Elliot runs, each 7 to 14 s on its own, run
 # with `pytest -m slow`. Their behaviour is also exercised by fast tests on shorter slices:
 # FunctionTest by test_engine (multi-symbol, engine against the legacy path) and the CLI/store
 # tests, Elliot by test_elliot_state_golden and test_elliot_incremental (MSFT).

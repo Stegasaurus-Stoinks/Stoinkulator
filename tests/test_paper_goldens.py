@@ -1,6 +1,7 @@
 """Goldens for the realistic broker (`PaperBroker`), and per-bar consistency checks.
 
-The same eight cases as `tests/test_golden_backtests.py`, run through
+The same cases as `tests/test_golden_backtests.py` (twelve: the original eight and the four
+`fvgzone_*` ones), run through
 `harness.run_paper_backtest` (Engine + PaperBroker + Ledger, default costs:
 commission 0.005/share with a 1.00 minimum, no slippage, capital 10,000).
 `tests/golden_paper/<case>.json` pins what the ledger reports. The legacy
@@ -18,7 +19,7 @@ Each golden holds:
   `equity_series_bytes` below.
 
 Regenerate with `pytest tests/test_paper_goldens.py --update-golden`; to
-regenerate all eight goldens add `-m "slow or not slow"` (the slow cases are
+regenerate all the goldens add `-m "slow or not slow"` (the slow cases are
 FunctionTest and the three Elliot runs, which a bare run skips). Explain the
 diff in the PR.
 """
