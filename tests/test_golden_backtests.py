@@ -76,10 +76,16 @@ CASES = [
         {"idname": "TSLA-fvgzone-1m", "ticker": "TSLA", "zone_minutes": 1, "trend_filter": False},
         id="fvgzone_tsla_1m_nofilter",
     ),
+    # FVGZone higher-timeframe trend filter (issue 280): defaults plus a 30-minute trend.
+    pytest.param(
+        "FVGZone",
+        {"idname": "TSLA-fvgzone-htf30", "ticker": "TSLA", "htf_minutes": 30},
+        id="fvgzone_tsla_htf30",
+    ),
 ]
 
 
-# The cheap cases (the original four and the four fvgzone ones, the same as the realistic-fill
+# The cheap cases (the original four and the five fvgzone ones, the same as the realistic-fill
 # goldens in test_paper_goldens.py use) stay in the fast suite; FunctionTest and the three
 # Elliot runs, each 7 to 14 s on its own, run
 # with `pytest -m slow`. Their behaviour is also exercised by fast tests on shorter slices:

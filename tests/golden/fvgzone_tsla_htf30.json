@@ -1,0 +1,101 @@
+[
+ {
+  "id": "TSLA-fvgzone-htf300",
+  "symbol": "TSLA",
+  "volume": 131,
+  "direction": 1,
+  "openTime": "2024-08-19 15:00:00",
+  "openPrice": 222.34,
+  "closeTime": "2024-08-19 15:07:00",
+  "closePrice": 221.96,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf301",
+  "symbol": "TSLA",
+  "volume": 44,
+  "direction": 0,
+  "openTime": "2024-08-20 14:52:00",
+  "openPrice": 221.4,
+  "closeTime": "2024-08-20 15:55:00",
+  "closePrice": 221.62,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf302",
+  "symbol": "TSLA",
+  "volume": 49,
+  "direction": 0,
+  "openTime": "2024-08-21 11:19:00",
+  "openPrice": 221.22,
+  "closeTime": "2024-08-21 13:10:00",
+  "closePrice": 222.24,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf303",
+  "symbol": "TSLA",
+  "volume": 56,
+  "direction": 0,
+  "openTime": "2024-08-22 10:56:00",
+  "openPrice": 218.62,
+  "closeTime": "2024-08-22 11:43:00",
+  "closePrice": 216.86,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf304",
+  "symbol": "TSLA",
+  "volume": 68,
+  "direction": 0,
+  "openTime": "2024-08-22 12:08:00",
+  "openPrice": 216.39,
+  "closeTime": "2024-08-22 12:26:00",
+  "closePrice": 217.12,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf305",
+  "symbol": "TSLA",
+  "volume": 135,
+  "direction": 0,
+  "openTime": "2024-08-22 13:12:00",
+  "openPrice": 216.74,
+  "closeTime": "2024-08-22 13:13:00",
+  "closePrice": 216.0,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf306",
+  "symbol": "TSLA",
+  "volume": 178,
+  "direction": 0,
+  "openTime": "2024-08-22 14:15:00",
+  "openPrice": 213.99,
+  "closeTime": "2024-08-22 14:54:00",
+  "closePrice": 213.43,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf307",
+  "symbol": "TSLA",
+  "volume": 75,
+  "direction": 0,
+  "openTime": "2024-08-26 10:26:00",
+  "openPrice": 213.9,
+  "closeTime": "2024-08-26 10:31:00",
+  "closePrice": 212.58,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone-htf308",
+  "symbol": "TSLA",
+  "volume": 78,
+  "direction": 0,
+  "openTime": "2024-08-26 13:57:00",
+  "openPrice": 211.47,
+  "closeTime": "2024-08-26 14:26:00",
+  "closePrice": 212.11,
+  "status": "Closed"
+ }
+]

@@ -29,6 +29,7 @@ import pandas as pd
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 from MainStoinker.engine.gaprule import RefusedEntry
 from MainStoinker.indicators.fvg import Direction, FvgConfig, FvgDetector
+from MainStoinker.indicators.trend import TrendConfig, TrendIndicator
 
 SESSION_OPEN_MINUTE = 9 * 60 + 30  # 09:30
 SESSION_MINUTES = 390  # 09:30 to 16:00
@@ -50,9 +51,13 @@ DEFAULTS: dict[str, Any] = {
     "last_entry": "15:30",
     "flat_time": "15:55",
     "min_size_atr": 0.25,
+    "htf_minutes": 0,
+    "htf_ema": 20,
 }
 
 # Series for the dashboard: (column, draw type). 'line' is drawn smooth, 'segment' stepped.
+# `HTF_SERIES` is added after these, per instance, only when `htf_minutes` is on, so an
+# algo without the filter has exactly the columns it always had.
 SERIES: tuple[tuple[str, str], ...] = (
     ("VWAP", "line"),
     ("EMA", "line"),
@@ -63,6 +68,8 @@ SERIES: tuple[tuple[str, str], ...] = (
     ("StopPrice", "segment"),
     ("tp", "segment"),
 )
+
+HTF_SERIES: tuple[tuple[str, str], ...] = (("HTFEMA", "line"),)
 
 _NAN = math.nan
 _TICK = 100
@@ -185,12 +192,20 @@ class Algo(ParentAlgo):
             self._fvg_config = FvgConfig(bar_minutes=self.zone_minutes, min_size_atr=min_size_atr)
         except ValueError as exc:
             raise _fail(who, str(exc)) from None
+        self.htf_minutes = _integer(who, cfg, "htf_minutes", 0, SESSION_MINUTES)
+        if self.htf_minutes == 1:
+            raise _fail(who, "htf_minutes must be 0 (off) or from 2 to 390, got 1")
+        self.htf_ema = _integer(who, cfg, "htf_ema", 1)
+        self._htf: TrendIndicator | None = None
+        if self.htf_minutes:
+            self._htf = TrendIndicator(TrendConfig(bar_minutes=self.htf_minutes, ema_bars=self.htf_ema))
+        self._series = SERIES + (HTF_SERIES if self._htf is not None else ())
 
         super().__init__(algoConfigData)
 
         # Dashboard series (see `SERIES`); the frame is built from these lists on demand.
-        self.FrontEndDataStruct = [name for name, _ in SERIES]
-        self.FrontEndDataType = [kind for _, kind in SERIES]
+        self.FrontEndDataStruct = [name for name, _ in self._series]
+        self.FrontEndDataType = [kind for _, kind in self._series]
         self.DataColumns = ["time", *self.FrontEndDataStruct]
         self._columns: dict[str, list] = {name: [] for name in self.DataColumns}
         self._frame: pd.DataFrame | None = None
@@ -301,6 +316,9 @@ class Algo(ParentAlgo):
         self._vwap_den += 3 * volume
 
         self._add_to_bucket(when, offset, o_t, h_t, l_t, c_t)
+        htf = self._htf
+        if htf is not None:
+            htf.update(when, o, h, lo, c)  # completed higher-timeframe bars only: no look-ahead
 
         zones = []
         for z in self._det.live_zones():
@@ -328,6 +346,8 @@ class Algo(ParentAlgo):
             values["VWAP"] = self._vwap_num / self._vwap_den / _TICK
         if self._ema_count >= self.trend_ema and self._ema is not None:
             values["EMA"] = self._ema / _TICK
+        if htf is not None and htf.ready and htf.ema is not None:
+            values["HTFEMA"] = htf.ema
         above, below = self._nearest_zones(zones, c_t)
         if above is not None:
             values["ZoneAboveTop"], values["ZoneAboveBottom"] = above.top, above.bottom
@@ -337,7 +357,7 @@ class Algo(ParentAlgo):
 
     def _append(self, stamp: int, values: dict[str, float]) -> None:
         self._columns["time"].append(stamp)
-        for name, _ in SERIES:
+        for name, _ in self._series:
             self._columns[name].append(values.get(name, _NAN))
 
     # ----- higher-timeframe bars and the detector -----
@@ -391,8 +411,9 @@ class Algo(ParentAlgo):
         return False
 
     def _look_for_entry(self, when: datetime, zones: list, h_t: int, l_t: int, c_t: int) -> None:
-        long_ok = self._trend_ok(c_t, long=True)
-        short_ok = self._trend_ok(c_t, long=False)
+        htf = self._htf.direction if self._htf is not None else None
+        long_ok = self._trend_ok(c_t, long=True) and htf in (None, "up")
+        short_ok = self._trend_ok(c_t, long=False) and htf in (None, "down")
         for z in reversed(zones):  # newest first
             if z.id in self._traded:
                 continue
@@ -462,7 +483,7 @@ class Algo(ParentAlgo):
     def update_frontend(self) -> dict:
         """The newest indicator values, built from the last row (no frame is made)."""
         data = []
-        for name, kind in SERIES:
+        for name, kind in self._series:
             value = self._columns[name][-1]
             if not math.isnan(value):
                 data.append({"name": name, "data": value, "type": kind})

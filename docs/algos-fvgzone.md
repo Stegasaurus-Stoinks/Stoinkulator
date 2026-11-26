@@ -38,6 +38,8 @@ given as JSON numbers or numeric strings (like the other algos).
 | `last_entry` | "15:30" | no entry on a bar labelled after this |
 | `flat_time` | "15:55" | an open position is closed on the first bar labelled at or after this |
 | `min_size_atr` | 0.25 | the detector's `min_size_atr`; `null` switches it off |
+| `htf_minutes` | 0 | minutes per higher-timeframe trend bar: 0 switches the filter off, otherwise 2 to 390 |
+| `htf_ema` | 20 | EMA length over the completed higher-timeframe closes (1 or more) |
 
 Times are bar labels (the bar START, naive New York time, as in the data). Required:
 `09:30 <= first_entry <= last_entry < flat_time`. The detector runs with
@@ -78,6 +80,16 @@ shown and used only after `trend_ema` bars). Long setups need close > VWAP and c
 EMA, short setups close < VWAP and close < EMA (both strict). While the EMA is not warm
 or the session has no volume, the filter blocks every entry.
 
+**Higher-timeframe trend filter** (when `htf_minutes` is not 0; off by default, and then the algo behaves
+exactly as before: every golden file is unchanged). `MainStoinker.indicators.trend.TrendIndicator`
+(see `docs/indicators.md`) is fed every 1-minute bar and builds its own `htf_minutes` buckets aligned to
+09:30, independent of `zone_minutes`. A long entry needs its direction to be `up`, a short entry `down`, as
+known at the entry bar's close: only complete buckets count (one that this very bar completes does,
+a bucket still in progress does not). `none` (including a trend that is not ready yet) blocks both sides. It is checked IN ADDITION to
+`trend_filter`; the two are independent. A retest blocked by the trend is handled like one blocked by
+`trend_filter`: nothing is sent, the zone is NOT used up and may be retested later, and nothing is put in
+`algo.skipped` (that list is for risk skips). The EMA runs on from session to session.
+
 **Entry, long** (short is the exact mirror, all in integer cents): a usable up zone is
 retested by a 1-minute bar with `low <= zone top` that CLOSES above the zone top. The
 newest qualifying zone wins when several qualify on a bar; if its setup is then skipped
@@ -112,7 +124,9 @@ fills; no dependence on broker internals). Tested through the real engine for bo
 `VWAP`, `EMA` (line), `ZoneAboveTop`, `ZoneAboveBottom`, `ZoneBelowTop`,
 `ZoneBelowBottom` (segment: the usable live zone nearest above and nearest below the
 bar's close, ties to the newest) and, while in a trade, `StopPrice` and `tp`
-(segment). The zone edges are taken from the detector's live zones with the same
+(segment). With `htf_minutes` on there is one more line, `HTFEMA` (the trend EMA, drawn from the bar on which
+the trend is ready, holding its value between buckets). The module's `SERIES` stays the fixed base list;
+`HTFEMA` is added per instance, so an algo without the filter has exactly the columns it always had. The zone edges are taken from the detector's live zones with the same
 nearest rule as `nearest_zone` (not through `nearest_zone` itself, so that zones not yet
 known or left from an earlier session are not drawn). `AlgoData` is a property built
 lazily from per-column lists; during a run no frame is built (`update_frontend` is
@@ -123,7 +137,14 @@ overridden to read the last row), so there is no per-bar cost that grows with hi
 On the first `update` the algo processes every earlier row of the price frame (the
 engine's warm-up bars) to warm the EMA, the ATR and the detector, with trading
 disabled; the same happens if rows were skipped. One row of `AlgoData` exists per bar,
-as the series store expects. A zone retested only during that history is not marked
+as the series store expects. The trend filter's indicator is fed in the same pass, so a warm-up frame makes it ready: it needs
+`htf_ema` completed `htf_minutes` buckets, that is `htf_ema * htf_minutes` minutes of regular-session
+bars (600 for the defaults 30 and 20, about 1.5 sessions; only complete sessions, and the EMA also carries
+over days, so a longer history gives a steadier EMA). Until then it blocks every entry. `run` supplies `--warmup-days`
+days of month-file bars (default 2, about 780 bars, enough for the defaults; see `docs/live-data.md`); for a
+longer trend ask for more days, or the algo does not trade until the live session has filled the gap.
+
+A zone retested only during that history is not marked
 used (the algo cannot know whether another process traded it).
 
 ## Limits
