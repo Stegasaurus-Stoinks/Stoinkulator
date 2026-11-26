@@ -38,8 +38,10 @@ national day of mourning. A caller may also pass its own table, `extra`, to any 
 `null` closes the day, a "HH:MM" string sets the close). `extra` wins over `OVERRIDES`.
 
 Not covered: sessions shortened for other reasons than the pattern above (the
-exchange may announce one; add it as an override), and any year before 1990 or so
-(the rules above are today's, applied to every year; Juneteenth only from 2022).
+exchange may announce one; add it as an override), and years before about 2005: the
+rules above are today's, applied to every year (Juneteenth only from 2022), and
+one-off closures are listed only from 2004 (the closure of 2001-09-11 to 14, for
+example, is not).
 """
 
 from __future__ import annotations

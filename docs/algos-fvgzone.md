@@ -60,7 +60,8 @@ given on a full day. On a day that closes early it is also held to the close-rel
 never outlive an early close: an absolute 15:55 on a half day behaves as 12:55, an absolute
 12:40 stays 12:40. The algo takes each day's times when the day's first bar arrives; bars on a day
 the calendar calls closed (data on a holiday) use the full-day times. `last_entry_before_close`
-must be greater than `flat_before_close` (1 to 390 each). The detector runs with
+must be greater than `flat_before_close` when both times are relative (1 to 390 each; with an
+absolute `last_entry` or `flat_time` the order is checked on the full-day times only). The detector runs with
 `FvgConfig(bar_minutes=zone_minutes, min_size_atr=min_size_atr)`: textbook rule,
 `min_size` 0.05 exclusive, invalidation on a close beyond the far edge, zones expire
 at the end of the session.
