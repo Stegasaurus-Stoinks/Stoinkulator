@@ -387,6 +387,8 @@ notes.empty = await run((c) => c.resolve(answer([])));
 notes.unavailable = await run((c) => c.resolve(answer([], { available: false, reason: "changed" })));
 notes.nonCent = await run((c) => c.resolve(answer([], { reason: "non_cent_price" })));
 notes.truncated = await run((c) => c.resolve(answer([zone(1)], { truncated: true })));
+notes.cold = await run((c) => c.resolve(answer([zone(1)], { warm: false })));
+notes.warm = await run((c) => c.resolve(answer([zone(1)], { warm: true })));
 notes.garbage = await run((c) => c.resolve({ nonsense: true }));
 console.log(JSON.stringify({ notes, painted: paint(s).log.length }));
 """)
@@ -397,6 +399,7 @@ console.log(JSON.stringify({ notes, painted: paint(s).log.length }));
     assert "bars cannot be shown" in notes["unavailable"]
     assert "not whole cents" in notes["nonCent"]
     assert "only the newest" in notes["truncated"]
+    assert "starts cold" in notes["cold"] and notes["warm"] == ""
     assert "could not be loaded" in notes["garbage"]
     assert out["painted"] == 0  # the last answer was garbage: nothing is drawn
 
@@ -533,7 +536,7 @@ console.log(JSON.stringify(out));
     assert out["afterStep"]["start"].startswith("2024-01-03") and out["afterStep"]["bar_minutes"] == "5"
 
 
-def test_the_algo_view_with_the_control_off_requests_no_zones_through_days_and_refreshes(node_workdir: Path) -> None:
+def test_the_algo_view_with_the_control_off_requests_no_zones_through_days(node_workdir: Path) -> None:
     out = run_node(node_workdir, "fvg_view_off", VIEW_SOURCE + WITH_PRIMITIVES + """
 setStorage(null);
 install({ "/api/runs/1": ok(doc()), "/api/runs/1/trades": ok({ trades: TRADES }), "/api/runs/1/equity": ok(equity),

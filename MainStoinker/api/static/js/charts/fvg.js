@@ -43,6 +43,7 @@ import { readTheme } from "./theme.js";
 export const TIMEFRAMES = [1, 5, 15];
 export const STORAGE_KEY = "stoinkulator.fvg.v1";
 export const MAX_ZONES_NOTE = "More zones than can be shown: only the newest are drawn.";
+const COLD_NOTE = "The data has no earlier day, so the ATR window starts cold here.";
 const NON_CENT_NOTE = "No zones: some prices of these bars are not whole cents, which the detector refuses.";
 const OVER = ["filled", "invalidated", "expired"];
 
@@ -315,6 +316,7 @@ export function createFvgZones(candleHandle, { ctx, container, fetchZones, view 
       else if (data.reason === "non_cent_price") note = NON_CENT_NOTE;
       else if (data.truncated === true) note = MAX_ZONES_NOTE;
       else if (list.length === 0) note = "No zones in this window.";
+      if (data.available === true && data.warm === false) note = (note ? note + " " : "") + COLD_NOTE;
       setStatus(note);
       respan();
     }).catch((err) => {

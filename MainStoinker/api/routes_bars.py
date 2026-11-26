@@ -15,7 +15,7 @@ Reading the file is blocking work, so it runs inside the `with_store` callback, 
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -89,13 +89,15 @@ def _no_bars() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", *_PRICES, "volume"])
 
 
-def _from_day_start(first: datetime, widen: bool) -> datetime:
-    """`first`, or midnight of its day when the caller wants the whole day (a warm-up for indicators)."""
-    return datetime.combine(first.date(), time.min) if widen else first
+def _from_day_start(first: datetime, widen_days: int | None) -> datetime:
+    """`first`, or midnight `widen_days` days before its day (an indicator's warm-up), if asked."""
+    if widen_days is None:
+        return first
+    return datetime.combine(first.date() - timedelta(days=widen_days), time.min)
 
 
 def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
-                 start: str | None, end: str | None, widen: bool) -> Loaded:
+                 start: str | None, end: str | None, widen_days: int | None) -> Loaded:
     """A live run's bars come from the database (`run_bars`), under the same window rules.
 
     With no window the default day is the day of the run's last bar, else of the
@@ -114,7 +116,7 @@ def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
     if first is None or last is None:
         return Loaded(_no_bars(), None, None, None)
     asked = first
-    first = _from_day_start(first, widen)
+    first = _from_day_start(first, widen_days)
 
     def servable(limit: int | None) -> tuple[pd.DataFrame, int]:
         stored = store.load_bars(run_id, symbol, first, last, limit=limit)
@@ -133,14 +135,15 @@ def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
 
 
 def load_window(store: Store, run_id: int, symbol: str, start: str | None, end: str | None,
-                *, widen: bool = False) -> Loaded:
+                *, widen_days: int | None = None) -> Loaded:
     """The servable bars of a run's symbol in the window (see `Loaded`).
 
     The run, symbol and window rules, errors (404 before 422) and sources are the bars route's. `frame` is
     None when the bars cannot be served (`reason` then says why: "missing" or "changed"); otherwise it holds
-    the rows in the window (it may be empty) and `reason` is "unverified" or None. With `widen` the window
-    starts at midnight of its first day (the bars of the whole day up to the window's end), which an
-    indicator needs to be warm. The caller applies the `MAX_BARS` limit (`check_width`).
+    the rows in the window (it may be empty) and `reason` is "unverified" or None. With `widen_days` the bars
+    are read from midnight that many days before the window's first day (up to the window's end), which an
+    indicator needs to warm up; those rows are outside the window asked for. The caller applies the
+    `MAX_BARS` limit (`check_width`) to the rows of the window asked for.
     """
     run = next((r for r in store.list_runs() if r.run_id == run_id), None)
     if run is None:
@@ -149,12 +152,12 @@ def load_window(store: Store, run_id: int, symbol: str, start: str | None, end: 
     if symbol not in data.symbols:
         raise NotFound("no such symbol in this run")
     if run.kind in LIVE_KINDS:
-        return _stored_bars(store, run_id, symbol, data, start, end, widen)
+        return _stored_bars(store, run_id, symbol, data, start, end, widen_days)
     try:
         first, last = parse_window(start, end, default_day=data.last_bar)
     except WindowError as error:
         raise HTTPException(422, str(error)) from None
-    asked, first = first, _from_day_start(first, widen)
+    asked, first = first, _from_day_start(first, widen_days)
     if not data.directory:
         return Loaded(None, "missing", asked, last)
     directory = Path(data.directory)

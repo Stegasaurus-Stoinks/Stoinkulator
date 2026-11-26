@@ -6,9 +6,14 @@ errors (404 before 422) and the time format are the bars route's. When the bars 
 (`available: false`) the answer is the same with an empty zone list and the reason.
 
 The detector (`MainStoinker.indicators.fvg`, defaults of `FvgConfig` except what the query changes) runs
-over the bars from midnight of the window's first day to the window's END, never beyond it: the ATR
-window is warm, zones formed before the window that are still live inside it appear, and nothing is
-known that the chart's last bar did not know. `bar_minutes` 5 and 15 resample the 1-minute bars first
+over the bars of the PREVIOUS available trading day (the latest earlier day the run's data has, looked for
+up to `LOOKBACK_DAYS` calendar days back), then those from midnight of the window's first day to the
+window's END, never beyond it. As in an algo that runs on from day to day (`atr_cross_session`), the
+previous day only fills the ATR window; zones do not cross sessions and no zone formed on it is returned.
+So a day shows the same zones whether it is first in the window or not, and zones formed earlier on the
+first day that are still live inside the window appear. The answer's `warm` is false when the data has no
+earlier day (the first day of the data): the ATR then starts cold, as before. Nothing is read or known
+that the chart's last bar did not know. `bar_minutes` 5 and 15 resample the 1-minute bars first
 (`resample_session`). The zones kept are those that overlap the window: usable (`known_at`) no later
 than its end and not ended before its start. A zone is drawn from `known_at`, never from `formed_time`;
 `end_time` is the time it stopped being live (the known time of its closing change), null while it is
@@ -27,6 +32,7 @@ from typing import Any
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Request
 
+from MainStoinker.api import routes_bars
 from MainStoinker.api.db import with_store
 from MainStoinker.api.routes_bars import check_width, load_window
 from MainStoinker.api.windows import format_time
@@ -36,6 +42,7 @@ from MainStoinker.indicators.fvg import FvgConfig, detect_fvgs, resample_session
 router = APIRouter()
 
 MAX_ZONES = 2_000
+LOOKBACK_DAYS = 4  # calendar days: a weekend, or a long weekend (Friday to Tuesday)
 BAR_MINUTES = (1, 5, 15)
 MAX_MIN_SIZE_ATR = 1_000.0
 _LIVE = ("open", "touched")
@@ -78,9 +85,10 @@ def _config(bar_minutes: int, min_size_atr: float | None, same_direction: bool) 
 
 
 def _answer(symbol: str, available: bool, reason: str | None, config: FvgConfig,
-            zones: list[dict[str, Any]] | None = None, truncated: bool = False) -> dict[str, Any]:
+            zones: list[dict[str, Any]] | None = None, truncated: bool = False,
+            warm: bool = False) -> dict[str, Any]:
     return {"symbol": symbol, "available": available, "reason": reason, "bar_minutes": config.bar_minutes,
-            "config": asdict(config), "truncated": truncated, "zones": zones or []}
+            "config": asdict(config), "truncated": truncated, "warm": warm, "zones": zones or []}
 
 
 def _time(value: Any) -> datetime:
@@ -110,24 +118,39 @@ def _zone(row: Any) -> dict[str, Any]:
 
 def _fvg(store: Store, run_id: int, symbol: str, start: str | None, end: str | None,
          bar_minutes: str | None, min_size_atr: str | None, same_direction: str | None) -> dict[str, Any]:
-    loaded = load_window(store, run_id, symbol, start, end, widen=True)  # 404, then the window's 422
+    loaded = load_window(store, run_id, symbol, start, end, widen_days=LOOKBACK_DAYS)  # 404, then 422
     minutes = _bar_minutes(bar_minutes)
     config = _config(minutes, _min_size_atr(min_size_atr), _same_direction(same_direction))
+    if loaded.frame is not None and len(loaded.frame) > routes_bars.MAX_BARS:
+        # too many rows with the look-back: read without it (the width check below is the bars route's)
+        loaded = load_window(store, run_id, symbol, start, end)
     if loaded.frame is None:
         return _answer(symbol, False, loaded.reason or "missing", config)
-    check_width(loaded.frame)
-    if loaded.frame.empty or loaded.first is None or loaded.last is None:
+    if loaded.first is None or loaded.last is None:
         return _answer(symbol, True, loaded.reason, config)
+    first, last = loaded.first, loaded.last
+    first_day = pd.Timestamp(first.date())
     frame = loaded.frame.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    check_width(frame[frame["date"] >= first])  # the rows of the window asked for, as the bars route does
+    earlier = frame["date"] < first_day
+    warm = bool(earlier.any())
+    if warm:
+        previous = frame.loc[earlier, "date"].max().normalize()
+        frame = frame[(frame["date"] >= previous)].reset_index(drop=True)
+    else:
+        frame = frame[~earlier].reset_index(drop=True)
+    if frame.empty:
+        return _answer(symbol, True, loaded.reason, config)
     if minutes > 1:
         frame = resample_session(frame, minutes)
     try:
         found = detect_fvgs(frame, config)
     except ValueError:  # a price that is not a cent price (or not finite)
-        return _answer(symbol, True, "non_cent_price", config)
-    first, last = loaded.first, loaded.last
+        return _answer(symbol, True, "non_cent_price", config, warm=warm)
     kept = []
     for row in found.itertuples(index=False):
+        if _time(row.formed_time) < first_day:  # formed on the warm-up day: it only fed the ATR window
+            continue
         known = _time(row.known_at)
         ends = None if row.state in _LIVE else _time(row.last_change_known_at)
         if known <= last and (ends is None or ends >= first):
@@ -135,7 +158,7 @@ def _fvg(store: Store, run_id: int, symbol: str, start: str | None, end: str | N
     kept.sort(key=lambda item: (item[0], item[1]))
     truncated = len(kept) > MAX_ZONES
     zones = [_zone(row) for _known, _id, row in kept[-MAX_ZONES:]]
-    return _answer(symbol, True, loaded.reason, config, zones, truncated)
+    return _answer(symbol, True, loaded.reason, config, zones, truncated, warm)
 
 
 @router.get("/api/runs/{run_id}/fvg")

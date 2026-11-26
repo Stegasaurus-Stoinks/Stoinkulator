@@ -99,14 +99,20 @@ def ts(text: str) -> pd.Timestamp:
 
 def expected(frame: pd.DataFrame, first: str, last: str, *, minutes: int = 1,
              config: FvgConfig | None = None) -> list[dict[str, Any]]:
-    """What the API must answer: the detector over the bars from midnight of `first`'s day to `last`."""
+    """What the API must answer: the detector over the previous available day, then the bars from midnight of
+    `first`'s day to `last`; zones of the previous day are not returned."""
     lo, hi = ts(first), ts(last)
-    bars = frame[(frame["date"] >= lo.normalize()) & (frame["date"] <= hi)].reset_index(drop=True)
+    day0 = lo.normalize()
+    earlier = frame[frame["date"] < day0]
+    start = earlier["date"].max().normalize() if len(earlier) else day0
+    bars = frame[(frame["date"] >= start) & (frame["date"] <= hi)].reset_index(drop=True)
     if minutes > 1:
         bars = resample_session(bars, minutes)
     cfg = config or FvgConfig(bar_minutes=minutes)
     out = []
     for row in detect_fvgs(bars, cfg).itertuples(index=False):
+        if row.formed_time < day0:
+            continue
         live = row.state in ("open", "touched")
         end = None if live else row.last_change_known_at
         if row.known_at <= hi and (end is None or end >= lo):
@@ -216,6 +222,65 @@ def test_five_and_fifteen_minute_zones(client, data_dir: Path, minutes: int) -> 
         stamp = ts(zone["known_at"])
         assert (stamp.hour * 60 + stamp.minute - (9 * 60 + 30)) % minutes == 0
     assert body["zones"] != get_fvg(client, start=DAY1[0], end=DAY1[1]).json()["zones"]
+
+
+def test_a_day_shows_the_same_zones_alone_or_as_the_second_day_of_a_window(client, data_dir: Path) -> None:
+    frame = frame_of(data_dir)
+    day2 = ("2024-01-03 00:00:00", "2024-01-03 23:59:59")
+    for minutes in (1, 5, 15):
+        alone = get_fvg(client, start=day2[0], end=day2[1], bar_minutes=minutes).json()
+        both = get_fvg(client, start=DAY1[0], end=day2[1], bar_minutes=minutes).json()
+        day_of_both = [z for z in both["zones"] if z["formed_time"] >= day2[0]]
+        assert alone["zones"] and day_of_both == alone["zones"], minutes
+        assert project(alone["zones"]) == expected(frame, *day2, minutes=minutes)
+        assert alone["warm"] is True and both["warm"] is False
+    # equal to the detector over the previous day plus the day, minus the previous day's own zones
+    both_days = frame[frame["date"] >= "2024-01-02"].reset_index(drop=True)
+    direct = detect_fvgs(both_days, FvgConfig())
+    direct = direct[direct["formed_time"] >= pd.Timestamp("2024-01-03")]
+    alone = get_fvg(client, start=day2[0], end=day2[1]).json()["zones"]
+    assert [z["id"] for z in alone] == sorted(direct["id"].tolist(), key=lambda i: (
+        direct.loc[direct["id"] == i, "known_at"].iloc[0], i))
+    # larger bars can form zones from the open: a cold detector needs five of them for its ATR window
+    today = frame[frame["date"] >= "2024-01-03"].reset_index(drop=True)
+    differs = []
+    for minutes in (5, 15):
+        cold = detect_fvgs(resample_session(today, minutes), FvgConfig(bar_minutes=minutes))
+        warm = get_fvg(client, start=day2[0], end=day2[1], bar_minutes=minutes).json()["zones"]
+        cold_view = list(zip(cold["formed_time"].astype(str), cold["size_atr"].round(6), strict=True))
+        warm_view = [(z["formed_time"], None if z["size_atr"] is None else round(z["size_atr"], 6))
+                     for z in warm]
+        differs.append(cold_view != warm_view)
+    assert any(differs)
+
+
+def test_warm_is_false_on_the_first_day_of_the_data_and_the_zones_are_the_cold_ones(
+        client, data_dir: Path) -> None:
+    body = get_fvg(client, start=DAY1[0], end=DAY1[1]).json()
+    assert body["warm"] is False
+    cold = detect_fvgs(frame_of(data_dir).query("date < '2024-01-03'").reset_index(drop=True), FvgConfig())
+    assert [z["id"] for z in body["zones"]] == sorted(cold["id"].tolist(), key=lambda i: (
+        cold.loc[cold["id"] == i, "known_at"].iloc[0], i))
+    assert get_fvg(client).json()["warm"] is True  # the default window is the last day
+
+
+def test_the_width_check_counts_the_rows_of_the_window_asked_for(client, data_dir: Path, monkeypatch) -> None:
+    import MainStoinker.api.routes_bars as routes_bars
+
+    monkeypatch.setattr(routes_bars, "MAX_BARS", 215)  # the warm-up rows (211 to 10:30) fit
+    mid = {"start": "2024-01-03 10:00:00", "end": "2024-01-03 10:30:00"}  # 31 rows asked for
+    assert client.get("/api/runs/1/bars", params={"symbol": "AAPL", **mid}).status_code == 200
+    response = get_fvg(client, **mid)
+    assert response.status_code == 200 and response.json()["warm"] is True
+    assert project(response.json()["zones"]) == expected(frame_of(data_dir), mid["start"], mid["end"])
+    wide = {"start": "2024-01-02 09:30:00", "end": "2024-01-03 11:59:59"}  # 300 rows: too many for both
+    assert client.get("/api/runs/1/bars", params={"symbol": "AAPL", **wide}).status_code == 422
+    assert get_fvg(client, **wide).status_code == 422
+    # the rows before the window never make a narrow window "too wide": with a limit that the warm-up rows
+    # exceed, the answer is still a 200 (read without the warm-up)
+    monkeypatch.setattr(routes_bars, "MAX_BARS", 100)
+    assert client.get("/api/runs/1/bars", params={"symbol": "AAPL", **mid}).status_code == 200
+    assert get_fvg(client, **mid).status_code == 200
 
 
 def test_the_options_change_the_config_and_the_zones(client, data_dir: Path) -> None:
@@ -339,13 +404,22 @@ def test_zones_of_a_stored_run_of_the_golden_algos_equal_the_detector_on_its_bar
     assert bars["available"] and bars["bars"]
     body = client.get(f"/api/runs/{run['run_id']}/fvg", params={"symbol": symbol}).json()
     assert body["available"] is True
-    frame = pd.DataFrame(bars["bars"]).rename(columns={"time": "date"})
+    day = pd.Timestamp(bars["bars"][-1]["time"]).normalize()
+    around = client.get(f"/api/runs/{run['run_id']}/bars", params={
+        "symbol": symbol, "start": f"{day - pd.Timedelta(days=4):%Y-%m-%d} 00:00:00",
+        "end": f"{day:%Y-%m-%d} 23:59:59"}).json()
+    frame = pd.DataFrame(around["bars"]).rename(columns={"time": "date"})
     frame["date"] = pd.to_datetime(frame["date"])
+    earlier = frame[frame["date"] < day]
+    if len(earlier):  # the previous available day warms the ATR window
+        frame = frame[frame["date"] >= earlier["date"].max().normalize()].reset_index(drop=True)
+    assert body["warm"] is bool(len(earlier))
     try:
         want = detect_fvgs(frame, FvgConfig())
     except ValueError:  # the offline bars are not all cent prices: the route says so
         assert (body["reason"], body["zones"]) == ("non_cent_price", [])
         return
+    want = want[want["formed_time"] >= day]
     assert [z["id"] for z in body["zones"]] == sorted(want["id"].tolist(), key=lambda i: (
         want.loc[want["id"] == i, "known_at"].iloc[0], i))
 

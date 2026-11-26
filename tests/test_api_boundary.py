@@ -123,7 +123,7 @@ def test_allowlist_names_nothing_it_must_forbid() -> None:
     for forbidden in MUST_BE_FORBIDDEN:
         assert not is_allowed(forbidden), forbidden
         assert not any(_is_under(forbidden, a) or _is_under(a, forbidden)
-                       for a in ALLOWED_ENGINE_MODULES), forbidden
+                       for a in (*ALLOWED_ENGINE_MODULES, *ALLOWED_PACKAGES)), forbidden
 
 
 def test_allowlist_checker_catches_violations() -> None:
@@ -155,7 +155,7 @@ def test_allowlist_checker_catches_violations() -> None:
 
 
 def test_the_indicators_the_api_may_import_stay_pure() -> None:
-    """Importing the API loads no project module of `indicators` beyond its own, and no `ibapi`."""
+    """The API loads `indicators.fvg`; no module of that package imports another project module or `ibapi`."""
     code = (
         "import sys\n"
         "import MainStoinker.api.routes_fvg\n"
