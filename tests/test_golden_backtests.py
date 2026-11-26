@@ -55,6 +55,27 @@ CASES = [
         {"idname": "elliot-tsla", "ticker": "TSLA", "order": 10, "trailingStopDelta": 0.10},
         id="elliot_tsla",
     ),
+    # FVGZone (issue 277): defaults on each symbol, and the 1-minute zones without trend filter.
+    pytest.param(
+        "FVGZone",
+        {"idname": "AAPL-fvgzone", "ticker": "AAPL"},
+        id="fvgzone_aapl",
+    ),
+    pytest.param(
+        "FVGZone",
+        {"idname": "MSFT-fvgzone", "ticker": "MSFT"},
+        id="fvgzone_msft",
+    ),
+    pytest.param(
+        "FVGZone",
+        {"idname": "TSLA-fvgzone", "ticker": "TSLA"},
+        id="fvgzone_tsla",
+    ),
+    pytest.param(
+        "FVGZone",
+        {"idname": "TSLA-fvgzone-1m", "ticker": "TSLA", "zone_minutes": 1, "trend_filter": False},
+        id="fvgzone_tsla_1m_nofilter",
+    ),
 ]
 
 

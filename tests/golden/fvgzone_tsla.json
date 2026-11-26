@@ -1,0 +1,167 @@
+[
+ {
+  "id": "TSLA-fvgzone0",
+  "symbol": "TSLA",
+  "volume": 35,
+  "direction": 1,
+  "openTime": "2024-08-19 09:54:00",
+  "openPrice": 217.3,
+  "closeTime": "2024-08-19 10:13:00",
+  "closePrice": 220.14,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone1",
+  "symbol": "TSLA",
+  "volume": 42,
+  "direction": 1,
+  "openTime": "2024-08-19 10:21:00",
+  "openPrice": 220.3,
+  "closeTime": "2024-08-19 11:17:00",
+  "closePrice": 219.12,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone2",
+  "symbol": "TSLA",
+  "volume": 104,
+  "direction": 1,
+  "openTime": "2024-08-19 12:21:00",
+  "openPrice": 220.81,
+  "closeTime": "2024-08-19 12:34:00",
+  "closePrice": 220.33,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone3",
+  "symbol": "TSLA",
+  "volume": 131,
+  "direction": 1,
+  "openTime": "2024-08-19 15:00:00",
+  "openPrice": 222.34,
+  "closeTime": "2024-08-19 15:07:00",
+  "closePrice": 221.96,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone4",
+  "symbol": "TSLA",
+  "volume": 52,
+  "direction": 0,
+  "openTime": "2024-08-20 10:46:00",
+  "openPrice": 220.47,
+  "closeTime": "2024-08-20 11:09:00",
+  "closePrice": 221.42,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone5",
+  "symbol": "TSLA",
+  "volume": 44,
+  "direction": 0,
+  "openTime": "2024-08-20 14:52:00",
+  "openPrice": 221.4,
+  "closeTime": "2024-08-20 15:55:00",
+  "closePrice": 221.62,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone6",
+  "symbol": "TSLA",
+  "volume": 48,
+  "direction": 0,
+  "openTime": "2024-08-21 10:11:00",
+  "openPrice": 221.41,
+  "closeTime": "2024-08-21 10:15:00",
+  "closePrice": 219.35,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone7",
+  "symbol": "TSLA",
+  "volume": 49,
+  "direction": 0,
+  "openTime": "2024-08-21 11:19:00",
+  "openPrice": 221.22,
+  "closeTime": "2024-08-21 13:10:00",
+  "closePrice": 222.24,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone8",
+  "symbol": "TSLA",
+  "volume": 172,
+  "direction": 1,
+  "openTime": "2024-08-21 14:37:00",
+  "openPrice": 223.5,
+  "closeTime": "2024-08-21 14:38:00",
+  "closePrice": 223.21,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone9",
+  "symbol": "TSLA",
+  "volume": 56,
+  "direction": 0,
+  "openTime": "2024-08-22 10:56:00",
+  "openPrice": 218.62,
+  "closeTime": "2024-08-22 11:43:00",
+  "closePrice": 216.86,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone10",
+  "symbol": "TSLA",
+  "volume": 68,
+  "direction": 0,
+  "openTime": "2024-08-22 12:08:00",
+  "openPrice": 216.39,
+  "closeTime": "2024-08-22 12:26:00",
+  "closePrice": 217.12,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone11",
+  "symbol": "TSLA",
+  "volume": 135,
+  "direction": 0,
+  "openTime": "2024-08-22 13:12:00",
+  "openPrice": 216.74,
+  "closeTime": "2024-08-22 13:13:00",
+  "closePrice": 216.0,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone12",
+  "symbol": "TSLA",
+  "volume": 178,
+  "direction": 0,
+  "openTime": "2024-08-22 14:15:00",
+  "openPrice": 213.99,
+  "closeTime": "2024-08-22 14:54:00",
+  "closePrice": 213.43,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone13",
+  "symbol": "TSLA",
+  "volume": 75,
+  "direction": 0,
+  "openTime": "2024-08-26 10:26:00",
+  "openPrice": 213.9,
+  "closeTime": "2024-08-26 10:31:00",
+  "closePrice": 212.58,
+  "status": "Closed"
+ },
+ {
+  "id": "TSLA-fvgzone14",
+  "symbol": "TSLA",
+  "volume": 78,
+  "direction": 0,
+  "openTime": "2024-08-26 13:57:00",
+  "openPrice": 211.47,
+  "closeTime": "2024-08-26 14:26:00",
+  "closePrice": 212.11,
+  "status": "Closed"
+ }
+]
