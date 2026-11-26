@@ -9,6 +9,10 @@ parts that build brokers, load algos or run backtests (`cli`, `engine`,
 `algos`, `modes`, `paper_broker`, `broker`, `router`). `ibapi` is refused too.
 A new module is therefore forbidden until it is added here in a reviewed edit.
 
+`MainStoinker.indicators` (issue 276: the FVG zones of the dashboard) is allowed as a whole
+package: it is pure (standard library, numpy, pandas; its own boundary test) and
+`test_the_indicators_the_api_may_import_stay_pure` re-checks that from this side.
+
 The allowed list is what the API needs now (`store`) and what issues 83 to 87
 need (`stats`, `run_documents`, `report`, `feed` for the bar reader, `ledger`
 record types). `run_documents` does not exist yet; naming it here only reserves
@@ -24,6 +28,7 @@ must not import the API.
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +49,8 @@ ALLOWED_ENGINE_MODULES = frozenset({
     "MainStoinker.engine.feed",
     "MainStoinker.engine.ledger",
 })
+# Whole packages outside `engine` that the API may import (issue 276).
+ALLOWED_PACKAGES = ("MainStoinker.indicators",)
 # Packages whose members are named one by one: `from MainStoinker.engine import store`.
 PARENT_PACKAGES = frozenset({ROOT_PACKAGE, ENGINE_PACKAGE})
 # Named explicitly in the issue, and checked at runtime as well.
@@ -69,7 +76,8 @@ def is_allowed(module: str) -> bool:
         return False
     if _is_under(module, API_PACKAGE):
         return True
-    return any(_is_under(module, allowed) for allowed in ALLOWED_ENGINE_MODULES)
+    return any(_is_under(module, allowed)
+               for allowed in (*ALLOWED_ENGINE_MODULES, *ALLOWED_PACKAGES))
 
 
 def imported_modules(source: str, filename: str, package: str) -> list[tuple[int, str]]:
@@ -140,6 +148,38 @@ def test_allowlist_checker_catches_violations() -> None:
     assert not bad("from MainStoinker.api.db import with_store\n")
     assert not bad("from . import db\n")
     assert not bad("import fastapi\nimport sqlite3\n")
+    assert not bad("from MainStoinker.indicators.fvg import FvgConfig\n")
+    assert not bad("from MainStoinker.indicators import fvg\n")
+    assert not bad("from MainStoinker import indicators\n")
+    assert bad("from MainStoinker.indicatorsX import y\n")  # a prefix is not a package
+
+
+def test_the_indicators_the_api_may_import_stay_pure() -> None:
+    """Importing the API loads no project module of `indicators` beyond its own, and no `ibapi`."""
+    code = (
+        "import sys\n"
+        "import MainStoinker.api.routes_fvg\n"
+        "own = sorted(m for m in sys.modules if m.startswith('MainStoinker.indicators'))\n"
+        "assert 'MainStoinker.indicators.fvg' in own, own\n"
+        "import ast, pathlib\n"
+        "import MainStoinker.indicators as pkg\n"
+        "seen = set()\n"
+        "for path in pathlib.Path(pkg.__file__).parent.rglob('*.py'):\n"
+        "    for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):\n"
+        "        if isinstance(node, ast.Import):\n"
+        "            seen.update(a.name for a in node.names)\n"
+        "        elif isinstance(node, ast.ImportFrom):\n"
+        "            seen.add(('.' * node.level) + (node.module or ''))\n"
+        "bad = sorted(n for n in seen if n.startswith('ibapi') or n.startswith('..') or (\n"
+        "    n.startswith('MainStoinker') and not n.startswith('MainStoinker.indicators')))\n"
+        "print(','.join(bad))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", code], capture_output=True, text=True, timeout=120,
+        cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ""
 
 
 def test_engine_does_not_import_api() -> None:

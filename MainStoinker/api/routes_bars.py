@@ -15,8 +15,9 @@ Reading the file is blocking work, so it runs inside the `with_store` callback, 
 
 from __future__ import annotations
 
+from datetime import datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -71,8 +72,30 @@ def _servable(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[keep.to_numpy()]
 
 
+class Loaded(NamedTuple):
+    """`load_window`'s answer: `frame` is None when the bars cannot be served (`reason` says why).
+
+    `first` and `last` are the window asked for (as parsed, before any widening); None only for a live run
+    that has no bar yet and was given no window.
+    """
+
+    frame: pd.DataFrame | None
+    reason: str | None
+    first: datetime | None
+    last: datetime | None
+
+
+def _no_bars() -> pd.DataFrame:
+    return pd.DataFrame(columns=["date", *_PRICES, "volume"])
+
+
+def _from_day_start(first: datetime, widen: bool) -> datetime:
+    """`first`, or midnight of its day when the caller wants the whole day (a warm-up for indicators)."""
+    return datetime.combine(first.date(), time.min) if widen else first
+
+
 def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
-                 start: str | None, end: str | None) -> dict[str, Any]:
+                 start: str | None, end: str | None, widen: bool) -> Loaded:
     """A live run's bars come from the database (`run_bars`), under the same window rules.
 
     With no window the default day is the day of the run's last bar, else of the
@@ -89,7 +112,10 @@ def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
     except WindowError as error:
         raise HTTPException(422, str(error)) from None
     if first is None or last is None:
-        return {"symbol": symbol, "available": True, "reason": None, "bars": []}
+        return Loaded(_no_bars(), None, None, None)
+    asked = first
+    first = _from_day_start(first, widen)
+
     def servable(limit: int | None) -> tuple[pd.DataFrame, int]:
         stored = store.load_bars(run_id, symbol, first, last, limit=limit)
         frame = pd.DataFrame(
@@ -103,11 +129,19 @@ def _stored_bars(store: Store, run_id: int, symbol: str, data: DataMeta,
     window, read = servable(MAX_BARS + 1)
     if read > MAX_BARS and len(window) <= MAX_BARS:
         window, _ = servable(None)
-    return _served(symbol, window, None)
+    return Loaded(window, None, asked, last)
 
 
-def _bars(store: Store, run_id: int, symbol: str,
-          start: str | None, end: str | None) -> dict[str, Any]:
+def load_window(store: Store, run_id: int, symbol: str, start: str | None, end: str | None,
+                *, widen: bool = False) -> Loaded:
+    """The servable bars of a run's symbol in the window (see `Loaded`).
+
+    The run, symbol and window rules, errors (404 before 422) and sources are the bars route's. `frame` is
+    None when the bars cannot be served (`reason` then says why: "missing" or "changed"); otherwise it holds
+    the rows in the window (it may be empty) and `reason` is "unverified" or None. With `widen` the window
+    starts at midnight of its first day (the bars of the whole day up to the window's end), which an
+    indicator needs to be warm. The caller applies the `MAX_BARS` limit (`check_width`).
+    """
     run = next((r for r in store.list_runs() if r.run_id == run_id), None)
     if run is None:
         raise NotFound("no such run")
@@ -115,13 +149,14 @@ def _bars(store: Store, run_id: int, symbol: str,
     if symbol not in data.symbols:
         raise NotFound("no such symbol in this run")
     if run.kind in LIVE_KINDS:
-        return _stored_bars(store, run_id, symbol, data, start, end)
+        return _stored_bars(store, run_id, symbol, data, start, end, widen)
     try:
         first, last = parse_window(start, end, default_day=data.last_bar)
     except WindowError as error:
         raise HTTPException(422, str(error)) from None
+    asked, first = first, _from_day_start(first, widen)
     if not data.directory:
-        return _empty(symbol, "missing")
+        return Loaded(None, "missing", asked, last)
     directory = Path(data.directory)
     reason: str | None = "unverified"
     recorded = next(((sha, size) for sym, sha, size in data.files if sym == symbol), None)
@@ -129,24 +164,36 @@ def _bars(store: Store, run_id: int, symbol: str,
         try:
             current = symbol_fingerprint(directory, symbol)
         except (OSError, ValueError):  # absent, both layouts present, or not a plain ticker
-            return _empty(symbol, "missing")
+            return Loaded(None, "missing", asked, last)
         if current != recorded:
-            return _empty(symbol, "changed")
+            return Loaded(None, "changed", asked, last)
         reason = None
     frame = _read(directory, symbol)
     if frame is None:
-        return _empty(symbol, "missing")
+        return Loaded(None, "missing", asked, last)
     try:
         window = bars_between(_servable(frame), first, last)
     except TypeError:  # dates that cannot be compared with a naive window
-        return _empty(symbol, "missing")
+        return Loaded(None, "missing", asked, last)
+    return Loaded(window, reason, asked, last)
+
+
+def check_width(window: pd.DataFrame) -> None:
+    if len(window) > MAX_BARS:
+        raise HTTPException(422, f"window too wide: more than {MAX_BARS} bars")
+
+
+def _bars(store: Store, run_id: int, symbol: str,
+          start: str | None, end: str | None) -> dict[str, Any]:
+    window, reason, _first, _last = load_window(store, run_id, symbol, start, end)
+    if window is None:
+        return _empty(symbol, reason or "missing")
     return _served(symbol, window, reason)
 
 
 def _served(symbol: str, window: pd.DataFrame, reason: str | None) -> dict[str, Any]:
     """The response of a window of bars (already servable); shared by files and the store."""
-    if len(window) > MAX_BARS:
-        raise HTTPException(422, f"window too wide: more than {MAX_BARS} bars")
+    check_width(window)
     bars = [
         {"time": format_time(stamp.to_pydatetime()), "open": o, "high": h, "low": low, "close": c,
          "volume": v}

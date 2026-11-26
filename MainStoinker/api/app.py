@@ -18,6 +18,7 @@ from MainStoinker.api import API_VERSION
 from MainStoinker.api.errors import install_error_handlers
 from MainStoinker.api.routes_bars import router as bars_router
 from MainStoinker.api.routes_compare import router as compare_router
+from MainStoinker.api.routes_fvg import router as fvg_router
 from MainStoinker.api.routes_health import router as health_router
 from MainStoinker.api.routes_runs import router as runs_router
 from MainStoinker.api.routes_series import router as series_router
@@ -90,7 +91,7 @@ def create_app(db_spec: str, env: Mapping[str, str], *, allow_remote: bool = Fal
     app.state.clock = now
     install_error_handlers(app)
     for router in (health_router, runs_router, trades_router, bars_router,
-                   series_router, compare_router):
+                   fvg_router, series_router, compare_router):
         app.include_router(router)
     # Last, so it never shadows an API route.
     app.mount("/", _StaticFiles(directory=str(files("MainStoinker.api") / "static"), html=True),
