@@ -30,6 +30,17 @@ itself, or spelled in another case, is an error. This module never imports or re
 (Loading an algo imports its module, which pulls legacy modules in
 transitively; that happens only while a run is in progress.)
 
+Window and warm-up: `--replay-from/--replay-to` replay chosen New York days after
+`--warmup-days` days of warm-up. `--start DATE [--end DATE]` is the declared form:
+each algo's `warmup_sessions()` says how many trading sessions of history it needs,
+the largest need is counted back from DATE by the market calendar, those sessions are
+the warm-up (the same `Engine._begin` seeding a live session's warm-up frames go
+through: the algos see the history, no order, trade, mark or statistic comes from it),
+and the replay runs from DATE to `--end` (default: the end of the data). Bars that do
+not reach back far enough are refused, naming the first day needed and the first day
+available, unless `--allow-cold`. The stored run's config has `start` (from, to,
+warm-up sessions, first warm-up day, sessions loaded, cold); `report` shows it.
+
 Fills: `--fills legacy` (default) fills at the bar close with no costs and
 writes `trades.json` exactly as before and removes a `ledger.json` left in
 `--out` by an earlier realistic run (only that file name). `--fills realistic`
@@ -150,6 +161,7 @@ from .verify import (
     VerifyUsageError,
     verify_run,
 )
+from .warmup import declared_sessions, first_session_needed
 
 _NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _MONEY = re.compile(_NUMBER)
@@ -336,7 +348,29 @@ def build_parser() -> argparse.ArgumentParser:
         "(and ledger.json with --fills realistic; legacy fills remove a stale one)",
     )
     bt.add_argument(
-        "--warmup-days", type=int, default=2, metavar="N", help="days of warm-up history (default 2)"
+        "--warmup-days", type=int, default=None, metavar="N",
+        help="days of warm-up history (default 2; not with --start)"
+    )
+    bt.add_argument(
+        "--start",
+        metavar="DATE",
+        help="trade only from this New York date (YYYY-MM-DD) to the end of the data (or "
+        "--end). The algos' declared warm-up need (warmup_sessions(): the largest of them, in "
+        "trading sessions by the market calendar) is loaded from before DATE and given to the "
+        "algos as warm-up: no orders, trades, equity or statistics come from it. Refused when "
+        "the bars do not reach back far enough (see --allow-cold). Not with --replay-from, "
+        "--replay-to or --warmup-days"
+    )
+    bt.add_argument(
+        "--end",
+        metavar="DATE",
+        help="last New York date to trade, inclusive (default: the end of the data); needs --start"
+    )
+    bt.add_argument(
+        "--allow-cold",
+        action="store_true",
+        help="with --start: start anyway when the bars do not cover the warm-up (it is said in "
+        "the output and recorded in the stored run)"
     )
     bt.add_argument(
         "--replay-from",
@@ -671,6 +705,90 @@ def parse_window(args: argparse.Namespace) -> tuple[date, date] | None:
     return dates[0], dates[1]
 
 
+def parse_start(args: argparse.Namespace) -> tuple[date, date | None] | None:
+    """The `(start, end)` dates of `--start/--end` (end None: the end of the data), or None.
+
+    Raises `CliError` for `--end` or `--allow-cold` without `--start`, `--start` together
+    with `--replay-from`, `--replay-to` or `--warmup-days` (two ways of choosing the
+    warm-up and the window), a malformed date, or `--end` before `--start`.
+    """
+    if args.start is None:
+        if args.end is not None:
+            raise CliError("--end needs --start")
+        if args.allow_cold:
+            raise CliError("--allow-cold needs --start")
+        return None
+    for flag, given in (("--replay-from", args.replay_from), ("--replay-to", args.replay_to),
+                        ("--warmup-days", args.warmup_days)):
+        if given is not None:
+            raise CliError(f"--start cannot be combined with {flag}")
+    dates = []
+    for flag, text in (("--start", args.start), ("--end", args.end)):
+        if text is None:
+            dates.append(None)
+            continue
+        try:
+            if not _DATE.fullmatch(text):
+                raise ValueError(text)
+            dates.append(date.fromisoformat(text))
+        except ValueError:
+            raise CliError(f"{flag} must be a date as YYYY-MM-DD, got {ascii(text)}") from None
+    if dates[1] is not None and dates[1] < dates[0]:
+        raise CliError(f"--end {dates[1]} is before --start {dates[0]}")
+    return dates[0], dates[1]
+
+
+def declared_needs(entries: Sequence[Mapping[str, Any]]) -> list[tuple[str, int]]:
+    """What each algo of `entries` declares as its warm-up need, `(idname, sessions)`.
+
+    The algos are built once, here, in a throw-away working directory (legacy
+    constructors write side files) with their output silenced, only to ask them; the
+    run builds its own.
+    """
+    algos: list = []
+    with tempfile.TemporaryDirectory(prefix="stoink-need-", ignore_cleanup_errors=True) as work:
+        try:
+            with _working_directory(Path(work)), _maybe_quiet(True):
+                _load_algos(entries, None, algos)
+                return declared_sessions(algos)
+        finally:
+            close_algo_logs(algos)
+
+
+def _warmup_check(
+    feed: CsvBarFeed, start: date, need: int, first_needed: date,
+    needs: Sequence[tuple[str, int]],
+) -> tuple[dict[str, Any], str | None]:
+    """`(note, shortfall)` for `--start`: what is stored with the run, and why the warm-up is short.
+
+    `note` is the run's `config["start"]` (the window is added by the caller); `shortfall` is
+    a sentence when some symbol has bars for fewer of the `need` sessions than needed, else None.
+    """
+    loaded = min(
+        (int(feed.warmup(symbol)["date"].dt.normalize().nunique()) for symbol in feed.symbols()),
+        default=0)
+    note: dict[str, Any] = {
+        "from": start.isoformat(),
+        "to": None,
+        "warmup_sessions": need,
+        "warmup_first_day": first_needed.isoformat(),
+        "warmup_sessions_loaded": loaded,
+        "cold": False,
+    }
+    if loaded >= need:
+        return note, None
+    who = ", ".join(f"{name} ({sessions})" for name, sessions in needs if sessions == need)
+    head = (f"--start {start} needs {need} trading sessions of warm-up (declared by {who}), "
+            f"beginning {first_needed}")
+    late = {s: feed.first_day(s) for s in feed.symbols() if feed.first_day(s) > first_needed}
+    if late:
+        symbol = max(late, key=lambda s: late[s])
+        return note, (f"{head}, but the bars of {symbol} begin {late[symbol]} "
+                      f"({loaded} of {need} sessions available)")
+    return note, (f"{head}, but some symbol has bars on only {loaded} of those {need} sessions "
+                  f"(days without bars)")
+
+
 def run_backtest_command(
     args: argparse.Namespace,
     *,
@@ -691,9 +809,11 @@ def run_backtest_command(
     algos_path = Path(args.algos).resolve()
     data_dir = Path(args.data).resolve()
     out_dir = Path(args.out).resolve()
-    if args.warmup_days < 0:
+    start = parse_start(args)
+    warmup_days = 2 if args.warmup_days is None else args.warmup_days
+    if warmup_days < 0:
         raise CliError("--warmup-days must be 0 or more")
-    window = parse_window(args)
+    window: tuple[date, date | None] | None = parse_window(args)
     if args.db is not None and args.db.removeprefix("sqlite:///") == ":memory:":
         raise CliError("--db :memory: would keep nothing once the command ends; "
                        "give a database file")
@@ -706,13 +826,39 @@ def run_backtest_command(
         check_algos_importable(entries)
     if not data_dir.is_dir():
         raise CliError(f"data directory not found: {data_dir}")
+    needs: list[tuple[str, int]] = []
+    need = 0
+    first_needed: date | None = None
+    if start is not None:
+        window = start
+        try:
+            needs = declared_needs(entries)
+            need = max((sessions for _, sessions in needs), default=0)
+            first_needed = first_session_needed(start[0], need)
+        except (ValueError, OverflowError) as exc:
+            raise CliError(f"cannot work out the warm-up for --start: {exc}") from exc
     try:
-        feed = CsvBarFeed(data_dir, config_symbols(entries), args.warmup_days, window=window)
+        feed = CsvBarFeed(data_dir, config_symbols(entries), warmup_days, window=window,
+                          warmup_from=first_needed)
     except (ValueError, FileNotFoundError) as exc:
         raise CliError(str(exc)) from exc
+    flags = "--start/--end" if start is not None else "--replay-from/--replay-to"
+    hint = "--start and --end" if start is not None else f"--warmup-days {warmup_days}"
     if window is not None and not any(feed.replay_counts().values()):
-        raise CliError(f"no data for any symbol between {window[0]} and {window[1]} "
-                       f"(--replay-from/--replay-to); check the dates and the data")
+        raise CliError(f"no data for any symbol between {window[0]} and "
+                       f"{window[1] or 'the end of the data'} ({flags}); check the dates and "
+                       f"the data")
+    warmup_note: dict[str, Any] | None = None
+    if start is not None:
+        assert first_needed is not None
+        warmup_note, cold_message = _warmup_check(feed, start[0], need, first_needed, needs)
+        warmup_note["to"] = None if start[1] is None else start[1].isoformat()
+        if cold_message is not None:
+            if not args.allow_cold:
+                raise CliError(f"{cold_message}; use a later --start, add earlier bars, or "
+                               f"--allow-cold to start anyway")
+            warmup_note["cold"] = True
+            print(f"warning: cold start: {cold_message}", file=sys.stderr)
     # A symbol with no replay bars while another has some is an input problem (it would
     # only show as one "no bar at N of N minutes" line). When NO symbol has any, the run
     # stays a run of zero bars as before: many existing tests use data shorter than the
@@ -723,7 +869,7 @@ def run_backtest_command(
             if count == 0:
                 raise CliError(
                     f"symbol {symbol} has no bars in the replay window (its data is all "
-                    f"warm-up or empty; check the data and --warmup-days {args.warmup_days})"
+                    f"warm-up or empty; check the data and {hint})"
                 )
     # Symbols whose replay data never overlap (no minute with a bar for every symbol)
     # are an input problem: nothing would be tested together. Anything less (a stale
@@ -731,8 +877,7 @@ def run_backtest_command(
     if len(feed.symbols()) > 1 and any(counts.values()) and feed.shared_count() == 0:
         raise CliError(
             f"no minute has a bar for every symbol ({', '.join(feed.symbols())}): the "
-            f"symbols' data do not overlap; check the data files and --warmup-days "
-            f"{args.warmup_days}"
+            f"symbols' data do not overlap; check the data files and {hint}"
         )
     coverage_warnings = feed.coverage_warnings()
     # One pass over the batches (they are in memory): count them and note the
@@ -809,9 +954,11 @@ def run_backtest_command(
                     code_version=(code_version or current_code_version)(),
                     config={
                         "entries": entries,
-                        "warmup_days": args.warmup_days,
+                        **({"start": warmup_note} if start is not None
+                           else {"warmup_days": warmup_days}),
                         **({"window": {"from": window[0].isoformat(),
-                                       "to": window[1].isoformat()}} if window else {}),
+                                       "to": window[1].isoformat()}}
+                           if window and start is None else {}),
                         "capital": fmt4(capital),
                         "costs": {
                             "commission_per_share": fmt4(costs.commission_per_share),
@@ -917,6 +1064,10 @@ def run_backtest_command(
         if store is not None:
             store.close()
 
+    if warmup_note is not None:
+        print(f"warm-up: {warmup_note['warmup_sessions']} sessions needed (from "
+              f"{warmup_note['warmup_first_day']}), {warmup_note['warmup_sessions_loaded']} loaded"
+              + (", cold start" if warmup_note["cold"] else ""))
     print(f"replayed {bar_count} bars for {', '.join(feed.symbols())}")
     for symbol, count in feed.missing_counts().items():
         if count:

@@ -31,6 +31,10 @@ class Algo(ParentAlgo):
         # print(self.AlgoData.shape)
         
 
+    def warmup_sessions(self):
+        # `update` reads the last two rows and an EMA of `long` bars: whole sessions of 390 bars
+        return -(-max(self.short, self.long, 2) // 390)
+
     def update(self, StockData):
 
 

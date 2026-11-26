@@ -249,6 +249,7 @@ def _header_base(run: RunData, data_directory: str) -> dict[str, Any]:
     s = run.summary
     config = run.config if isinstance(run.config, Mapping) else {}
     costs = config.get("costs") if s.fills == "realistic" else None
+    start = config.get("start")
     return {
         "run_id": s.run_id,
         "status": s.status,
@@ -272,6 +273,8 @@ def _header_base(run: RunData, data_directory: str) -> dict[str, Any]:
         "data_warnings": list(s.data.warnings),
         "capital": config.get("capital") if s.fills == "realistic" else None,
         "costs": costs if isinstance(costs, Mapping) else None,
+        # only a `backtest --start` run has it: start, end and the warm-up used (issue 286)
+        **({"start": dict(start)} if isinstance(start, Mapping) else {}),
     }
 
 

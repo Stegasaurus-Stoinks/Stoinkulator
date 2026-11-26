@@ -257,6 +257,35 @@ class Algo(ParentAlgo):
         self.currentZone: Any = None
         self.skipped: list[tuple[datetime, str]] = []  # (bar time, why) of skipped setups
 
+    def warmup_sessions(self) -> int:
+        """Trading sessions of history needed before the first tradable bar (see the docs).
+
+        The largest of the needs of the settings that are on, each in whole sessions of
+        `SESSION_MINUTES` (390) bars, rounded up ("ready" is a bar count, as the algo
+        itself decides it, not numerical convergence of an EMA):
+
+        - ATR: `atr_bars` zone bars of `zone_minutes` minutes each (always on);
+        - `trend_filter`: `trend_ema` 1-minute bars;
+        - `htf_minutes`: `htf_ema` completed higher-timeframe bars, `SESSION_MINUTES //
+          htf_minutes` of them per session;
+        - `vol_slot_mult` > 0: `vol_slot_sessions` earlier sessions, plus one session of
+          margin because a half day has no afternoon slot;
+        - `trend_day_adr` > 0: `adr_sessions` earlier sessions.
+        """
+        def sessions(bars: int, per_session: int) -> int:
+            return -(-bars // per_session)
+
+        needs = [sessions(self._atr_window * self.zone_minutes, SESSION_MINUTES)]
+        if self.trend_filter:
+            needs.append(sessions(self.trend_ema, SESSION_MINUTES))
+        if self.htf_minutes:
+            needs.append(sessions(self.htf_ema, SESSION_MINUTES // self.htf_minutes))
+        if self.vol_slot_mult > 0:
+            needs.append(self.vol_slot_sessions + 1)
+        if self.trend_day_adr > 0:
+            needs.append(self.adr_sessions)
+        return max(needs)
+
     def _times_for_close(self, close: int, *, capped: bool) -> tuple[int, int]:
         """(last entry, flat time) in minutes for a session closing at `close`.
 

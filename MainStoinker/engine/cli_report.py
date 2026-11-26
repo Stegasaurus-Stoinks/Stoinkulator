@@ -315,6 +315,7 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
     lines.append(f"symbols: {', '.join(s.data.symbols) or '-'}")
     first, last = s.data.first_bar, s.data.last_bar
     lines.append(f"bars: {first if first else '-'} to {last if last else '-'}")
+    lines.extend(_start_lines(header.get("start")))
     lines.append(f"data directory: {header['data_directory']}")
     missing = header["missing_minutes"]
     if missing and any(missing.values()):
@@ -355,6 +356,19 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
         lines.extend(verdict.lines())
     _write(lines)
     return 0 if verdict is None else verdict.exit_code
+
+
+def _start_lines(start: Any) -> list[str]:
+    """The `backtest --start` lines of a report: the window and the warm-up used; none otherwise."""
+    if not isinstance(start, Mapping):
+        return []
+    end = start.get("to") or "the end of the data"
+    lines = [f"start: {start.get('from', '-')}, end: {end}"]
+    cold = " (COLD START: the bars did not cover the warm-up)" if start.get("cold") else ""
+    lines.append(f"warm-up: {start.get('warmup_sessions', '-')} sessions needed (from "
+                 f"{start.get('warmup_first_day', '-')}), "
+                 f"{start.get('warmup_sessions_loaded', '-')} loaded{cold}")
+    return lines
 
 
 def _liveness_lines(s: RunSummary, now: datetime, stale_after: timedelta) -> list[str]:

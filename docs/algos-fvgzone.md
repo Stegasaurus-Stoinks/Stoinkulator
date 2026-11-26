@@ -197,6 +197,39 @@ that 09:30 bar is missing from the data.
 A zone retested only during that history is not marked
 used (the algo cannot know whether another process traded it).
 
+### How much history: `warmup_sessions()`
+
+Every algo can say how many whole trading sessions of 1-minute bars it needs before its first
+tradable bar (`ParentAlgo.warmup_sessions()`, default 0). FVGZone works it out from its settings
+as the largest of the parts that are on (a session is 390 bars, every quotient rounds up):
+
+| part | on when | sessions |
+|------|---------|----------|
+| ATR | always | `ceil(atr_bars * zone_minutes / 390)` (`atr_bars` is the detector's 20) |
+| EMA of the 1-minute closes | `trend_filter` | `ceil(trend_ema / 390)` |
+| higher-timeframe EMA | `htf_minutes` > 0 | `ceil(htf_ema / (390 // htf_minutes))` (whole buckets per session) |
+| volume by slot | `vol_slot_mult` > 0 | `vol_slot_sessions + 1` (one session of margin: a half day has no afternoon slot) |
+| trend-day filter | `trend_day_adr` > 0 | `adr_sessions` |
+
+So the defaults need 1 session, `htf_minutes` 30 needs 2 (20 buckets, 13 per session), and
+`vol_slot_mult` 1.5 with `trend_day_adr` 0.3 needs 21 (20 + the margin). "Ready" here is what the
+algo itself checks: bar and session counts, not numerical convergence. An EMA never fully forgets
+its seed: the 50-bar EMA of 1-minute closes is down to about 1e-7 of its seed after one session, but
+a 20-bucket higher-timeframe EMA (alpha 2/21) is far from converged after the 2 declared sessions
+(a seed weight of 0.905 per bucket: still a noticeable part of it), so such
+a filter's early values still depend a little on where the history began. Sessions are counted at 390
+bars; a half day has 210, and two half days inside a 21-session window can leave an afternoon slot
+one session short, in which case the filter simply blocks (never trades wrongly) until it fills.
+
+`backtest --start DATE [--end DATE]` uses it: the largest need of the run's algos is counted back
+from `DATE` by the market calendar and those sessions are given to the algos as warm-up, through the
+same engine seeding a live session's warm-up frames use (no order, trade, equity or statistic comes
+from them). For FVGZone with the defaults on data that has a session before `DATE`, the trades of
+`--start DATE` equal those of a run over all the data from `DATE` on, trade for trade (the algo is flat
+every day at 15:55, and its zones, VWAP and used-up marks are per session). If the bars do not reach back
+far enough the command refuses and names the first day needed and the first day available;
+`--allow-cold` starts anyway, says so, and records it in the stored run.
+
 ## Limits
 
 - **Data that ends early.** A half day (13:00 close) is known from the market calendar and
