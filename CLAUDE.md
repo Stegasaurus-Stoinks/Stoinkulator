@@ -165,7 +165,7 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
   (enforced by `tests/test_engine_import_boundary.py`). Live modules: `live_feed.py` aligns the
   symbols' closed bars into one batch per minute; `live_store.py` the incremental writer of a live
   run; `live_counts.py` live run kinds, heartbeat and count keys; `warmup.py` warm-up frames from
-  the month files.
+  the month files; `market_calendar.py` US market holidays and early closes (pure, rule-based).
 - `MainStoinker/api/` read-only web API (FastAPI, GET only) and static dashboard, started by `serve`;
   may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy,
   and the pure `MainStoinker.indicators` (the FVG zones of the run page; enforced by

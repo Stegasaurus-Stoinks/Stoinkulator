@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,17 +24,10 @@ from MainStoinker.engine.feed import (
     symbol_bar_files,
     symbol_fingerprint,
 )
+from MainStoinker.engine.market_calendar import previous_trading_day
 
 _MONTH_FILE = re.compile(r".+_([0-9]{4})-([0-9]{2})\.csv")
 _STAMP = "%Y-%m-%d %H:%M:%S"
-
-
-def previous_weekday(today: date) -> date:
-    """The weekday before `today` (Monday gives the Friday before)."""
-    day = today - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return day
 
 
 def warmup_digest(frame: pd.DataFrame) -> str:
@@ -165,7 +158,9 @@ def live_warmup(
     cannot fail the warm-up).
 
     `warnings` lists, per symbol, a last warm-up day that is not the previous
-    weekday (or a market holiday) and fewer than `trading_days` days of history.
+    trading day of the market calendar (weekends and holidays skipped, so the day
+    after a holiday expects the day before it) and fewer than `trading_days`
+    days of history.
 
     Raises `TypeError` if `today` is a `datetime`; `FileNotFoundError` for a
     symbol without bar files; `ValueError` for a symbol with no rows before
@@ -179,7 +174,7 @@ def live_warmup(
     names = list(dict.fromkeys(symbols))
     if not names:
         raise ValueError("live_warmup needs at least one symbol")
-    expected = previous_weekday(today)
+    expected = previous_trading_day(today)
     frames: dict[str, pd.DataFrame] = {}
     described: dict[str, Any] = {}
     warnings: list[str] = []
@@ -195,7 +190,7 @@ def live_warmup(
         if last_day != expected:
             warnings.append(
                 f"symbol {symbol}: last warm-up day is {last_day.isoformat()}, expected the "
-                f"previous weekday {expected.isoformat()} (or a market holiday)"
+                f"previous trading day {expected.isoformat()}"
             )
         if len(keep) < trading_days:
             warnings.append(

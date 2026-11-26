@@ -318,3 +318,26 @@ def test_exact_days_for_n_1_2_and_more_than_data(tmp_path: Path) -> None:
         frames, description, _ = live_warmup(tmp_path, ["AAPL"], today, n)
         assert description["symbols"]["AAPL"]["days"] == want
         assert len(frames["AAPL"]) == len(want) * BARS_PER_DAY
+
+
+def test_a_holiday_is_not_a_missing_day(tmp_path: Path) -> None:
+    # Monday 2024-09-02 is Labor Day: the previous trading day of Tuesday 09-03 is Friday 08-30
+    write_days(tmp_path, "AAPL", ["2024-08-29", "2024-08-30"])
+    frames, _, warnings = live_warmup(tmp_path, ["AAPL"], date(2024, 9, 3), 2)
+    assert frames["AAPL"]["date"].dt.date.unique().tolist() == [date(2024, 8, 29), date(2024, 8, 30)]
+    assert warnings == []
+
+
+def test_a_missing_day_after_a_holiday_is_still_a_warning(tmp_path: Path) -> None:
+    # Thursday 2024-11-28 is Thanksgiving; for Monday 12-02 the expected day is Friday 11-29
+    # (a half day), not the holiday and not the weekend
+    write_days(tmp_path, "AAPL", ["2024-11-27"])
+    _, _, warnings = live_warmup(tmp_path, ["AAPL"], date(2024, 12, 2), 1)
+    assert len(warnings) == 1 and "2024-11-29" in warnings[0] and "trading day" in warnings[0]
+
+
+def test_days_are_counted_across_a_holiday(tmp_path: Path) -> None:
+    write_days(tmp_path, "AAPL", ["2024-08-29", "2024-08-30", "2024-09-03", "2024-09-04"])
+    _, description, warnings = live_warmup(tmp_path, ["AAPL"], date(2024, 9, 5), 3)
+    assert description["symbols"]["AAPL"]["days"] == ["2024-08-30", "2024-09-03", "2024-09-04"]
+    assert warnings == []

@@ -192,7 +192,7 @@ today from the month files in `--bars`, plus today's bars since 09:30 from the f
 IB sends. No algo is updated on these bars and nothing trades on them: a start after 09:30 does
 not catch up (decision D1 of issue 187). The warm-up needs month files for every symbol with at
 least one day before today, else the command is refused. A last warm-up day that is not the
-previous weekday is printed as a warning. The engine starts when every symbol's first backfill is
+previous trading day (market calendar: weekends and holidays skipped) is printed as a warning. The engine starts when every symbol's first backfill is
 over; bars that arrive earlier wait. Run `fetch-bars` for the warm-up days after 06:00 New York on
 the day of the session: a day fetched earlier is provisional, and a later refetch changes the
 file, which makes `report RUN --verify` say UNVERIFIABLE.

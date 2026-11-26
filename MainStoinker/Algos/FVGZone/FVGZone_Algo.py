@@ -28,12 +28,14 @@ import pandas as pd
 
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 from MainStoinker.engine.gaprule import RefusedEntry
+from MainStoinker.engine.market_calendar import session as market_session
 from MainStoinker.indicators.fvg import Direction, FvgConfig, FvgDetector
 from MainStoinker.indicators.session import DailyRange, SlotVolume
 from MainStoinker.indicators.trend import TrendConfig, TrendIndicator
 
 SESSION_OPEN_MINUTE = 9 * 60 + 30  # 09:30
 SESSION_MINUTES = 390  # 09:30 to 16:00
+FULL_CLOSE_MINUTE = SESSION_OPEN_MINUTE + SESSION_MINUTES  # 16:00
 
 # Keys the engine and the CLI put in a config object besides the algo's own parameters.
 GENERAL_KEYS = frozenset({"idname", "ticker", "mode"})
@@ -49,8 +51,10 @@ DEFAULTS: dict[str, Any] = {
     "risk_dollars": 50,
     "max_shares": 500,
     "first_entry": "09:45",
-    "last_entry": "15:30",
-    "flat_time": "15:55",
+    "last_entry": None,  # absolute "HH:MM"; unset: `last_entry_before_close` minutes before the close
+    "flat_time": None,  # absolute "HH:MM"; unset: `flat_before_close` minutes before the close
+    "last_entry_before_close": 30,
+    "flat_before_close": 5,
     "min_size_atr": 0.25,
     "htf_minutes": 0,
     "htf_ema": 20,
@@ -123,9 +127,11 @@ def _cents(who: str, cfg: dict, key: str, low: float = 0.0) -> int:
     return round(scaled)
 
 
-def _clock(who: str, cfg: dict, key: str) -> int:
-    """'HH:MM' as minutes since midnight."""
+def _clock(who: str, cfg: dict, key: str) -> int | None:
+    """'HH:MM' as minutes since midnight; None when the key is unset (or null)."""
     value = cfg.get(key, DEFAULTS[key])
+    if value is None:
+        return None
     try:
         text = str(value)
         hours, minutes = text.split(":")
@@ -184,10 +190,16 @@ class Algo(ParentAlgo):
             raise _fail(who, f"risk_dollars must be > 0, got {cfg.get('risk_dollars')!r}")
         self.max_shares = _integer(who, cfg, "max_shares", 1)
         self.first_entry = _clock(who, cfg, "first_entry")
-        self.last_entry = _clock(who, cfg, "last_entry")
-        self.flat_time = _clock(who, cfg, "flat_time")
+        # End-of-day times: absolute when given, else relative to the day's close. `last_entry`
+        # and `flat_time` stay the FULL-DAY times (16:00 close); `_day_limits` gives a day's own.
+        self._abs_last_entry = _clock(who, cfg, "last_entry")
+        self._abs_flat_time = _clock(who, cfg, "flat_time")
+        self.last_entry_before_close = _integer(who, cfg, "last_entry_before_close", 1, SESSION_MINUTES)
+        self.flat_before_close = _integer(who, cfg, "flat_before_close", 1, SESSION_MINUTES)
+        self.last_entry, self.flat_time = self._times_for_close(FULL_CLOSE_MINUTE, capped=False)
         if not SESSION_OPEN_MINUTE <= self.first_entry <= self.last_entry < self.flat_time:
             raise _fail(who, "times must satisfy 09:30 <= first_entry <= last_entry < flat_time")
+        self._last_entry_today, self._flat_today = self.last_entry, self.flat_time
         min_size_atr = cfg.get("min_size_atr", DEFAULTS["min_size_atr"])
         if min_size_atr is not None:
             min_size_atr = _number(who, cfg, "min_size_atr")
@@ -244,6 +256,33 @@ class Algo(ParentAlgo):
         self._reset_session_state()
         self.currentZone: Any = None
         self.skipped: list[tuple[datetime, str]] = []  # (bar time, why) of skipped setups
+
+    def _times_for_close(self, close: int, *, capped: bool) -> tuple[int, int]:
+        """(last entry, flat time) in minutes for a session closing at `close`.
+
+        Unset absolute times are `*_before_close` minutes before `close`. An explicit absolute
+        time is used as given on a full day; on a shorter day (`capped`) it is also held to the
+        close-relative limit, so a position can never outlive an early close.
+        """
+        last = close - self.last_entry_before_close
+        flat = close - self.flat_before_close
+        if self._abs_last_entry is not None:
+            last = min(self._abs_last_entry, last) if capped else self._abs_last_entry
+        if self._abs_flat_time is not None:
+            flat = min(self._abs_flat_time, flat) if capped else self._abs_flat_time
+        if capped:
+            last = min(last, flat - 1)
+        return last, flat
+
+    def _day_limits(self, day: Any) -> None:
+        """Set today's last-entry and flat times from the market calendar."""
+        found = market_session(day)
+        if found is None or found.close_minute >= FULL_CLOSE_MINUTE:
+            # a full day, or data on a day the calendar calls closed: the full-day times
+            self._last_entry_today, self._flat_today = self.last_entry, self.flat_time
+        else:
+            self._last_entry_today, self._flat_today = self._times_for_close(
+                found.close_minute, capped=True)
 
     # ----- the indicator frame the engine reads -----
 
@@ -327,6 +366,7 @@ class Algo(ParentAlgo):
                 exited = True
             self._reset_session_state()
             self._day = day
+            self._day_limits(day)
 
         # EMA of the 1-minute closes (all sessions in a row), seeded with the first close.
         self._ema = float(c_t) if self._ema is None else self._ema + self._ema_alpha * (c_t - self._ema)
@@ -360,7 +400,8 @@ class Algo(ParentAlgo):
         if live:
             if self.inTrade and not exited:
                 exited = self._manage_trade(minute_of_day)
-            if not self.inTrade and not exited and self.first_entry <= minute_of_day <= self.last_entry:
+            entry_window = self.first_entry <= minute_of_day <= self._last_entry_today
+            if not self.inTrade and not exited and entry_window:
                 self._look_for_entry(when, zones, h_t, l_t, c_t)
             if self.inTrade and not isinstance(getattr(self.trade, "brokerRef", None), RefusedEntry):
                 values["StopPrice"] = float(self.trade.stopPrice)
@@ -428,7 +469,7 @@ class Algo(ParentAlgo):
         if self.trade.check_tp(row) == 1:
             self.inTrade = False
             return True
-        if minute_of_day >= self.flat_time:
+        if minute_of_day >= self._flat_today:
             self.logger.info("***flat time close position***")
             self.close_trade()
             return True
