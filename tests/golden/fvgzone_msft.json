@@ -1,0 +1,167 @@
+[
+ {
+  "id": "MSFT-fvgzone0",
+  "symbol": "MSFT",
+  "volume": 81,
+  "direction": 1,
+  "openTime": "2024-08-19 10:07:00",
+  "openPrice": 419.01,
+  "closeTime": "2024-08-19 10:15:00",
+  "closePrice": 418.4,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone1",
+  "symbol": "MSFT",
+  "volume": 44,
+  "direction": 0,
+  "openTime": "2024-08-19 10:30:00",
+  "openPrice": 417.57,
+  "closeTime": "2024-08-19 12:44:00",
+  "closePrice": 418.69,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone2",
+  "symbol": "MSFT",
+  "volume": 185,
+  "direction": 1,
+  "openTime": "2024-08-20 14:21:00",
+  "openPrice": 425.22,
+  "closeTime": "2024-08-20 14:23:00",
+  "closePrice": 425.76,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone3",
+  "symbol": "MSFT",
+  "volume": 80,
+  "direction": 1,
+  "openTime": "2024-08-21 10:48:00",
+  "openPrice": 425.21,
+  "closeTime": "2024-08-21 10:50:00",
+  "closePrice": 424.59,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone4",
+  "symbol": "MSFT",
+  "volume": 50,
+  "direction": 0,
+  "openTime": "2024-08-21 11:04:00",
+  "openPrice": 423.78,
+  "closeTime": "2024-08-21 12:04:00",
+  "closePrice": 421.78,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone5",
+  "symbol": "MSFT",
+  "volume": 185,
+  "direction": 0,
+  "openTime": "2024-08-21 12:11:00",
+  "openPrice": 422.63,
+  "closeTime": "2024-08-21 12:21:00",
+  "closePrice": 422.9,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone6",
+  "symbol": "MSFT",
+  "volume": 42,
+  "direction": 0,
+  "openTime": "2024-08-22 10:15:00",
+  "openPrice": 424.11,
+  "closeTime": "2024-08-22 10:51:00",
+  "closePrice": 421.75,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone7",
+  "symbol": "MSFT",
+  "volume": 92,
+  "direction": 0,
+  "openTime": "2024-08-22 13:12:00",
+  "openPrice": 417.08,
+  "closeTime": "2024-08-22 13:31:00",
+  "closePrice": 416.0,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone8",
+  "symbol": "MSFT",
+  "volume": 116,
+  "direction": 0,
+  "openTime": "2024-08-22 14:00:00",
+  "openPrice": 414.94,
+  "closeTime": "2024-08-22 14:08:00",
+  "closePrice": 415.37,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone9",
+  "symbol": "MSFT",
+  "volume": 80,
+  "direction": 0,
+  "openTime": "2024-08-22 14:10:00",
+  "openPrice": 415.38,
+  "closeTime": "2024-08-22 14:15:00",
+  "closePrice": 416.0,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone10",
+  "symbol": "MSFT",
+  "volume": 28,
+  "direction": 0,
+  "openTime": "2024-08-23 10:55:00",
+  "openPrice": 414.46,
+  "closeTime": "2024-08-23 11:25:00",
+  "closePrice": 416.24,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone11",
+  "symbol": "MSFT",
+  "volume": 56,
+  "direction": 0,
+  "openTime": "2024-08-26 10:05:00",
+  "openPrice": 415.43,
+  "closeTime": "2024-08-26 10:31:00",
+  "closePrice": 413.67,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone12",
+  "symbol": "MSFT",
+  "volume": 84,
+  "direction": 0,
+  "openTime": "2024-08-26 10:45:00",
+  "openPrice": 413.25,
+  "closeTime": "2024-08-26 10:58:00",
+  "closePrice": 413.84,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone13",
+  "symbol": "MSFT",
+  "volume": 96,
+  "direction": 0,
+  "openTime": "2024-08-26 11:41:00",
+  "openPrice": 413.98,
+  "closeTime": "2024-08-26 13:39:00",
+  "closePrice": 412.94,
+  "status": "Closed"
+ },
+ {
+  "id": "MSFT-fvgzone14",
+  "symbol": "MSFT",
+  "volume": 166,
+  "direction": 0,
+  "openTime": "2024-08-26 14:03:00",
+  "openPrice": 412.07,
+  "closeTime": "2024-08-26 14:10:00",
+  "closePrice": 411.47,
+  "status": "Closed"
+ }
+]

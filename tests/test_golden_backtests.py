@@ -55,11 +55,33 @@ CASES = [
         {"idname": "elliot-tsla", "ticker": "TSLA", "order": 10, "trailingStopDelta": 0.10},
         id="elliot_tsla",
     ),
+    # FVGZone (issue 277): defaults on each symbol, and the 1-minute zones without trend filter.
+    pytest.param(
+        "FVGZone",
+        {"idname": "AAPL-fvgzone", "ticker": "AAPL"},
+        id="fvgzone_aapl",
+    ),
+    pytest.param(
+        "FVGZone",
+        {"idname": "MSFT-fvgzone", "ticker": "MSFT"},
+        id="fvgzone_msft",
+    ),
+    pytest.param(
+        "FVGZone",
+        {"idname": "TSLA-fvgzone", "ticker": "TSLA"},
+        id="fvgzone_tsla",
+    ),
+    pytest.param(
+        "FVGZone",
+        {"idname": "TSLA-fvgzone-1m", "ticker": "TSLA", "zone_minutes": 1, "trend_filter": False},
+        id="fvgzone_tsla_1m_nofilter",
+    ),
 ]
 
 
-# The four cheap cases stay in the fast suite (the same four as the realistic-fill goldens in
-# test_paper_goldens.py); FunctionTest and the three Elliot runs, each 7 to 14 s on its own, run
+# The cheap cases (the original four and the four fvgzone ones, the same as the realistic-fill
+# goldens in test_paper_goldens.py use) stay in the fast suite; FunctionTest and the three
+# Elliot runs, each 7 to 14 s on its own, run
 # with `pytest -m slow`. Their behaviour is also exercised by fast tests on shorter slices:
 # FunctionTest by test_engine (multi-symbol, engine against the legacy path) and the CLI/store
 # tests, Elliot by test_elliot_state_golden and test_elliot_incremental (MSFT).
