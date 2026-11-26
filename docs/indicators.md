@@ -181,3 +181,24 @@ An EMA of the closes of completed N-minute buckets, read from 1-minute bars; use
   one row per bar: `date`, `direction`, `ready`, `ema`, `last_close`, `bars_seen`, `known_at`, as known at
   that bar's close. For research.
 - Warm-up: `ema_bars * bar_minutes` minutes of regular-session bars make it ready (600 for the defaults).
+
+## Session indicators: `MainStoinker/indicators/session.py`
+
+Volume by time slot and the daily range, read from 1-minute bars; used by FVGZone's `vol_slot_mult` and
+`trend_day_adr` filters (`docs/algos-fvgzone.md`) and usable by any other algo. Both take plain numbers; feed
+integers (cents, shares) and sums are exact. Bad input (NaN, inf, a negative volume, high below low, a bar not
+after the previous one, a bad `sessions`) raises `ValueError`. Work per bar is constant, memory is bounded by
+`sessions`. Bars before 09:30 are ignored; a session is one calendar date.
+
+- `SlotVolume(bar_minutes, sessions=20).update(time, volume)` builds `bar_minutes` buckets aligned to 09:30 with
+  the same completeness rule as `TrendIndicator`. For the CURRENT session: `volume(start)` (a completed bucket's
+  volume, else None) and `mean(start)`, the mean volume of that slot over the previous `sessions` sessions that
+  have it (None until that many do; a half day has no afternoon slots and is skipped for them; a session joins
+  the history only when a later session starts). `relative_volume(start)` = volume / mean (None if either is
+  unavailable or the mean is 0), `at_least(start, multiple)` = volume >= multiple x mean by exact
+  cross-multiplication (None if unavailable), `history_count(start)`. `start` is a datetime or a minute of day.
+- `DailyRange(sessions=20).update(time, open, high, low, close)`: `session_open` (the open of the 09:30 bar;
+  None before any bar or when the session's first bar is later), `adr` (mean high - low of the previous
+  `sessions` completed sessions, None until `ready`), `range_sum`, `sessions_seen`, and
+  `distance_at_least(distance, multiple)` = distance >= multiple x ADR, exact (None until ready; the caller signs
+  the distance for the side).
