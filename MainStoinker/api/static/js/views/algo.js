@@ -18,6 +18,7 @@
 import { ApiError, HEALTH_EVENT, getJson, isAbortError } from "../api.js";
 import { createCandleChart } from "../charts/candles.js";
 import { createEquityChart } from "../charts/equity.js";
+import { createFvgZones } from "../charts/fvg.js";
 import { createOverlays } from "../charts/overlays.js";
 import { errorPanel, h, loadingPanel, viewHeading } from "../dom.js";
 import { chartTimeToDataTime, dataTimeToChartTime, netClass, trimDecimal } from "../format.js";
@@ -420,6 +421,18 @@ export async function render(container, params, ctx) {
       overlayBox.replaceChildren(errorPanel(err));
     }
   }
+  // The FVG zones (off by default; asks the fvg route only while on). A failure to build it leaves the rest working.
+  let fvg = null;
+  if (candles) {
+    try {
+      fvg = createFvgZones(candles, {
+        ctx, container: overlayBox,
+        fetchZones: (query, signal) => getJson("/api/runs/" + runId + "/fvg", { symbol, ...query }, { signal }),
+      });
+    } catch (err) {
+      console.error("FVG zones unavailable", err);
+    }
+  }
   // The orders of a realistic run, requested once for the view (not per day): the stop and target lines.
   const realistic = run.fills === "realistic";
   let ordersRequest = null;
@@ -544,6 +557,10 @@ export async function render(container, params, ctx) {
       const state = barsState(data, symbol, live);
       candles.setBars(state.candles ? data.bars : []);
       candles.setNote(state.note);
+      if (fvg) {
+        if (state.candles) fvg.update({ symbol, start: window.start, end: window.end });
+        else fvg.clear();
+      }
       drawTrades();
       if (!overlays) return;
       if (!state.candles) {
@@ -556,6 +573,7 @@ export async function render(container, params, ctx) {
       candles.setBars([]);
       candles.setNote("");
       if (overlays) overlays.clear();
+      if (fvg) fvg.clear();
       showError(err);
     } finally {
       if (request === mine) dayPending = false;
@@ -626,6 +644,10 @@ export async function render(container, params, ctx) {
         const state = barsState(data, symbol, true);
         candles.setBars(state.candles ? data.bars : [], { keepView: true });
         candles.setNote(state.note);
+        if (fvg) {
+          if (state.candles) fvg.update({ symbol, start: span.start, end: span.end });
+          else fvg.clear();
+        }
         drawTrades(false);
         if (overlays) {
           if (state.candles) drawOverlays(mine, seriesRequest, data.bars);

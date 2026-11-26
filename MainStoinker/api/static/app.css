@@ -309,6 +309,12 @@ td button.row-select[aria-pressed="true"]:hover:not(:disabled):not([aria-disable
 .overlay-legend .swatch-mark { display: inline-block; min-width: 1.2em; text-align: center; flex: none; }
 .overlay-note { margin: 2px 0 0; }
 .overlay-errors:empty { display: none; }
+/* FVG zones: the control above the price chart (checkbox, timeframe, status) and the details line */
+.fvg-control { margin: 0 0 8px; font-size: 12px; }
+.fvg-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.fvg-row label { display: inline-flex; align-items: center; gap: 4px; }
+.fvg-detail { margin: 4px 0 0; }
+.fvg-detail[hidden] { display: none; }
 .day-note { margin: 0 0 8px; font-size: 13px; }
 .day-note-button { margin-left: 8px; }
 .marker-shape.pos { color: var(--pos); }

@@ -167,8 +167,9 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
   run; `live_counts.py` live run kinds, heartbeat and count keys; `warmup.py` warm-up frames from
   the month files.
 - `MainStoinker/api/` read-only web API (FastAPI, GET only) and static dashboard, started by `serve`;
-  may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy
-  (enforced by `tests/test_api_boundary.py`); the engine never imports it.
+  may import `MainStoinker.engine` but not `engine.algos`/`cli`/`modes` or anything legacy,
+  and the pure `MainStoinker.indicators` (the FVG zones of the run page; enforced by
+  `tests/test_api_boundary.py`); the engine never imports it.
 - `MainStoinker/ib/` the only new-code package that imports `ibapi` (apart from three frozen legacy
   files; the list only shrinks); imports only `ib`, `engine` and `Util.broker_guard`, no socket
   modules; the engine and the API never import it (enforced by `tests/test_ib_import_boundary.py`).

@@ -121,3 +121,37 @@ class MyAlgo:
 The detector has no trade state and never places an order; it is for reading.
 `FVG_Algo.py` still uses its own rule; moving it to the detector is a later
 task with a golden diff.
+
+### On the dashboard
+
+The algo page of a run (`#/run/<id>/algo/<idname>`, the "Price and trades" panel) can draw the detector's
+zones on its candle chart, to see what the detector finds. It is a view only: nothing is stored and no algo
+uses it.
+
+- Control: above the chart, "FVG zones" (a checkbox, off by default) and a timeframe, 1, 5 or 15 min. The
+  choice is kept in the browser (`localStorage`); the page works without it. While it is off the page makes no
+  `/fvg` request.
+- Route: `GET /api/runs/{run_id}/fvg?symbol=S[&start=..&end=..][&bar_minutes=1|5|15][&min_size_atr=x][&same_direction=0|1]`.
+  Same run, symbol and window rules, errors (404 before 422) and time format as `GET .../bars`, and the same
+  bar loading. The detector (`FvgConfig` defaults, except the three options) runs over the bars of the
+  previous available trading day (it only fills the ATR window, as in an algo that runs on from day to day;
+  no zone of that day is returned), then those from midnight of the window's first day to the window's end.
+  So a day shows the same zones whether it is first in the window or not, 5 and 15 minute zones can form
+  from the open, and a zone formed earlier in the day that is still live inside the window appears. The
+  answer's `warm` is false when the data has no earlier day (the first day of the data): the ATR starts
+  cold there and the status line says so. It never reads a bar after the window's end, so the
+  picture holds nothing the chart's last bar did not know. 5 and 15 minute zones come from `resample_session`.
+  Each zone has the detector's fields plus `end_time`: when it stopped being live (the known time of the
+  change that closed it), `null` while it is live at the end of the data. The answer carries the `config` used,
+  `bar_minutes`, `warm`, `truncated` (at most 2,000 zones, the newest kept) and, when the bars are not available or a
+  price is not a whole cent, an empty list with the `reason` (`missing`, `changed`, `non_cent_price`).
+- Drawing: each zone is a band from its bottom to its top, from `known_at` (never `formed_time`) to `end_time`,
+  or to the right edge while it is live. Up zones are blue with a solid outline and a "▲" label, down zones
+  amber with a dashed outline and a "▼" label; filled, invalidated and expired zones are fainter, dotted and
+  name their state. Hovering a band, or clicking it to keep it, shows direction, top, bottom, size, size in
+  ATR, state, touches, deepest fill and the formed and known times. The chart library draws the bands as a
+  series primitive (`series.attachPrimitive`), so they follow zoom and scroll.
+- Zones follow the symbol and day shown, and refresh with the bars of a live run.
+
+This is the first use of `MainStoinker.indicators` by the API; the API import boundary
+(`tests/test_api_boundary.py`) allows that package and nothing else new.
