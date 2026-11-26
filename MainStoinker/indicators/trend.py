@@ -15,6 +15,8 @@ Rule: `up` when the last completed close is above the EMA of the completed close
 the EMA is higher than one bucket earlier; `down` is the mirror; otherwise `none`.
 Until `ema_bars` buckets have completed (`ready` is False) the direction is `none`.
 With `ema_bars` 1 the EMA equals the last close, so the direction is always `none`.
+For `ema_bars` >= 2 the two conditions are one: both hold exactly when the last
+completed close is above the EMA as it was before that close (`down`: below).
 
 The EMA uses `alpha = 2 / (ema_bars + 1)` and is seeded with the first completed
 close. Work per bar is constant. See docs/indicators.md.

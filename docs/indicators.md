@@ -174,6 +174,8 @@ An EMA of the closes of completed N-minute buckets, read from 1-minute bars; use
 - Rule: `up` when the last completed close is above the EMA and the EMA is higher than one bucket earlier;
   `down` the mirror; otherwise `none`. Not ready is `none`. EMA: `alpha = 2 / (ema_bars + 1)`, seeded with the
   first completed close. With `ema_bars` 1 the EMA is the last close, so the direction is always `none`.
+  For `ema_bars` >= 2 the two conditions are one: both hold exactly when the last completed close is above the
+  EMA as it was before that close (`down`: below).
 - Bad input (NaN, inf, a bar not after the previous one, a bad config) raises `ValueError`.
 - `trend_series(frame, config)` runs it over a frame of 1-minute bars (column `date` or the index) and returns
   one row per bar: `date`, `direction`, `ready`, `ema`, `last_close`, `bars_seen`, `known_at`, as known at
