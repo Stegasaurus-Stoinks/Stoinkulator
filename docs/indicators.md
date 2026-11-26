@@ -155,3 +155,27 @@ uses it.
 
 This is the first use of `MainStoinker.indicators` by the API; the API import boundary
 (`tests/test_api_boundary.py`) allows that package and nothing else new.
+
+## Higher-timeframe trend: `MainStoinker/indicators/trend.py`
+
+An EMA of the closes of completed N-minute buckets, read from 1-minute bars; used by FVGZone's
+`htf_minutes` filter (`docs/algos-fvgzone.md`) and usable by any other algo.
+
+- `TrendConfig` (frozen): `bar_minutes` (30, at least 2), `ema_bars` (20, at least 1), `cross_session`
+  (True: the EMA carries over days; False: it starts again each session).
+- `TrendIndicator(config).update(time, open, high, low, close)`, once per closed 1-minute bar, oldest first
+  (time = bar start, naive New York). It builds the buckets itself, aligned to 09:30 of each session, with the
+  same completeness rule as `resample_session`: a bucket is complete when all its minutes arrived, or when a
+  later bar of the same session shows it ended (a missing minute is allowed); a session's last bucket that
+  never completes is dropped. Bars before 09:30 are ignored. Work per bar is constant.
+- State after each update, from completed buckets only (so nothing after minute t can change the state at t):
+  `direction` (`"up"`, `"down"`, `"none"`), `ready` (at least `ema_bars` completed buckets), `ema`,
+  `last_close`, `bars_seen` (completed buckets in the EMA), `known_at` (end of the last completed bucket).
+- Rule: `up` when the last completed close is above the EMA and the EMA is higher than one bucket earlier;
+  `down` the mirror; otherwise `none`. Not ready is `none`. EMA: `alpha = 2 / (ema_bars + 1)`, seeded with the
+  first completed close. With `ema_bars` 1 the EMA is the last close, so the direction is always `none`.
+- Bad input (NaN, inf, a bar not after the previous one, a bad config) raises `ValueError`.
+- `trend_series(frame, config)` runs it over a frame of 1-minute bars (column `date` or the index) and returns
+  one row per bar: `date`, `direction`, `ready`, `ema`, `last_close`, `bars_seen`, `known_at`, as known at
+  that bar's close. For research.
+- Warm-up: `ema_bars * bar_minutes` minutes of regular-session bars make it ready (600 for the defaults).
