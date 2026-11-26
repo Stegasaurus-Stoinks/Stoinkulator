@@ -28,6 +28,7 @@ import pandas as pd
 
 from MainStoinker.Algos.ParentAlgo import ParentAlgo
 from MainStoinker.engine.gaprule import RefusedEntry
+from MainStoinker.engine.market_calendar import HALF_CLOSE_MINUTE
 from MainStoinker.engine.market_calendar import session as market_session
 from MainStoinker.indicators.fvg import Direction, FvgConfig, FvgDetector
 from MainStoinker.indicators.session import DailyRange, SlotVolume
@@ -36,6 +37,8 @@ from MainStoinker.indicators.trend import TrendConfig, TrendIndicator
 SESSION_OPEN_MINUTE = 9 * 60 + 30  # 09:30
 SESSION_MINUTES = 390  # 09:30 to 16:00
 FULL_CLOSE_MINUTE = SESSION_OPEN_MINUTE + SESSION_MINUTES  # 16:00
+HALF_SESSION_MINUTES = HALF_CLOSE_MINUTE - SESSION_OPEN_MINUTE  # a half day: 09:30 to 13:00
+EMA_SEED_WEIGHT = 1e-3  # `warmup_sessions`: the most an EMA's seed may still weigh
 
 # Keys the engine and the CLI put in a config object besides the algo's own parameters.
 GENERAL_KEYS = frozenset({"idname", "ticker", "mode"})
@@ -260,31 +263,50 @@ class Algo(ParentAlgo):
     def warmup_sessions(self) -> int:
         """Trading sessions of history needed before the first tradable bar (see the docs).
 
-        The largest of the needs of the settings that are on, each in whole sessions of
-        `SESSION_MINUTES` (390) bars, rounded up ("ready" is a bar count, as the algo
-        itself decides it, not numerical convergence of an EMA):
+        The largest of the needs of the settings that are on. A need counted in bars is
+        converted to the fewest sessions that still hold that many bars when up to two of
+        them are half days (`bars_per_session` full, `bars_per_half_day` for a half day;
+        two half days can sit in one window, see the docs):
 
-        - ATR: `atr_bars` zone bars of `zone_minutes` minutes each (always on);
-        - `trend_filter`: `trend_ema` 1-minute bars;
-        - `htf_minutes`: `htf_ema` completed higher-timeframe bars, `SESSION_MINUTES //
-          htf_minutes` of them per session;
-        - `vol_slot_mult` > 0: `vol_slot_sessions` earlier sessions, plus one session of
-          margin because a half day has no afternoon slot;
+        - ATR: `atr_bars * zone_minutes` minutes (always on);
+        - `trend_filter`: `max(trend_ema, k)` 1-minute bars, `k` as in `_ema_bars`;
+        - `htf_minutes`: `max(htf_ema, k)` higher-timeframe bars;
+        - `vol_slot_mult` > 0: `vol_slot_sessions` earlier sessions plus 2 of margin (a half
+          day has no afternoon slot, and two can fall in the window);
         - `trend_day_adr` > 0: `adr_sessions` earlier sessions.
         """
-        def sessions(bars: int, per_session: int) -> int:
-            return -(-bars // per_session)
-
-        needs = [sessions(self._atr_window * self.zone_minutes, SESSION_MINUTES)]
+        needs = [self._sessions_for(self._atr_window * self.zone_minutes, SESSION_MINUTES,
+                                    HALF_SESSION_MINUTES)]
         if self.trend_filter:
-            needs.append(sessions(self.trend_ema, SESSION_MINUTES))
+            needs.append(self._sessions_for(self._ema_bars(self.trend_ema), SESSION_MINUTES,
+                                            HALF_SESSION_MINUTES))
         if self.htf_minutes:
-            needs.append(sessions(self.htf_ema, SESSION_MINUTES // self.htf_minutes))
+            needs.append(self._sessions_for(
+                self._ema_bars(self.htf_ema), SESSION_MINUTES // self.htf_minutes,
+                HALF_SESSION_MINUTES // self.htf_minutes))
         if self.vol_slot_mult > 0:
-            needs.append(self.vol_slot_sessions + 1)
+            needs.append(self.vol_slot_sessions + 2)
         if self.trend_day_adr > 0:
             needs.append(self.adr_sessions)
         return max(needs)
+
+    @staticmethod
+    def _ema_bars(length: int) -> int:
+        """Bars an EMA of `length` needs: the count it takes to call itself ready, or, if more,
+        the count after which its seed weighs at most 0.1% (`(1 - alpha)^k <= 1e-3`,
+        `alpha = 2 / (length + 1)`)."""
+        if length == 1:
+            return 1  # alpha 1: no seed weight at all
+        alpha = 2.0 / (length + 1)
+        return max(length, math.ceil(math.log(EMA_SEED_WEIGHT) / math.log1p(-alpha)))
+
+    @staticmethod
+    def _sessions_for(bars: int, per_full: int, per_half: int) -> int:
+        """Fewest sessions that hold `bars`, if up to two of them are half days."""
+        sessions = 1
+        while (sessions - min(2, sessions)) * per_full + min(2, sessions) * per_half < bars:
+            sessions += 1
+        return sessions
 
     def _times_for_close(self, close: int, *, capped: bool) -> tuple[int, int]:
         """(last entry, flat time) in minutes for a session closing at `close`.

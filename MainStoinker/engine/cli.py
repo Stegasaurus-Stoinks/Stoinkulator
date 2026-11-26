@@ -139,7 +139,14 @@ from pathlib import Path
 from typing import Any
 
 from .algos import close_algo_logs, load_algo
-from .cli_report import ReportError, gap_rule_lines, run_report_command, run_runs_command
+from .cli_report import (
+    ReportError,
+    gap_rule_lines,
+    run_report_command,
+    run_runs_command,
+    sessions_text,
+    warmup_lines,
+)
 from .codeversion import current_code_version
 from .engine import Engine, EngineConfig
 from .feed import _SYMBOL, BarFeed, CsvBarFeed, file_fingerprint, symbol_fingerprint
@@ -774,11 +781,13 @@ def _warmup_check(
         "warmup_first_day": first_needed.isoformat(),
         "warmup_sessions_loaded": loaded,
         "cold": False,
+        # algos that declared no need: they start without history
+        "undeclared": [name for name, sessions in needs if sessions == 0],
     }
     if loaded >= need:
         return note, None
     who = ", ".join(f"{name} ({sessions})" for name, sessions in needs if sessions == need)
-    head = (f"--start {start} needs {need} trading sessions of warm-up (declared by {who}), "
+    head = (f"--start {start} needs {sessions_text(need)} of warm-up (declared by {who}), "
             f"beginning {first_needed}")
     late = {s: feed.first_day(s) for s in feed.symbols() if feed.first_day(s) > first_needed}
     if late:
@@ -1065,9 +1074,8 @@ def run_backtest_command(
             store.close()
 
     if warmup_note is not None:
-        print(f"warm-up: {warmup_note['warmup_sessions']} sessions needed (from "
-              f"{warmup_note['warmup_first_day']}), {warmup_note['warmup_sessions_loaded']} loaded"
-              + (", cold start" if warmup_note["cold"] else ""))
+        for line in warmup_lines(warmup_note):
+            print(line)
     print(f"replayed {bar_count} bars for {', '.join(feed.symbols())}")
     for symbol, count in feed.missing_counts().items():
         if count:

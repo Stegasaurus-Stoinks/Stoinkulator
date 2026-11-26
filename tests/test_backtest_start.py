@@ -10,6 +10,7 @@ bars or synthetic month files under `tmp_path`.
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from MainStoinker.engine.broker import SimBroker
 from MainStoinker.engine.cli import main
 from MainStoinker.engine.engine import Engine, EngineConfig
 from MainStoinker.engine.feed import COLUMNS, CsvBarFeed, month_file_path, write_month_file
+from MainStoinker.engine.market_calendar import is_half_day, trading_days
 from MainStoinker.engine.sink import NullSink
 from MainStoinker.engine.store import open_store
 from MainStoinker.engine.warmup import MAX_WARMUP_SESSIONS, declared_sessions, first_session_needed
@@ -50,26 +52,30 @@ def test_the_parent_algo_needs_no_history():
 
 
 @pytest.mark.parametrize(("settings", "expected"), [
-    # defaults: 20 zone bars of 5 minutes (100 minutes) and a 50-bar EMA: one session
+    # defaults: 100 minutes of ATR and 173 bars of EMA (50 bars to be ready, and the seed down to
+    # 0.1% takes 173): a half day has 210 bars, so one session holds it
     ({}, 1),
-    # htf 30 x 20: 20 completed 30-minute buckets, 13 per session -> 2 sessions
-    ({"htf_minutes": 30}, 2),
-    # volume by slot 20 sessions + 1 margin (half day), trend-day ADR 20 sessions
-    ({"vol_slot_mult": 1.5, "trend_day_adr": 0.3}, 21),
+    # htf 30 x 20: 70 buckets (20 to be ready, 70 for the seed); 13 per session, 7 on a half
+    # day: 7 sessions hold 70 even if two are half days (5 * 13 + 2 * 7 = 79; 6 give 66)
+    ({"htf_minutes": 30}, 7),
+    # volume by slot 20 sessions + 2 margin (two half days), trend-day ADR 20 sessions
+    ({"vol_slot_mult": 1.5, "trend_day_adr": 0.3}, 22),
     # each part on its own
-    ({"vol_slot_mult": 1.5}, 21),
+    ({"vol_slot_mult": 1.5}, 22),
     ({"trend_day_adr": 0.3}, 20),
-    ({"trend_day_adr": 0.3, "adr_sessions": 5, "vol_slot_mult": 2, "vol_slot_sessions": 7}, 8),
-    # the EMA of 1-minute closes: ceil(trend_ema / 390), only with the trend filter
-    ({"trend_ema": 390}, 1),
-    ({"trend_ema": 391}, 2),
+    ({"trend_day_adr": 0.3, "adr_sessions": 5, "vol_slot_mult": 2, "vol_slot_sessions": 7}, 9),
+    # the EMA of 1-minute closes, only with the trend filter: 1348 bars for 390, 729 for 211
+    ({"trend_ema": 211}, 3),
+    ({"trend_ema": 390}, 5),
     ({"trend_ema": 2000, "trend_filter": False}, 1),
-    # zone bars: 20 bars of 60 minutes = 1200 minutes -> 4 sessions
+    # zone bars: 20 bars of 60 minutes = 1200 minutes: 2 full + 2 half days hold exactly that
     ({"zone_minutes": 60}, 4),
-    # one higher-timeframe bar per session when htf_minutes is 390: htf_ema sessions
-    ({"htf_minutes": 390, "htf_ema": 3}, 3),
-    # 45-minute buckets: 8 whole buckets fit a session; 20 of them -> 3 sessions
-    ({"htf_minutes": 45}, 3),
+    # one higher-timeframe bar per session (none on a half day): 10 bars for the seed, 2 half days
+    ({"htf_minutes": 390, "htf_ema": 3}, 12),
+    # 45-minute buckets: 8 per session, 4 on a half day; 70 buckets -> 10 sessions
+    ({"htf_minutes": 45}, 10),
+    ({"htf_minutes": 30, "htf_ema": 21}, 7),
+    ({"htf_minutes": 30, "htf_ema": 26}, 8),
 ])
 def test_fvgzone_declares_the_largest_need_of_the_settings_that_are_on(settings, expected):
     assert fvg(**settings).warmup_sessions() == expected
@@ -252,7 +258,8 @@ def test_start_equals_the_full_run_cut_at_entries_from_the_start(tmp_path, monke
     FVGZone defaults (declared need: 1 session). It holds when
     (1) the data before D covers the declared need, so the ATR window (20 zone bars) is
         full and the EMA of 1-minute closes (50 bars) is ready: a session is 390 bars, so
-        the seed's weight in the EMA is (1 - 2/51)^390, about 1e-7, far below a cent;
+        the seed's weight in the EMA is (1 - 2/51)^390, about 1e-7, far below a cent
+        (the declared need only guarantees 0.1%, which the data here does far better);
     (2) every other piece of state is per session (zones, the session VWAP, used-up and
         dead zones) or a bar-count window (the ATR) that the warm-up session fills, and
         nothing is open across D: FVGZone ends every day flat at 15:55, so no position of
@@ -260,10 +267,9 @@ def test_start_equals_the_full_run_cut_at_entries_from_the_start(tmp_path, monke
         does not fire; and
     (3) the entries compared are the ones from D on (the trade id counts from a run's
         first trade, so it is left out).
-    It does NOT hold for a filter whose memory is longer than its declared window: an
-    htf EMA (alpha 2/21) is far from converged after the 2 declared sessions (a seed
-    weight of 0.905 per bucket), and the same comparison with `htf_minutes` 30 does differ
-    on this data (seen while writing the test); "ready" is a bar count, not convergence.
+    The `htf_minutes` 30 case cannot be run here: it declares 7 sessions and the data has 7
+    days in all, so no start date has them (`test_htf_equivalence_is_out_of_reach_of_the_data`
+    pins the number and the refusal instead).
     """
     monkeypatch.setattr(cli, "current_code_version", lambda: VERSION)
     env = Env(tmp_path, monkeypatch)
@@ -305,17 +311,17 @@ def refused(env: Env, capsys, *extra: str) -> str:
 def test_refused_when_the_bars_do_not_reach_back(offline, capsys):
     # defaults need 1 session; nothing is before 2024-08-16, so 2024-08-15 is the first day needed
     text = refused(offline, capsys, "--start", "2024-08-16")
-    assert "needs 1 trading sessions of warm-up" in text and "fvg (1)" in text
+    assert "needs 1 session of warm-up" in text and "fvg (1)" in text
     assert "beginning 2024-08-15" in text and "bars of AAPL begin 2024-08-16" in text
     assert "--allow-cold" in text
     assert not offline.out.exists()  # refused before anything was written
-    # a larger need: htf 30 wants 2 sessions, only 1 exists before 2024-08-19 (a Monday)
+    # a larger need: htf 30 wants 7 sessions, only 1 exists before 2024-08-19 (a Monday)
     offline.algos.write_text(json.dumps(
         [{"ID": "FVGZone", "data": [{"idname": "fvg", "ticker": "AAPL", "htf_minutes": 30}]}]),
         encoding="utf-8")
     text = refused(offline, capsys, "--start", "2024-08-19")
-    assert "needs 2 trading sessions" in text and "beginning 2024-08-15" in text
-    assert "begin 2024-08-16 (1 of 2 sessions available)" in text
+    assert "needs 7 sessions" in text and "beginning 2024-08-08" in text
+    assert "begin 2024-08-16 (1 of 7 sessions available)" in text
 
 
 def test_allow_cold_starts_anyway_and_says_so(offline, capsys, tmp_path):
@@ -323,12 +329,12 @@ def test_allow_cold_starts_anyway_and_says_so(offline, capsys, tmp_path):
     assert main(run_args(offline, "--start", "2024-08-19", "--allow-cold", "--db", db)) == 0
     captured = capsys.readouterr()
     assert "cold start" not in captured.err + captured.out  # the data covers it: not cold
-    assert "warm-up: 1 sessions needed (from 2024-08-16), 1 loaded" in captured.out
+    assert "warm-up: 1 session needed (from 2024-08-16), 1 loaded" in captured.out
     # an actual shortfall: the very first day has nothing before it
     assert main(run_args(offline, "--start", "2024-08-16", "--allow-cold", "--db", db)) == 0
     captured = capsys.readouterr()
-    assert "warning: cold start: --start 2024-08-16 needs 1 trading sessions" in captured.err
-    assert "warm-up: 1 sessions needed (from 2024-08-15), 0 loaded, cold start" in captured.out
+    assert "warning: cold start: --start 2024-08-16 needs 1 session" in captured.err
+    assert "warm-up: 1 session needed (from 2024-08-15), 0 loaded, cold start" in captured.out
     store = open_store(db, env=os.environ)
     try:
         cold = store.load_run(2).config["start"]
@@ -352,7 +358,8 @@ def test_the_stored_run_records_start_end_and_warmup_and_report_shows_them(offli
         store.close()
     assert first.config["start"] == {
         "from": "2024-08-21", "to": "2024-08-23", "warmup_sessions": 1,
-        "warmup_first_day": "2024-08-20", "warmup_sessions_loaded": 1, "cold": False}
+        "warmup_first_day": "2024-08-20", "warmup_sessions_loaded": 1, "cold": False,
+        "undeclared": []}
     assert second.config["start"]["to"] is None
     assert "warmup_days" not in first.config and "window" not in first.config
     assert "start" not in third.config and third.config["warmup_days"] == 2
@@ -361,7 +368,7 @@ def test_the_stored_run_records_start_end_and_warmup_and_report_shows_them(offli
     assert main(["report", "1", "--db", db]) == 0
     out = capsys.readouterr().out
     assert "start: 2024-08-21, end: 2024-08-23" in out
-    assert "warm-up: 1 sessions needed (from 2024-08-20), 1 loaded" in out
+    assert "warm-up: 1 session needed (from 2024-08-20), 1 loaded" in out
     assert main(["report", "2", "--db", db]) == 0
     assert "end: the end of the data" in capsys.readouterr().out
     assert main(["report", "1", "--db", db, "--json"]) == 0
@@ -393,3 +400,107 @@ def test_without_start_nothing_changes(offline, tmp_path):
     default = trades_of(offline, "plain")
     again = trades_of(offline, "plain2", "--warmup-days", "2")
     assert default == again and default
+
+
+def test_htf_equivalence_is_out_of_reach_of_the_data(offline, capsys):
+    """`htf_minutes` 30 declares 7 sessions; the 7 days of offline data hold at most 6 before a start."""
+    offline.algos.write_text(json.dumps(
+        [{"ID": "FVGZone", "data": [{"idname": "fvg", "ticker": "AAPL", "htf_minutes": 30}]}]),
+        encoding="utf-8")
+    assert fvg(htf_minutes=30).warmup_sessions() == 7
+    text = refused(offline, capsys, "--start", "2024-08-26")
+    assert "needs 7 sessions" in text and "(6 of 7 sessions available)" in text
+    assert "begin 2024-08-16" in text
+
+
+# ----- half days: the declared window holds the bars even with two half days in it -----
+
+
+def _capacity(sessions: int, full: int, half: int) -> int:
+    halves = min(2, sessions)
+    return (sessions - halves) * full + halves * half
+
+
+def _seed_bars(length: int) -> int:
+    """What an EMA of `length` needs: ready (`length`) or its seed down to 0.1%."""
+    return max(length, math.ceil(math.log(1e-3) / math.log(1 - 2 / (length + 1))))
+
+
+def test_trend_ema_window_holds_its_bars_with_two_half_days():
+    for length in range(2, 391):
+        need = _seed_bars(length)
+        sessions = fvg(trend_ema=length).warmup_sessions()
+        assert _capacity(sessions, 390, 210) >= need, length
+        if sessions > 1:  # and it is the fewest that does
+            assert _capacity(sessions - 1, 390, 210) < need, length
+
+
+def test_htf_window_holds_its_buckets_with_two_half_days():
+    for length in range(20, 27):
+        need = _seed_bars(length)
+        sessions = fvg(htf_minutes=30, htf_ema=length).warmup_sessions()
+        assert _capacity(sessions, 13, 7) >= need, length
+        assert _capacity(sessions - 1, 13, 7) < need, length
+
+
+def test_a_window_with_two_half_days_still_has_the_slot_history():
+    """Thanksgiving Friday and Christmas Eve 2024 are both inside the 22 sessions before 2024-12-26."""
+    algo = fvg(vol_slot_mult=1.5, trend_day_adr=0.3)
+    sessions = algo.warmup_sessions()
+    assert sessions == 22
+    start = date(2024, 12, 26)
+    first = first_session_needed(start, sessions)
+    window = list(trading_days(first, start - timedelta(days=1)))
+    assert len(window) == sessions
+    halves = [day for day in window if is_half_day(day)]
+    assert halves == [date(2024, 11, 29), date(2024, 12, 24)]
+    # every afternoon slot still has `vol_slot_sessions` sessions that hold it
+    assert len(window) - len(halves) >= algo.vol_slot_sessions
+
+
+# ----- every algo that can be started with --start -----
+
+
+@pytest.mark.parametrize(("algo_id", "entry"), [
+    ("EMACrossing", EMA),
+    ("OpeningRangeCandle", {"idname": "orc", "ticker": "AAPL", "RRRatio": 3}),
+    ("FridayFrenzy", {"idname": "ff", "ticker": "TSLA", "RRRatio": 3}),
+    ("FVG", {"idname": "fvgold", "ticker": "AAPL", "RRRatio": 3}),
+])
+def test_legacy_algos_run_under_start(tmp_path, monkeypatch, capsys, algo_id, entry):
+    """They read the last two rows of their data: they declare 1 session, so no frame has one row."""
+    monkeypatch.setattr(cli, "current_code_version", lambda: VERSION)
+    env = Env(tmp_path, monkeypatch)
+    env.setup([{"ID": algo_id, "data": [entry]}], [entry["ticker"]], rows=None)
+    assert load_algo(algo_id, entry).warmup_sessions() == 1
+    assert main(run_args(env, "--start", "2024-08-21")) == 0
+    out = capsys.readouterr().out
+    assert "warm-up: 1 session needed (from 2024-08-20), 1 loaded" in out
+    assert "no warm-up declared" not in out
+
+
+def test_algos_without_a_declared_need_are_named(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "current_code_version", lambda: VERSION)
+    env = Env(tmp_path, monkeypatch)
+    func = {"idname": "MSFT-functest", "ticker": "MSFT", "RRRatio": 3}
+    env.setup([{"ID": "FVGZone", "data": [{"idname": "fvg", "ticker": "AAPL"}]},
+               {"ID": "FunctionTest", "data": [func]}], ["AAPL", "MSFT"], rows=None)
+    db = str(tmp_path / "runs.db")
+    assert main(run_args(env, "--start", "2024-08-21", "--db", db)) == 0
+    out = capsys.readouterr().out
+    assert "warm-up: 1 session needed (from 2024-08-20), 1 loaded" in out
+    assert "no warm-up declared by MSFT-functest" in out
+    assert main(["report", "1", "--db", db]) == 0
+    assert "no warm-up declared by MSFT-functest" in capsys.readouterr().out
+    store = open_store(db, env=os.environ)
+    try:
+        assert store.load_run(1).config["start"]["undeclared"] == ["MSFT-functest"]
+    finally:
+        store.close()
+    # nothing declared at all: the line says so instead of looking like a warm run
+    env.setup([{"ID": "FunctionTest", "data": [func]}], ["MSFT"], rows=None)
+    assert main(run_args(env, "--start", "2024-08-21", "--db", db)) == 0
+    out = capsys.readouterr().out
+    assert "warm-up: none declared by MSFT-functest" in out and "needed" not in out
+    assert main(["report", "2", "--db", db]) == 0
+    assert "warm-up: none declared by MSFT-functest" in capsys.readouterr().out
