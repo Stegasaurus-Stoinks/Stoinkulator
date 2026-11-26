@@ -260,12 +260,12 @@ def calm(n: int, start: int = 0):
 
 
 def test_atr_filter_and_minimum_history():
-    # history of ten bars with true range 0.10; then candle 1 (50.05 high) and a gap of 0.06
+    # ten bars with true range 0.10, then candle 1 (high 50.05) and a gap of 0.06 (0.6 ATR)
     base = calm(10)
     c1 = (50.0, 50.05, 49.95, 50.0)
     c2 = (50.0, 50.2, 50.0, 50.15)
-    c3_small = (50.15, 50.3, 50.11, 50.2)  # gap 50.11 - 50.05 = 0.06 < 0.25 * ATR(0.10)? no: 0.025
-    cfg = FvgConfig(min_size_atr=0.5)  # needs gap >= 0.05; ATR ~0.10
+    c3_small = (50.15, 50.3, 50.11, 50.2)  # low 50.11: gap 0.06
+    cfg = FvgConfig(min_size_atr=0.5)  # needs a gap of 0.5 * ATR (0.10) = 0.05
     ok = feed(FvgDetector(cfg), [*base, c1, c2, c3_small])
     assert kinds(ok) == ["formed"] and ok[0].zone.size_atr == pytest.approx(0.6)
     strict = FvgConfig(min_size_atr=0.7)
@@ -371,14 +371,69 @@ def test_snapshot_before_any_bar():
     assert snap["live"] == 0.0 and snap["in_zone"] == 0.0
 
 
-def test_detection_does_not_depend_on_anything_but_bars():
-    # same bars, same zones, whatever is called in between
+def test_queries_between_bars_do_not_change_detection():
     a, b = FvgDetector(NO_ATR), FvgDetector(NO_ATR)
-    ea = feed(a, UP3 + DOWN3[:1] * 0)
-    for _ in range(3):
-        b.snapshot(), b.live_zones(), b.nearest_zone(10.0)
-    eb = feed(b, UP3)
-    assert [e.zone for e in ea] == [e.zone for e in eb]
+    ea = []
+    for k, bar in enumerate(UP3 + [(10.3, 10.3, 10.06, 10.2)]):
+        ea += b.update(at(k), *bar)
+        b.snapshot(), b.live_zones(), b.nearest_zone(10.0), b.zone_containing(10.05)
+    eb = feed(a, UP3 + [(10.3, 10.3, 10.06, 10.2)])
+    assert [(e.kind, e.zone) for e in ea] == [(e.kind, e.zone) for e in eb]
+
+
+def test_config_is_read_only_on_the_detector():
+    det = FvgDetector(NO_ATR)
+    assert det.config is NO_ATR
+    with pytest.raises(AttributeError):
+        det.config = FvgConfig()
+
+
+def test_known_at_is_the_label_of_candle_three_plus_one_bar():
+    det = FvgDetector(NO_ATR)
+    z = feed(det, UP3)[0].zone
+    assert z.known_at == z.formed_time + timedelta(minutes=1) == at(3)
+    ev = feed(det, [(10.4, 10.4, 10.06, 10.2)], start=3)
+    assert ev[0].zone.last_change_time == at(3) and ev[0].zone.last_change_known_at == at(4)
+    cfg5 = replace(NO_ATR, bar_minutes=5)
+    det5 = FvgDetector(cfg5)
+    z5 = [e for k, b in enumerate(UP3) for e in det5.update(at(5 * k), *b)][0].zone
+    assert z5.formed_time == at(10) and z5.known_at == at(15)
+
+
+def test_known_at_in_the_batch_frame_for_resampled_bars():
+    frame = load("MSFT", 2000)
+    for minutes in (1, 5):
+        bars = frame if minutes == 1 else resample_session(frame, minutes)
+        out = detect_fvgs(bars, FvgConfig(bar_minutes=minutes))
+        assert len(out) > 0
+        step = pd.Timedelta(minutes=minutes)
+        assert ((out["known_at"] - out["formed_time"]) == step).all()
+        assert (out["last_change_known_at"] - out["last_change_time"] == step).all()
+
+
+def test_non_cent_nan_and_inf_prices_raise():
+    for bad in (1.005, float("nan"), float("inf"), -float("inf")):
+        det = FvgDetector(NO_ATR)
+        with pytest.raises(ValueError):
+            det.update(at(0), 10.0, bad, 9.9, 10.0)
+    # a rejected bar leaves the detector unchanged
+    det = FvgDetector(NO_ATR)
+    with pytest.raises(ValueError):
+        det.update(at(0), 10.0, 1.005, 9.9, 10.0)
+    assert det.bars_seen == 0
+    # float noise on a real cent price is fine
+    assert FvgDetector(NO_ATR).update(at(0), 0.1 + 0.2, 0.30000000000000004, 0.29, 0.3) == []
+
+
+def test_min_size_is_quantized_to_cents():
+    inclusive = FvgConfig(min_size=0.1 + 0.2, min_size_inclusive=True, min_size_atr=None)
+    assert inclusive.min_size_ticks == 30
+    bars = [(9.5, 10.0, 9.4, 9.9), (9.9, 10.5, 9.9, 10.4), (10.4, 10.6, 10.3, 10.5)]  # gap 0.30
+    assert kinds(feed(FvgDetector(inclusive), bars)) == ["formed"]
+    assert feed(FvgDetector(replace(inclusive, min_size_inclusive=False)), bars) == []
+    for bad in (0.055, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            FvgConfig(min_size=bad)
 
 
 # ---------- data helpers ----------

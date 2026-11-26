@@ -3,11 +3,13 @@
 A bullish gap is three consecutive bars where the low of candle 3 is above the
 high of candle 1; the zone is [high1, low3]. A bearish gap is the mirror:
 the high of candle 3 is below the low of candle 1; the zone is [high3, low1].
-The zone is known at the close of candle 3.
+The zone is known at the close of candle 3. Times are bar labels (the bar
+START), so a zone is usable from `known_at` = label of candle 3 + one bar.
 
-Prices are compared as integer ticks of 0.01 (the float input rounded to the
-nearest cent), so a gap of exactly 0.05 is exactly 0.05. The ATR and body
-means use integer sums in a fixed-size window, which makes them exact too.
+Inputs must be cent prices (others raise ValueError). They are compared as
+integer ticks of 0.01 (the float input rounded to the nearest cent), so a gap
+of exactly 0.05 is exactly 0.05. The ATR and body means use integer sums in a
+fixed-size window, which makes them exact too.
 Fill fractions and ATR multiples are floats.
 
 Work per bar depends on the number of live zones and the window size, never on
@@ -21,7 +23,6 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -65,9 +66,17 @@ class FvgConfig:
     invalidate_on: str = "close_beyond_far_edge"
     max_closed: int = 1000
 
+    @property
+    def min_size_ticks(self) -> int:
+        """`min_size` in whole cents."""
+        return round(self.min_size * TICK)
+
     def __post_init__(self) -> None:
         if self.min_size < 0:
             raise ValueError("min_size must be >= 0")
+        scaled = self.min_size * TICK
+        if not math.isfinite(scaled) or abs(scaled - round(scaled)) > _CENT_TOLERANCE:
+            raise ValueError(f"min_size {self.min_size!r} must be a whole number of cents")
         if self.atr_bars < 1 or not 1 <= self.atr_min_bars <= self.atr_bars:
             raise ValueError("need 1 <= atr_min_bars <= atr_bars")
         if self.bar_minutes < 1:
@@ -102,6 +111,10 @@ class Fvg:
     deepest_fill: float = 0.0
     age_bars: int = 0
     last_change_time: Any = None
+    # Times are bar labels (bar START). A zone can first be used at `known_at`,
+    # the label of candle 3 plus one bar; the same for the last state change.
+    known_at: Any = None
+    last_change_known_at: Any = None
     top_ticks: int = 0
     bottom_ticks: int = 0
 
@@ -117,17 +130,35 @@ class FvgEvent:
     time: Any
 
 
+_CENT_TOLERANCE = 1e-6
+
+
 def _ticks(price: float) -> int:
-    return round(float(price) * TICK)
+    """Price in cents. Raises ValueError for NaN, inf or a price that is not a cent price."""
+    scaled = float(price) * TICK
+    if not math.isfinite(scaled):
+        raise ValueError(f"price {price!r} is not finite")
+    ticks = round(scaled)
+    if abs(scaled - ticks) > _CENT_TOLERANCE:
+        raise ValueError(f"price {price!r} is not a cent price (inputs must be multiples of 0.01)")
+    return ticks
 
 
 class FvgDetector:
-    """Incremental detector: call `update` once per closed bar, oldest first."""
+    """Incremental detector: call `update` once per closed bar, oldest first.
+
+    Prices must be cent prices (float noise below 1e-6 of a cent is accepted).
+    """
+
+    @property
+    def config(self) -> FvgConfig:
+        return self._config
 
     def __init__(self, config: FvgConfig | None = None) -> None:
-        self.config = config or FvgConfig()
-        cfg = self.config
-        self._min_size_ticks = Decimal(str(cfg.min_size)) * TICK  # exact: 0.05 -> 5
+        self._config = config or FvgConfig()
+        cfg = self._config
+        self._min_size_ticks = cfg.min_size_ticks
+        self._step = timedelta(minutes=cfg.bar_minutes)
         self._bars: deque[tuple[Any, int, int, int, int]] = deque(maxlen=3)  # t, o, h, l, c
         # State of the rolling windows after each of the last three bars:
         # (count, sum of true range, sum of body).
@@ -263,6 +294,8 @@ class FvgDetector:
             formed_time=t3,
             candle_times=(t1, t2, t3),
             last_change_time=t3,
+            known_at=t3 + self._step,
+            last_change_known_at=t3 + self._step,
             top_ticks=top,
             bottom_ticks=bottom,
         )
@@ -295,6 +328,7 @@ class FvgDetector:
             if z.state is State.OPEN:
                 z.state = State.TOUCHED
                 z.last_change_time = time
+                z.last_change_known_at = time + self._step
                 events.append(FvgEvent("touched", replace(z), time))
             invalid = close_beyond if cfg.invalidate_on == "close_beyond_far_edge" else wick_beyond
             if invalid:
@@ -309,6 +343,7 @@ class FvgDetector:
     def _close(self, z: Fvg, state: State, time: Any, events: list[FvgEvent]) -> None:
         z.state = state
         z.last_change_time = time
+        z.last_change_known_at = time + self._step
         if self._closed.maxlen:
             self._closed.append(z)
         events.append(FvgEvent(state.value, replace(z), time))
@@ -407,6 +442,7 @@ class FvgDetector:
 _COLUMNS = (
     "id", "direction", "top", "bottom", "midpoint", "size", "size_atr", "formed_time",
     "time_1", "time_2", "time_3", "state", "touches", "deepest_fill", "age_bars", "last_change_time",
+    "known_at", "last_change_known_at",
 )
 
 
@@ -444,6 +480,7 @@ def detect_fvgs(frame: pd.DataFrame, config: FvgConfig | None = None) -> pd.Data
         (
             z.id, z.direction.value, z.top, z.bottom, z.midpoint, z.size, z.size_atr, z.formed_time,
             *z.candle_times, z.state.value, z.touches, z.deepest_fill, z.age_bars, z.last_change_time,
+            z.known_at, z.last_change_known_at,
         )
         for z in zones.values()
     ]
@@ -453,8 +490,10 @@ def detect_fvgs(frame: pd.DataFrame, config: FvgConfig | None = None) -> pd.Data
 def resample_session(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
     """1-minute bars to `minutes`-minute bars, aligned to 09:30 of each session.
 
-    Bars before 09:30 are ignored. The last bar of a session is dropped when it
-    holds fewer than `minutes` source bars. The result has columns `date`,
+    Bars before 09:30 are ignored; bars at or after 16:00 are not filtered. Only
+    a session's incomplete LAST bucket is dropped (fewer than `minutes` source
+    bars); a bucket with a missing minute in the middle is kept. The result
+    has columns `date` (the bucket START, like the input),
     `open`, `high`, `low`, `close` (and `volume` if the input has it). The
     input is not modified.
     """

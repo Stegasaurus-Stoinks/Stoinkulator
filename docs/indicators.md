@@ -14,13 +14,17 @@ Three consecutive bars of the same session, `bar_minutes` apart:
 - Up gap: `low3 > high1`. Zone `[high1, low3]`, near edge `low3`, far edge `high1`.
 - Down gap: `high3 < low1`. Zone `[high3, low1]`, near edge `high3`, far edge `low1`.
 
-The zone is known at the close of candle 3 (`formed_time`). The bars do not
+The zone exists at the close of candle 3. `formed_time` is the label of candle 3
+and labels are bar STARTS, so the zone is usable from `known_at` (that label plus
+`bar_minutes`), not from `formed_time`. The bars do not
 need to point the same way (`require_same_direction=True` brings the old
 algo's shape rule back). Three candles that span two dates or skip a bar form
 no gap, so 15:59 / 09:30 / 09:31 is never an "overnight gap".
 
-Prices are compared as integer ticks of 0.01: each float input is rounded to
-the nearest cent. A gap of exactly `min_size` is refused (one cent more is
+Inputs must be cent prices: a price that is not a multiple of 0.01 (within
+1e-6 of a cent, so float noise such as `0.30000000000000004` is fine), NaN or inf
+raises `ValueError`. Prices are compared as integer ticks of 0.01: each float
+input is rounded to the nearest cent. A gap of exactly `min_size` is refused (one cent more is
 accepted) whatever the float noise of the subtraction. Integer ticks were
 chosen over `Decimal` because they are exact, hashable and fast; the data are
 cent prices. The ATR and body means are integer sums over a fixed window
@@ -48,7 +52,7 @@ final event. Events are `formed`, `touched`, `filled`, `invalidated`,
 
 | field | default | meaning |
 |-------|---------|---------|
-| `min_size` | `0.05` | smallest gap in price units; `min_size_inclusive=False` means the gap must be larger |
+| `min_size` | `0.05` | smallest gap in price units, a whole number of cents (anything else raises); `min_size_inclusive=False` means the gap must be larger |
 | `min_size_atr` | `0.25` | smallest gap as a multiple of the mean true range of the `atr_bars` (20) bars ending at candle 1; `None` switches it off. Needs `atr_min_bars` (5) bars, otherwise no gap. The gap may equal the limit. |
 | `atr_cross_session` | `True` | the window may reach into the previous session; `False` restarts it each session (the first bar of a session then has no previous close) |
 | `require_same_direction` | `False` | `True`: all three candles up (down gap: all down), the old algo's rule |
@@ -77,8 +81,20 @@ final event. Events are `formed`, `touched`, `filled`, `invalidated`,
   `close`; it is not modified. It runs the same detector, so it returns the
   zones of the incremental run, and it keeps every zone whatever `max_closed` is.
 - `resample_session(frame, minutes)`: 1-minute bars to N-minute bars aligned to
-  09:30 per session; bars before 09:30 are ignored and a session's last bar is
-  dropped when it holds fewer than N source bars.
+  09:30 per session, labelled with the bucket START. Bars before 09:30 are
+  ignored; bars at or after 16:00 are not filtered. Only a session's
+  incomplete LAST bucket (fewer than N source bars) is dropped; a bucket with a
+  missing minute in the middle is kept.
+- `detect_fvgs` also returns `known_at` and `last_change_known_at`; the
+  detector's `config` is read-only.
+
+### Mixing timeframes
+
+Bar labels are bar starts. A zone found on 5-minute bars with `formed_time`
+09:40 (candle 3 covers 09:40 to 09:45) is only knowable at 09:45, so its
+`known_at` is 09:45. When you join a batch result with finer bars (say 1-minute
+bars), use `known_at`, never `formed_time`: at 09:41 to 09:44 that zone does not
+exist yet. The same holds for `last_change_known_at` and the state changes.
 
 Work per bar depends on the number of live zones and the window size, not on the
 number of bars seen (`last_visits` and `total_visits` count the zones visited).
