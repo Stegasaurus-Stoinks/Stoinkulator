@@ -175,8 +175,9 @@ history comes from the same frame: the sessions of the warm-up bars count, and t
 session's first bar arrives. `run` loads only 2 warm-up days by default, so with these filters on (defaults)
 the algo does not trade in a live session; start it with `--warmup-days 25` (20 sessions plus a margin for a
 half day that lacks a slot) and month files (`fetch-bars`) that cover that many trading days before today.
-The trend-day filter also needs the 09:30 bar of the session itself, so a run started after 09:30 has no
-session open that day and the filter blocks until the next session.
+The trend-day filter also needs the 09:30 bar of the session itself. A live run started after 09:30 still has
+it, because the warm-up frame holds today's closed bars since the open; the filter blocks for the day only when
+that 09:30 bar is missing from the data.
 
 A zone retested only during that history is not marked
 used (the algo cannot know whether another process traded it).
