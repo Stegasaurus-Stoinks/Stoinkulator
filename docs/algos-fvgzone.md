@@ -35,8 +35,10 @@ given as JSON numbers or numeric strings (like the other algos).
 | `risk_dollars` | 50 | money risked per trade |
 | `max_shares` | 500 | cap on the size |
 | `first_entry` | "09:45" | no entry on a bar labelled before this |
-| `last_entry` | "15:30" | no entry on a bar labelled after this |
-| `flat_time` | "15:55" | an open position is closed on the first bar labelled at or after this |
+| `last_entry_before_close` | 30 | minutes before the day's close: no entry on a bar labelled after it (15:30 on a full day, 12:30 on a half day) |
+| `flat_before_close` | 5 | minutes before the day's close: an open position is closed on the first bar labelled at or after it (15:55 / 12:55) |
+| `last_entry` | unset | optional absolute "HH:MM" instead of `last_entry_before_close` (see "End-of-day times") |
+| `flat_time` | unset | optional absolute "HH:MM" instead of `flat_before_close` |
 | `min_size_atr` | 0.25 | the detector's `min_size_atr`; `null` switches it off |
 | `htf_minutes` | 0 | minutes per higher-timeframe trend bar: 0 switches the filter off, otherwise 2 to 390 |
 | `htf_ema` | 20 | EMA length over the completed higher-timeframe closes (1 or more) |
@@ -45,8 +47,20 @@ given as JSON numbers or numeric strings (like the other algos).
 | `trend_day_adr` | 0 | trend-day filter: 0 is off; above 0 an entry needs the move from the session open, in the side's direction, to be at least this multiple of the ADR (0 or more) |
 | `adr_sessions` | 20 | sessions in the ADR (1 or more) |
 
-Times are bar labels (the bar START, naive New York time, as in the data). Required:
-`09:30 <= first_entry <= last_entry < flat_time`. The detector runs with
+Times are bar labels (the bar START, naive New York time, as in the data). Required, for a
+full day: `09:30 <= first_entry <= last_entry < flat_time`.
+
+**End-of-day times.** The close of each day comes from the market calendar
+(`MainStoinker/engine/market_calendar.py`: 16:00, or 13:00 on an early-close day; holidays and
+weekends have no session). The defaults are relative to it, so a full day ends flat at 15:55 with
+the last entry at 15:30 exactly as before, and a half day ends flat at 12:55 with the last entry
+at 12:30. An absolute `last_entry` / `flat_time` replaces its relative key. It is used exactly as
+given on a full day. On a day that closes early it is also held to the close-relative limit
+(the minimum of the two), and the last entry to one minute before the flat time, so a position can
+never outlive an early close: an absolute 15:55 on a half day behaves as 12:55, an absolute
+12:40 stays 12:40. The algo takes each day's times when the day's first bar arrives; bars on a day
+the calendar calls closed (data on a holiday) use the full-day times. `last_entry_before_close`
+must be greater than `flat_before_close` (1 to 390 each). The detector runs with
 `FvgConfig(bar_minutes=zone_minutes, min_size_atr=min_size_atr)`: textbook rule,
 `min_size` 0.05 exclusive, invalidation on a close beyond the far edge, zones expire
 at the end of the session.
@@ -184,10 +198,12 @@ used (the algo cannot know whether another process traded it).
 
 ## Limits
 
-- **Half days and data that ends early.** The algo cannot know a session closes early
-  (it does not know the close; `flat_time` is its only scheduled exit). What happens to a
-  position still open when its session's data stops (a half day closing at 13:00, a feed
-  that stops) depends on where the algo runs:
+- **Data that ends early.** A half day (13:00 close) is known from the market calendar and
+  ends flat at 12:55 (see "End-of-day times"), so it no longer leaves a position open; only
+  an early close the calendar does not know (add it to its override table), a feed that
+  stops, or an absolute time set later than the data ends can. What happens to a
+  position still open when its session's data stops depends on where the algo runs
+  (the cases below named "a half day" are such a day without a calendar entry):
   - *Backtest, `SimBroker` (legacy fills).* The first bar of the next session closes the
     position at that bar's close (an overnight carry in the data), after
     `check_stoploss` has had its say (a close below the stop on that bar exits at the
@@ -200,11 +216,12 @@ used (the algo cannot know whether another process traded it).
     it to the ledger's end-of-data close.
   - *The live `run` command.* Each session builds the algo fresh, so the next-day logic
     never runs there. As found by reading `MainStoinker/ib/live_run.py`: at the end of a
-    run (end of session, `--minutes` elapsing before `flat_time`, a half day, a stop file)
+    run (end of session, `--minutes` elapsing before the flat time, a stop file)
     `engine.end_live()` is called, which does NOT close open positions; they are left open
     at the end of the run and listed in the output ("position(s) left OPEN at the end of
     the run (listed, never closed by the session)"). Nothing closes them afterwards.
-    Set `flat_time` / `last_entry` for a half day or a short `--minutes` yourself.
+    The algo itself ends flat at 12:55 on a half day (the calendar is checked in the algo, not in
+    the session driver); set `flat_time` / `last_entry` for a short `--minutes` yourself.
 - **Retest geometry.** A retest bar that closes above the zone top qualifies when its
   low stays above the far edge (see "Far edge"); the far-edge watch is per 1-minute bar,
   while the detector's own state (invalidation on a close beyond the far edge, fill) is
