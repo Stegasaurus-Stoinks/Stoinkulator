@@ -1175,16 +1175,12 @@ ALLOWED_RUN = [
     run(args="--algos=C:/s/a.json --bars=C:/s/bars --db=C:/s/runs.db --minutes 9 --paper --no-prompt"),
     run(args="--db sqlite:///C:/s/runs.db --algos C:/s/a.json --bars C:/s/bars "
              "--minutes 9 --paper --no-prompt"),
-    run(args=f"{RUN_ARGS} --port 7497"),
-    run(args=f"{RUN_ARGS} --port=7497 --host 127.0.0.1"),
-    run(args=f"{RUN_ARGS} --host=127.0.0.1"),
     run(args=f"{RUN_ARGS} --fills realistic"),
     run(args=f"{RUN_ARGS} --fills=realistic"),
     run(args='--algos "C:/my dir/a.json" --bars "C:/my dir/bars" --db "C:/my dir/r.db" '
              "--minutes 5 --paper --no-prompt"),
-    run(args=f"{RUN_ARGS} --out C:/s/live --stop-file C:/s/stop.flag --warmup-days 3 --no-record"),
-    run(args=f"{RUN_ARGS} --record C:/s/rec.jsonl --client-id 20 --connect-timeout 30"),
-    run(args=f"{RUN_ARGS} --capital 100000 --commission-per-share 0.005 --slippage-per-share 0.01"),
+    run(args=f"{RUN_ARGS} --stop-file C:/s/stop.flag --fills realistic"),
+    run(args=f"{RUN_ARGS} --stop-file=C:/s/stop.flag"),
     run(args="--algos C:\\s\\a.json --bars C:\\s\\bars --db C:\\s\\r.db --minutes 5 --paper --no-prompt"),
     "  " + run() + "\n",
 ]
@@ -1356,6 +1352,15 @@ def refused_run_table() -> list[str]:
         a(f"{RUN_ARGS} --help=1"),
         a("--help"),
         a("-h"),
+    )
+    # issue 292: these were ALLOWED before the option allowlist (the owner can add one back)
+    add(
+        a(f"{RUN_ARGS} --port 7497"),
+        a(f"{RUN_ARGS} --port=7497 --host 127.0.0.1"),
+        a(f"{RUN_ARGS} --host=127.0.0.1"),
+        a(f"{RUN_ARGS} --out C:/s/live --stop-file C:/s/stop.flag --warmup-days 3 --no-record"),
+        a(f"{RUN_ARGS} --record C:/s/rec.jsonl --client-id 20 --connect-timeout 30"),
+        a(f"{RUN_ARGS} --capital 100000 --commission-per-share 0.005 --slippage-per-share 0.01"),
     )
     # shell syntax, wrappers, the live opt-in name
     for tail in (" ; echo", " && echo", " || echo", " | cat", " & echo", " > out.txt", " 2>&1", " `x`",

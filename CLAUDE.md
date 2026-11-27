@@ -23,7 +23,10 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   under the same rules (main session only, clean unmodified `origin/revival`
   checkout, one broker session at a time, paper only, data from TWS and simulated
   fills only: it places no orders; exit code 5 means not a paper account: stop,
-  tell the owner). A first write migrates the runs database, so the database path
+  tell the owner). For an agent, those, `--fills realistic` and `--stop-file F` are the
+  only options of `run`: any other option (`--allow-cold`, `--no-fetch`, `--warmup-days`,
+  `--out`, `--no-record`, `--capital`, ...) is the owner's alone and the hook refuses
+  it. A first write migrates the runs database, so the database path
   is the owner's: agents use only the path the owner named for the session. Any
   other way of running it is owner-run only. Everything else works only against
   offline data and the test harness.
@@ -78,7 +81,14 @@ account performance. Roadmap and task breakdown live in GitHub Issues.
   `--bars` and `--db` each once with an explicit value (no reliance on `STOINK_DB`);
   `--fills` only `realistic`; any token that contains `--order` (also `--orders`,
   abbreviations and `=` forms) and `--help` are refused, and so is any stray word, as
-  `run` has no positional argument. The hook does
+  `run` has no positional argument. The options of this `run` shape are an allowlist
+  and nothing else: `--algos V`, `--bars V`, `--db V`, `--minutes N`, `--paper`,
+  `--no-prompt`, `--fills realistic` and `--stop-file V` (each at most once, the first
+  six exactly once, `=` forms only for the valued ones, a value never starts with `-`);
+  every other option is refused in any spelling (any letter case, `=` form, abbreviation,
+  single-dash form), among them `--allow-cold`, `--no-fetch`, `--warmup-days`,
+  `--no-record`, `--out`, `--capital`, `--port` and `--host`, and an unknown flag never
+  takes the token after it as its value. The hook does
   not check which code is checked out or which interpreter file it is. It is a
   tripwire against accidents, not a security boundary.
 - Never set that variable, and never weaken, disable, bypass or work around
@@ -114,7 +124,8 @@ Owner forms of the same four (the owner's terminal, prompted: you type the port;
 `run --algos F --bars D --db F --minutes N --port P` (with `--paper` instead of `--port`
 for 7497; every algo needs `"mode": "paper"`, `--fills` is `realistic`, `--stop-file F` ends
 the run cleanly; `--warmup-days N` overrides the warm-up length, `--no-fetch` and `--allow-cold`
-are owner options for the warm-up history). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
+are owner options for the warm-up history; `--allow-cold`, `--no-fetch` and `--warmup-days` are
+owner-only and the hook refuses them for agents). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
 
 Exit codes (`--help` shows them; the not-paper code is 5 for `fetch-bars`, the
 watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177):
