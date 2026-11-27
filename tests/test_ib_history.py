@@ -374,26 +374,26 @@ def test_gap_summary_lists_a_complete_day_only_when_the_calendar_disagrees() -> 
     assert history.gaps_csv_text(noted, "AAPL").splitlines()[1] == "AAPL,2024-11-29,complete,390,390,0,"
 
 
-def test_plan_range_skips_holidays_and_weekends_and_closes_a_half_day_at_13_00() -> None:
+def test_plan_range_skips_holidays_and_weekends_and_plans_a_half_day_only_after_16_00() -> None:
     # Thanksgiving week 2024: Thursday is a holiday and Friday a half day
     days = history.plan_days(date(2024, 11, 25), date(2024, 12, 2), LATE)
     assert days == [date(2024, 11, 25), date(2024, 11, 26), date(2024, 11, 27), HALF, date(2024, 12, 2)]
     assert history.plan_days(date(2024, 11, 28), date(2024, 11, 28), LATE) == []  # only a holiday
-    # the half day has closed at 13:01 New York, a full day has not
-    now = datetime(2024, 11, 29, 13, 1, tzinfo=NY)
-    plan = history.plan_range(date(2024, 11, 29), date(2024, 11, 29), now)
-    assert plan.days == [HALF] and plan.not_closed == []
-    at_noon = datetime(2024, 11, 29, 12, 59, tzinfo=NY)
-    with pytest.raises(ValueError, match="no trading day"):
-        history.plan_range(HALF, HALF, at_noon)
-    with pytest.raises(ValueError, match="not closed"):  # a full day is still open at 13:01
-        history.plan_range(date(2024, 11, 26), date(2024, 11, 26), datetime(2024, 11, 26, 13, 1, tzinfo=NY))
+    # a request ends at 16:00 and never in the future: at 14:00 New York the half day (closed at
+    # 13:00 by the calendar) is NOT planned, after 16:00 it is
+    two_pm = datetime(2024, 11, 29, 14, 0, tzinfo=NY)
+    with pytest.raises(ValueError, match="not closed"):
+        history.plan_range(HALF, HALF, two_pm)
+    plan = history.plan_range(date(2024, 11, 27), HALF, two_pm)
+    assert plan.days == [date(2024, 11, 27)] and plan.not_closed == [HALF]
+    for stamp in (datetime(2024, 11, 29, 16, 0, tzinfo=NY), datetime(2024, 11, 29, 16, 1, tzinfo=NY)):
+        assert history.plan_range(HALF, HALF, stamp).days == [HALF]
+    with pytest.raises(ValueError, match="not closed"):  # one minute before 16:00
+        history.plan_range(HALF, HALF, datetime(2024, 11, 29, 15, 59, tzinfo=NY))
     # a caller's table moves a day
     assert history.plan_days(HALF, HALF, LATE, {HALF: None}) == []
-    # the request itself still ends at 16:00 whatever the day: IB returns the session's bars
+    # the request itself ends at 16:00 whatever the day: IB returns the session's bars
     assert history.day_request(HALF).end_date_time == "20241129-21:00:00"
-    assert history.session_end_utc(HALF) == datetime(2024, 11, 29, 18, 0, tzinfo=UTC)
-    assert history.session_end_utc(date(2024, 11, 26)) == datetime(2024, 11, 26, 21, 0, tzinfo=UTC)
 
 
 def test_gap_report_missing_day(tmp_path: Path) -> None:

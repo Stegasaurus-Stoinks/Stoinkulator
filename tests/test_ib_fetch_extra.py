@@ -901,6 +901,27 @@ def test_an_early_close_the_calendar_does_not_know_is_listed_in_short_days_and_s
     assert len(read_symbol_bars(out, "AAPL")) == 210  # the data is kept as it came
 
 
+def test_a_half_day_is_not_requested_between_13_00_and_16_00_but_after_16_00(out: Path) -> None:
+    """A request ends at 16:00 and never in the future (issue 285 review): at 14:00 New York on the
+    half day no request for it is built, only the earlier day; after 16:00 it is requested."""
+    half = date(2024, 11, 29)
+    prior = date(2024, 11, 27)
+
+    def early(req_id: int, d: date, symbol: str) -> list[Played]:
+        return [*bars_played(req_id, day_rows(d, 210, symbol)), end_played(req_id)]
+
+    with make_rig(server_now=datetime(2024, 11, 29, 14, 0, tzinfo=NY)) as rig:
+        rig.script(prior, short_day())
+        rig.script(half, early)
+        result = rig.run(["AAPL"], prior, half, out)
+    assert rig.days_requested() == [prior]
+    assert result.not_closed == [half]
+    with make_rig(server_now=minutes_after_close(half, 60)) as rig2:
+        rig2.script(half, early)
+        again = rig2.run(["AAPL"], half, half, out)
+    assert rig2.days_requested() == [half] and again.symbols["AAPL"].ok == 1
+
+
 def test_a_full_day_of_bars_on_a_half_day_is_kept_complete_and_noted(out: Path) -> None:
     """The other disagreement: the calendar says 13:00, IB sent all 390 bars. Nothing is dropped."""
     half = date(2024, 11, 29)

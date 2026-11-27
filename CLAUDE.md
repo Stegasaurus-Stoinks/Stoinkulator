@@ -122,7 +122,7 @@ watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177
 |------|--------------|--------------|--------------|-------|
 | 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming | the session ended as planned (end of session at 16:20, or 13:20 on a half day, `--minutes` elapsed or the stop file): stored `completed` |
 | 1 | a day failed or a symbol not fetched | a step failed (incl. NO data) | a symbol stopped or delivered no bars | a symbol stopped: stored `failed` |
-| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same | same, and a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running: nothing built or connected |
+| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same, and a weekend or market holiday | same, and a weekend or market holiday, a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running: nothing built or connected |
 | 3 | could not connect | same | same | same |
 | 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault | lost or closed connection, or an error: stored `failed` |
 | 5 | not a paper account | (unused) | not a paper account | not a paper account |

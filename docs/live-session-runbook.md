@@ -73,7 +73,10 @@ latest 16:21). On a half day (13:00 close: the day after Thanksgiving, 24 Decemb
 the market calendar moves every one of those times by three hours: start at about 09:25 with
 `--minutes 235` (09:25 to 13:20; a larger number is fine, the session ends on its own at about
 13:20) and expect `completed`, `session_end`, exit 0. On a weekend or a market holiday `run` refuses
-to start (exit 2, `Refused: ... is not a trading day`). Without `--no-prompt` the command prints what it will do and asks you to type
+to start (exit 2, `Refused: ... is not a trading day`). The `--minutes` deadline runs from the start of the
+watch: 415 (235 on a half day) leaves no room if the command is started at or before about 09:25:10, and the
+session then ends as `minutes_elapsed` just before the last two held bars (fed at the close + 20 minutes) are fed;
+the safe values are 420 on a full day and 240 on a half day (420 is the cap). Without `--no-prompt` the command prints what it will do and asks you to type
 `7497`.
 
 A start before 09:30 depends on a subscription opened before the open rolling into the session

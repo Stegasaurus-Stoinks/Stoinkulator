@@ -57,7 +57,7 @@ from MainStoinker.ib.cli import (
     scrub,
 )
 from MainStoinker.ib.connection import IbConnection
-from MainStoinker.ib.history import session_close_utc, session_end_utc
+from MainStoinker.ib.history import session_close_utc
 from MainStoinker.ib.market_data import (
     CLOSED,
     DATA_LOST,
@@ -175,7 +175,7 @@ def closed_session_day(server_now: datetime) -> date:
     Today if it is a trading day and its close has passed, else the previous trading day.
     """
     today = server_now.astimezone(NY).date()
-    if calendar.is_trading_day(today) and session_end_utc(today) <= server_now:
+    if calendar.is_trading_day(today) and session_close_utc(today) <= server_now:
         return today
     return calendar.previous_trading_day(today)
 

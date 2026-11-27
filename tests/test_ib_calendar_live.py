@@ -446,6 +446,9 @@ def test_a_half_day_session_ends_completed_at_13_20_with_the_last_bar_12_59(
     assert "ending the session (session_end)" in text
     assert "Live session: completed, end reason session_end (exit 0)" in text
     assert "verify: VERIFIED" in text
+    # positions at the end: the existing rule (left open and listed, never closed by the session)
+    open_lines = text.count("OPEN POSITION (left open)")
+    assert "no position left open" in text and open_lines == 0, text
     # the run ended at the half day's 13:20, not before (the last bars wait for it) and not much after
     ended = rig.server_epoch + rig.t
     assert hep(13, 20) <= ended < hep(13, 23), ended - hep(13, 20)
@@ -511,5 +514,45 @@ def test_ibs_close_for_today_moves_the_whole_session(
     text = rig.text
     assert "WARNING: IB reports the regular session closing at 16:00 today" in text
     assert result.code == 7 and result.store.list_runs()[0].end_reason == "data_fault", text
+
+
+# -- follow IB only for a close the exchange uses (13:00 or 16:00) --------------------------------
+
+
+def test_ib_13_00_on_a_calendar_full_day_is_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(tmp_path, ("AAPL", "MSFT"))  # the default scripted day, Friday 2024-08-16: a full day
+    hours = "20240816:0930-20240816:1300"
+    with_hours(monkeypatch, {"AAPL": hours, "MSFT": hours})
+    rig.standard()
+    try:
+        assert rig.watch(symbols="AAPL,MSFT", minutes=5) == 0, rig.text
+        assert ("WARNING: IB reports the regular session closing at 13:00 today, the market calendar says "
+                "16:00. Following IB for today") in rig.text
+    finally:
+        for conn in rig.connections:
+            conn.close()
+        for fake in rig.fakes:
+            fake.close()
+
+
+@pytest.mark.parametrize("hours,reported", [
+    ("20241129:0930-20241129:1200", "12:00"),
+    ("20241129:0930-20241129:1500", "15:00"),
+])
+def test_an_ib_close_the_exchange_does_not_use_is_not_followed(
+        watch_rig: Rig, monkeypatch: pytest.MonkeyPatch, hours: str, reported: str) -> None:
+    with_hours(monkeypatch, {"AAPL": hours, "MSFT": hours})
+    half_day_script(watch_rig)
+    assert watch_on(watch_rig, HALF, "AAPL,MSFT", 30) == 0, watch_rig.text
+    text = watch_rig.text
+    assert (f"WARNING: IB reports the regular session closing at {reported} today, the market calendar "
+            f"says 13:00. {reported} is not a close the exchange uses (13:00 or 16:00): IB's hours are NOT "
+            "followed, the calendar is: close 13:00.") in text
+    assert "Following IB" not in text
+    assert text.count("market closed: no new bars expected") == 2  # the calendar's 13:00 stood
+
+
+def test_the_exchange_closes_are_13_00_and_16_00() -> None:
+    assert watch_bars.EXCHANGE_CLOSES == frozenset({13 * 60, 16 * 60})
 
 

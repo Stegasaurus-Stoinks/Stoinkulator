@@ -38,7 +38,8 @@ The layers, bottom to top:
   most 60 per 10 minutes, fewer than 6 per contract per 2 s, no identical request within 15 s), the
   resume manifest, the gap report. The market calendar (`engine/market_calendar.py`) decides the
   days: weekends and holidays are not planned (and not requested), a half day (13:00 close) is
-  closed at 13:00 and expected to hold 210 bars (`complete` with them). Where the calendar and the
+  expected to hold 210 bars (`complete` with them). A day is still planned only once 16:00 New York
+  of that day has passed, also a half day (a request ends at 16:00, never in the future). Where the calendar and the
   data disagree the data is kept and the gap report says so (see "Gap files").
 - `fetch.py` the driver behind `fetch-bars`; `probe.py` the steps of `probe-data`; `watch_bars.py`
   the live bar watcher; `cli.py` the argument parsing, path checks, console gate, paper mode,
@@ -300,10 +301,21 @@ one-off closures listed in `OVERRIDES`).
   and before the first history request, today's close by the calendar is compared with IB's
   regular hours for the day: one line `Trading hours: ...` says they agree, or that they could not be
   read and the calendar is followed (no field, another time zone, a session that does not start at
-  09:30, a day the text does not mention, ...). If IB's close differs, a `WARNING` line is printed and
-  IB's close is used for today in every derived time; if IB says the day is closed, nothing is
-  requested and the session ends with exit 2. Symbols that differ among themselves: the earliest
-  close, or closed, wins.
+  09:30, a day the text does not mention, ...). The rule, in plain words:
+  - IB's close equals the calendar's: nothing changes.
+  - IB's close differs, and IB's close is exactly 13:00 or 16:00 (the only closes the exchange
+    uses): a `WARNING` line, and IB's close is used for today in every derived time. Example: the
+    calendar says half day, IB says 16:00: the session is judged as a full day; if the stream then
+    stops at 13:00, the silent-symbol check of `run` ends the run as a data fault (`data_fault`, exit
+    7) by design, and the watcher reports `no data` / a stopped stream the way it would on a full
+    day. The other way round (calendar full, IB says 13:00): the session ends at 13:00 and 13:20 as
+    on any half day.
+  - IB's close differs and is any other value (12:00, 15:00, a mis-parse that still looks valid): a
+    `WARNING` naming both values, and the calendar is followed. IB's value is not used.
+  - IB's hours cannot be read: one line, the calendar is followed.
+  - IB says closed for a symbol on a day the calendar calls open: nothing is requested and the
+    session ends with exit 2 (refused).
+  Symbols that differ among themselves: the earliest close, or closed, wins, then the rule above.
 - Gap reports. A half day is expected to hold 210 bars and is `complete` with them. A day the
   calendar calls full that has exactly the bars 09:30 to 12:59 stays `short`; bars after 12:59 on a
   calendar half day are kept (judged against 390) and bars on a calendar holiday are kept. Each such

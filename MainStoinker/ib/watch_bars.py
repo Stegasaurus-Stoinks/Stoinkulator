@@ -52,7 +52,8 @@ acceptable, a partial row is not. Hence:
   close and the close plus 20 minutes. A weekend or a holiday is refused before connecting (exit
   code 2). Once the contract details are in, today's close by the calendar is compared with the
   regular hours IB reports in them (no new request): a disagreement prints a warning and IB's
-  hours are followed for today; hours IB reports as closed end the run before any request (exit 2).
+  hours are followed for today, but only if IB's close is 13:00 or 16:00 (any other value: warning,
+  the calendar stands); hours IB reports as closed end the run before any request (exit 2).
 - The DELAYED label is separate (it changes no judgement): in the regular session (server time) a
   symbol is declared DELAYED, once, when two live updates at least
   10 s apart both show a lag over 120 s, or the backfill showed it and one live update confirms
@@ -265,7 +266,7 @@ EXIT_INTERRUPTED = 130
 
 EXIT_CODES_TEXT = """\
 exit codes:
-  0    watched to the end and every symbol was streaming (or the market was closed)
+  0    watched to the end and every symbol was streaming (after the close, nothing more expected)
   1    finished, but a symbol stopped (IB error, unknown symbol, unusable live file), had no
        stream at the end (a re-request still outstanding) or delivered no bars
   2    refused: console gate, port guard, --paper conditions, bad arguments, unusable path, a
@@ -303,6 +304,7 @@ FORMING_EVERY = 10.0  # seconds between two forming-bar lines of one symbol
 CLOSE_GRACE = 2  # a backfill bar this soon after its minute ended may still be forming
 SETTLE_SECONDS = 90  # a bar with no later update this long after its minute is closed by time
 LABEL_CONFIRM = 10.0  # live updates this far apart must both show the lag before DELAYED is declared
+EXCHANGE_CLOSES = frozenset({13 * 60, 16 * 60})  # the only closes IB's hours may move today's session to
 SESSION_GRACE = 20 * 60  # the last bars of a session wait for 16:20 (covers 15-minute delayed data)
 FARM_BROKEN = {2103: "market", 2105: "historical"}  # IB notices: a data farm connection is broken
 FARM_OK = {2104: "market", 2106: "historical"}  # ... and that farm is OK again
@@ -313,8 +315,6 @@ NO_DATA_AFTER = 120.0  # session seconds without any bar of today or update befo
 NO_DATA_HINT = ("check the market data subscription of this account (quotes answering IB 354 / 10167 "
                 "mean none; a paper account needs the live account's data shared with it); on a "
                 "market holiday or with delayed data this is expected")
-SESSION_OPEN_MINUTE = 9 * 60 + 30
-SESSION_CLOSE_MINUTE = 16 * 60
 BACKFILL_TIMEOUT = 90.0
 SERVER_TIME_TIMEOUT = 10.0
 RESOLVE_TIMEOUT = 10.0
@@ -1130,9 +1130,10 @@ class Watcher:
         IB reports in the contract details every symbol's lookup already returned (no new request).
         Prints one line. On a disagreement it prints a warning and follows IB for today: IB says
         closed: nothing is requested (False); IB says another close: `calendar_extra` carries it and
-        every time derived from the close follows it. Hours that cannot be read are not compared (one
-        line), the calendar stands. Several symbols that disagree among themselves: the earliest
-        close, and a closed answer, win."""
+        every time derived from the close follows it, but only when IB's close is one the exchange
+        uses (`EXCHANGE_CLOSES`: 13:00 or 16:00); any other value is a warning and the calendar
+        stands. Hours that cannot be read are not compared (one line), the calendar stands. Several
+        symbols that disagree among themselves: the earliest close, and a closed answer, win."""
         answers = [(s, trading_hours.ib_hours_for(s.info.liquid_hours, s.info.time_zone_id, today))
                    for s in self.syms if s.info is not None]
         calendar_close = calendar.close_minute(today)
@@ -1157,6 +1158,11 @@ class Watcher:
             self.say(f"Trading hours: IB's hours for today agree with the market calendar (close {shown}).")
             return True
         reported = f"{ib_close // 60:02d}:{ib_close % 60:02d}"
+        if ib_close not in EXCHANGE_CLOSES:  # a mis-parse that still looks valid is the dangerous case
+            self.say(f"WARNING: IB reports the regular session closing at {reported} today, the market "
+                     f"calendar says {shown}. {reported} is not a close the exchange uses (13:00 or "
+                     f"16:00): IB's hours are NOT followed, the calendar is: close {shown}.")
+            return True
         self.say(f"WARNING: IB reports the regular session closing at {reported} today, the market "
                  f"calendar says {shown}. Following IB for today: every time derived from the close "
                  f"({reported}) follows it.")

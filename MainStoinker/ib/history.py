@@ -9,10 +9,11 @@ that zone, so a full day has `SESSION_MINUTES` (390) one-minute bars, stamped
 09:30 to 15:59 (a bar is stamped with the start of its minute).
 
 The market calendar (`engine/market_calendar.py`) decides which days are planned and what a day
-is expected to hold: weekends and holidays are not planned, a half day (13:00 close) is closed
-at 13:00 and expected to hold `EARLY_CLOSE_MINUTES` (210) bars, 09:30 to 12:59, and is `complete`
-with them. The request itself is unchanged (it ends at 16:00 whatever the day: IB returns the
-session's bars). The calendar never decides what is kept: `filter_day` keeps every bar of the
+is expected to hold: weekends and holidays are not planned, a half day (13:00 close) is
+expected to hold `EARLY_CLOSE_MINUTES` (210) bars, 09:30 to 12:59, and is `complete` with them.
+The request itself is unchanged (it ends at 16:00 whatever the day: IB returns the session's
+bars), so a day is planned only once 16:00 New York of that day has passed, also a half day.
+The calendar never decides what is kept: `filter_day` keeps every bar of the
 requested date, and when the data and the calendar disagree the gap report keeps the old
 tolerance (a day with exactly the bars 09:30 to 12:59 on a day the calendar calls full is `short`,
 any other missing tail `partial`, a full day of bars on a day the calendar calls half is
@@ -139,18 +140,10 @@ def check_symbol(symbol: str) -> str:
 def session_close_utc(day: date) -> datetime:
     """16:00 New York of `day` as an aware UTC datetime (DST handled by the zone database).
 
-    The END OF A REQUEST for the day's bars, whatever the day: not the close of the session (see
-    `session_end_utc`)."""
+    The END OF A REQUEST for the day's bars, whatever the day (a half day too: IB returns the
+    session's bars), and the moment from which a day is planned: no request ever ends in the
+    future, also on a half day (13:00 close; its bars are provisional until 06:00 next morning)."""
     return datetime.combine(day, SESSION_CLOSE, tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
-
-
-def session_end_utc(day: date, extra: calendar.Overrides | None = None) -> datetime:
-    """The close of `day`'s regular session by the market calendar (16:00, or 13:00 on a half day)
-    as an aware UTC datetime; 16:00 for a day with no session (a stand-in, the day is not planned)."""
-    found = calendar.session(day, extra)
-    minute = calendar.FULL_CLOSE_MINUTE if found is None else found.close_minute
-    return datetime.combine(day, dtime(minute // 60, minute % 60),
-                            tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
 
 
 def day_final_utc(day: date) -> datetime:
@@ -176,8 +169,9 @@ def plan_range(start: date, end: date, server_now: datetime,
     """Every closed trading day from `start` to `end`, plus the ones not closed yet.
 
     `server_now` is an aware datetime (the injected clock). A trading day (by the market
-    calendar: no weekend, no holiday) is closed once its regular session (16:00 New York, 13:00 on a
-    half day) is over at `server_now`. Trading days whose session has not closed go into
+    calendar: no weekend, no holiday) is planned once 16:00 New York of that day is over at
+    `server_now`, also on a half day (a request ends at 16:00 and never in the future). Trading days
+    not planned yet go into
     `not_closed` (in order) so the driver can report them; they are never planned. The plan is
     refused with `ValueError` only when the range holds trading days but none of them has closed. A
     range of only weekend days and holidays plans nothing. `start` after `end` is a `ValueError`.
@@ -191,7 +185,7 @@ def plan_range(start: date, end: date, server_now: datetime,
     current = start
     while current <= end:
         if calendar.is_trading_day(current, extra):
-            (days if session_end_utc(current, extra) <= server_now else not_closed).append(current)
+            (days if session_close_utc(current) <= server_now else not_closed).append(current)
         current += timedelta(days=1)
     if not_closed and not days:
         raise ValueError(
