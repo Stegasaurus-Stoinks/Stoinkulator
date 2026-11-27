@@ -97,7 +97,7 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -m pytest -m slow          # slow suite, also parallel: full Elliot state digests, legacy-path parity, the four slow golden cases; ~2-2.5 min (serial `-n 0`: ~15 min)
 .venv\Scripts\ruff.exe check .                      # legacy defect set
 .venv\Scripts\ruff.exe check tests conftest.py MainStoinker/engine MainStoinker/api MainStoinker/ib MainStoinker/__main__.py --select E,F,W,I,B   # new-code set
-.venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS.json --data OfflineData --out OUTDIR   # offline backtest -> OUTDIR/trades.json
+.venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS.json --data OfflineData --out OUTDIR [--start D [--end D] [--allow-cold]]   # offline backtest -> OUTDIR/trades.json; --start loads the algos' declared warm-up (`warmup_sessions()`) before D, refuses short data unless --allow-cold
 .venv\Scripts\python.exe -m MainStoinker runs --db DB [--json]              # list the runs stored by `backtest --db` (read-only)
 .venv\Scripts\python.exe -m MainStoinker report RUN --db DB [--json]        # per-algo and total statistics of one stored run
 .venv\Scripts\python.exe -m MainStoinker serve --db DB [--port 8750] [--allow-remote]   # read-only API + dashboard on 127.0.0.1 (needs requirements-web.txt)

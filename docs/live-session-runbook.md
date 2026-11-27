@@ -169,6 +169,10 @@ it only reads. What to look for:
        .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols AAPL,MSFT --start YYYY-MM-DD --end YYYY-MM-DD --paper --no-prompt
        .venv\Scripts\python.exe -m MainStoinker backtest --algos ALGOS_FILE --data "$env:USERPROFILE\Stoinkulator\bars" --out "$env:USERPROFILE\Stoinkulator\compare-YYYY-MM-DD" --replay-from YYYY-MM-DD --fills realistic --db "$env:USERPROFILE\Stoinkulator\live-runs.db" --quiet
 
+   (`--start YYYY-MM-DD --end YYYY-MM-DD` instead of `--replay-from` also loads the history the algos
+   declare they need before that day, `warmup_sessions()`, and refuses when the bars do not reach back
+   far enough; it needs bars from earlier days, so fetch them too.)
+
    YYYY-MM-DD is the day of the session in both commands. `fetch-bars` needs TWS on the paper
    login again. The fetched day stays provisional until 06:00, so do it after that time.
 5. Findings: one new issue per finding, with the run id, the end reason and the lines around it.

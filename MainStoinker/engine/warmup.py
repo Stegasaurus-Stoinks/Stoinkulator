@@ -1,4 +1,5 @@
-"""Warm-up history for a live session, read from the month files before today.
+"""Warm-up history: what an algo needs (`declared_sessions`, `first_session_needed`, used by
+`backtest --start`) and, for a live session, frames read from the month files before today.
 
 `live_warmup` reads only the data folder (never the current directory) and
 imports nothing outside `MainStoinker.engine`. Data time is naive
@@ -9,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,46 @@ from MainStoinker.engine.market_calendar import previous_trading_day
 
 _MONTH_FILE = re.compile(r".+_([0-9]{4})-([0-9]{2})\.csv")
 _STAMP = "%Y-%m-%d %H:%M:%S"
+
+
+MAX_WARMUP_SESSIONS = 2500
+"""Most warm-up sessions a backtest will walk back (about ten years of trading days)."""
+
+
+def declared_sessions(algos: Iterable[object]) -> list[tuple[str, int]]:
+    """`(name, sessions)` for each algo: what its `warmup_sessions()` declares.
+
+    An algo without the method needs 0. The answer must be a whole number (not a
+    bool) from 0 to `MAX_WARMUP_SESSIONS`, else `ValueError` naming the algo.
+    """
+    declared: list[tuple[str, int]] = []
+    for algo in algos:
+        name = str(getattr(algo, "name", algo))
+        method = getattr(algo, "warmup_sessions", None)
+        sessions = 0 if method is None else method()
+        if (isinstance(sessions, bool) or not isinstance(sessions, int)
+                or not 0 <= sessions <= MAX_WARMUP_SESSIONS):
+            raise ValueError(f"algo {name!r}: warmup_sessions() must be a whole number from 0 "
+                             f"to {MAX_WARMUP_SESSIONS}, got {sessions!r}")
+        declared.append((name, sessions))
+    return declared
+
+
+def first_session_needed(start: date, sessions: int) -> date:
+    """The day `sessions` trading days before `start` (market calendar; `start` itself
+    need not be a trading day). With 0 sessions it is `start`.
+
+    A warm-up of `sessions` sessions is every session from this day up to the one
+    before `start`.
+    """
+    if isinstance(start, datetime) or not isinstance(start, date):
+        raise TypeError(f"start must be a datetime.date, not {type(start).__name__}")
+    if not 0 <= sessions <= MAX_WARMUP_SESSIONS:
+        raise ValueError(f"sessions must be from 0 to {MAX_WARMUP_SESSIONS}, got {sessions}")
+    day = start
+    for _ in range(sessions):
+        day = previous_trading_day(day)
+    return day
 
 
 def warmup_digest(frame: pd.DataFrame) -> str:

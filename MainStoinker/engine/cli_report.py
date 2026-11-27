@@ -315,6 +315,7 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
     lines.append(f"symbols: {', '.join(s.data.symbols) or '-'}")
     first, last = s.data.first_bar, s.data.last_bar
     lines.append(f"bars: {first if first else '-'} to {last if last else '-'}")
+    lines.extend(_start_lines(header.get("start")))
     lines.append(f"data directory: {header['data_directory']}")
     missing = header["missing_minutes"]
     if missing and any(missing.values()):
@@ -355,6 +356,38 @@ def run_report_command(spec: str | None, run_text: str, *, as_json: bool,
         lines.extend(verdict.lines())
     _write(lines)
     return 0 if verdict is None else verdict.exit_code
+
+
+def _start_lines(start: Any) -> list[str]:
+    """The `backtest --start` lines of a report: the window and the warm-up used; none otherwise."""
+    if not isinstance(start, Mapping):
+        return []
+    end = start.get("to") or "the end of the data"
+    lines = [f"start: {start.get('from', '-')}, end: {end}"]
+    return [*lines, *warmup_lines(start, cold_text=" (COLD START: the bars did not cover the warm-up)")]
+
+
+def sessions_text(count: Any) -> str:
+    """'1 session', '21 sessions' (anything else as given)."""
+    return f"{count} session" + ("" if count == 1 else "s")
+
+
+def warmup_lines(start: Mapping[str, Any], cold_text: str = ", cold start") -> list[str]:
+    """The warm-up lines of a `--start` run (its stored `start` record).
+
+    With no algo declaring a need: "warm-up: none declared by A, B". Otherwise the sessions
+    needed and loaded, and, when some algos declared nothing, a line naming them.
+    """
+    undeclared = ", ".join(start.get("undeclared") or [])
+    if not start.get("warmup_sessions") and undeclared:
+        return [f"warm-up: none declared by {undeclared} (they start without history)"]
+    cold = cold_text if start.get("cold") else ""
+    lines = [f"warm-up: {sessions_text(start.get('warmup_sessions', '-'))} needed (from "
+             f"{start.get('warmup_first_day', '-')}), "
+             f"{start.get('warmup_sessions_loaded', '-')} loaded{cold}"]
+    if undeclared:
+        lines.append(f"no warm-up declared by {undeclared} (they start without history)")
+    return lines
 
 
 def _liveness_lines(s: RunSummary, now: datetime, stale_after: timedelta) -> list[str]:

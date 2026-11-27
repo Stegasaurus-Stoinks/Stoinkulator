@@ -314,17 +314,27 @@ def _uncovered_minutes(stamps: Sequence[pd.Timestamp]) -> int:
 
 
 def _split_window(
-    data: pd.DataFrame, warmup_days: int, window: tuple[date, date]
+    data: pd.DataFrame,
+    warmup_days: int,
+    window: tuple[date, date | None],
+    warmup_from: date | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """`(warm-up, replay)` frames of one symbol for the New York dates `window` (inclusive).
 
-    Replay is every row dated within the window. Warm-up is every row of the
-    `warmup_days` latest days before the window start that have rows in this
-    symbol's data (its trading days: weekends and holidays have none).
+    Replay is every row dated within the window (`last` None: to the end of the
+    data). Warm-up is every row of the `warmup_days` latest days before the window
+    start that have rows in this symbol's data (its trading days: weekends and
+    holidays have none); with `warmup_from` it is instead every row dated from
+    that day up to the day before the window start (`warmup_days` is then unused).
     """
     first, last = window
     days = data["date"].dt.normalize()
-    in_window = (days >= pd.Timestamp(first)) & (days <= pd.Timestamp(last))
+    in_window = days >= pd.Timestamp(first)
+    if last is not None:
+        in_window &= days <= pd.Timestamp(last)
+    if warmup_from is not None:
+        warm = (days >= pd.Timestamp(warmup_from)) & (days < pd.Timestamp(first))
+        return data.loc[warm].reset_index(drop=True), data.loc[in_window].reset_index(drop=True)
     before = days[days < pd.Timestamp(first)].drop_duplicates()
     chosen = before.iloc[max(len(before) - warmup_days, 0):] if warmup_days > 0 else before.iloc[:0]
     return (
@@ -372,7 +382,10 @@ class CsvBarFeed:
     With `window=(first, last)` (inclusive New York dates) the replay is exactly the
     rows dated in the window and the warm-up is the rows of the `warmup_days`
     latest days before `first` that the symbol has data for; the rest is unused.
-    Without it nothing above changes.
+    `last` may be None: the replay then runs to the end of the data. With
+    `warmup_from` (needs `window`) the warm-up is instead every row from that day
+    up to the day before `first` (`warmup_days` is then unused). `first_day(symbol)`
+    is the date of the symbol's first stored row. Without these nothing above changes.
 
     A symbol with no replay bars at all (warm-up only, or an empty window) is
     not an error here: it misses every batch and `replay_counts()` shows 0. The
@@ -386,18 +399,24 @@ class CsvBarFeed:
         data_dir: Path,
         symbols: Sequence[str],
         warmup_days: int = 2,
-        window: tuple[date, date] | None = None,
+        window: tuple[date, date | None] | None = None,
+        warmup_from: date | None = None,
     ) -> None:
         self._symbols: list[str] = list(dict.fromkeys(symbols))
         if not self._symbols:
             raise ValueError("CsvBarFeed needs at least one symbol")
+        if warmup_from is not None and window is None:
+            raise ValueError("warmup_from needs a window")
         self._warmup: dict[str, pd.DataFrame] = {}
+        self._first_day: dict[str, date] = {}
         replay: dict[str, pd.DataFrame] = {}
         for symbol in self._symbols:
             data = self._read(Path(data_dir), symbol)
             self._check_sorted(Path(data_dir), symbol, data)
+            self._first_day[symbol] = data["date"].iloc[0].date()
             if window is not None:
-                self._warmup[symbol], replay[symbol] = _split_window(data, warmup_days, window)
+                self._warmup[symbol], replay[symbol] = _split_window(
+                    data, warmup_days, window, warmup_from)
                 continue
             cutoff = data["date"].iloc[0] + timedelta(days=warmup_days)
             is_warmup = data["date"] < cutoff
@@ -464,6 +483,13 @@ class CsvBarFeed:
                     rounds.append({})
                 rounds[k][symbol] = bar
         return [(stamp, rounds) for stamp in sorted(by_time) for rounds in by_time[stamp]]
+
+    def first_day(self, symbol: str) -> date:
+        """The New York date of `symbol`'s first stored row (before any warm-up split)."""
+        try:
+            return self._first_day[symbol]
+        except KeyError:
+            raise KeyError(f"unknown symbol {symbol!r}; feed has {self._symbols}") from None
 
     def replay_counts(self) -> dict[str, int]:
         """Per symbol, in `symbols()` order: how many replay bars it has (after warm-up)."""
