@@ -209,7 +209,10 @@ def check_coverage(bars_dir: Path, symbols: Sequence[str], days: Sequence[date],
     for symbol in symbols:
         frame = _bars_of(bars_dir, symbol, days)
         manifest = _manifest(bars_dir, symbol)
-        rows = {r.day: r for r in gap_report(days, frame)} if frame is not None and len(frame) else {}
+        try:
+            rows = {r.day: r for r in gap_report(days, frame)} if frame is not None and len(frame) else {}
+        except ValueError as exc:  # time-zone aware dates, minutes that are not whole
+            raise HistoryError(f"{symbol}: the bars cannot be judged: {exc}") from exc
         missing: list[date] = []
         provisional: list[date] = []
         partial: list[tuple[date, int]] = []

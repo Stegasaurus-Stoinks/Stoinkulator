@@ -114,7 +114,7 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
   missing (at least 10 s per symbol-day, all before 09:30). `History: STOPPED: ...` ends the
   session with exit 7, nothing traded, no run stored; a start after 09:30 with a gap, `--no-fetch`
   with a gap or a day not final before 06:00 is refused (exit 2) and names the `fetch-bars`
-  command. Your own options (the hook for agents refuses them): `--no-fetch`, `--allow-cold`,
+  command. Your own options (not part of the command shape agents use): `--no-fetch`, `--allow-cold`,
   `--warmup-days N`.
 - Last lines of every command: `Recording: <file>` with the scan findings, `Result: ... (exit N)`.
 

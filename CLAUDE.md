@@ -113,8 +113,8 @@ Owner forms of the same four (the owner's terminal, prompted: you type the port;
 `probe-data --symbols A,B --port P`, `watch_bars --symbols A,B --minutes N --port P`,
 `run --algos F --bars D --db F --minutes N --port P` (with `--paper` instead of `--port`
 for 7497; every algo needs `"mode": "paper"`, `--fills` is `realistic`, `--stop-file F` ends
-the run cleanly; `--warmup-days N`, `--no-fetch` and `--allow-cold` are owner options for the
-warm-up history). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
+the run cleanly; `--warmup-days N` overrides the warm-up length, `--no-fetch` and `--allow-cold`
+are owner options for the warm-up history). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
 
 Exit codes (`--help` shows them; the not-paper code is 5 for `fetch-bars`, the
 watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177):
