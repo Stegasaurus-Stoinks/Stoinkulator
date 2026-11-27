@@ -228,7 +228,9 @@ def test_the_parser_has_no_orders_option_and_matches_options_exactly(
     assert "--port" in parse_fails(
         ["--algos", "a", "--bars", "b", "--db", "d", "--pap", "--minutes", "5"], capsys)
     args = run_cli.parse_args(["--algos", "a", "--bars", "b", "--paper", "--minutes", "5"])
-    assert (args.client_id, args.port, args.fills, args.warmup_days) == (20, 7497, "realistic", 2)
+    # no --warmup-days: the warm-up is the algos' declared need, at least 2 (issue 287)
+    assert (args.client_id, args.port, args.fills, args.warmup_days) == (20, 7497, "realistic", None)
+    assert (args.no_fetch, args.allow_cold) == (False, False)
 
 
 def test_help_and_usage_errors_build_no_client() -> None:

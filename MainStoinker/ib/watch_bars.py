@@ -262,6 +262,7 @@ EXIT_NO_CONNECTION = 3
 EXIT_STOPPED = 4
 EXIT_NOT_PAPER = 5
 EXIT_NO_DATA = 6
+EXIT_FAULT = 7  # a driver stopped the session on a data fault (`live_run`); never the watcher itself
 EXIT_INTERRUPTED = 130
 
 EXIT_CODES_TEXT = """\
@@ -649,7 +650,11 @@ class WatchSeams:
     `on_pass` are described in the module docstring; `minutes` replaces `args.minutes` and
     `backfill_minutes` replaces `args.backfill_minutes` (or `backfill_since_open` asks for today's
     bars from 09:30 at every request), each within the driver limits; `on_watcher` is called with
-    the `Watcher` right after it is built (to read `drop_counts()` later)."""
+    the `Watcher` right after it is built (to read `drop_counts()` later). `before_watch` is called
+    with the connection, the market data client and the printer after the paper check and before the
+    watcher is built (so before any bar is subscribed): it returns None to go on or an exit code to
+    end the session there (the connection and the recording are closed as always); the live
+    session uses it to fetch the history its algos need (`live_history`)."""
 
     extra_sinks: tuple[ClosedBars, ...] = ()
     listener: BarListener | None = None
@@ -658,6 +663,7 @@ class WatchSeams:
     backfill_minutes: int | None = None
     backfill_since_open: bool = False
     on_watcher: Callable[[Watcher], None] | None = None
+    before_watch: Callable[[IbConnection, IbMarketData, Callable[[str], None]], int | None] | None = None
 
     def __post_init__(self) -> None:
         _check_limits(self.minutes, self.backfill_minutes, self.backfill_since_open)
@@ -1888,6 +1894,7 @@ _LABELS = {
     EXIT_INTERRUPTED: "interrupted with Ctrl-C",
     EXIT_NOT_PAPER: NOT_PAPER_LABEL,
     EXIT_NO_DATA: "watched to the end, but no data received for at least one symbol",
+    EXIT_FAULT: "stopped before watching: the history the session needs is incomplete",
 }
 ADVICE_CLIENT_ID = ("Client id in use: another API client is connected with this id. Close it or pass "
                     "another --client-id.")
@@ -1978,13 +1985,17 @@ def run_watch(
         else:
             verified = paper
             md = market_data_factory(conn)
-            watcher = Watcher(args, conn, md, say, sink, clock, sleep, wall, listener=seam.listener,
-                              on_pass=seam.on_pass, minutes=seam.minutes,
-                              backfill_minutes=seam.backfill_minutes,
-                              backfill_since_open=seam.backfill_since_open)
-            if seam.on_watcher is not None:
-                seam.on_watcher(watcher)
-            code = watcher.run()
+            early = seam.before_watch(conn, md, say) if seam.before_watch is not None else None
+            if early is not None:
+                code = early  # nothing was subscribed: the finally block closes everything
+            else:
+                watcher = Watcher(args, conn, md, say, sink, clock, sleep, wall, listener=seam.listener,
+                                  on_pass=seam.on_pass, minutes=seam.minutes,
+                                  backfill_minutes=seam.backfill_minutes,
+                                  backfill_since_open=seam.backfill_since_open)
+                if seam.on_watcher is not None:
+                    seam.on_watcher(watcher)
+                code = watcher.run()
     except KeyboardInterrupt:
         say()
         say("Interrupted (Ctrl-C).")

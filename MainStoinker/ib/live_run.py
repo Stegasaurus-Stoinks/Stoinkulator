@@ -12,8 +12,9 @@ place an order, and it imports nothing that can.
 The sequence of a session
 -------------------------
 
-1. Refuse (exit 2, nothing built, no connection) unless the options are usable: paper mode,
-   realistic fills, every algo's `"mode"` is `paper`, a warm-up can be read from the month files,
+1. Refuse (exit 2, nothing connected) unless the options are usable: paper mode,
+   realistic fills, every algo's `"mode"` is `paper`, the algos can be built (once, to read their
+   warm-up need), a warm-up can be read from the month files or fetched before the open,
    `--minutes` is within the driver limits, no stop file is lying about, and today (New York, by this
    computer's clock) is a trading day by the market calendar (a weekend or a holiday is refused). A
    half day (13:00 close) follows the calendar:
@@ -109,17 +110,38 @@ The `args` this driver reads (a namespace; the command builds it)
 
 `paper` (must be True), `host`, `port`, `client_id`, `connect_timeout` (as the watcher reads
 them), `entries` (the algo config, as `validate_algo_config` takes it; every config needs
-`"mode": "paper"`), `bars` (the folder of the month files), `warmup_days`, `capital` (Decimal
+`"mode": "paper"`), `bars` (the folder of the month files), `warmup_days` (None or absent: the
+algos' declared need, at least 2; a number: an explicit override), `no_fetch`, `allow_cold`
+(absent means False), `needs` (the algos' declared needs, as `algo_needs` returns them; absent:
+worked out here), `capital` (Decimal
 or text), `costs` (a `CostModel`), `fills` (absent or `"realistic"`), `out` (the live files
 folder), `record` / `private` (the session recording: `record` None means no recording),
 `minutes`, `run_out` (the working folder of the algos, created if missing), `stop_file` (a path
 or None), `code_version` (text, or a callable; absent: `current_code_version()`), `quiet`.
 `symbols` is set from the entries (the feed order).
 
+The history before the open (issue 287; `live_history` has the rules)
+---------------------------------------------------------------------
+
+Before anything is connected the plan builds the algos ONCE, in a throw-away folder
+(`algo_needs`), to validate their config and read what each declares (`warmup_sessions()`): a
+mistake is a refusal (exit 2), nothing connected, nothing stored. The warm-up is `--warmup-days`
+when given (below the largest need it is refused unless `allow_cold`), else the largest need, at
+least 2 trading sessions of the market calendar. The month files are checked for those days
+(present, complete, final). If something is missing or provisional and the fetch can finish
+before 09:30 New York (this computer's clock, IB's pacing limits), the session connects, passes the
+paper check and fetches exactly that through `fetch` (the watcher's `before_watch` seam), before
+it subscribes to any live bar. Anything that cannot be completed before the open is a refusal
+(exit 2, nothing connected: `no_fetch`, the open has passed, the estimate is too long, a day that
+is not final before 06:00 New York) unless `allow_cold`. A fetch that is not done at the open, a
+fetch that left gaps, or a window used up ends the session with exit 7 (4 if the connection was
+lost), no run stored. The time the fetch took comes off `--minutes`.
+
 Exit codes: the watcher's (0 ok, 1 symbol stopped, 2 refused, 3 could not connect, 4 stopped by a
 lost or closed connection or an error, 5 not paper, 6 no data, 130 Ctrl-C) and 7, new: the
 driver stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a
-step that took too long). See the table above for which reason goes with which code.
+step that took too long) or, before any bar, because the history is incomplete. See the table
+above for which reason goes with which code.
 """
 
 from __future__ import annotations
@@ -135,6 +157,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, TextIO
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -146,6 +169,7 @@ from MainStoinker.engine.cli import (
     build_engine,
     check_algos_importable,
     config_symbols,
+    declared_needs,
     make_verifier,
     validate_algo_config,
 )
@@ -170,9 +194,24 @@ from MainStoinker.engine.store import AlgoMeta, DataMeta, Store, StoreError
 from MainStoinker.engine.verify import StoredBarsFeed
 from MainStoinker.engine.warmup import live_warmup
 from MainStoinker.ib.cli import PAPER_HOST, PAPER_PORT, _Say
+from MainStoinker.ib.live_history import (
+    Coverage,
+    HistoryError,
+    HistoryOutcome,
+    HistoryStep,
+    check_coverage,
+    describe_requests,
+    estimate_seconds,
+    fetch_command,
+    format_seconds,
+    needed_days,
+    open_epoch,
+    warmup_sessions_for,
+)
 from MainStoinker.ib.watch_bars import (
     DELAY_THRESHOLD,
     EXIT_FAILED,
+    EXIT_FAULT,
     EXIT_INTERRUPTED,
     EXIT_NO_DATA,
     EXIT_NOT_PAPER,
@@ -192,7 +231,6 @@ from MainStoinker.ib.watch_bars import (
     run_watch,
 )
 
-EXIT_FAULT = 7  # the driver stopped the run on a data fault (module text)
 DEFAULT_CLIENT_ID = 20  # the engine's client id (the watcher command uses 22)
 RUN_KIND = LIVE_KINDS[0]  # "paper-live"
 DATA_SOURCE = "ib-live"
@@ -251,7 +289,16 @@ class _Plan:
     minutes: int
     code_version: str | Callable[[], str] | None
     preflight_day: date
-    preflight: tuple[dict[str, pd.DataFrame], dict[str, Any], list[str]]
+    # the warm-up read from the month files before connecting; None when the history is fetched
+    # first (the session builds it after the fetch)
+    preflight: tuple[dict[str, pd.DataFrame], dict[str, Any], list[str]] | None
+    needs: tuple[tuple[str, int], ...] = ()
+    days: tuple[date, ...] = ()  # the trading sessions of the warm-up
+    coverage: Coverage | None = None
+    will_fetch: bool = False  # the missing history is fetched after the paper check
+    allow_cold: bool = False
+    notes: tuple[str, ...] = ()  # the console lines of the plan (module text)
+    cold: tuple[str, ...] = ()  # why the warm-up is shorter than needed (`allow_cold`), stored as warnings
 
 
 def _decimal(value: Any, what: str) -> Decimal:
@@ -264,8 +311,28 @@ def _decimal(value: Any, what: str) -> Decimal:
     return number
 
 
-def _plan(args: argparse.Namespace, today: date) -> _Plan:
-    """Check the options (module text, step 1); `SessionRefused` for the first problem."""
+def algo_needs(entries: Sequence[Mapping[str, Any]]) -> list[tuple[str, int]]:
+    """Validate the algo config and build the algos ONCE, in a throw-away folder with their output
+    hidden, to read what each declares (`warmup_sessions()`): `(idname, sessions)` in config order.
+
+    This is the only build before the connection (`engine.cli.declared_needs`, as `backtest --start`
+    does it); the session builds its own, in its working folder, once the history is there. Every
+    problem, also an algo whose constructor raises, is a `SessionRefused`."""
+    try:
+        valid = validate_algo_config(entries)
+        check_algos_importable_quiet(valid)
+        return declared_needs(valid)
+    except (CliError, ModeError, ValueError, OverflowError) as exc:
+        raise SessionRefused(f"the algo config cannot be used: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - an algo's constructor raised: still a refusal
+        raise SessionRefused(f"the algo config cannot be used: an algo could not be built "
+                             f"({type(exc).__name__}: {exc})") from exc
+
+
+def _plan(args: argparse.Namespace, today: date, now: datetime | None = None) -> _Plan:
+    """Check the options (module text, step 1); `SessionRefused` for the first problem.
+
+    `now` is this computer's clock (aware); without it the plan assumes 09:00 New York on `today`."""
     if getattr(args, "paper", False) is not True:
         raise SessionRefused("a live session is paper only: `paper` must be True")
     if not calendar.is_trading_day(today):  # this computer's clock in New York; IB's decides once connected
@@ -294,9 +361,10 @@ def _plan(args: argparse.Namespace, today: date) -> _Plan:
     bars = getattr(args, "bars", None)
     if bars is None or not Path(bars).is_dir():
         raise SessionRefused("`bars` must be the folder of the warm-up month files")
-    days = getattr(args, "warmup_days", 2)
-    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
-        raise SessionRefused(f"`warmup_days` must be a whole number from 1, got {days!r}")
+    explicit = getattr(args, "warmup_days", None)
+    if explicit is not None and (not isinstance(explicit, int) or isinstance(explicit, bool)
+                                 or explicit < 1):
+        raise SessionRefused(f"`warmup_days` must be a whole number from 1, got {explicit!r}")
     capital = _decimal(getattr(args, "capital", None), "`capital`")
     if capital <= 0:
         raise SessionRefused("`capital` must be above 0")
@@ -313,13 +381,102 @@ def _plan(args: argparse.Namespace, today: date) -> _Plan:
     stop_file = getattr(args, "stop_file", None)
     if stop_file is not None and Path(stop_file).exists():
         raise SessionRefused("the stop file exists already: remove it before starting a session")
+    given_needs = getattr(args, "needs", None)  # the command worked them out before anything else
+    needs = tuple((str(n), int(s)) for n, s in (algo_needs(entries) if given_needs is None
+                                                 else given_needs))
+    allow_cold = getattr(args, "allow_cold", False) is True
+    no_fetch = getattr(args, "no_fetch", False) is True
+    sessions, why = warmup_sessions_for(needs, explicit)
+    need = max((n for _, n in needs), default=0)
+    notes = [f"Warm-up: {sessions} trading session(s) of history ({why})"]
+    if explicit is not None and explicit < need:
+        who = ", ".join(f"{name} {n}" for name, n in needs if n == need)
+        if not allow_cold:
+            raise SessionRefused(
+                f"--warmup-days {explicit} is below what the algos declare ({need}: {who}): use {need} "
+                "or more, leave it out, or add --allow-cold to start with less history")
+        notes.append(f"Warm-up: COLD START (--allow-cold): --warmup-days {explicit} is below the "
+                     f"declared need of {need} ({who})")
+    try:  # the router is what checks the modes: an error is a refusal, not a failure after connecting
+        build_router(entries, fills=FILLS, costs=costs, capital=capital, ledger=Ledger())
+    except (CliError, ModeError, ValueError) as exc:
+        raise SessionRefused(f"the algo config cannot be used: {exc}") from exc
+    when = now if now is not None else datetime(today.year, today.month, today.day, 9, 0,
+                                                tzinfo=_NY_ZONE)
+    needed = needed_days(today, sessions)
     try:
-        frames, description, warnings = live_warmup(Path(bars), symbols, today, days)
-    except (FileNotFoundError, ValueError, TypeError) as exc:
-        raise SessionRefused(f"no warm-up can be built from the month files: {exc}") from exc
-    return _Plan(entries, symbols, Path(bars), days, capital, costs, Path(run_out),
+        coverage = check_coverage(Path(bars), symbols, needed, when)
+    except HistoryError as exc:
+        raise SessionRefused(f"the month files cannot be checked: {exc}") from exc
+    will_fetch, preflight_wanted, history_notes, blockers = _history_plan(
+        coverage, Path(bars), today, when, no_fetch, allow_cold)
+    notes.extend(history_notes)
+    cold = list(blockers)
+    if explicit is not None and explicit < need:
+        cold.insert(0, f"--warmup-days {explicit} is below the declared need of {need}")
+    preflight = None
+    if preflight_wanted:
+        try:
+            preflight = live_warmup(Path(bars), symbols, today, sessions)
+        except (FileNotFoundError, ValueError, TypeError) as exc:
+            raise SessionRefused(f"no warm-up can be built from the month files: {exc}") from exc
+    return _Plan(entries, symbols, Path(bars), sessions, capital, costs, Path(run_out),
                  None if stop_file is None else Path(stop_file), minutes,
-                 getattr(args, "code_version", None), today, (frames, description, warnings))
+                 getattr(args, "code_version", None), today, preflight, needs, tuple(needed),
+                 coverage, will_fetch, allow_cold, tuple(notes), tuple(cold))
+
+
+_NY_ZONE = ZoneInfo("America/New_York")
+
+
+def _history_plan(coverage: Coverage, bars: Path, today: date, now: datetime, no_fetch: bool,
+                  allow_cold: bool) -> tuple[bool, bool, list[str], list[str]]:
+    """`(will_fetch, build the warm-up now, console lines, blockers)` for what the coverage found; a
+    `SessionRefused` when the history is incomplete and cannot be completed before the open (module
+    text) unless the owner allowed a cold start."""
+    days = coverage.days
+    names = [s.symbol for s in coverage.symbols]
+    span = f"{len(days)} session(s) {days[0].isoformat()} to {days[-1].isoformat()}" if days else "none"
+    notes: list[str] = []
+    kept = [f"{s.symbol} {d.isoformat()} ({n} bars)" for s in coverage.symbols for d, n in s.partial]
+    if coverage.clean:
+        notes.append(f"History: nothing missing: the month files hold the {span} for "
+                     f"{', '.join(names)}, complete and final; nothing is requested")
+        if kept:
+            notes.append("History: days kept with fewer bars than the session (IB's final answer): "
+                         + ", ".join(kept))
+        return False, True, notes, []
+    todo, blocked = coverage.todo(), coverage.blocked()
+    opening, stamp = open_epoch(today), now.timestamp()
+    seconds = estimate_seconds(coverage.requests) if todo else 0.0
+    blockers: list[str] = []
+    if blocked:
+        blockers.append("a day fetched before 06:00 New York of the day after it is not final before "
+                        "then (history.DAY_FINAL_AT)")
+    if todo and no_fetch:
+        blockers.append(f"--no-fetch: nothing is fetched here; fetch it first with: "
+                        f"{fetch_command(bars, todo)}")
+    elif todo and stamp >= opening:
+        blockers.append("the open (09:30 New York) has passed, so there is no time to fetch it; "
+                        f"fetch it first with: {fetch_command(bars, todo)}")
+    elif todo and stamp + seconds > opening:
+        blockers.append(f"the fetch cannot finish before the open: at least {format_seconds(seconds)} "
+                        f"needed, {format_seconds(opening - stamp)} left; start earlier or fetch it "
+                        f"first with: {fetch_command(bars, todo)}")
+    gaps = coverage.describe_gaps()
+    if blockers and not allow_cold:
+        raise SessionRefused(f"the warm-up history for {span} is incomplete ({gaps}); "
+                             + "; ".join(blockers) + "; or --allow-cold to start with what is stored")
+    will_fetch = bool(todo) and not (no_fetch or stamp >= opening or stamp + seconds > opening)
+    if will_fetch:
+        notes.append(f"History: incomplete: {gaps}; it is fetched after the connection, before the "
+                     f"open ({describe_requests(coverage, seconds)})")
+    if blockers:
+        notes.append(f"History: COLD START (--allow-cold): {'; '.join(blockers)}")
+    if kept:
+        notes.append("History: days kept with fewer bars than the session (IB's final answer): "
+                     + ", ".join(kept))
+    return will_fetch, not will_fetch, notes, blockers
 
 
 def check_algos_importable_quiet(entries: Sequence[Mapping[str, Any]]) -> None:
@@ -433,16 +590,25 @@ class _Session:
     started_server: float = -math.inf  # server time when the engine started
     last_stop_look: float = -math.inf
     watch_over: bool = False
+    # the warm-up from the month files (the plan's, or the one built after the history fetch)
+    warm: tuple[dict[str, pd.DataFrame], dict[str, Any], list[str]] | None = None
+    history: HistoryOutcome | None = None  # the history step's outcome (None: it did not run)
+    cold_notes: list[str] = field(default_factory=list)  # a cold start decided at the connection
 
     def __post_init__(self) -> None:
         self.aligner = LiveBarAligner(self.plan.symbols)
         self.counts = _Counts.new(self.plan.symbols)
         self.warm_today = {s: [] for s in self.plan.symbols}
+        self.warm = self.plan.preflight
 
     # -- the watcher's callbacks ------------------------------------------------------------
 
     def set_watcher(self, watcher: Watcher) -> None:
         self.watcher = watcher
+        if self.history is not None and self.history.elapsed > 0:
+            # the history fetch ran inside the --minutes window: the watch gets what is left of it
+            left = int((self.plan.minutes * 60 - self.history.elapsed) // 60)
+            watcher.minutes = max(1, min(watcher.minutes, left))
 
     def _extra(self) -> Mapping[date, int | None] | None:
         """The market calendar's table of this run (IB's close for today when it differs)."""
@@ -577,9 +743,9 @@ class _Session:
     def _start_engine(self, clock: StreamClock) -> None:
         plan = self.plan
         today = _ny(clock.server_now).date()
-        if today == plan.preflight_day:
-            frames, description, warnings = plan.preflight
-        else:  # the clock of this computer and IB's disagree about the date
+        if today == plan.preflight_day and self.warm is not None:
+            frames, description, warnings = self.warm
+        else:  # the clock of this computer and IB's disagree about the date, or nothing was built yet
             frames, description, warnings = live_warmup(plan.bars_dir, plan.symbols, today,
                                                         plan.warmup_days)
         frames = {s: f.copy() for s, f in frames.items()}
@@ -597,7 +763,8 @@ class _Session:
         self.today = today
         self.started_server = clock.server_now
         self.description = description
-        self.warnings = list(warnings)
+        self.warnings = list(warnings) + [
+            f"cold start (--allow-cold): {why}" for why in (*plan.cold, *self.cold_notes)]
         self.files = tuple(
             (s, str(description["symbols"][s]["data_snapshot_sha256"]),
              int(description["symbols"][s]["data_snapshot_size"])) for s in plan.symbols)
@@ -870,6 +1037,10 @@ def _outcome(session: _Session, watcher_code: int) -> tuple[str, str | None, int
     cause = watcher.end_cause if watcher is not None else ""
     if watcher_code == EXIT_NOT_PAPER:
         return "failed", "not_paper", EXIT_NOT_PAPER
+    history = session.history
+    if watcher is None and history is not None and history.stop is not None:
+        # the history step ended the session before any bar was subscribed: no run was begun
+        return "failed", "history_incomplete", history.stop[0]
     if watcher is None:  # never connected, or refused before the watcher: its code stands
         return "failed", "error", watcher_code
     if cause == "not_trading_day":  # IB's date or hours say the market is closed: nothing was requested
@@ -1082,10 +1253,12 @@ def run_live_session(
     say = _Say(out)
     try:
         today = _ny(wall().timestamp()).date()
-        plan = _plan(args, today)
+        plan = _plan(args, today, wall())
     except SessionRefused as exc:
         say(f"Refused: {exc}")
         return EXIT_REFUSED
+    for line in plan.notes:
+        say(line)
     try:
         close_abandoned_runs(store, wall(), say)
         # the command sets this: stale runs are closed above, so a run still marked running now was
@@ -1111,9 +1284,11 @@ def run_live_session(
     args.minutes = plan.minutes
     with open(os.devnull, "w") as devnull:
         session = _Session(plan, store, clock, wall, say, devnull, sleep)
+        before_watch = _history_hook(plan, session, clock, sleep, wall) if plan.will_fetch else None
         seams = WatchSeams(extra_sinks=(_Sink(session),), listener=session,
                            on_pass=session.on_pass, minutes=plan.minutes,
-                           backfill_since_open=True, on_watcher=session.set_watcher)
+                           backfill_since_open=True, on_watcher=session.set_watcher,
+                           before_watch=before_watch)
         code = EXIT_STOPPED
         try:
             code = run_watch(args, connection_factory=connection_factory,
@@ -1123,6 +1298,37 @@ def run_live_session(
         finally:  # every path: the watcher returned, or something it did not catch got out
             result = _end(session, code, store, say)
         return result
+
+
+def _history_hook(plan: _Plan, session: _Session, clock: Callable[[], float],
+                  sleep: Callable[[float], None], wall: Callable[[], datetime],
+                  ) -> Callable[[Any, Any, Callable[[str], None]], int | None]:
+    """The watcher's `before_watch`: the history step (`live_history.HistoryStep`), then the check
+    that the fetch left something of the `--minutes` window. Returns None to go on, else the exit
+    code of a session that does not start (nothing subscribed, no run begun)."""
+    assert plan.coverage is not None
+
+    def rebuild() -> None:
+        session.warm = live_warmup(plan.bars_dir, plan.symbols, plan.preflight_day, plan.warmup_days)
+
+    step = HistoryStep(
+        bars_dir=plan.bars_dir, symbols=tuple(plan.symbols), days=plan.days, today=plan.preflight_day,
+        coverage=plan.coverage, allow_cold=plan.allow_cold, clock=clock, sleep=sleep, wall=wall,
+        exit_stop=EXIT_FAULT, exit_lost=EXIT_STOPPED, rebuild=rebuild)
+    session.history = step.outcome
+
+    def before_watch(conn: Any, md: Any, say: Callable[[str], None]) -> int | None:
+        code = step(conn, md, say)
+        if code is None and step.outcome.elapsed > plan.minutes * 60 - 60:
+            step.outcome.stop = (EXIT_FAULT, "the --minutes window is used up by the history fetch")
+            say(f"History: STOPPED: the fetch took {format_seconds(step.outcome.elapsed)} and used up "
+                f"the --minutes window ({plan.minutes} min): nothing was traded and no run was stored")
+            return EXIT_FAULT
+        if code is None and step.outcome.cold is not None:
+            session.cold_notes.append(step.outcome.cold)
+        return code
+
+    return before_watch
 
 
 class _Shield:
@@ -1186,7 +1392,11 @@ def _end_run(session: _Session, watcher_code: int, store: Store, say: Callable[[
     status, reason, code = _outcome(session, watcher_code)
     if session.run_id is None:
         shield.call(lambda: close_algo_logs(session.algos))
-        say(f"live: no run was stored ({reason}): nothing was fed")
+        if reason == "history_incomplete":
+            say("live: no run was stored: the session stopped before the open because its history is "
+                f"incomplete; nothing was traded (exit {code})")
+        else:
+            say(f"live: no run was stored ({reason}): nothing was fed")
         return code
     outcome, positions = _finish_run(session, status, reason, say, shield)
     shield.call(lambda: close_algo_logs(session.algos))
@@ -1218,5 +1428,6 @@ def _end_run(session: _Session, watcher_code: int, store: Store, say: Callable[[
 
 
 __all__ = [
-    "DROP_FIELDS", "EXIT_FAULT", "SessionRefused", "close_abandoned_runs", "run_live_session",
+    "DROP_FIELDS", "EXIT_FAULT", "SessionRefused", "algo_needs", "close_abandoned_runs",
+    "run_live_session",
 ]
