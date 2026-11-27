@@ -1,6 +1,6 @@
 """Goldens for the realistic broker (`PaperBroker`), and per-bar consistency checks.
 
-The same cases as `tests/test_golden_backtests.py` (thirteen: the original eight and the five
+The same cases as `tests/test_golden_backtests.py` (fourteen: the original eight and the six
 `fvgzone_*` ones), run through
 `harness.run_paper_backtest` (Engine + PaperBroker + Ledger, default costs:
 commission 0.005/share with a 1.00 minimum, no slippage, capital 10,000).

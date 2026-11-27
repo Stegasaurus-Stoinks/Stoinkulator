@@ -64,6 +64,18 @@ def test_the_parent_algo_needs_no_history():
     ({"vol_slot_mult": 1.5}, 22),
     ({"trend_day_adr": 0.3}, 20),
     ({"trend_day_adr": 0.3, "adr_sessions": 5, "vol_slot_mult": 2, "vol_slot_sessions": 7}, 9),
+    # volume against the previous bars: 20 + 1 zone bars of 5 minutes = 105 minutes, one session;
+    # 80 + 1 bars = 405 minutes: one full day holds 390 and a half day 210, so 2 sessions (2 x 210)
+    ({"vol_prev_mult": 1.5}, 1),
+    ({"vol_prev_mult": 1.5, "vol_prev_bars": 80}, 2),
+    # 21 bars of 60 minutes = 1260 minutes (the ATR alone needs 1200, 4 sessions): 5 sessions
+    ({"zone_minutes": 60, "vol_prev_mult": 1.5}, 5),
+    ({"vol_prev_mult": 0, "vol_prev_bars": 500}, 1),  # off: not counted
+    # the study combinations: C1, C2, C3 (filters_mode does not change the need)
+    ({"vol_slot_mult": 1.5, "trend_day_adr": 0.3}, 22),
+    ({"vol_prev_mult": 1.5, "trend_day_adr": 0.3}, 20),
+    ({"vol_slot_mult": 1.5, "trend_day_adr": 0.5, "filters_mode": "any"}, 22),
+    ({"vol_slot_mult": 1.5, "vol_prev_mult": 1.5, "trend_day_adr": 0.5, "filters_mode": "any"}, 22),
     # the EMA of 1-minute closes, only with the trend filter: 1348 bars for 390, 729 for 211
     ({"trend_ema": 211}, 3),
     ({"trend_ema": 390}, 5),

@@ -82,10 +82,17 @@ CASES = [
         {"idname": "TSLA-fvgzone-htf30", "ticker": "TSLA", "htf_minutes": 30},
         id="fvgzone_tsla_htf30",
     ),
+    # FVGZone volume against the previous bars (issue 293): the middle candle needs 1.5 x the mean of the
+    # 20 zone bars before it (7 of the 14 default trades on the 7 offline days pass).
+    pytest.param(
+        "FVGZone",
+        {"idname": "TSLA-fvgzone-volprev", "ticker": "TSLA", "vol_prev_mult": 1.5},
+        id="fvgzone_tsla_volprev",
+    ),
 ]
 
 
-# The cheap cases (the original four and the five fvgzone ones, the same as the realistic-fill
+# The cheap cases (the original four and the six fvgzone ones, the same as the realistic-fill
 # goldens in test_paper_goldens.py use) stay in the fast suite; FunctionTest and the three
 # Elliot runs, each 7 to 14 s on its own, run
 # with `pytest -m slow`. Their behaviour is also exercised by fast tests on shorter slices:

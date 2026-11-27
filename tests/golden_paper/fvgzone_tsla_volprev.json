@@ -1,0 +1,121 @@
+{
+ "algo": "FVGZone",
+ "capital": "10000.0000",
+ "costs": {
+  "commission_minimum": "1.0000",
+  "commission_per_share": "0.0050",
+  "slippage_per_share": "0.0000"
+ },
+ "equity_points": 2340,
+ "equity_sha256": "2297e30b833cfab10e1fcecca27d9c19b2152b909eef74c8ede60566c541f688",
+ "idname": "TSLA-fvgzone-volprev",
+ "summary": {
+  "cancelled_entries": 0,
+  "commission": "14.0000",
+  "final_equity": "10131.4500",
+  "ignored_events": {
+   "close": 0,
+   "modify_stop": 0,
+   "take_profit": 0
+  },
+  "max_drawdown": "219.7400",
+  "net": "131.4500",
+  "synthetic_closes": 0,
+  "trade_count": 7,
+  "wins": 3
+ },
+ "ticker": "TSLA",
+ "trades": [
+  {
+   "commission": "2.0000",
+   "entry_price": "217.2800",
+   "entry_time": "2024-08-19 09:55:00",
+   "exit_price": "220.1400",
+   "exit_reason": "target",
+   "exit_time": "2024-08-19 10:13:00",
+   "gross": "100.1000",
+   "net": "98.1000",
+   "quantity": "35.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "220.2800",
+   "entry_time": "2024-08-19 10:22:00",
+   "exit_price": "219.1200",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-19 11:17:00",
+   "gross": "-48.7200",
+   "net": "-50.7200",
+   "quantity": "42.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "222.3400",
+   "entry_time": "2024-08-19 15:01:00",
+   "exit_price": "221.9600",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-19 15:02:00",
+   "gross": "-49.7800",
+   "net": "-51.7800",
+   "quantity": "131.0000",
+   "side": "long",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "221.4300",
+   "entry_time": "2024-08-20 14:53:00",
+   "exit_price": "221.6400",
+   "exit_reason": "algo_exit",
+   "exit_time": "2024-08-20 15:56:00",
+   "gross": "-9.2400",
+   "net": "-11.2400",
+   "quantity": "44.0000",
+   "side": "short",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "221.4700",
+   "entry_time": "2024-08-21 10:12:00",
+   "exit_price": "219.3500",
+   "exit_reason": "target",
+   "exit_time": "2024-08-21 10:15:00",
+   "gross": "101.7600",
+   "net": "99.7600",
+   "quantity": "48.0000",
+   "side": "short",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "213.9300",
+   "entry_time": "2024-08-26 10:27:00",
+   "exit_price": "212.5800",
+   "exit_reason": "target",
+   "exit_time": "2024-08-26 10:31:00",
+   "gross": "101.2500",
+   "net": "99.2500",
+   "quantity": "75.0000",
+   "side": "short",
+   "synthetic": false
+  },
+  {
+   "commission": "2.0000",
+   "entry_price": "211.4700",
+   "entry_time": "2024-08-26 13:58:00",
+   "exit_price": "212.1100",
+   "exit_reason": "stop",
+   "exit_time": "2024-08-26 14:20:00",
+   "gross": "-49.9200",
+   "net": "-51.9200",
+   "quantity": "78.0000",
+   "side": "short",
+   "synthetic": false
+  }
+ ]
+}

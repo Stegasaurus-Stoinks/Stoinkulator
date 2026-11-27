@@ -33,6 +33,7 @@ from MainStoinker.engine.market_calendar import session as market_session
 from MainStoinker.indicators.fvg import Direction, FvgConfig, FvgDetector
 from MainStoinker.indicators.session import DailyRange, SlotVolume
 from MainStoinker.indicators.trend import TrendConfig, TrendIndicator
+from MainStoinker.indicators.volume import PrevBarsVolume
 
 SESSION_OPEN_MINUTE = 9 * 60 + 30  # 09:30
 SESSION_MINUTES = 390  # 09:30 to 16:00
@@ -65,7 +66,12 @@ DEFAULTS: dict[str, Any] = {
     "vol_slot_sessions": 20,
     "trend_day_adr": 0,
     "adr_sessions": 20,
+    "vol_prev_mult": 0,
+    "vol_prev_bars": 20,
+    "filters_mode": "all",
 }
+
+FILTERS_MODES = ("all", "any")
 
 # Series for the dashboard: (column, draw type). 'line' is drawn smooth, 'segment' stepped.
 # `HTF_SERIES` is added after these, per instance, only when `htf_minutes` is on, so an
@@ -159,12 +165,13 @@ def _cent_ticks(price: float) -> int:
 class _Bucket:
     """The higher-timeframe bar being built (all prices in cents)."""
 
-    __slots__ = ("index", "label", "open", "high", "low", "close", "count")
+    __slots__ = ("index", "label", "open", "high", "low", "close", "count", "volume")
 
-    def __init__(self, index: int, label: datetime, o: int, h: int, lo: int, c: int) -> None:
+    def __init__(self, index: int, label: datetime, o: int, h: int, lo: int, c: int, v: int) -> None:
         self.index, self.label = index, label
         self.open, self.high, self.low, self.close = o, h, lo, c
         self.count = 1
+        self.volume = v
 
 
 class Algo(ParentAlgo):
@@ -228,11 +235,26 @@ class Algo(ParentAlgo):
         if self.trend_day_adr < 0:
             raise _fail(who, f"trend_day_adr must be >= 0 (0 is off), got {cfg.get('trend_day_adr')!r}")
         self.adr_sessions = _integer(who, cfg, "adr_sessions", 1)
-        # Both stay None when off, so an algo without the filters does no extra work per bar.
+        self.vol_prev_mult = _number(who, cfg, "vol_prev_mult")
+        if self.vol_prev_mult < 0:
+            raise _fail(who, f"vol_prev_mult must be >= 0 (0 is off), got {cfg.get('vol_prev_mult')!r}")
+        self.vol_prev_bars = _integer(who, cfg, "vol_prev_bars", 1)
+        filters_mode = cfg.get("filters_mode", DEFAULTS["filters_mode"])
+        if filters_mode not in FILTERS_MODES:  # also a non-string (a list or a number)
+            raise _fail(who, f"filters_mode must be one of {list(FILTERS_MODES)}, got {filters_mode!r}")
+        self.filters_mode = filters_mode
+        on = sum(1 for value in (self.vol_slot_mult, self.vol_prev_mult, self.trend_day_adr) if value > 0)
+        if self.filters_mode == "any" and on < 2:
+            raise _fail(who, "filters_mode 'any' needs at least two of vol_slot_mult, vol_prev_mult and "
+                             f"trend_day_adr to be on (above 0), {on} are on")
+        # All stay None when off, so an algo without the filters does no extra work per bar.
         self._slot_volume: SlotVolume | None = None
+        self._prev_volume: PrevBarsVolume | None = None
         self._daily_range: DailyRange | None = None
         if self.vol_slot_mult > 0:
             self._slot_volume = SlotVolume(self.zone_minutes, self.vol_slot_sessions)
+        if self.vol_prev_mult > 0:
+            self._prev_volume = PrevBarsVolume(self.vol_prev_bars)
         if self.trend_day_adr > 0:
             self._daily_range = DailyRange(self.adr_sessions)
 
@@ -273,7 +295,11 @@ class Algo(ParentAlgo):
         - `htf_minutes`: `max(htf_ema, k)` higher-timeframe bars;
         - `vol_slot_mult` > 0: `vol_slot_sessions` earlier sessions plus 2 of margin (a half
           day has no afternoon slot, and two can fall in the window);
+        - `vol_prev_mult` > 0: `vol_prev_bars + 1` zone-timeframe bars (the bars before the zone's
+          middle candle, and that candle), counted across sessions;
         - `trend_day_adr` > 0: `adr_sessions` earlier sessions.
+
+        `filters_mode` does not change it: with "any" any one of the filters may be the one that passes.
         """
         needs = [self._sessions_for(self._atr_window * self.zone_minutes, SESSION_MINUTES,
                                     HALF_SESSION_MINUTES)]
@@ -286,6 +312,9 @@ class Algo(ParentAlgo):
                 HALF_SESSION_MINUTES // self.htf_minutes))
         if self.vol_slot_mult > 0:
             needs.append(self.vol_slot_sessions + 2)
+        if self.vol_prev_mult > 0:
+            needs.append(self._sessions_for((self.vol_prev_bars + 1) * self.zone_minutes, SESSION_MINUTES,
+                                            HALF_SESSION_MINUTES))
         if self.trend_day_adr > 0:
             needs.append(self.adr_sessions)
         return max(needs)
@@ -426,7 +455,7 @@ class Algo(ParentAlgo):
         self._vwap_num += volume * (h_t + l_t + c_t)
         self._vwap_den += 3 * volume
 
-        self._add_to_bucket(when, offset, o_t, h_t, l_t, c_t)
+        self._add_to_bucket(when, offset, o_t, h_t, l_t, c_t, volume)
         htf = self._htf
         if htf is not None:
             htf.update(when, o, h, lo, c)  # completed higher-timeframe bars only: no look-ahead
@@ -478,7 +507,8 @@ class Algo(ParentAlgo):
 
     # ----- higher-timeframe bars and the detector -----
 
-    def _add_to_bucket(self, when: datetime, offset: int, o: int, h: int, lo: int, c: int) -> None:
+    def _add_to_bucket(self, when: datetime, offset: int, o: int, h: int, lo: int, c: int,
+                       volume: int) -> None:
         m = self.zone_minutes
         index = offset // m
         bucket = self._bucket
@@ -487,18 +517,21 @@ class Algo(ParentAlgo):
             bucket = self._bucket = None
         if bucket is None:
             label = when - timedelta(minutes=offset % m)
-            bucket = self._bucket = _Bucket(index, label, o, h, lo, c)
+            bucket = self._bucket = _Bucket(index, label, o, h, lo, c, volume)
         else:
             bucket.high = max(bucket.high, h)
             bucket.low = min(bucket.low, lo)
             bucket.close = c
             bucket.count += 1
+            bucket.volume += volume
         if bucket.count == m:  # every minute present: complete now, no need to wait
             self._feed(bucket)
             self._bucket = None
 
     def _feed(self, b: _Bucket) -> None:
         self._det.update(b.label, b.open / _TICK, b.high / _TICK, b.low / _TICK, b.close / _TICK)
+        if self._prev_volume is not None:
+            self._prev_volume.update(b.label, b.volume)  # completed bars only, in order
         prev = self._prev_htf_close
         tr = b.high - b.low if prev is None else max(b.high - b.low, abs(b.high - prev), abs(b.low - prev))
         if len(self._tr) == self._atr_window:
@@ -549,23 +582,37 @@ class Algo(ParentAlgo):
             return  # the newest qualifying zone wins, even if its setup is then skipped
 
     def _session_filters_ok(self, zone: Any, c_t: int) -> bool:
-        """The volume-by-slot and trend-day filters for a retest of `zone` closing at `c_t`.
+        """The volume-by-slot, volume-against-previous-bars and trend-day filters for a retest of
+        `zone` closing at `c_t`.
 
-        Each is off at 0. An answer that is not known (history not warm, no 09:30 bar) blocks.
+        Each is off at 0. A filter that is on answers True (passed), False (failed) or None (not
+        known: history not warm, no 09:30 bar), and None counts as not passed. `filters_mode` "all":
+        every filter that is on must pass; "any": at least one must (construction guarantees that
+        two are on). Filters that are off are not asked.
         """
-        slot_volume = self._slot_volume
-        if slot_volume is not None and not slot_volume.at_least(zone.candle_times[1], self.vol_slot_mult):
+        mid = zone.candle_times[1]
+        slot_volume, prev_volume, daily = self._slot_volume, self._prev_volume, self._daily_range
+        if self.filters_mode == "any":
+            return (
+                (slot_volume is not None and slot_volume.at_least(mid, self.vol_slot_mult) is True)
+                or (prev_volume is not None and prev_volume.at_least(mid, self.vol_prev_mult) is True)
+                or (daily is not None and self._trend_day(zone, c_t) is True)
+            )
+        if slot_volume is not None and not slot_volume.at_least(mid, self.vol_slot_mult):
             return False  # False or None (not available): blocked
+        if prev_volume is not None and not prev_volume.at_least(mid, self.vol_prev_mult):
+            return False
+        return daily is None or bool(self._trend_day(zone, c_t))
+
+    def _trend_day(self, zone: Any, c_t: int) -> bool | None:
+        """The trend-day filter (on): the signed move from the session open against the ADR, or None."""
         daily = self._daily_range
-        if daily is not None:
-            session_open = daily.session_open
-            if session_open is None:
-                return False
-            distance = c_t - session_open
-            signed = distance if zone.direction is Direction.UP else -distance
-            if not daily.distance_at_least(signed, self.trend_day_adr):
-                return False
-        return True
+        session_open = daily.session_open if daily is not None else None
+        if daily is None or session_open is None:
+            return None
+        distance = c_t - session_open
+        signed = distance if zone.direction is Direction.UP else -distance
+        return daily.distance_at_least(signed, self.trend_day_adr)
 
     def _trend_ok(self, c_t: int, *, long: bool) -> bool:
         if not self.trend_filter:

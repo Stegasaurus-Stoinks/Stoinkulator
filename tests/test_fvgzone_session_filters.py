@@ -194,3 +194,167 @@ def test_defaults():
 def test_bad_parameters_fail_at_construction(bad):
     with pytest.raises(ValueError, match="FVGZone 't'"):
         load_algo("FVGZone", {"idname": "t", "ticker": "AAPL", **bad})
+
+
+# ----- volume against the previous bars (issue 293) -----
+
+# zone bars of 1 minute: the 28 bars before the middle candle (09:58) are quiet at 1000 shares, so the
+# mean of the previous 20 is 1000 with no history day at all
+PREV = {**BASE, "vol_prev_mult": 1.5, "vol_prev_bars": 20}
+
+
+def test_prev_volume_allowed_at_the_multiple_and_blocked_below_it():
+    assert taken(Rig(**PREV).feed(day_bars(D3, 1500)))  # 1500 >= 1.5 x 1000: equal is allowed
+    assert taken(Rig(**PREV).feed(day_bars(D3, 4000)))
+    low = Rig(**PREV).feed(day_bars(D3, 1499))
+    assert low.trades == []
+    assert low.algo._traded == set()  # blocked: the zone is not used up
+
+
+def test_prev_volume_short_side():
+    assert taken(Rig(**PREV).feed(mirror(day_bars(D3, 1500))))
+    assert Rig(**PREV).feed(mirror(day_bars(D3, 1499))).trades == []
+
+
+def test_prev_volume_mean_is_of_the_bars_before_the_middle_candle_only():
+    day = day_bars(D3, 1500)
+
+    def with_volume(volume: int, keep) -> list[B]:
+        return [B(x.at, x.o, x.h, x.l, x.c, volume) if keep(x.at) else x for x in day]
+
+    # a busy 09:57 bar (just before the middle candle) is in the mean: (19 * 1000 + 20000) / 20 = 1950
+    assert Rig(**PREV).feed(with_volume(20_000, lambda t: t == stamp(D3, "09:57"))).trades == []
+    # busy bars after the middle candle are not
+    assert taken(Rig(**PREV).feed(with_volume(90_000, lambda t: t >= stamp(D3, "09:59"))))
+    # 09:37 is the 21st bar before 09:58: outside the 20
+    assert taken(Rig(**PREV).feed(with_volume(90_000, lambda t: t == stamp(D3, "09:37"))))
+    # 09:38 is the 20th: inside
+    assert Rig(**PREV).feed(with_volume(90_000, lambda t: t == stamp(D3, "09:38"))).trades == []
+
+
+def test_prev_volume_not_enough_earlier_bars_is_blocked():
+    rig = Rig(**{**PREV, "vol_prev_bars": 29}).feed(day_bars(D3, 100_000))  # 28 precede the middle candle
+    assert rig.trades == [] and rig.algo._traded == set()
+    assert taken(Rig(**{**PREV, "vol_prev_bars": 28}).feed(day_bars(D3, 100_000)))
+
+
+def test_prev_volume_bars_are_counted_across_the_session_boundary():
+    cfg = {**PREV, "vol_prev_bars": 30}  # 28 bars today, so 2 come from the day before
+    quiet_day = day_bars(D2)
+    assert taken(Rig(**cfg).feed([*quiet_day, *day_bars(D3, 1500)]))
+    assert Rig(**cfg).feed([*quiet_day, *day_bars(D3, 1499)]).trades == []
+    # the last two bars of the day before are busy: the mean is (28 * 1000 + 2 * 31000) / 30 = 3000,
+    # so 1.5 x it is 4500
+    busy = [B(x.at, x.o, x.h, x.l, x.c, 31_000) if x.at >= stamp(D2, "09:59") else x for x in quiet_day]
+    assert Rig(**cfg).feed([*busy, *day_bars(D3, 4499)]).trades == []
+    assert taken(Rig(**cfg).feed([*busy, *day_bars(D3, 4500)]))
+    # with no day before, 30 bars are not there: blocked
+    assert Rig(**cfg).feed(day_bars(D3, 100_000)).trades == []
+
+
+def test_prev_volume_works_from_a_warm_up_frame():
+    rig = Rig(**PREV)
+    for x in [*day_bars(D2), *day_bars(D3, 1500)]:  # appended without update: one update sees all
+        rig.store.append(Bar(x.at, int(x.at.timestamp()), x.o, x.h, x.l, x.c, x.v))
+    rig.algo.update(rig.store.view())
+    assert taken(rig)
+
+
+def test_prev_volume_counts_zone_bars_not_minutes():
+    # 5-minute zone bars: the indicator is fed one volume per COMPLETED zone bar (the sum of its minutes)
+    rig = Rig(zone_minutes=5, trend_filter=False, vol_prev_mult=1.5, vol_prev_bars=3)
+    rig.feed(run_of(D1, "09:30", quiet(15, vol=100)))  # three zone bars of 500 shares
+    ind = rig.algo._prev_volume
+    assert [ind.volume(stamp(D1, t)) for t in ("09:30", "09:35", "09:40")] == [500, 500, 500]
+    assert ind.mean(stamp(D1, "09:40")) is None  # only two zone bars before it
+    rig.feed(run_of(D1, "09:45", quiet(5, vol=900)))
+    assert ind.volume(stamp(D1, "09:45")) == 4500 and ind.mean(stamp(D1, "09:45")) == 500.0
+
+
+# ----- filters_mode -----
+
+ANY = {"filters_mode": "any"}
+
+
+def test_any_passes_when_one_filter_passes():
+    both = {**VOL, **ADR, **ANY}
+    assert taken(run(both, day_bars(D3, 1500)))  # both pass
+    assert taken(run({**both, "trend_day_adr": 0.5626}, day_bars(D3, 1500)))  # volume only
+    assert taken(run(both, day_bars(D3, 1499)))  # trend day only
+    assert taken(run(both, day_bars(D3, 1499), flip=True))
+
+
+def test_any_with_none_passing_blocks_and_leaves_the_zone_unused():
+    rig = run({**VOL, **ADR, **ANY, "trend_day_adr": 0.5626}, day_bars(D3, 1499))
+    assert rig.trades == [] and rig.algo._traded == set()
+
+
+def test_any_a_filter_that_is_not_ready_counts_as_not_passed():
+    # one history day: the slot mean and the ADR (2 sessions each) are both not ready
+    assert run({**VOL, **ADR, **ANY}, day_bars(D3, 100_000), day_bars(D2)).trades == []
+    # the previous-bars volume is ready without history: it alone decides under "any"
+    mixed = {**VOL, **PREV, **ANY}
+    assert taken(run(mixed, day_bars(D3, 1500), day_bars(D2)))
+    assert run(mixed, day_bars(D3, 1499), day_bars(D2)).trades == []
+    # all three not ready (80 bars are never there): blocked
+    cold = {**VOL, **PREV, **ANY, "vol_prev_bars": 80}
+    assert run(cold, day_bars(D3, 100_000), day_bars(D2)).trades == []
+
+
+def test_all_is_the_default_and_a_not_ready_filter_blocks_it():
+    mixed = {**VOL, **PREV}
+    assert run(mixed, day_bars(D3, 100_000), day_bars(D2)).trades == []  # the slot mean is not ready
+    assert taken(run({**mixed, "filters_mode": "all"}, day_bars(D3, 1500)))  # warm: both pass
+    assert run(mixed, day_bars(D3, 1499)).trades == []
+
+
+def test_any_trend_day_without_a_0930_bar_does_not_pass():
+    cfg = {**PREV, **ADR, **ANY}
+    # no session open: the trend day cannot pass; the volume fails here and passes below
+    assert Rig(**cfg).feed([*history(), *day_bars(D3, 1499)[1:]]).trades == []
+    assert taken(Rig(**cfg).feed([*history(), *day_bars(D3, 1500)[1:]]))  # volume passes
+
+
+def test_any_with_three_filters():
+    three = {**VOL, **PREV, **ADR, **ANY, "trend_day_adr": 0.5626}
+    assert taken(run(three, day_bars(D3, 1500)))
+    assert run(three, day_bars(D3, 1499)).trades == []
+
+
+def test_new_keys_off_by_default():
+    algo = load_algo("FVGZone", {"idname": "t", "ticker": "AAPL"})
+    assert (algo.vol_prev_mult, algo.vol_prev_bars, algo.filters_mode) == (0, 20, "all")
+    assert algo._prev_volume is None
+    on = load_algo("FVGZone", {"idname": "t", "ticker": "AAPL", "vol_prev_mult": "1.5", "vol_prev_bars": 12})
+    assert (on.vol_prev_mult, on.vol_prev_bars) == (1.5, 12)
+    assert on._prev_volume.bars == 12
+    plain = Rig(**BASE).feed(day_bars(D1))
+    explicit = Rig(**BASE, vol_prev_mult=0, vol_prev_bars=7, filters_mode="all").feed(day_bars(D1))
+    assert explicit.algo._prev_volume is None
+    assert summary(plain.trades[0]) == summary(explicit.trades[0])
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"vol_prev_mult": -1}, {"vol_prev_mult": "x"}, {"vol_prev_mult": True}, {"vol_prev_mult": float("nan")},
+     {"vol_prev_mult": None}, {"vol_prev_bars": 0}, {"vol_prev_bars": 2.5}, {"vol_prev_bars": "x"},
+     {"vol_prev_bars": True}, {"filters_mode": "ANY"}, {"filters_mode": ""}, {"filters_mode": None},
+     {"filters_mode": 1}, {"filters_mode": True}, {"filters_mode": ["all"]},
+     # "any" needs at least two session filters on
+     {"filters_mode": "any"}, {"filters_mode": "any", "vol_slot_mult": 1.5},
+     {"filters_mode": "any", "vol_prev_mult": 1.5}, {"filters_mode": "any", "trend_day_adr": 0.3},
+     {"filters_mode": "any", "vol_slot_mult": 0, "vol_prev_mult": 0, "trend_day_adr": 0.3}],
+    ids=lambda d: ",".join(f"{k}={v}" for k, v in d.items()),
+)
+def test_bad_new_parameters_fail_at_construction(bad):
+    with pytest.raises(ValueError, match="FVGZone 't'"):
+        load_algo("FVGZone", {"idname": "t", "ticker": "AAPL", **bad})
+
+
+@pytest.mark.parametrize("on", [
+    {"vol_slot_mult": 1.5, "vol_prev_mult": 1.5}, {"vol_slot_mult": 1.5, "trend_day_adr": 0.3},
+    {"vol_prev_mult": 1.5, "trend_day_adr": 0.3},
+    {"vol_slot_mult": 1.5, "vol_prev_mult": 1.5, "trend_day_adr": 0.3}])
+def test_any_is_accepted_with_two_or_three_filters_on(on):
+    algo = load_algo("FVGZone", {"idname": "t", "ticker": "AAPL", "filters_mode": "any", **on})
+    assert algo.filters_mode == "any"

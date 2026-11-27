@@ -202,3 +202,21 @@ after the previous one, a bad `sessions`) raises `ValueError`. Work per bar is c
   `sessions` completed sessions, None until `ready`), `range_sum`, `sessions_seen`, and
   `distance_at_least(distance, multiple)` = distance >= multiple x ADR, exact (None until ready; the caller signs
   the distance for the side).
+
+## Volume against the previous bars: `MainStoinker/indicators/volume.py`
+
+A bar's volume against the mean of the N bars before it, for bars of any timeframe; used by FVGZone's
+`vol_prev_mult` rule (`docs/algos-fvgzone.md`) and usable by any other algo. Feed COMPLETED bars oldest first.
+
+- `PrevBarsVolume(bars=20).update(time, volume)`, once per completed bar (time = bar start). The `bars` bars
+  before a bar are counted straight through the session boundary (no reset at the open, like an ATR); the bar
+  itself and later bars are never in its mean, so nothing after a bar can change its answer (fixed when the bar
+  is fed). Until `bars` earlier bars exist every query says None.
+- Queries, for a bar of the CURRENT date (`start` is a datetime or a minute of day; a datetime of another date,
+  or a bar not fed yet, says None): `volume(start)`, `mean(start)` (the mean of the `bars` bars before it),
+  `relative_volume(start)` (None if unavailable or the mean is 0) and `at_least(start, multiple)` = volume >=
+  multiple x mean by exact cross-multiplication (`volume * bars >= multiple * sum`, the multiple read as the
+  decimal it is written as; None if unavailable).
+- Bad input (a negative, NaN or inf volume, a time not after the previous bar, a bad `bars` or `multiple`)
+  raises `ValueError`. Work per bar is constant; memory is the last `bars` volumes plus one entry per bar of the
+  current date.

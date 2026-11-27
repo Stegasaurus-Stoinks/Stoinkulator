@@ -46,6 +46,9 @@ given as JSON numbers or numeric strings (like the other algos).
 | `vol_slot_sessions` | 20 | sessions in the slot mean (1 or more) |
 | `trend_day_adr` | 0 | trend-day filter: 0 is off; above 0 an entry needs the move from the session open, in the side's direction, to be at least this multiple of the ADR (0 or more) |
 | `adr_sessions` | 20 | sessions in the ADR (1 or more) |
+| `vol_prev_mult` | 0 | volume-against-the-previous-bars filter: 0 is off; above 0 the zone's middle candle needs a volume of at least this multiple of the mean volume of the `vol_prev_bars` zone bars before it (0 or more) |
+| `vol_prev_bars` | 20 | zone-timeframe bars in that mean (1 or more) |
+| `filters_mode` | `"all"` | `"all"`: every session filter that is on must pass; `"any"`: at least one must (needs at least two of `vol_slot_mult`, `vol_prev_mult`, `trend_day_adr` on, else the algo refuses to start) |
 
 Times are bar labels (the bar START, naive New York time, as in the data). Required, for a
 full day: `09:30 <= first_entry <= last_entry < flat_time`.
@@ -125,10 +128,32 @@ the mean of high minus low over the previous `adr_sessions` sessions (a session 
 With D = the entry bar's close minus the session open, an entry needs D, signed for the side (a long needs D,
 a short needs -D), to be at least `trend_day_adr` times the ADR, exactly as above. Blocks while fewer than
 `adr_sessions` sessions have completed, and on a day whose first bar is later than 09:30 (no session open).
-Both filters are independent of each other (when both are on, both must pass), of `trend_filter` and of
+Both filters are independent of each other (when both are on, both must pass under `filters_mode` "all",
+the default; see below for "any"), of `trend_filter` and of
 `htf_minutes`. A retest blocked by either is handled like one blocked by `trend_filter`: nothing is sent, the
 zone is NOT used up and may be retested later, and nothing is put in `algo.skipped`. They reproduce the
 research variants V2b and T4b (`vol_slot_mult` 1.5 and `trend_day_adr` 0.3 are the values studied).
+
+**Volume against the previous bars** (`vol_prev_mult` above 0; off by default, same guarantee: every golden file
+is unchanged). `MainStoinker.indicators.volume.PrevBarsVolume` (see `docs/indicators.md`) is fed the volume of
+every COMPLETED zone-timeframe bar (the sum of its minutes). A zone may be traded only if the volume of its
+MIDDLE candle is at least `vol_prev_mult` times the mean volume of the `vol_prev_bars` zone bars immediately
+before it: `volume * bars >= mult * sum of the previous bars`, in exact arithmetic. The bars are counted straight
+through the session boundary (no reset at the open, like the ATR), so the mean of the opening candles
+reaches into the day before. Fewer than `vol_prev_bars` earlier bars blocks. This is research variant V2a
+(`vol_prev_mult` 1.5 with 20 bars is the value studied).
+
+**Session filters together: `filters_mode`.** The session filters are `vol_slot_mult`, `vol_prev_mult` and
+`trend_day_adr`; `trend_filter` and `htf_minutes` are not part of this and always apply. With `"all"` (the
+default, and the only behaviour before) every session filter that is on must pass. With `"any"` at least one of
+the session filters that is on must pass; a filter that is not ready (no history, no 09:30 bar) counts as not
+passed, so with everything not ready the entry is blocked. `"any"` with fewer than two session filters on is
+refused at construction (it would be `"all"` with one filter, or no filter at all). A blocked retest is
+handled as above (the zone is not used up). With these the study combinations are: C1 = `vol_slot_mult` 1.5 and
+`trend_day_adr` 0.3 (V2b AND T4b), C2 = `vol_prev_mult` 1.5 and `trend_day_adr` 0.3 (V2a AND T4b), C3 =
+`vol_slot_mult` 1.5 and `trend_day_adr` 0.5 with `filters_mode` `"any"` (V2b OR T4a). On the owner's bars 2025-11
+to 2026-06 (entries 2025-12-23 to 2026-06-30, realistic fills, capital 10,000) the algo's trades equal the
+research lists trade for trade: 238, 148 and 498 trades.
 
 **Entry, long** (short is the exact mirror, all in integer cents): a usable up zone is
 retested by a 1-minute bar with `low <= zone top` that CLOSES above the zone top. The
@@ -184,7 +209,8 @@ over days, so a longer history gives a steadier EMA). Until then it blocks every
 days of month-file bars (default 2, about 780 bars, enough for the defaults; see `docs/live-data.md`); for a
 longer trend ask for more days, or the algo does not trade until the live session has filled the gap.
 
-The two session filters need history too: `vol_slot_sessions` earlier sessions that have the zone's slot and
+The volume-against-the-previous-bars rule needs only `vol_prev_bars` zone bars before the middle candle (bars of
+the warm-up count, across sessions), which a day or two of warm-up gives. The filters `vol_slot_mult` and `trend_day_adr` need history too: `vol_slot_sessions` earlier sessions that have the zone's slot and
 `adr_sessions` completed earlier sessions (20 each by default), and until then they block every entry. The
 history comes from the same frame: the sessions of the warm-up bars count, and the last one joins when the next
 session's first bar arrives. `run` loads only 2 warm-up days by default, so with these filters on (defaults)
@@ -212,6 +238,7 @@ Thanksgiving and Christmas Eve):
 | EMA of the 1-minute closes | `trend_filter` | the larger of `trend_ema` bars (what the algo needs to call it ready) and the bars after which the EMA's start value weighs at most 0.1% |
 | higher-timeframe EMA | `htf_minutes` > 0 | the same rule in higher-timeframe bars (390 // `htf_minutes` per full session, 210 // `htf_minutes` per half day) |
 | volume by slot | `vol_slot_mult` > 0 | `vol_slot_sessions + 2` sessions (the 2 for half days: they have no afternoon slot) |
+| volume against the previous bars | `vol_prev_mult` > 0 | `(vol_prev_bars + 1) * zone_minutes` minutes of bars (the bars before the zone's middle candle, and that candle), as sessions by the ATR rule: 1 for the defaults |
 | trend-day filter | `trend_day_adr` > 0 | `adr_sessions` sessions |
 
 The 0.1% rule: an EMA of length `n` has `alpha = 2 / (n + 1)`, and after `k` bars the start value
@@ -220,7 +247,9 @@ weighs `(1 - alpha)^k`; `k` is the smallest count with `(1 - alpha)^k <= 0.001`.
 
 So the defaults need 1 session (173 EMA bars and 100 minutes of ATR fit in a half day's 210 bars),
 `htf_minutes` 30 needs 7 (70 buckets: 5 full sessions of 13 and 2 half days of 7 hold 79, 6 sessions
-only 66), and `vol_slot_mult` 1.5 with `trend_day_adr` 0.3 needs 22 (20 + 2). "Ready" is still what the
+only 66), and `vol_slot_mult` 1.5 with `trend_day_adr` 0.3 needs 22 (20 + 2). The study combinations: C1
+(`vol_slot_mult` and `trend_day_adr`) 22, C2 (`vol_prev_mult` and `trend_day_adr`) 20, C3 (`vol_slot_mult`
+and `trend_day_adr` with `filters_mode` `"any"`) 22; `filters_mode` does not change the need. "Ready" is still what the
 algo itself checks (bar and session counts); the 0.1% rule only widens the window for the two EMAs.
 Even so, any EMA still depends slightly on where its history began: at the first tradable bar the
 start value weighs at most 0.1%, so a result can differ from a longer history's by at most 0.1% of the
