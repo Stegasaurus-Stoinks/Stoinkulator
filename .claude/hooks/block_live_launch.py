@@ -99,6 +99,14 @@ and guarded options, and in addition: ``--minutes`` exactly once with 1 to 3 pla
 if given; ``--help`` and every prefix of it, and any token that contains ``--order`` (the stage 3
 order option, in any spelling, case, abbreviation or ``=`` form; also as a value) refused
 outright; ``run`` has no positional argument, so every token is an option or its value.
+Issue 292: the options are an ALLOWLIST, and nothing else is allowed: ``--algos V``,
+``--bars V``, ``--db V``, ``--minutes N``, ``--paper``, ``--no-prompt``, ``--fills realistic`` and
+``--stop-file V`` (each at most once; the first six exactly once; ``V`` an explicit value that does
+not start with ``-``; ``--name=value`` for the valued ones only). Every other token is refused: any
+other option (``--allow-cold``, ``--no-fetch``, ``--warmup-days``, ``--no-record``, ``--out``,
+``--capital``, ``--port``, ``--host``, ``--record``, ...) in any spelling, letter case, ``=`` form
+or abbreviation, any single-dash form, any stray word. The walk (``_paper_run_allowlist``) never
+treats an unknown flag as taking a value, so it cannot swallow the token after it.
 ``--minutes``, ``--algos``, ``--bars``, ``--db``, ``--fills``, ``--orders`` and
 ``--help`` join the guarded names for this form (no abbreviation, no other spelling). The
 neutral re-judgement replaces ``run`` by ``backtest``, like the other subcommand words. ``run``
@@ -616,7 +624,7 @@ _CONNECT_MESSAGE = (
     "watcher is the same with -P -m MainStoinker.ib.watch_bars <args> and --minutes N "
     "(1 to 3 digits) as well; the unattended paper session is -P -m MainStoinker run "
     "--algos F --bars D --db F --minutes N (each once, explicit; no --orders, no --help; "
-    "--fills only realistic). A "
+    "--fills only realistic, --stop-file F optional; no other option at all). A "
     "drive-absolute path ending in .venv\\Scripts\\python.exe also works, in double "
     "quotes if it has spaces. No ; && || | & ` $ % < > ( ) quotes other than \", newline, cd, "
     "variable assignment or wrapper (start, cmd /c, powershell -c, bash -c) may appear, "
@@ -1261,7 +1269,14 @@ _PAPER_WATCHER_GUARDED = ("--minutes",)
 _PAPER_RUN_GUARDED = ("--minutes", "--algos", "--bars", "--db", "--fills", "--orders", "--help")
 _PAPER_RUN_REQUIRED = ("--algos", "--bars", "--db")
 _PAPER_RUN_FILLS = "realistic"
-_PAPER_RUN_NO_VALUE = frozenset({"--paper", "--no-prompt", "--no-record"})  # ``run`` flags without a value
+# The option allowlist of the ``run`` form (issue 292): these and NOTHING else. Exact, case-sensitive
+# names; a flag takes no value and no ``=``; a valued option takes the next token or ``--name=value``
+# (a value never starts with ``-``); each at most once, and the first six exactly once.
+_PAPER_RUN_FLAGS = frozenset({"--paper", "--no-prompt"})
+_PAPER_RUN_VALUED = frozenset(
+    {"--algos", "--bars", "--db", "--minutes", "--fills", "--stop-file"}
+)
+_PAPER_RUN_ONCE = ("--algos", "--bars", "--db", "--minutes", "--paper", "--no-prompt")
 _PAPER_RUN_ORDER_WORD = "--order"
 _PAPER_TOKEN_RE = re.compile(_PAPER_TOKEN)
 # The interpreter: the project venv, written relative (``.venv\Scripts\python.exe``) or as
@@ -1369,27 +1384,54 @@ def _paper_match(command: str) -> re.Match[str] | None:
         # itself refuses 0 and anything over 420)
         if len(minutes) != 1 or minutes[0] is None or not _PAPER_MINUTES_VALUE.fullmatch(minutes[0]):
             return None
-    if run and not (_paper_run_options_ok(run_values) and _paper_run_no_positional(tokens)):
+    if run and not (_paper_run_options_ok(run_values) and _paper_run_allowlist(tokens)):
         return None
     return m
 
 
-def _paper_run_no_positional(tokens: list[str]) -> bool:
-    """``run`` has no positional argument: every token is an option or the value of the one before
-    (a flag takes none, ``--name=value`` carries its own), so a stray word such as a second
-    subcommand (``run backtest``, a trailing ``fetch-bars``) is refused here, not left to argparse."""
+def _paper_run_allowlist(tokens: list[str]) -> bool:
+    """The ``run`` form takes ONLY the options of ``_PAPER_RUN_FLAGS`` and ``_PAPER_RUN_VALUED``.
+
+    The walk is strict: a token that is not exactly a known option (any other option, another
+    letter case, an abbreviation, a single-dash form, a quoted option, a stray word) ends it, so an
+    unknown flag can never take the next token as its value and hide it. A known valued option takes
+    the next token (or ``--name=value``), which must be non-empty and must not start with ``-``,
+    so a value is never an option either. Each option occurs at most once; the six of
+    ``_PAPER_RUN_ONCE`` exactly once; ``--minutes`` is 1 to 3 plain digits; ``--fills`` only
+    ``realistic``."""
+    seen: dict[str, int] = {}
     i = 0
     while i < len(tokens):
         tok = tokens[i]
+        name, eq, inline = tok.partition("=")
         if not tok.startswith("--"):
             return False
-        if "=" in tok or tok in _PAPER_RUN_NO_VALUE:
+        value: str | None = None
+        if name in _PAPER_RUN_FLAGS:
+            if eq:
+                return False
             i += 1
-        elif i + 1 < len(tokens):
-            i += 2
+        elif name in _PAPER_RUN_VALUED:
+            if eq:
+                value = inline
+                i += 1
+            elif i + 1 < len(tokens):
+                value = tokens[i + 1]
+                i += 2
+            else:
+                return False
+            if not value or value.startswith(("-", '"-')):
+                return False
         else:
-            return False  # an option with no value
-    return True
+            return False
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            return False
+        if name == "--minutes" and not (value and _PAPER_MINUTES_VALUE.fullmatch(value)):
+            return False
+        if name == "--fills" and value != _PAPER_RUN_FILLS:
+            return False
+    return all(seen.get(name) == 1 for name in _PAPER_RUN_ONCE)
 
 
 def _paper_run_options_ok(values: dict[str, list[str | None]]) -> bool:
