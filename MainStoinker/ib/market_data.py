@@ -266,6 +266,9 @@ class StockInfo:
     currency: str
     min_tick: float
     time_zone_id: str
+    liquid_hours: str = field(default="", compare=False)
+    """The contract details' regular trading hours (already part of the answer; not a new request).
+    Not part of the comparison: two lookups of one stock are the same stock."""
 
     def contract(self) -> Contract:
         """A new STK / SMART / USD contract carrying the conId and primary exchange."""
@@ -853,7 +856,7 @@ def _single_stock(symbol: str, found: list[events.ContractDetailsEvent]) -> Stoc
         )
     info = StockInfo(
         symbol, details.con_id, details.primary_exchange, details.currency,
-        details.min_tick, details.time_zone_id,
+        details.min_tick, details.time_zone_id, liquid_hours=details.liquid_hours or "",
     )
     try:
         info.contract()

@@ -8,11 +8,16 @@ in code and never the machine's zone. The regular session is 09:30 to 16:00 in
 that zone, so a full day has `SESSION_MINUTES` (390) one-minute bars, stamped
 09:30 to 15:59 (a bar is stamped with the start of its minute).
 
-There is deliberately no holiday calendar. A holiday is planned like any
-weekday; IB answers it with the previous session (or nothing), `filter_day`
-keeps only bars of the requested date, and an empty day is recorded as
-`no_data`. Half days come out of the gap report as `short` (complete from 09:30
-to 12:59 and nothing after); any other missing tail is `partial`.
+The market calendar (`engine/market_calendar.py`) decides which days are planned and what a day
+is expected to hold: weekends and holidays are not planned, a half day (13:00 close) is closed
+at 13:00 and expected to hold `EARLY_CLOSE_MINUTES` (210) bars, 09:30 to 12:59, and is `complete`
+with them. The request itself is unchanged (it ends at 16:00 whatever the day: IB returns the
+session's bars). The calendar never decides what is kept: `filter_day` keeps every bar of the
+requested date, and when the data and the calendar disagree the gap report keeps the old
+tolerance (a day with exactly the bars 09:30 to 12:59 on a day the calendar calls full is `short`,
+any other missing tail `partial`, a full day of bars on a day the calendar calls half is
+`complete`) and says so in `GapRow.note`. IB still answers a day it has no session for with the
+previous session or nothing, which is recorded as `no_data`.
 
 Contract for the driver (the later task that talks to IB)
 ---------------------------------------------------------
@@ -65,6 +70,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from MainStoinker.engine import market_calendar as calendar
 from MainStoinker.engine.feed import (
     REPLACE_RETRY_PAUSE,
     REPLACE_RETRY_SECONDS,
@@ -131,8 +137,20 @@ def check_symbol(symbol: str) -> str:
 
 
 def session_close_utc(day: date) -> datetime:
-    """16:00 New York of `day` as an aware UTC datetime (DST handled by the zone database)."""
+    """16:00 New York of `day` as an aware UTC datetime (DST handled by the zone database).
+
+    The END OF A REQUEST for the day's bars, whatever the day: not the close of the session (see
+    `session_end_utc`)."""
     return datetime.combine(day, SESSION_CLOSE, tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
+
+
+def session_end_utc(day: date, extra: calendar.Overrides | None = None) -> datetime:
+    """The close of `day`'s regular session by the market calendar (16:00, or 13:00 on a half day)
+    as an aware UTC datetime; 16:00 for a day with no session (a stand-in, the day is not planned)."""
+    found = calendar.session(day, extra)
+    minute = calendar.FULL_CLOSE_MINUTE if found is None else found.close_minute
+    return datetime.combine(day, dtime(minute // 60, minute % 60),
+                            tzinfo=_zone(DATA_ZONE)).astimezone(_UTC)
 
 
 def day_final_utc(day: date) -> datetime:
@@ -153,16 +171,17 @@ class DayPlan:
     not_closed: list[date]
 
 
-def plan_range(start: date, end: date, server_now: datetime) -> DayPlan:
-    """Every closed trading day (weekday) from `start` to `end`, plus the ones not closed yet.
+def plan_range(start: date, end: date, server_now: datetime,
+               extra: calendar.Overrides | None = None) -> DayPlan:
+    """Every closed trading day from `start` to `end`, plus the ones not closed yet.
 
-    `server_now` is an aware datetime (the injected clock). A weekday is closed
-    once its regular session (16:00 New York) is over at `server_now`. Weekdays
-    whose session has not closed go into `not_closed` (in order) so the driver
-    can report them; they are never planned. The plan is refused with
-    `ValueError` only when the range holds trading days but none of them has
-    closed. A range of only weekend days plans nothing. `start` after `end` is a
-    `ValueError`. Holidays are not removed (see the module docstring).
+    `server_now` is an aware datetime (the injected clock). A trading day (by the market
+    calendar: no weekend, no holiday) is closed once its regular session (16:00 New York, 13:00 on a
+    half day) is over at `server_now`. Trading days whose session has not closed go into
+    `not_closed` (in order) so the driver can report them; they are never planned. The plan is
+    refused with `ValueError` only when the range holds trading days but none of them has closed. A
+    range of only weekend days and holidays plans nothing. `start` after `end` is a `ValueError`.
+    `extra` is the calendar's caller table (`market_calendar.load_overrides`).
     """
     _aware(server_now, "server_now")
     if start > end:
@@ -171,8 +190,8 @@ def plan_range(start: date, end: date, server_now: datetime) -> DayPlan:
     not_closed: list[date] = []
     current = start
     while current <= end:
-        if current.weekday() < 5:
-            (days if session_close_utc(current) <= server_now else not_closed).append(current)
+        if calendar.is_trading_day(current, extra):
+            (days if session_end_utc(current, extra) <= server_now else not_closed).append(current)
         current += timedelta(days=1)
     if not_closed and not days:
         raise ValueError(
@@ -181,9 +200,10 @@ def plan_range(start: date, end: date, server_now: datetime) -> DayPlan:
     return DayPlan(days, not_closed)
 
 
-def plan_days(start: date, end: date, server_now: datetime) -> list[date]:
+def plan_days(start: date, end: date, server_now: datetime,
+              extra: calendar.Overrides | None = None) -> list[date]:
     """The closed trading days of `plan_range` (the skipped, not closed ones are dropped)."""
-    return plan_range(start, end, server_now).days
+    return plan_range(start, end, server_now, extra).days
 
 
 def format_end_date_time(moment: datetime) -> str:
@@ -754,6 +774,7 @@ class GapRow:
     expected: int
     present: int
     missing: tuple[tuple[datetime, datetime], ...]  # inclusive minute ranges, naive data zone
+    note: str = ""  # where the data and the market calendar disagree (empty: they agree)
 
     @property
     def missing_count(self) -> int:
@@ -783,17 +804,27 @@ def _ranges(missing: Sequence[datetime]) -> tuple[tuple[datetime, datetime], ...
 def gap_report(
     days: Iterable[date], bars: pd.DataFrame, *, data_zone: str = DATA_ZONE,
     not_requested: Collection[date] = (), provisional: Collection[date] = (),
+    extra: calendar.Overrides | None = None,
 ) -> list[GapRow]:
     """One `GapRow` per day, in the order given, comparing `bars` (naive data-zone `date`) to the session.
+
+    What a day is expected to hold comes from the market calendar: 390 minutes (09:30 to 15:59) on
+    a full day, `EARLY_CLOSE_MINUTES` (09:30 to 12:59) on a half day.
 
     Status: `no_data` (no bar in the session minutes, so also a day that was
     never fetched, unless it is in `not_requested`), `not_fetched` (no bar, and the
     day is in `not_requested`: the run stopped before it was asked for; a day with
-    bars keeps its bar-based status), `provisional` (all 390 minutes, and the day is in
+    bars keeps its bar-based status), `provisional` (everything expected, and the day is in
     `provisional`: fetched before it is final; a short or partial provisional day keeps
-    its `short` / `partial` status), `complete` (all 390 minutes), `short` (bars complete from
-    09:30 to 12:59, an early close at 13:00, and nothing after) or `partial`
-    (any other gap: a hole, a missing tail such as only 15:59, a one-bar day).
+    its `short` / `partial` status), `complete` (everything the calendar expects), `short`
+    (a day the calendar calls full, with the bars complete from 09:30 to 12:59 and nothing after:
+    an early close the calendar did not know) or `partial` (any other gap: a hole, a missing tail
+    such as only 15:59, a one-bar day).
+
+    The data is never judged away by the calendar. Where they disagree the row says so in `note`
+    and the old tolerance stands: a day the calendar calls half but that has bars after 12:59 is
+    judged against the full 390 minutes (all of them: `complete`, with a note); a `short` day on a
+    full day, and any bar on a day the calendar has no session, get a note too.
     Bars outside 09:30 to 15:59 are ignored; duplicates count once and order
     does not matter. A tz-aware `date` column or timestamps not on whole minutes
     raise `ValueError` (they would silently match nothing).
@@ -803,6 +834,15 @@ def gap_report(
     rows = []
     for day in days:
         minutes = expected_minutes(day, data_zone)
+        found = calendar.session(day, extra)
+        note = ""
+        if found is not None and found.is_half_day:
+            cut = max(0, found.close_minute - found.open_minute)
+            if any(m in present for m in minutes[cut:]):
+                note = (f"the market calendar has an early close at {found.close_minute // 60:02d}:"
+                        f"{found.close_minute % 60:02d} but the data has bars after it")
+            else:
+                minutes = minutes[:cut]
         missing = [m for m in minutes if m not in present]
         have = len(minutes) - len(missing)
         ranges = _ranges(missing)
@@ -812,9 +852,13 @@ def gap_report(
             status = GAP_PROVISIONAL if day in provisional else GAP_COMPLETE
         elif have == EARLY_CLOSE_MINUTES and missing == minutes[EARLY_CLOSE_MINUTES:]:
             status = GAP_SHORT
+            if found is not None and not found.is_half_day:
+                note = "the market calendar expects a full day: an early close it did not know"
         else:
             status = GAP_PARTIAL
-        rows.append(GapRow(day, status, len(minutes), have, ranges))
+        if have and found is None:
+            note = "the market calendar has no session on this day but the data has bars"
+        rows.append(GapRow(day, status, len(minutes), have, ranges, note))
     return rows
 
 
@@ -845,14 +889,19 @@ def gaps_summary_text(rows: Sequence[GapRow], symbol: str = "") -> str:
     provisional = sum(1 for r in rows if r.status == GAP_PROVISIONAL)
     if provisional:  # only while a day awaits its refetch
         lines.append(f"  {GAP_PROVISIONAL}: {provisional}")
+    disagree = sum(1 for r in rows if r.note)
+    if disagree:  # only where the data and the market calendar disagree
+        lines.append(f"  days where the data and the market calendar disagree: {disagree}")
     lines.append(f"  missing minutes in days with data: "
                  f"{sum(r.missing_count for r in rows if r.status not in (GAP_NO_DATA, GAP_NOT_FETCHED))}")
     for r in rows:
-        if r.status == GAP_COMPLETE:
+        if r.status == GAP_COMPLETE and not r.note:
             continue
-        detail = ("" if r.status in (GAP_NO_DATA, GAP_NOT_FETCHED, GAP_PROVISIONAL)
+        detail = ("" if r.status in (GAP_NO_DATA, GAP_NOT_FETCHED, GAP_PROVISIONAL, GAP_COMPLETE)
                   else " " + ", ".join(_range_text(s) for s in r.missing))
         lines.append(f"{r.day.isoformat()} {r.status}{detail}")
+        if r.note:
+            lines.append(f"  calendar: {r.note}")
     return "\n".join(lines) + "\n"
 
 

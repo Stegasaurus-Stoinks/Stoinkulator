@@ -152,23 +152,24 @@ def test_clean_run_three_symbols_three_months_across_a_year_end(out: Path) -> No
         for holiday, previous in YE_HOLIDAYS.items():
             rig.script(holiday, holiday_behaviour(previous))
         result = rig.run(symbols, YE_START, YE_END, out)
-    days = weekdays(YE_START, YE_END)
+    # the calendar skips the holidays (issue 285)
+    days = [d for d in weekdays(YE_START, YE_END) if d not in YE_HOLIDAYS]
     assert result.complete and result.stop_reason is None and result.fatal is None
     assert result.estimate is not None and result.estimate.requests == 3 * len(days)
     assert len(rig.requests) == 3 * len(days)
     assert_paced(rig.requests)
     for symbol in symbols:
         sym = result.symbols[symbol]
-        assert (sym.ok, sym.no_data, sym.failed) == (len(days) - 4, 4, 0)
+        assert (sym.ok, sym.no_data, sym.failed) == (len(days), 0, 0)
         names = sorted(p.name for p in (out / symbol).glob(f"{symbol}_*.csv"))
         assert names == [f"{symbol}_2024-11.csv", f"{symbol}_2024-12.csv", f"{symbol}_2025-01.csv"]
         frame = read_symbol_bars(out, symbol)  # the engine's own reader accepts what was written
         assert frame["date"].is_monotonic_increasing and not frame["date"].duplicated().any()
-        assert len(frame) == (len(days) - 4) * 20
+        assert len(frame) == len(days) * 20
         stored_days = set(frame["date"].dt.date)
-        assert not stored_days & set(YE_HOLIDAYS)  # IB's previous-session answer never stored twice
+        assert not stored_days & set(YE_HOLIDAYS)  # no holiday is asked for, none is stored
         manifest = manifest_days(out, symbol)
-        assert [manifest[d.isoformat()] for d in sorted(YE_HOLIDAYS)] == ["no_data"] * 4
+        assert not set(manifest) & {d.isoformat() for d in YE_HOLIDAYS}  # holidays are not in the manifest
     assert_no_stray_files(out)
     sent = {c.name for c in rig.fake.calls} - {"connect", "disconnect", "run"}
     assert sent <= DATA_REQUESTS, sent - DATA_REQUESTS
@@ -313,7 +314,8 @@ def test_resume_after_each_kind_of_stop_equals_an_uninterrupted_run(
         second = scripted_rig_run(rig2, out)
     assert second.complete, second.stop_reason
     assert_paced(rig2.requests)
-    planned = weekdays(RS_START, RS_END)
+    # Labor Day is not planned (issue 285)
+    planned = [d for d in weekdays(RS_START, RS_END) if d != RS_HOLIDAY]
     for symbol in RS_SYMBOLS:  # only what was missing is asked for, each day once
         asked = [d for c, d, _ in rig2.requests if c == CON_IDS[symbol]]
         assert sorted(asked) == sorted(set(planned) - left[symbol])
@@ -421,23 +423,26 @@ def test_connection_lost_between_two_requests_sends_nothing_more(out: Path, how:
     assert_ok_days_on_disk(out, "AAPL")
 
 
-def test_early_close_day_is_ok_with_210_bars_and_reported_short(out: Path) -> None:
+def test_early_close_day_is_ok_with_210_bars_and_complete_by_the_calendar(out: Path) -> None:
+    """Issue 285: the day after Thanksgiving closes at 13:00 by the market calendar, so 210 bars are
+    what is expected: `complete` (before: `short`), and Thanksgiving itself is not planned."""
     half = date(2024, 11, 29)
 
     def early(req_id: int, day: date, symbol: str) -> list[Played]:
         return [*bars_played(req_id, day_rows(day, 210, symbol)), end_played(req_id)]
 
     with make_rig(server_now=after(date(2024, 12, 3))) as rig:
-        rig.script(date(2024, 11, 28), holiday_behaviour(date(2024, 11, 27)))
+        rig.script(date(2024, 11, 28), holiday_behaviour(date(2024, 11, 27)))  # never asked for
         rig.script(half, early)
         result = rig.run(["AAPL"], date(2024, 11, 27), half, out)
     sym = result.symbols["AAPL"]
-    assert (sym.ok, sym.no_data, sym.failed) == (2, 1, 0)
+    assert (sym.ok, sym.no_data, sym.failed) == (2, 0, 0)
+    assert rig.days_requested() == [date(2024, 11, 27), half]
     raw = json.loads((out / "AAPL" / "manifest.json").read_text(encoding="utf-8"))
     assert raw["days"][half.isoformat()]["bars"] == 210
-    assert [r.status for r in sym.gaps] == ["complete", "no_data", "short"]
-    assert "AAPL,2024-11-29,short,390,210,180,13:00-15:59" in (out / "AAPL" / "gaps.csv").read_text(
-        encoding="utf-8")
+    assert [r.status for r in sym.gaps] == ["complete", "complete"]
+    assert "AAPL,2024-11-29,complete,210,210,0," in (out / "AAPL" / "gaps.csv").read_text(encoding="utf-8")
+    assert sym.short_days == [] and sym.calendar_notes == [] and result.days_with_gaps == 0
     assert_paced(rig.requests)
 
 
@@ -855,12 +860,13 @@ def test_no_data_at_the_final_time_is_no_data_and_three_hours_after_the_close_is
     assert manifest_days(out) == {day.isoformat(): "no_data"}
 
 
-def test_a_holiday_two_days_ago_is_no_data(out: Path) -> None:
-    holiday = date(2024, 9, 2)  # Labor Day
+def test_a_range_of_only_a_holiday_plans_nothing(out: Path) -> None:
+    holiday = date(2024, 9, 2)  # Labor Day (issue 285: before, it was asked for and recorded `no_data`)
     with make_rig(server_now=minutes_after_close(date(2024, 9, 4), 0)) as rig:
         rig.script(holiday, holiday_behaviour(date(2024, 8, 30)))
         result = rig.run(["AAPL"], holiday, holiday, out)
-    assert result.symbols["AAPL"].no_data == 1 and result.complete
+    assert rig.requests == []
+    assert result.symbols["AAPL"].no_data == 0 and result.symbols["AAPL"].ok == 0 and result.complete
 
 
 def test_the_settle_seconds_argument_is_gone(out: Path) -> None:
@@ -870,22 +876,49 @@ def test_the_settle_seconds_argument_is_gone(out: Path) -> None:
     assert rig.requests == []
 
 
-def test_early_close_day_is_listed_in_short_days_and_stays_ok(out: Path) -> None:
-    half = date(2024, 11, 29)
+def test_an_early_close_the_calendar_does_not_know_is_listed_in_short_days_and_stays_ok(out: Path) -> None:
+    """The old tolerance stands where the calendar and the data disagree (issue 285): a day the
+    calendar calls full that came back with exactly 09:30 to 12:59 is `short`, kept, and noted."""
+    day = date(2024, 11, 26)  # a full day by the calendar
 
-    def early(req_id: int, day: date, symbol: str) -> list[Played]:
-        return [*bars_played(req_id, day_rows(day, 210, symbol)), end_played(req_id)]
+    def early(req_id: int, d: date, symbol: str) -> list[Played]:
+        return [*bars_played(req_id, day_rows(d, 210, symbol)), end_played(req_id)]
 
     with make_rig(server_now=after(date(2024, 12, 3))) as rig:
-        rig.script(date(2024, 11, 28), holiday_behaviour(date(2024, 11, 27)))
-        rig.script(half, early)
-        result = rig.run(["AAPL"], date(2024, 11, 27), half, out)
+        rig.script(day, early)
+        result = rig.run(["AAPL"], day, day, out)
     sym = result.symbols["AAPL"]
-    assert sym.short_days == [(half, 210, "short")]  # the holiday (no bars) is not in the list
-    assert result.days_with_gaps == 1 and result.complete and sym.ok == 2
+    assert sym.short_days == [(day, 210, "short")]
+    assert result.days_with_gaps == 1 and result.complete and sym.ok == 1
+    assert sym.calendar_notes == [(day, "the market calendar expects a full day: an early close it did "
+                                        "not know")]
     event = next(e for e in rig.events if e.kind == "gaps")
-    assert event.detail["short_days"] == [(half.isoformat(), 210, "short")]
+    assert event.detail["short_days"] == [(day.isoformat(), 210, "short")]
     assert event.detail["days_with_gaps"] == 1
+    assert event.detail["calendar_notes"] == [(day.isoformat(), sym.calendar_notes[0][1])]
+    assert "calendar: the market calendar expects a full day" in (
+        out / "AAPL" / "gaps_summary.txt").read_text(encoding="utf-8")
+    assert len(read_symbol_bars(out, "AAPL")) == 210  # the data is kept as it came
+
+
+def test_a_full_day_of_bars_on_a_half_day_is_kept_complete_and_noted(out: Path) -> None:
+    """The other disagreement: the calendar says 13:00, IB sent all 390 bars. Nothing is dropped."""
+    half = date(2024, 11, 29)
+
+    def full(req_id: int, d: date, symbol: str) -> list[Played]:
+        return [*bars_played(req_id, day_rows(d, 390, symbol)), end_played(req_id)]
+
+    with make_rig(server_now=after(date(2024, 12, 3))) as rig:
+        rig.script(half, full)
+        result = rig.run(["AAPL"], half, half, out)
+    sym = result.symbols["AAPL"]
+    assert [r.status for r in sym.gaps] == ["complete"] and sym.ok == 1
+    assert sym.short_days == [] and result.days_with_gaps == 0
+    assert [d for d, _ in sym.calendar_notes] == [half]
+    assert "early close at 13:00 but the data has bars after it" in sym.calendar_notes[0][1]
+    assert "days where the data and the market calendar disagree: 1" in (
+        out / "AAPL" / "gaps_summary.txt").read_text(encoding="utf-8")
+    assert len(read_symbol_bars(out, "AAPL")) == 390
 
 
 def test_a_one_bar_day_is_listed_in_short_days_as_partial(out: Path) -> None:

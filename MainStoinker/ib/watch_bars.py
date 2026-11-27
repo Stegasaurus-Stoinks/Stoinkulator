@@ -44,17 +44,24 @@ acceptable, a partial row is not. Hence:
   `server time - start of the newest bar of today` seen, from the backfill (at request time) and
   from every live update. It is an upper bound on the lag, so closing by it is never early. A
   bar is closed by time 90 s after its minute ended on that clock; a bar ending in the last two
-  minutes of the session also waits for 16:20 New York server time (covers delayed data). Before
-  any bar of today exists nothing is closed by time.
-- The DELAYED label is separate (it changes no judgement): in the regular session (09:30 to
-  16:00, weekday, server time) a symbol is declared DELAYED, once, when two live updates at least
+  minutes of the session also waits for the close plus 20 minutes (16:20 New York server time;
+  13:20 on a half day; covers delayed data). Before any bar of today exists nothing is closed by
+  time.
+- The session is the market calendar's (`engine/market_calendar.py`): 09:30 to 16:00, or to 13:00 on
+  a half day, never on a weekend or a holiday. Every "16:00" and "16:20" in this text is the day's
+  close and the close plus 20 minutes. A weekend or a holiday is refused before connecting (exit
+  code 2). Once the contract details are in, today's close by the calendar is compared with the
+  regular hours IB reports in them (no new request): a disagreement prints a warning and IB's
+  hours are followed for today; hours IB reports as closed end the run before any request (exit 2).
+- The DELAYED label is separate (it changes no judgement): in the regular session (server time) a
+  symbol is declared DELAYED, once, when two live updates at least
   10 s apart both show a lag over 120 s, or the backfill showed it and one live update confirms
   it; a current update withdraws it. Bar lines and the summary then say "(delayed about N min)".
-  A start after the open with no bar of today yet says so; after 16:00 the output says "market
+  A start after the open with no bar of today yet says so; after the close the output says "market
   closed: no new bars expected", or for a delayed stream "regular session ended; delayed bars
   continue for about N minutes".
-- No data (exit code 6): a symbol that, in the regular session by IB's server clock (weekday, 09:30
-  to 16:00 New York), has received no bar of today's session and no live update for at least 120 s
+- No data (exit code 6): a symbol that, in the regular session by IB's server clock (09:30 to the
+  day's close), has received no bar of today's session and no live update for at least 120 s
   after its backfill ended (a start before 09:30 starts the clock at 09:30; the end of the watch
   counts too) is `no data received`: one line says so as soon as it is established, with a hint
   about the account's market data subscription, the summary says so instead of `streaming`, and
@@ -165,9 +172,10 @@ Checks, in this sequence, before any client or connection is built: arguments; d
 machine's idea of "home"); output and recording paths (not in the repository or a OneDrive
 folder, not a file or under one); the port guard (`check_broker_port`: paper ports always, a
 live port only if the OWNER set the opt-in variable named in the refusal text, in their own
-terminal; this module never sets it); the folders are created; the console gate (an interactive
-terminal; the owner types the port number). The environment is read in `main` only. Every printed line passes
-`scrub` and `ManagedAccounts` is never printed.
+terminal; this module never sets it); the day (a weekend or a market holiday, by this computer's
+clock in New York, is refused: nothing is created or connected); the folders are created; the
+console gate (an interactive terminal; the owner types the port number). The environment is read in
+`main` only. Every printed line passes `scrub` and `ManagedAccounts` is never printed.
 
 The session recording (on by default, `watch-bars-<date>-<n>.jsonl`) is written by
 `SessionRecorder` and checked with `scan_recording` afterwards. Updates arrive every few
@@ -191,8 +199,9 @@ from pathlib import Path
 from typing import Any, Protocol, TextIO
 from zoneinfo import ZoneInfo
 
+from MainStoinker.engine import market_calendar as calendar
 from MainStoinker.engine.feed import Bar
-from MainStoinker.ib import events
+from MainStoinker.ib import events, trading_hours
 from MainStoinker.ib.bars import BadBar, bar_from_ib, data_time
 from MainStoinker.ib.cli import (
     NOT_PAPER_LABEL,
@@ -259,15 +268,17 @@ exit codes:
   0    watched to the end and every symbol was streaming (or the market was closed)
   1    finished, but a symbol stopped (IB error, unknown symbol, unusable live file), had no
        stream at the end (a re-request still outstanding) or delivered no bars
-  2    refused: console gate, port guard, --paper conditions, bad arguments, unusable path
+  2    refused: console gate, port guard, --paper conditions, bad arguments, unusable path, a
+       weekend or a market holiday (also when IB's hours say the market is closed today)
   3    could not connect to TWS or IB Gateway
   4    stopped by a lost or closed connection, or by an unexpected error
   5    --paper only: the account TWS is signed into is not a paper account (checked before
        the first request and all along); at the start nothing was requested, later the watch was
        stopped; never retried
   6    finished, every symbol streaming or closed, but at least one symbol received no data: no
-       bar of today's session and no live update for 120 s of the regular session (09:30 to 16:00
-       New York, weekday) after its backfill ended: check the account's market data subscription
+       bar of today's session and no live update for 120 s of the regular session (09:30 to the
+       day's close, 16:00 or 13:00 on a half day, New York) after its backfill ended: check the
+       account's market data subscription
   130  interrupted with Ctrl-C (requests cancelled, connection and recording closed)
 """
 
@@ -865,30 +876,40 @@ def _ny(epoch: float) -> datetime:
     return datetime.fromtimestamp(epoch, tz=UTC).astimezone(NY)
 
 
-def _in_session(epoch: float) -> bool:
-    """The regular session by IB's clock: a weekday, 09:30 up to 16:00 New York (holidays unknown)."""
+def _in_session(epoch: float, extra: calendar.Overrides | None = None) -> bool:
+    """The regular session by IB's clock: 09:30 up to the close of that New York day by the market
+    calendar (16:00, or 13:00 on a half day); never on a weekend or a holiday. `extra` is the
+    calendar table of this run (IB's hours for today when they differ, see `Watcher.calendar_extra`)."""
     moment = _ny(epoch)
+    found = calendar.session(moment.date(), extra)
+    if found is None:
+        return False
     minute = moment.hour * 60 + moment.minute
-    return moment.weekday() < 5 and SESSION_OPEN_MINUTE <= minute < SESSION_CLOSE_MINUTE
+    return found.open_minute <= minute < found.close_minute
 
 
-def _session_end(day: date) -> int:
-    return int(datetime(day.year, day.month, day.day, 16, tzinfo=NY).timestamp())
+def _session_end(day: date, extra: calendar.Overrides | None = None) -> int:
+    """Epoch of the close of `day`'s regular session: the calendar's close (16:00, 13:00 on a half
+    day). A day with no session has no close: 16:00 stands in, so every offset from it stays defined."""
+    found = calendar.session(day, extra)
+    minute = calendar.FULL_CLOSE_MINUTE if found is None else found.close_minute
+    return int(datetime(day.year, day.month, day.day, minute // 60, minute % 60, tzinfo=NY).timestamp())
 
 
 def _session_start(day: date) -> int:
     return int(datetime(day.year, day.month, day.day, 9, 30, tzinfo=NY).timestamp())
 
 
-def _session_exposure(since: float, now: float, outages: Sequence[Sequence[Any]] = ()) -> float:
-    """Seconds of the regular session (weekday, 09:30 to 16:00 New York, server time) that lie
-    between `since` and `now` on the New York date of `now`, less the time of any outage
-    (`[start, end, kind]`, end `inf` while open) inside that window."""
+def _session_exposure(since: float, now: float, outages: Sequence[Sequence[Any]] = (),
+                      extra: calendar.Overrides | None = None) -> float:
+    """Seconds of the regular session (09:30 to the day's close by the market calendar, server
+    time) that lie between `since` and `now` on the New York date of `now`, less the time of any
+    outage (`[start, end, kind]`, end `inf` while open) inside that window."""
     day = _ny(now).date()
-    if day.weekday() >= 5:
+    if not calendar.is_trading_day(day, extra):
         return 0.0
     start = max(since, _session_start(day))
-    end = min(now, _session_end(day))
+    end = min(now, _session_end(day, extra))
     if end <= start:
         return 0.0
     spans = sorted((max(o[0], start), min(o[1], end)) for o in outages if o[0] < end and o[1] > start)
@@ -953,8 +974,20 @@ class Watcher:
         self._general_seen: dict[int, events.IbError] = {}
         self._stop_reason: str | None = None  # set by `request_stop`
         self.end_cause = ""  # why `run` ended, set once it has (see `end_cause` in the module text)
+        # the market calendar's table for this run: empty, or today's close as IB reports it when that
+        # differs from the calendar (`_cross_check`); read by `in_session` and `session_end`
+        self.calendar_extra: dict[date, int | None] = {}
 
     # -- time -----------------------------------------------------------------------------
+
+    def in_session(self, epoch: float) -> bool:
+        """True in the regular session of that moment's New York day: 09:30 up to the close by the
+        market calendar (13:00 on a half day), never on a weekend or a holiday."""
+        return _in_session(epoch, self.calendar_extra)
+
+    def session_end(self, day: date) -> int:
+        """Epoch of the close of `day`'s regular session (16:00; 13:00 on a half day)."""
+        return _session_end(day, self.calendar_extra)
 
     def server_now(self) -> float:
         assert self.server0 is not None
@@ -1079,10 +1112,56 @@ class Watcher:
         diff = (server - self.wall()).total_seconds()
         say(f"IB server time {server.astimezone(NY):%Y-%m-%d %H:%M:%S} New York; "
             f"IB minus this computer's clock = {diff:+.1f} s (IB time has 1 s resolution)")
+        today = _ny(self.server0).date()
+        if not calendar.is_trading_day(today):  # this computer's clock said otherwise: IB's decides
+            say(f"STOPPED: by IB's server date, {trading_hours.not_a_trading_day_text(today)} (market "
+                "calendar); nothing was requested.")
+            self.end_cause = "not_trading_day"
+            return EXIT_REFUSED
         for sym in self.syms:
             self._resolve(sym)
+        if not self._cross_check(today):
+            return EXIT_REFUSED
         self._request_all()
         return self._loop()
+
+    def _cross_check(self, today: date) -> bool:
+        """Data only: compare the market calendar's hours for `today` with the regular trading hours
+        IB reports in the contract details every symbol's lookup already returned (no new request).
+        Prints one line. On a disagreement it prints a warning and follows IB for today: IB says
+        closed: nothing is requested (False); IB says another close: `calendar_extra` carries it and
+        every time derived from the close follows it. Hours that cannot be read are not compared (one
+        line), the calendar stands. Several symbols that disagree among themselves: the earliest
+        close, and a closed answer, win."""
+        answers = [(s, trading_hours.ib_hours_for(s.info.liquid_hours, s.info.time_zone_id, today))
+                   for s in self.syms if s.info is not None]
+        calendar_close = calendar.close_minute(today)
+        shown = f"{calendar_close // 60:02d}:{calendar_close % 60:02d}"
+        known = [(s, h) for s, h in answers if h.kind != trading_hours.UNKNOWN]
+        if not known:
+            reasons = sorted({h.why for _, h in answers}) or ["no symbol was looked up"]
+            self.say(f"Trading hours: IB's hours for today were not compared with the market calendar "
+                     f"({'; '.join(reasons)}); following the calendar: close {shown}.")
+            return True
+        if any(h.kind == trading_hours.CLOSED for _, h in known):
+            names = ", ".join(s.name for s, h in known if h.kind == trading_hours.CLOSED)
+            self.say(f"WARNING: IB reports no regular session today for {names}, but the market calendar "
+                     f"has one (close {shown}). Following IB: nothing is requested.")
+            self.end_cause = "not_trading_day"
+            return False
+        ib_close = min(h.close_minute for _, h in known if h.close_minute is not None)
+        if len({h.close_minute for _, h in known}) > 1:
+            self.say("WARNING: the symbols' trading hours differ from each other; following the earliest "
+                     "close.")
+        if ib_close == calendar_close:
+            self.say(f"Trading hours: IB's hours for today agree with the market calendar (close {shown}).")
+            return True
+        reported = f"{ib_close // 60:02d}:{ib_close % 60:02d}"
+        self.say(f"WARNING: IB reports the regular session closing at {reported} today, the market "
+                 f"calendar says {shown}. Following IB for today: every time derived from the close "
+                 f"({reported}) follows it.")
+        self.calendar_extra[today] = ib_close
+        return True
 
     def _resolve(self, sym: _Sym) -> None:
         try:
@@ -1351,7 +1430,7 @@ class Watcher:
     def _assess(self, sym: _Sym) -> None:
         """Say once, when the regular session is over, what to expect."""
         now = self.server_now()
-        if _in_session(now):
+        if self.in_session(now):
             sym.closed_noted = False
             return
         if not sym.closed_noted:
@@ -1377,7 +1456,8 @@ class Watcher:
         if self._down():
             return False
         since = max(sym.live_since, sym.last_update_at or 0.0)
-        return _session_exposure(since, self.server_now(), self.outages) >= NO_DATA_AFTER
+        return (_session_exposure(since, self.server_now(), self.outages, self.calendar_extra)
+                >= NO_DATA_AFTER)
 
     def _check_no_data(self, sym: _Sym) -> None:
         """Say once, as soon as it is established, that `sym` has received no data."""
@@ -1397,7 +1477,7 @@ class Watcher:
             if sym.over_since is None:
                 sym.over_since = now
             confirmed = sym.backfill_over or now - sym.over_since >= LABEL_CONFIRM
-            if confirmed and not sym.delayed and _in_session(now):
+            if confirmed and not sym.delayed and self.in_session(now):
                 sym.delayed = True
                 self.say(f"{sym.name}: bars are about {max(1, round(sym.lag / 60))} minutes behind IB's "
                          "clock: this looks like delayed market data (the paper account may not share "
@@ -1486,7 +1566,7 @@ class Watcher:
         else:
             text = f"{sym.name}: {'backfill' if initial else 're-requested backfill'}: 0 bars"
         self.say(text)
-        if sym.newest is None and _in_session(now) and not sym.nothing_yet_noted:
+        if sym.newest is None and self.in_session(now) and not sym.nothing_yet_noted:
             sym.nothing_yet_noted = True
             self.say(f"{sym.name}: no bars of today's session yet; with delayed data the first bars "
                      "appear about 15 minutes after the open")
@@ -1588,7 +1668,7 @@ class Watcher:
         now = self.server_now()
         if now - sym.lag_bound < bar.time + 60 + SETTLE_SECONDS:
             return
-        end_of_session = _session_end(_ny(bar.time).date())
+        end_of_session = self.session_end(_ny(bar.time).date())
         if bar.time + 60 + SETTLE_SECONDS > end_of_session and now < end_of_session + SESSION_GRACE:
             return
         self._close_forming(sym, now, "time")
@@ -2006,6 +2086,15 @@ def main(
     except BrokerPortRefused as exc:
         say(port_refusal_text(exc))
         return EXIT_REFUSED
+    day = today or wall_clock().astimezone(NY).date()  # this computer's clock; IB's decides once connected
+    if not calendar.is_trading_day(day):
+        say(f"Refused: {trading_hours.not_a_trading_day_text(day)}. Nothing was started.")
+        return EXIT_REFUSED
+    if calendar.is_half_day(day):
+        close = calendar.close_minute(day)
+        say(f"Note: {day.isoformat()} is a half day by the market calendar: the regular session ends "
+            f"at {close // 60:02d}:{close % 60:02d} New York (the last bars of the session are held "
+            f"for {SESSION_GRACE // 60} minutes after that).")
     folders = [args.out] + ([args.record.parent] if args.record is not None else [])
     try:
         created = make_folders(folders)  # the last refusal: the folders must be creatable
