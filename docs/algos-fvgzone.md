@@ -128,7 +128,8 @@ the mean of high minus low over the previous `adr_sessions` sessions (a session 
 With D = the entry bar's close minus the session open, an entry needs D, signed for the side (a long needs D,
 a short needs -D), to be at least `trend_day_adr` times the ADR, exactly as above. Blocks while fewer than
 `adr_sessions` sessions have completed, and on a day whose first bar is later than 09:30 (no session open).
-Both filters are independent of each other (when both are on, both must pass), of `trend_filter` and of
+Both filters are independent of each other (when both are on, both must pass under `filters_mode` "all",
+the default; see below for "any"), of `trend_filter` and of
 `htf_minutes`. A retest blocked by either is handled like one blocked by `trend_filter`: nothing is sent, the
 zone is NOT used up and may be retested later, and nothing is put in `algo.skipped`. They reproduce the
 research variants V2b and T4b (`vol_slot_mult` 1.5 and `trend_day_adr` 0.3 are the values studied).
@@ -209,7 +210,7 @@ days of month-file bars (default 2, about 780 bars, enough for the defaults; see
 longer trend ask for more days, or the algo does not trade until the live session has filled the gap.
 
 The volume-against-the-previous-bars rule needs only `vol_prev_bars` zone bars before the middle candle (bars of
-the warm-up count, across sessions), which a day or two of warm-up gives. The two session filters need history too: `vol_slot_sessions` earlier sessions that have the zone's slot and
+the warm-up count, across sessions), which a day or two of warm-up gives. The filters `vol_slot_mult` and `trend_day_adr` need history too: `vol_slot_sessions` earlier sessions that have the zone's slot and
 `adr_sessions` completed earlier sessions (20 each by default), and until then they block every entry. The
 history comes from the same frame: the sessions of the warm-up bars count, and the last one joins when the next
 session's first bar arrives. `run` loads only 2 warm-up days by default, so with these filters on (defaults)
