@@ -102,10 +102,24 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
   nothing and also ends with exit 0.
 - Watcher: one line per closed bar, the offsets, then a summary with every symbol `streaming`. A
   symbol that shows no bars at all is `no data received` and the exit code is 6.
-- `run`: after the paper-mode line and the description, `live: run N begun (paper-live, realistic
-  fills) ...`, one line per closed bar, and at the end `Live session: completed, end reason
-  session_end (exit 0)` (or `minutes_elapsed`, `stop_file`), with the check `live: verify:
-  VERIFIED` above it.
+- `run`: after the paper-mode line and the description (it has a `Warm-up:` line), `Warm-up: N
+  trading session(s) of history (...)` and one `History:` line before the connection: `History:
+  nothing missing: ... nothing is requested` (no history request is sent), or `History: incomplete:
+  ...; it is fetched after the connection, before the open` followed, after `Connected.`, by
+  `History: estimate: ...`, `History: fetching ...`, the fetch's day lines and `History: complete:
+  ...` (issue 287: the history the algos need is fetched before the open, data only, into `--bars`).
+  Then `live: run N begun (paper-live, realistic fills) ...`, one line per closed bar, and at the
+  end `Live session: completed, end reason session_end (exit 0)` (or `minutes_elapsed`,
+  `stop_file`), with the check `live: verify: VERIFIED` above it. The fetch (at least 10 s
+  per symbol-day, all before 09:30) comes off the `--minutes` window, which counts from the start of
+  the command: for a full session to 16:20 have the history on disk already (`fetch-bars` the
+  evening before after 16:00 for all but the last day, or in the morning after 06:00) and start
+  `run` at about 09:25 so it only tops up. Starting at 09:00 with `--minutes 415` ends the run at
+  15:55 (420: 16:00); the console says so in a WARNING line. `History: STOPPED: ...` ends the
+  session with exit 7, nothing traded, no run stored; a start after 09:30 with a gap, `--no-fetch`
+  with a gap or a day not final before 06:00 is refused (exit 2) and names the `fetch-bars`
+  command. Your own options (not part of the command shape agents use): `--no-fetch`, `--allow-cold`,
+  `--warmup-days N`.
 - Last lines of every command: `Recording: <file>` with the scan findings, `Result: ... (exit N)`.
 
 ## Exit codes
@@ -116,10 +130,10 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
 | 1 | finished with problems (`fetch-bars`: a day failed or a symbol was not fetched; `probe-data`: a step failed or a symbol has NO data; watcher: a symbol stopped or delivered no bars; `run`: a symbol stopped, the run is stored `failed`) | read the lines above the result; run `fetch-bars` again to retry failed days; for NO data check the market data subscriptions and code 10197 |
 | 2 | refused, nothing started (gate, port guard, arguments, path, `--paper` conditions) | read the message; it says which check |
 | 3 | could not connect | TWS running and logged in, API enabled, the right port, 127.0.0.1 trusted, no dialog waiting in TWS |
-| 4 | `fetch-bars`: stopped early (connection lost, pacing violation twice, a fault). Watcher: connection lost or closed, or an unexpected error. `probe-data`: not a paper account (`--paper` only). `run`: connection lost or closed, or an error; the run is stored `failed` | `fetch-bars`: what was finished is on disk; check TWS is running and logged in, run the same command again to resume; after a pacing stop wait at least 10 minutes first. Watcher: check TWS, start a new watch (files of the day are appended, only later bars). `probe-data`: log TWS into the paper account, do not retry in a loop. `run`: a restart is a new run (an earlier run is never resumed) |
+| 4 | `fetch-bars`: stopped early (connection lost, pacing violation twice, a fault). Watcher: connection lost or closed, or an unexpected error. `probe-data`: not a paper account (`--paper` only). `run`: connection lost or closed, or an error; the run is stored `failed` (a connection lost while `run` fetched its history: no run stored) | `fetch-bars`: what was finished is on disk; check TWS is running and logged in, run the same command again to resume; after a pacing stop wait at least 10 minutes first. Watcher: check TWS, start a new watch (files of the day are appended, only later bars). `probe-data`: log TWS into the paper account, do not retry in a loop. `run`: a restart is a new run (an earlier run is never resumed) |
 | 5 | `--paper` only, `fetch-bars`, watcher and `run`: the account TWS is signed into is not a paper account; nothing was requested | log TWS into the paper account; do not retry in a loop |
 | 6 | watcher: a symbol received no data (`no data received`). `run`: no data received for a symbol; the run is stored `failed` | check the market data subscription of the paper account and code 10197; a closure the market calendar does not list (announced at short notice) gives the same. Weekends and the listed holidays are refused at the start (exit 2); a half day ends at 13:00 and is not a fault |
-| 7 | `run` only: the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step over 60 s) | read the `live: FAULT` line; see `docs/live-session-runbook.md` |
+| 7 | `run` only: the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step over 60 s); or, before any bar and with no run stored, the history was not complete by the open (`History: STOPPED`) | read the `live: FAULT` or `History: STOPPED` line; see `docs/live-session-runbook.md`. For history: fetch the days named, start earlier, or `--allow-cold` to start with what is stored |
 | 130 | Ctrl-C | the connection and the recording were closed. `fetch-bars`: run the same command to resume. `probe-data` and watcher: nothing to resume, start again if needed |
 
 ## Recordings

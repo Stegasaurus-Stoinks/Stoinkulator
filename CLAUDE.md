@@ -104,7 +104,7 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols "AAPL,MSFT" --start 2024-08-16 --end 2024-08-26 --paper --no-prompt   # DATA only, PAPER account only (TWS on 7497): bars to CSV; one session at a time, main session only
 .venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols "AAPL" --paper --no-prompt   # DATA only, PAPER account only: what market data the account gets
 .venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt   # DATA only, PAPER account only: watch live 1-minute bars for N minutes (1-420); one session at a time, main session only
-.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20; on a half day, 13:00 close, 235 = 09:25 to 13:20); one session at a time, main session only; DB path from the owner
+.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20; on a half day, 13:00 close, 235 = 09:25 to 13:20); one session at a time, main session only; DB path from the owner; the warm-up is the algos' declared need (at least 2 sessions) and missing or provisional days are fetched into BARS before the open, data only (at least 10 s per symbol-day, all before 09:30, counted in the `--minutes` window: have the history on disk and start about 09:25)
 ```
 
 Owner forms of the same four (the owner's terminal, prompted: you type the port;
@@ -113,7 +113,8 @@ Owner forms of the same four (the owner's terminal, prompted: you type the port;
 `probe-data --symbols A,B --port P`, `watch_bars --symbols A,B --minutes N --port P`,
 `run --algos F --bars D --db F --minutes N --port P` (with `--paper` instead of `--port`
 for 7497; every algo needs `"mode": "paper"`, `--fills` is `realistic`, `--stop-file F` ends
-the run cleanly). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
+the run cleanly; `--warmup-days N` overrides the warm-up length, `--no-fetch` and `--allow-cold`
+are owner options for the warm-up history). Options and outcomes: `docs/live-data.md`; `run --help` for `run`.
 
 Exit codes (`--help` shows them; the not-paper code is 5 for `fetch-bars`, the
 watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177):
@@ -122,12 +123,12 @@ watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177
 |------|--------------|--------------|--------------|-------|
 | 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming | the session ended as planned (end of session at 16:20, or 13:20 on a half day, `--minutes` elapsed or the stop file): stored `completed` |
 | 1 | a day failed or a symbol not fetched | a step failed (incl. NO data) | a symbol stopped or delivered no bars | a symbol stopped: stored `failed` |
-| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same, and a weekend or market holiday | same, and a weekend or market holiday, a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running: nothing built or connected |
+| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same, and a weekend or market holiday | same, and a weekend or market holiday, a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running, an algo config that cannot be built, warm-up history that is missing and cannot be fetched before the open: nothing connected |
 | 3 | could not connect | same | same | same |
-| 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault | lost or closed connection, or an error: stored `failed` |
+| 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault | lost or closed connection, or an error: stored `failed` (also a connection lost while the warm-up history was fetched: no run stored) |
 | 5 | not a paper account | (unused) | not a paper account | not a paper account |
 | 6 | (unused) | (unused) | no data received for a symbol in the session: check the account's market data subscription | no data received for a symbol: stored `failed`, `no_data` |
-| 7 | (unused) | (unused) | (unused) | the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step that took too long): stored `failed` |
+| 7 | (unused) | (unused) | (unused) | the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step that took too long): stored `failed`; or, before any bar, the warm-up history was not complete by the open: nothing traded, no run stored |
 | 130 | Ctrl-C | same | same | same (the run was ended in the store first) |
 
 Where data lands (the owner's folders, outside the repo and OneDrive; a command
@@ -137,7 +138,8 @@ refuses a path inside either): `%USERPROFILE%\Stoinkulator\bars` (`fetch-bars`),
 and the run database named by `run --db` (the owner's file; a first write migrates it).
 Bars are month files
 `DIR/SYMBOL/SYMBOL_YYYY-MM.csv` (naive New York times, regular hours) with
-`manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them; live files are
+`manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them (`run` may also write these into
+its `--bars` folder when it fetches missing warm-up days); live files are
 `DIR/SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`. Agents write there only through a
 command's own defaults, in a session the owner asked for; tests never (the
 command test files enforce it with `tests/home_guard.py`).
@@ -180,7 +182,8 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
   recording with account/path redaction; `cli.py` `fetch-bars` and `probe-data` (gate, paper mode,
   paths); `probe.py` the probe steps; `watch_bars.py` the live bar watcher; `live_run.py` the
   live paper session driver (watcher, aligner, engine and run writer; no orders); `run_cli.py` the
-  `run` command (paper only, refusals, gate); `contracts.py`, `events.py`.
+  `run` command (paper only, refusals, gate); `live_history.py` the warm-up coverage check and the
+  fetch of missing days before the open; `contracts.py`, `events.py`.
 - `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests. Data time is naive
   `America/New_York` wall-clock time (session 09:30 to 16:00); algos' hard-coded times use it too.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.

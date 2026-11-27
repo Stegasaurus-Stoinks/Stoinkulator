@@ -38,15 +38,36 @@ says VERIFIED; the dashboard showed the run while it ran; the next-morning compa
 
 ## Before the start (morning, New York time)
 
-1. After 06:00: fetch the warm-up days. A day fetched before 06:00 next day is provisional, and a
-   refetch later changes the file, which would make the check of the run UNVERIFIABLE. Use the
-   symbols of the algos file (here AAPL and MSFT) and a start a few trading days back:
+1. The warm-up days. `run` works out how many it needs (the largest `warmup_sessions()` of the
+   algos in the algos file, at least 2 trading sessions, counted by the market calendar), checks
+   the month files in `--bars`, and fetches what is missing or still provisional itself, after the
+   paper check and before it subscribes to live bars (issue 287): you do not have to run
+   `fetch-bars` first. It needs time: at least 10 s per missing symbol-day at IB's pacing limits,
+   all of it before 09:30 New York, and that time comes off the `--minutes` window (which counts
+   from the start of the command, not from 09:30). A full session to 16:20 therefore needs the
+   history ALREADY on disk: fetch it beforehand (the evening before after 16:00 for all but the
+   last day, or in the morning after 06:00 New York) and start `run` at about 09:25, so that it
+   only tops up what is missing. Starting early to fetch costs the end of the day: `--minutes 415`
+   from 09:00 ends the run at 15:55 and even 420 ends it at 16:00, before the last bars at 16:20
+   (the console prints a WARNING with the time the run will stop). A day fetched before 06:00 next
+   day is provisional and is fetched again by the first `run` after 06:00 of the session day;
+   yesterday, present or missing, is never taken as final before 06:00 (a start before then is
+   refused). To fetch by hand (use the symbols of the algos file, here
+   AAPL and MSFT, and a start a few trading days back):
 
        .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols AAPL,MSFT --start YYYY-MM-DD --end YYYY-MM-DD --paper --no-prompt
 
-   `--end` is the last trading day before today. The warm-up is the last 2 trading days before
-   today from `%USERPROFILE%\Stoinkulator\bars` (`--warmup-days` changes that). `fetch-bars` ends with
-   `Result: complete (exit 0)`.
+   `--end` is the last trading day before today. `fetch-bars` ends with `Result: complete (exit
+   0)`. Console lines to expect from `run` before the open: `Warm-up: N trading session(s) of
+   history (...)`, then either `History: nothing missing: ...` (one line, nothing is requested) or
+   `History: incomplete: ...` and, after the connection, `History: estimate: ...`, the fetch's lines
+   and `History: complete: ...`. If it says `History: STOPPED: ...` (exit 7) nothing was traded and
+   no run was stored: read the reason (a day failed, the fetch was not done at 09:30), run
+   `fetch-bars` for the days it names, then start again. A start after 09:30 with history missing,
+   or `--no-fetch` with a gap, is refused (exit 2) and the line names the `fetch-bars` command.
+   Owner-only options: `--warmup-days N` overrides the length (below the algos' need it is refused),
+   `--no-fetch` refuses a gap instead of fetching, `--allow-cold` starts anyway with the history it
+   has (said, and stored in the run's warnings).
 2. Check out a clean `origin/revival`: `git status` shows nothing for tracked files, no untracked
    `.py` files in the repository root or under `MainStoinker/`, and `HEAD` is a commit of
    `origin/revival`.
@@ -190,12 +211,12 @@ resumed.
 | exit | meaning | what to do |
 |------|---------|------------|
 | 1 | a symbol stopped (`symbol_stopped`) | read the watcher lines above the fault line (IB error, unknown symbol, unusable live file). Fix that, start a new run |
-| 2 | refused, nothing was connected | the line `Refused: ...` says which check. Another `paper-live` run marked running and written within 3 minutes: wait, or check `runs`. A stop file that exists: delete it. A missing warm-up: run `fetch-bars` |
+| 2 | refused, nothing was connected | the line `Refused: ...` says which check. Another `paper-live` run marked running and written within 3 minutes: wait, or check `runs`. A stop file that exists: delete it. Missing history that cannot be fetched before 09:30 (`--no-fetch`, a start after the open, too little time, a day not final before 06:00), or an algo config that cannot be built: the line says which, and names the `fetch-bars` command |
 | 3 | could not connect | TWS running and logged in on the paper login, API enabled, port 7497, 127.0.0.1 trusted, no dialog waiting in TWS, client id 20 not used by another program. Nothing was stored |
-| 4 | stopped by a lost or closed connection, or by an error (`connection_closed`, `error`) | check TWS (a restart, a lost internet connection, a login dialog). Read the last line: if it says `could not be closed`, see the last row. Start a new run if the session is still open (it only warms up on today's earlier bars; no catch-up trading) |
+| 4 | stopped by a lost or closed connection, or by an error (`connection_closed`, `error`); also a connection lost while the history was fetched (no run stored) | check TWS (a restart, a lost internet connection, a login dialog). Read the last line: if it says `could not be closed`, see the last row. Start a new run if the session is still open (it only warms up on today's earlier bars; no catch-up trading) |
 | 5 | TWS is not on a paper account (`not_paper`) | STOP. Do not retry. Log TWS into the paper account yourself, and look at what happened before you try again |
 | 6 | no data received (`no_data`) | check the market data subscription of the paper account (shared with the live account's data), 10197 (another session uses the data), and whether a closure the market calendar does not list was announced (weekends and the listed holidays are refused at the start, never run) |
-| 7 | the run was stopped on a data fault (`delayed_data`, `data_fault`, `step_too_slow`) | read the line `live: FAULT (...)`. Delayed data: market data again. A data fault or slow step is a finding: open an issue with the console text |
+| 7 | the run was stopped on a data fault (`delayed_data`, `data_fault`, `step_too_slow`), or, before any bar and with no run stored, the history was not complete by the open | read the line `live: FAULT (...)`. Delayed data: market data again. A data fault or slow step is a finding: open an issue with the console text. `History: STOPPED: ...`: see "Before the start", item 1: fetch the days it names, start again earlier |
 | 130 | Ctrl-C | the run is stored `failed`, `interrupted` |
 | any | the last line says `still marked running in the database` | the database stayed busy or refused the end of the run. Wait 3 minutes: it shows as `stale`, and the next `run` closes it as `failed`, `abandoned`. Do not edit the database by hand. `report RUN --verify` still works on it |
 

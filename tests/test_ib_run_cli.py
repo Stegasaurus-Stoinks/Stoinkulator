@@ -160,6 +160,37 @@ def test_refuses_legacy_fills(rig: Rig) -> None:
     assert not (rig.tmp / "runs.db").exists()
 
 
+def test_a_config_that_cannot_be_built_is_refused_before_the_database_is_opened(rig: Rig) -> None:
+    """The algos are built once before anything is connected (issue 287): a constructor that raises
+    is a refusal, exit 2, with no client built and no database file made."""
+    entries = ema_entries()
+    entries[0]["data"][0]["short"] = "abc"
+    write_algos(rig.tmp, entries)
+    text = refused(rig, argv_of(rig.tmp))
+    assert "the algo config cannot be used" in text
+    assert not (rig.tmp / "runs.db").exists()
+
+
+def test_the_description_names_the_warmup_and_the_history_rule(rig: Rig) -> None:
+    quick_session(rig)
+    assert go(rig, [*argv_of(rig.tmp), "--warmup-days", "2"]) == 0, rig.text
+    assert "Warm-up:          2 trading session(s) (--warmup-days; the algos declare 1); missing or " \
+           "provisional days are fetched before the open (data only)" in rig.text
+
+
+def test_no_fetch_with_a_gap_is_refused_and_names_the_fetch_command(rig: Rig) -> None:
+    (rig.tmp / "bars" / "TSLA" / "TSLA_2024-08.csv").unlink()
+    text = refused(rig, [*argv_of(rig.tmp), "--no-fetch"])
+    assert "fetch-bars --symbols TSLA" in text and "--no-fetch" in text
+    assert not (rig.tmp / "runs.db").exists()
+
+
+def test_the_new_options_are_flags_and_default_to_off(capsys: pytest.CaptureFixture[str]) -> None:
+    args = run_cli.parse_args([*argv_of(Path("unused")), "--no-fetch", "--allow-cold"])
+    assert args.no_fetch is True and args.allow_cold is True
+    assert parse_fails([*argv_of(Path("unused")), "--warmup-days", "0"], capsys)
+
+
 @pytest.mark.parametrize("option", ["--capital=0", "--capital=-5", "--commission-per-share=-1",
                                     "--commission-min=abc", "--slippage-per-share=0.00001"])
 def test_cost_options_are_checked_as_backtest_checks_them(rig: Rig, option: str) -> None:
@@ -228,7 +259,9 @@ def test_the_parser_has_no_orders_option_and_matches_options_exactly(
     assert "--port" in parse_fails(
         ["--algos", "a", "--bars", "b", "--db", "d", "--pap", "--minutes", "5"], capsys)
     args = run_cli.parse_args(["--algos", "a", "--bars", "b", "--paper", "--minutes", "5"])
-    assert (args.client_id, args.port, args.fills, args.warmup_days) == (20, 7497, "realistic", 2)
+    # no --warmup-days: the warm-up is the algos' declared need, at least 2 (issue 287)
+    assert (args.client_id, args.port, args.fills, args.warmup_days) == (20, 7497, "realistic", None)
+    assert (args.no_fetch, args.allow_cold) == (False, False)
 
 
 def test_help_and_usage_errors_build_no_client() -> None:

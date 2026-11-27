@@ -17,7 +17,14 @@ Refused (exit 2, before anything is built or connected; one line each):
 * no `--paper` (a live session is paper only), a port the guard refuses, and with `--paper` any port
   but 7497, any host but 127.0.0.1, or `STOINK_ALLOW_LIVE_PORT` present in the environment;
 * `--fills legacy`, and any algo whose `"mode"` is not `paper` (`backtest`, `live`, or absent);
-* an algos file that cannot be used, more than 5 symbols, bars that are not a folder;
+* an algos file that cannot be used, an algo that cannot be built (the algos are built once, in a
+  throw-away folder, before anything is connected, to read their `warmup_sessions()`), more than 5
+  symbols, bars that are not a folder;
+* a warm-up that cannot be completed before the open: the month files lack days the algos need and
+  `--no-fetch` is given, the open (09:30 New York) has passed, the fetch cannot finish by then, or
+  a day is not final before 06:00 New York; `--warmup-days` below the algos' need. `--allow-cold`
+  turns these into a cold start (said, and stored as a warning of the run). By default the missing
+  or provisional days are fetched after the paper check, before any bar is subscribed (issue 287);
 * a path in the repository or in a OneDrive folder (`--out`, `--bars`, `--db`, `--stop-file`,
   `--record`, the algos' working folder), a path that is a file where a folder is needed, a stop file
   that exists, a recording file that exists, a `--db` that cannot be opened (or no `--db` and no
@@ -90,7 +97,15 @@ from MainStoinker.ib.cli import (
 )
 from MainStoinker.ib.connection import IbConnection
 from MainStoinker.ib.history import DATA_ZONE
-from MainStoinker.ib.live_run import DEFAULT_CLIENT_ID, MODE, run_live_session
+from MainStoinker.ib.live_history import DEFAULT_WARMUP_DAYS, warmup_sessions_for
+from MainStoinker.ib.live_run import (
+    DEFAULT_CLIENT_ID,
+    MODE,
+    SessionRefused,
+    algo_needs,
+    check_session_plan,
+    run_live_session,
+)
 from MainStoinker.ib.market_data import IbMarketData
 from MainStoinker.ib.recorder import SessionRecorder
 from MainStoinker.ib.watch_bars import MAX_SYMBOLS, SESSION_GRACE
@@ -101,7 +116,6 @@ RUN_KIND = LIVE_KINDS[0]  # "paper-live"
 MIN_MINUTES = 1
 # a session from 09:25 to 16:20 is 415 minutes (235 on a half day); the driver itself would take 600
 MAX_MINUTES = 420
-DEFAULT_WARMUP_DAYS = 2
 LIVE_BUSY_TIMEOUT = 2.0  # seconds one attempt of a store call waits for another writer
 NY = ZoneInfo(DATA_ZONE)
 
@@ -112,15 +126,20 @@ exit codes:
   1    a symbol stopped (IB error, unusable live file): the run is stored as failed
   2    refused: usage error, console gate, port guard, --paper conditions (port, host,
        STOINK_ALLOW_LIVE_PORT set), a mode other than paper, legacy fills, an unusable path or
-       database, another paper-live run still running, a weekend or a market holiday; nothing
-       was built or connected (also, after connecting: IB says the market is closed today)
+       database, another paper-live run still running, a weekend or a market holiday, an algo
+       config that cannot be built, history that is missing and cannot be fetched before the
+       open (--no-fetch, the open has passed, too little time), --warmup-days below the algos'
+       need; nothing was connected (also, after connecting: IB says the market is closed today)
   3    could not connect to TWS or IB Gateway
-  4    stopped by a lost or closed connection, or by an error (the run is stored as failed)
+  4    stopped by a lost or closed connection, or by an error (the run is stored as failed; a
+       connection lost while the history was fetched: no run was stored, run again to resume)
   5    the account TWS is signed into is not a paper account (at the start nothing was
        requested and nothing stored; later the run was ended); never retry
   6    no data received for a symbol in the session (the run is stored as failed, no_data)
   7    the session stopped the run on a data fault: delayed data, refused or late bars, a silent
-       symbol, a step that took too long (the run is stored as failed)
+       symbol, a step that took too long (the run is stored as failed); or, before any bar, the
+       history the algos need was not complete by the open (the fetch was not done at 09:30, or
+       left gaps, or used up --minutes): nothing was traded and no run was stored
   130  interrupted with Ctrl-C (the run was ended in the store first; its status says why)
 The last line printed names the stored status and end reason of the run.
 """
@@ -164,9 +183,19 @@ def build_parser(paper: bool = False) -> argparse.ArgumentParser:
                         help=r"folder for the live files (default %%USERPROFILE%%\Stoinkulator\live; "
                              "not in the repo or OneDrive; the watcher must not write it at the same "
                              "time)")
-    parser.add_argument("--warmup-days", type=int, default=DEFAULT_WARMUP_DAYS, metavar="N",
-                        help=f"trading days of warm-up from the month files (default "
-                             f"{DEFAULT_WARMUP_DAYS}, at least 1)")
+    parser.add_argument("--warmup-days", type=int, default=None, metavar="N",
+                        help="trading sessions of warm-up (an override). Default: the largest "
+                             "warmup_sessions() any algo declares, at least "
+                             f"{DEFAULT_WARMUP_DAYS}. Below the declared need it is refused unless "
+                             "--allow-cold")
+    parser.add_argument("--no-fetch", action="store_true",
+                        help="do not fetch missing history before the open: a gap in the month files "
+                             "is a refusal that names the fetch-bars command to run (owner form; the "
+                             "default is to fetch, data only)")
+    parser.add_argument("--allow-cold", action="store_true",
+                        help="start with less history than the algos need (a shorter --warmup-days, "
+                             "or history that is missing and cannot be fetched before the open); "
+                             "said on the console and stored in the run's warnings (owner form)")
     parser.add_argument("--fills", choices=("realistic", "legacy"), default="realistic",
                         help="only realistic is accepted; legacy is refused")
     parser.add_argument("--capital", default=None, metavar="AMOUNT",
@@ -195,13 +224,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     _check_connection_arguments(parser, args)
     if not MIN_MINUTES <= args.minutes <= MAX_MINUTES:
         parser.error(f"--minutes must be {MIN_MINUTES} to {MAX_MINUTES}")
-    if args.warmup_days < 1:
+    if args.warmup_days is not None and args.warmup_days < 1:
         parser.error("--warmup-days must be 1 or more")
     return args
 
 
 def describe_run(args: argparse.Namespace) -> str:
     record = f"{args.record}" if args.record else "none (--no-record)"
+    sessions, why = warmup_sessions_for(args.needs, args.warmup_days)
+    history = ("a gap in the month files is a refusal (--no-fetch)" if args.no_fetch else
+               "missing or provisional days are fetched before the open (data only)")
     return "\n".join([
         first_banner_line(args),
         f"  Connects to:      {args.host}:{args.port}",
@@ -209,6 +241,7 @@ def describe_run(args: argparse.Namespace) -> str:
         f"  Symbols:          {', '.join(args.symbols)}",
         f"  Runs for:         at most {args.minutes} minutes (or to the end of the session)",
         f"  Algos:            {args.algos} (every algo in mode paper)",
+        f"  Warm-up:          {sessions} trading session(s) ({why}); {history}",
         f"  Run database:     {args.db}",
         f"  Live files:       {args.out}",
         f"  Recording file:   {record}",
@@ -268,6 +301,10 @@ def _check_inputs(args: argparse.Namespace, variables: Mapping[str, str]) -> Non
     symbols = config_symbols(entries)
     if not 1 <= len(symbols) <= MAX_SYMBOLS:
         raise CliError(f"the algos name {len(symbols)} symbols; a session takes 1 to {MAX_SYMBOLS}")
+    try:  # the one build of the algos before the connection: a config mistake ends here (issue 287)
+        args.needs = algo_needs(entries)
+    except SessionRefused as exc:
+        raise CliError(str(exc)) from exc
     args.entries, args.symbols = entries, symbols
     home = home_folder(variables)
     bars = Path(args.bars)
@@ -355,6 +392,11 @@ def main(
         _check_inputs(args, variables)
         resolve_paths(args, variables, day, Path.cwd(), RUN)  # the recording and the private words
     except (CliError, PathRefused) as exc:
+        say(f"Refused: {exc}")
+        return EXIT_REFUSED
+    try:  # the history refusals (--no-fetch, after the open, too late to fetch ...): before the database
+        check_session_plan(args, day, wall_clock())
+    except SessionRefused as exc:
         say(f"Refused: {exc}")
         return EXIT_REFUSED
     # Nothing is written to the database before the console gate: this only reads it. Closing the

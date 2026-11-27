@@ -1214,9 +1214,11 @@ def test_unusable_options_are_refused_with_exit_2_and_nothing_is_built(
 
 def test_a_missing_warmup_file_is_refused_before_the_connection(
         rig: Rig, tmp_path: Path, stores: list[SqliteStore]) -> None:
+    """The session of these tests starts at 09:30:10, after the open: history that is missing cannot
+    be fetched in time (issue 287: it used to be "no warm-up can be built")."""
     (tmp_path / "bars" / "TSLA" / "TSLA_2024-08.csv").unlink()
     result = session(rig, tmp_path, stores)
-    assert result.code == 2 and "no warm-up can be built" in rig.text
+    assert result.code == 2 and "TSLA missing 2024-08-15" in rig.text and "fetch-bars" in rig.text
     assert not rig.connections
 
 
