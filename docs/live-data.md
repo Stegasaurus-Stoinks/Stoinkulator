@@ -161,7 +161,9 @@ Options (the exact text is in `--help`):
 | `--bars DIR` | required | the folder of the month files (`fetch-bars` output) for the warm-up; not in the repo or OneDrive |
 | `--db SPEC` | the `STOINK_DB` environment variable | the run database: a file path or `sqlite:///path`; created if missing; not in the repo or OneDrive. With neither `--db` nor `STOINK_DB` the command is refused. `:memory:` is refused |
 | `--out DIR` | `%USERPROFILE%\Stoinkulator\live` | folder for the live files (`SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`, as the watcher writes them). The watcher must not write it at the same time |
-| `--warmup-days N` | 2 | trading days of warm-up from the month files, at least 1 |
+| `--warmup-days N` | the algos' need, at least 2 | trading sessions of warm-up. By default the largest `warmup_sessions()` any algo declares, but at least 2. An explicit value replaces it; below the declared need it is refused (exit 2) unless `--allow-cold` |
+| `--no-fetch` | off | do not fetch missing history before the open: a gap in the month files is a refusal (exit 2) that prints the `fetch-bars` command to run. The default is to fetch (owner form) |
+| `--allow-cold` | off | start with less history than the algos need (a shorter `--warmup-days`, or history that is missing and cannot be fetched before the open) instead of refusing or stopping; said on the console and stored in the run's warnings (owner form) |
 | `--fills realistic\|legacy` | `realistic` | only `realistic` is accepted; `legacy` is refused |
 | `--capital AMOUNT` | 10000 | starting capital per algo (as `backtest`) |
 | `--commission-per-share AMOUNT` | 0.005 | commission per share (as `backtest`) |
@@ -191,15 +193,59 @@ Where it writes:
 Folders the command makes and leaves empty after a refusal are removed again. A path inside the
 repository or a OneDrive folder is refused for every one of the above.
 
-The warm-up. Before the engine starts, the algos get the last `--warmup-days` trading days before
-today from the month files in `--bars`, plus today's bars since 09:30 from the first backfill that
+The warm-up. Before the engine starts, the algos get the last N trading sessions before today from
+the month files in `--bars` (N below), plus today's bars since 09:30 from the first backfill that
 IB sends. No algo is updated on these bars and nothing trades on them: a start after 09:30 does
-not catch up (decision D1 of issue 187). The warm-up needs month files for every symbol with at
-least one day before today, else the command is refused. A last warm-up day that is not the
-previous trading day (market calendar: weekends and holidays skipped) is printed as a warning. The engine starts when every symbol's first backfill is
-over; bars that arrive earlier wait. Run `fetch-bars` for the warm-up days after 06:00 New York on
-the day of the session: a day fetched earlier is provisional, and a later refetch changes the
-file, which makes `report RUN --verify` say UNVERIFIABLE.
+not catch up (decision D1 of issue 187). A last warm-up day that is not the previous trading day
+(market calendar: weekends and holidays skipped) is printed as a warning. The engine starts when
+every symbol's first backfill is over; bars that arrive earlier wait.
+
+The history before the open (issue 287). `run` makes sure the month files hold what the algos need
+before it subscribes to any live bar, in this order:
+
+1. Before anything is connected, the algos are built once (in a throw-away folder, their output
+   hidden, as `backtest --start` does) to validate their config and read what each declares with
+   `warmup_sessions()`. A config mistake, also an algo whose constructor raises, is a refusal (exit
+   2): nothing is connected, no client is built, nothing is stored. Console line:
+   `Warm-up: 22 trading session(s) of history (the most any algo declares: FVGZone-AAPL)`, or `(the
+   default; the algos declare 1)`, or `(--warmup-days; the algos declare 22)`. N is the largest need,
+   at least 2, counted in trading sessions by the market calendar (a holiday is no session; a half
+   day is one). `--warmup-days` below the need is refused unless `--allow-cold`.
+2. The month files are checked for those days (offline; `live_history.check_coverage`): every day
+   present, complete by the calendar (a half day's 210 bars are complete), and final. A day fetched
+   before 06:00 New York next day (`history.DAY_FINAL_AT`) is provisional; yesterday's bars are
+   never taken as final before 06:00 New York of the session day. A day with holes (IB sends no bar
+   for a minute without a trade) counts when the manifest records it as `ok` and final, that being
+   IB's own final answer; without such a record it is fetched.
+3. Nothing missing: one line, `History: nothing missing: the month files hold the 2 session(s)
+   2024-08-14 to 2024-08-15 for AAPL, MSFT, complete and final; nothing is requested`, and no
+   history request is sent.
+4. Something missing or provisional, and there is time (this computer's clock plus the pacing
+   limits: `fetch-bars`' estimate rules, at least 10 s per request) to finish before 09:30 New York:
+   the session connects and passes the paper check, then fetches exactly those days, only for the
+   symbols that lack them, into `--bars`, through the same fetch driver as `fetch-bars` (the same
+   pacing, manifest, gap report and session recording; no new message id, the client's allowlist
+   is unchanged), and only then subscribes to live bars. Console lines: `History: incomplete:
+   AAPL missing 2024-08-14; ...; it is fetched after the connection, before the open (up to 3
+   requests for 3 symbols ...)` before connecting; after the paper check `History: estimate: ...;
+   the open (09:30 New York) is in 1 h 29 min`, `History: fetching N symbol-day(s) before the open,
+   data only`, the fetch's own progress lines under `History:`, and `History: complete: the month
+   files hold the N session(s) ... for ...`. The warm-up is built from the files after the fetch.
+5. The time the fetch takes comes off `--minutes` (the session never runs longer than `--minutes`
+   from the start of the command; the window is not extended).
+6. What cannot be done in time is never traded cold. Refused before connecting (exit 2): `--no-fetch`
+   with a gap (the line names the `fetch-bars` command), a start after 09:30, an estimate that does
+   not fit before the open, a provisional day before 06:00. Stopped after connecting (exit 7, no run
+   stored, nothing subscribed): the fetch is not done at 09:30 (checked at every progress event of
+   the fetch, so within one request; what was fetched stays on disk and a rerun resumes), a day
+   failed or IB had no data for it, or the fetch used up the `--minutes` window. Exit 4 if the
+   connection was lost during the fetch. The line says `History: STOPPED: ...` and `no run was
+   stored`. With `--allow-cold` none of these stops the session: it starts with the history it has,
+   says `History: COLD START (--allow-cold): ...` and stores the reason as a warning of the run.
+
+A later refetch of a day that a run used changes the month file and makes `report RUN --verify` say
+UNVERIFIABLE for that run (as before). A fetch made by the session itself, before the run is
+begun, is part of its warm-up: the run's record is of the files as they were after it.
 
 Gaps. The watcher drops every minute it cannot vouch for (seen only in the backfill, spanning a
 connection loss or a data farm break, a stalled stream, a re-request gap). A bar that follows a gap
@@ -331,12 +377,12 @@ one-off closures listed in `OVERRIDES`).
 |------|--------------|--------------|--------------|-------|
 | 0 | complete: every day ok, no data or already done | every step done (delayed data is a success) | watched to the end, every symbol streaming | the session ended as planned (`session_end` at 16:20, or 13:20 on a half day, `minutes_elapsed` or `stop_file`); stored as `completed` |
 | 1 | finished, but a day failed or a symbol was not fetched | connected, but a step failed (including NO data) | finished, but a symbol stopped, had no stream at the end or delivered no bars | a symbol stopped; stored as `failed` |
-| 2 | refused: gate, port guard, arguments, path, folder layout, `--paper` conditions | refused (same list) | refused (same list), and a weekend or a market holiday | refused, nothing built or connected: usage, gate, port guard, `--paper` conditions, a mode other than `paper`, legacy fills, an unusable path or database, another `paper-live` run still running, a weekend or a market holiday (also after connecting: IB says the day is closed) |
+| 2 | refused: gate, port guard, arguments, path, folder layout, `--paper` conditions | refused (same list) | refused (same list), and a weekend or a market holiday | refused, nothing connected: usage, gate, port guard, `--paper` conditions, a mode other than `paper`, legacy fills, an unusable path or database, another `paper-live` run still running, a weekend or a market holiday, an algo config that cannot be built, history that is missing and cannot be fetched before the open (`--no-fetch`, the open has passed, too little time, a day not final before 06:00), `--warmup-days` below the algos' need (also after connecting: IB says the day is closed) |
 | 3 | could not connect | could not connect | could not connect | could not connect |
-| 4 | stopped early: connection lost, pacing violation twice or a fatal fault; rerun resumes | not a paper account (`--paper` only) | stopped by a lost or closed connection, or an unexpected error | stopped by a lost or closed connection or by an error; stored as `failed`. Also: the run ended as planned but its end could not be stored |
+| 4 | stopped early: connection lost, pacing violation twice or a fatal fault; rerun resumes | not a paper account (`--paper` only) | stopped by a lost or closed connection, or an unexpected error | stopped by a lost or closed connection or by an error; stored as `failed`. Also: the run ended as planned but its end could not be stored; a connection lost while the history was fetched (no run stored; run again, the fetch resumes) |
 | 5 | not a paper account (`--paper` only) | not used | not a paper account (`--paper` only) | not a paper account (at the start nothing requested, nothing stored; later the run was ended) |
 | 6 | not used | not used | finished, every symbol streaming or closed, but at least one symbol received no data: no bar of today's session and no live update for 120 s of the regular session after its backfill ended | no data received for a symbol; stored as `failed`, `no_data` |
-| 7 | not used | not used | not used | the session stopped the run on a data fault: delayed data, refused or late bars, a silent symbol, a step that took more than 60 s; stored as `failed` |
+| 7 | not used | not used | not used | the session stopped the run on a data fault: delayed data, refused or late bars, a silent symbol, a step that took more than 60 s; stored as `failed`. Also, before any bar is subscribed: the history the algos need was not complete by the open (the fetch was not done at 09:30, left a day missing, or used up `--minutes`); nothing traded, no run stored |
 | 130 | Ctrl-C | Ctrl-C | Ctrl-C | Ctrl-C (the run was ended in the store first) |
 
 4 means "stopped, run again" for `fetch-bars` and "not a paper account" for `probe-data` (issue 177

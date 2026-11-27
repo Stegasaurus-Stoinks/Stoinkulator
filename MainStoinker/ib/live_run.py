@@ -429,6 +429,13 @@ def _plan(args: argparse.Namespace, today: date, now: datetime | None = None) ->
 _NY_ZONE = ZoneInfo("America/New_York")
 
 
+def check_session_plan(args: argparse.Namespace, today: date, now: datetime) -> None:
+    """Every refusal of the plan (`_plan`), for a caller that wants them before it opens the
+    database (`run_cli`): `SessionRefused` for the first problem, else nothing. The driver plans
+    again itself; the algos are not built a second time when `args.needs` is set."""
+    _plan(args, today, now)
+
+
 def _history_plan(coverage: Coverage, bars: Path, today: date, now: datetime, no_fetch: bool,
                   allow_cold: bool) -> tuple[bool, bool, list[str], list[str]]:
     """`(will_fetch, build the warm-up now, console lines, blockers)` for what the coverage found; a
@@ -449,30 +456,29 @@ def _history_plan(coverage: Coverage, bars: Path, today: date, now: datetime, no
     todo, blocked = coverage.todo(), coverage.blocked()
     opening, stamp = open_epoch(today), now.timestamp()
     seconds = estimate_seconds(coverage.requests) if todo else 0.0
-    blockers: list[str] = []
+    blockers: list[str] = []  # short and free of paths: stored with the run when the start is cold
+    hint = f" (fetch it first with: {fetch_command(bars, todo)})" if todo else ""
     if blocked:
         blockers.append("a day fetched before 06:00 New York of the day after it is not final before "
-                        "then (history.DAY_FINAL_AT)")
+                        "then")
     if todo and no_fetch:
-        blockers.append(f"--no-fetch: nothing is fetched here; fetch it first with: "
-                        f"{fetch_command(bars, todo)}")
+        blockers.append("--no-fetch: the missing history is not fetched")
     elif todo and stamp >= opening:
-        blockers.append("the open (09:30 New York) has passed, so there is no time to fetch it; "
-                        f"fetch it first with: {fetch_command(bars, todo)}")
+        blockers.append("the open (09:30 New York) has passed: no time to fetch the missing history")
     elif todo and stamp + seconds > opening:
         blockers.append(f"the fetch cannot finish before the open: at least {format_seconds(seconds)} "
-                        f"needed, {format_seconds(opening - stamp)} left; start earlier or fetch it "
-                        f"first with: {fetch_command(bars, todo)}")
+                        f"needed, {format_seconds(opening - stamp)} left")
     gaps = coverage.describe_gaps()
     if blockers and not allow_cold:
         raise SessionRefused(f"the warm-up history for {span} is incomplete ({gaps}); "
-                             + "; ".join(blockers) + "; or --allow-cold to start with what is stored")
+                             + "; ".join(blockers) + hint + "; or --allow-cold to start with what is "
+                             "stored")
     will_fetch = bool(todo) and not (no_fetch or stamp >= opening or stamp + seconds > opening)
     if will_fetch:
         notes.append(f"History: incomplete: {gaps}; it is fetched after the connection, before the "
                      f"open ({describe_requests(coverage, seconds)})")
     if blockers:
-        notes.append(f"History: COLD START (--allow-cold): {'; '.join(blockers)}")
+        notes.append(f"History: COLD START (--allow-cold): {'; '.join(blockers)}{hint}")
     if kept:
         notes.append("History: days kept with fewer bars than the session (IB's final answer): "
                      + ", ".join(kept))
@@ -1428,6 +1434,6 @@ def _end_run(session: _Session, watcher_code: int, store: Store, say: Callable[[
 
 
 __all__ = [
-    "DROP_FIELDS", "EXIT_FAULT", "SessionRefused", "algo_needs", "close_abandoned_runs",
-    "run_live_session",
+    "DROP_FIELDS", "EXIT_FAULT", "SessionRefused", "algo_needs", "check_session_plan",
+    "close_abandoned_runs", "run_live_session",
 ]

@@ -103,6 +103,7 @@ from MainStoinker.ib.live_run import (
     MODE,
     SessionRefused,
     algo_needs,
+    check_session_plan,
     run_live_session,
 )
 from MainStoinker.ib.market_data import IbMarketData
@@ -391,6 +392,11 @@ def main(
         _check_inputs(args, variables)
         resolve_paths(args, variables, day, Path.cwd(), RUN)  # the recording and the private words
     except (CliError, PathRefused) as exc:
+        say(f"Refused: {exc}")
+        return EXIT_REFUSED
+    try:  # the history refusals (--no-fetch, after the open, too late to fetch ...): before the database
+        check_session_plan(args, day, wall_clock())
+    except SessionRefused as exc:
         say(f"Refused: {exc}")
         return EXIT_REFUSED
     # Nothing is written to the database before the console gate: this only reads it. Closing the
