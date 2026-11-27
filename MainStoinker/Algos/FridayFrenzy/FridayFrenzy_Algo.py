@@ -61,6 +61,10 @@ class Algo(ParentAlgo):
         self.inTrade = False
         
 
+    def warmup_sessions(self):
+        # `update` reads the last two rows of its data: a first frame of one row crashes it
+        return 1
+
     def update(self, StockData):
 
 

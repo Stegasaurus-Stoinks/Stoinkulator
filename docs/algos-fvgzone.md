@@ -197,6 +197,48 @@ that 09:30 bar is missing from the data.
 A zone retested only during that history is not marked
 used (the algo cannot know whether another process traded it).
 
+### How much history: `warmup_sessions()`
+
+Every algo can say how many whole trading sessions of 1-minute bars it needs before its first
+tradable bar (`ParentAlgo.warmup_sessions()`, default 0). FVGZone works it out from its settings
+as the largest of the parts that are on. A need counted in bars is turned into the fewest sessions
+that still hold that many bars when up to two of them are half days (a full session has 390
+1-minute bars, a half day 210; two half days can sit in one window, for example the day after
+Thanksgiving and Christmas Eve):
+
+| part | on when | needed |
+|------|---------|--------|
+| ATR | always | `atr_bars * zone_minutes` minutes (`atr_bars` is the detector's 20) |
+| EMA of the 1-minute closes | `trend_filter` | the larger of `trend_ema` bars (what the algo needs to call it ready) and the bars after which the EMA's start value weighs at most 0.1% |
+| higher-timeframe EMA | `htf_minutes` > 0 | the same rule in higher-timeframe bars (390 // `htf_minutes` per full session, 210 // `htf_minutes` per half day) |
+| volume by slot | `vol_slot_mult` > 0 | `vol_slot_sessions + 2` sessions (the 2 for half days: they have no afternoon slot) |
+| trend-day filter | `trend_day_adr` > 0 | `adr_sessions` sessions |
+
+The 0.1% rule: an EMA of length `n` has `alpha = 2 / (n + 1)`, and after `k` bars the start value
+weighs `(1 - alpha)^k`; `k` is the smallest count with `(1 - alpha)^k <= 0.001`. That is 173 bars for
+`trend_ema` 50 and 70 buckets for `htf_ema` 20.
+
+So the defaults need 1 session (173 EMA bars and 100 minutes of ATR fit in a half day's 210 bars),
+`htf_minutes` 30 needs 7 (70 buckets: 5 full sessions of 13 and 2 half days of 7 hold 79, 6 sessions
+only 66), and `vol_slot_mult` 1.5 with `trend_day_adr` 0.3 needs 22 (20 + 2). "Ready" is still what the
+algo itself checks (bar and session counts); the 0.1% rule only widens the window for the two EMAs.
+Even so, any EMA still depends slightly on where its history began: at the first tradable bar the
+start value weighs at most 0.1%, so a result can differ from a longer history's by at most 0.1% of the
+distance between the two start values.
+
+`backtest --start DATE [--end DATE]` uses it: the largest need of the run's algos is counted back
+from `DATE` by the market calendar and those sessions are given to the algos as warm-up, through the
+same engine seeding a live session's warm-up frames use (no order, trade, equity or statistic comes
+from them). For FVGZone with the defaults on data that has a session before `DATE`, the trades of
+`--start DATE` equal those of a run over all the data from `DATE` on, trade for trade (the algo is flat
+every day at 15:55, and its zones, VWAP and used-up marks are per session). If the bars do not reach back
+far enough the command refuses and names the first day needed and the first day available;
+`--allow-cold` starts anyway, says so, and records it in the stored run. Algos that declare no need
+(Elliot, FunctionTest, TrendLine) are named in the output, the report and the stored run
+("warm-up: none declared by ..."): they start without history. With `htf_minutes` 30 the offline
+data (7 days) is too short for `--start` (7 sessions needed), so the trade-for-trade equivalence
+above is tested only for the defaults; the declared number is pinned by a unit test instead.
+
 ## Limits
 
 - **Data that ends early.** A half day (13:00 close) is known from the market calendar and

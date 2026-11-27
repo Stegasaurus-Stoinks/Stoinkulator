@@ -38,6 +38,16 @@ class ParentAlgo:
         self.trade = 0
         self.broker = None
 
+    def warmup_sessions(self) -> int:
+        """Whole trading sessions of 1-minute bars this algo needs before its first tradable bar.
+
+        Worked out from the algo's own settings; 0 (the default) means it trades from
+        the first bar it is given. `backtest --start` loads the largest need of all its
+        algos before the start date and gives those bars to the algos as warm-up
+        history (no orders are possible then).
+        """
+        return 0
+
     def pre_update(self, StockData):
         # TODO: add check_stoploss in here
 
