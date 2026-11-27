@@ -243,7 +243,8 @@ def test_prev_volume_bars_are_counted_across_the_session_boundary():
     quiet_day = day_bars(D2)
     assert taken(Rig(**cfg).feed([*quiet_day, *day_bars(D3, 1500)]))
     assert Rig(**cfg).feed([*quiet_day, *day_bars(D3, 1499)]).trades == []
-    # the last two bars of the day before are busy: the mean is (28 * 1000 + 2 * 31000) / 30 = 3000, 1.5 x that is 4500
+    # the last two bars of the day before are busy: the mean is (28 * 1000 + 2 * 31000) / 30 = 3000,
+    # so 1.5 x it is 4500
     busy = [B(x.at, x.o, x.h, x.l, x.c, 31_000) if x.at >= stamp(D2, "09:59") else x for x in quiet_day]
     assert Rig(**cfg).feed([*busy, *day_bars(D3, 4499)]).trades == []
     assert taken(Rig(**cfg).feed([*busy, *day_bars(D3, 4500)]))
@@ -253,7 +254,7 @@ def test_prev_volume_bars_are_counted_across_the_session_boundary():
 
 def test_prev_volume_works_from_a_warm_up_frame():
     rig = Rig(**PREV)
-    for x in [*day_bars(D2), *day_bars(D3, 1500)]:  # appended without update: one update sees all earlier rows
+    for x in [*day_bars(D2), *day_bars(D3, 1500)]:  # appended without update: one update sees all
         rig.store.append(Bar(x.at, int(x.at.timestamp()), x.o, x.h, x.l, x.c, x.v))
     rig.algo.update(rig.store.view())
     assert taken(rig)
@@ -309,7 +310,8 @@ def test_all_is_the_default_and_a_not_ready_filter_blocks_it():
 
 def test_any_trend_day_without_a_0930_bar_does_not_pass():
     cfg = {**PREV, **ADR, **ANY}
-    assert Rig(**cfg).feed([*history(), *day_bars(D3, 1499)[1:]]).trades == []  # no session open, volume fails
+    # no session open: the trend day cannot pass; the volume fails here and passes below
+    assert Rig(**cfg).feed([*history(), *day_bars(D3, 1499)[1:]]).trades == []
     assert taken(Rig(**cfg).feed([*history(), *day_bars(D3, 1500)[1:]]))  # volume passes
 
 

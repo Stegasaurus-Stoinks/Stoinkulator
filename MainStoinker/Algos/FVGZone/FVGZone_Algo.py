@@ -605,7 +605,7 @@ class Algo(ParentAlgo):
         return daily is None or bool(self._trend_day(zone, c_t))
 
     def _trend_day(self, zone: Any, c_t: int) -> bool | None:
-        """The trend-day filter (on): the signed move from the session open against the ADR; None if unknown."""
+        """The trend-day filter (on): the signed move from the session open against the ADR, or None."""
         daily = self._daily_range
         session_open = daily.session_open if daily is not None else None
         if daily is None or session_open is None:
