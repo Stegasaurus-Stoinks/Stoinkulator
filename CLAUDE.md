@@ -104,7 +104,7 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols "AAPL,MSFT" --start 2024-08-16 --end 2024-08-26 --paper --no-prompt   # DATA only, PAPER account only (TWS on 7497): bars to CSV; one session at a time, main session only
 .venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols "AAPL" --paper --no-prompt   # DATA only, PAPER account only: what market data the account gets
 .venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt   # DATA only, PAPER account only: watch live 1-minute bars for N minutes (1-420); one session at a time, main session only
-.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20; on a half day, 13:00 close, 235 = 09:25 to 13:20); one session at a time, main session only; DB path from the owner; the warm-up is the algos' declared need (at least 2 sessions) and missing or provisional days are fetched into BARS before the open, data only (start early enough: at least 10 s per symbol-day, all before 09:30)
+.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20; on a half day, 13:00 close, 235 = 09:25 to 13:20); one session at a time, main session only; DB path from the owner; the warm-up is the algos' declared need (at least 2 sessions) and missing or provisional days are fetched into BARS before the open, data only (at least 10 s per symbol-day, all before 09:30, counted in the `--minutes` window: have the history on disk and start about 09:25)
 ```
 
 Owner forms of the same four (the owner's terminal, prompted: you type the port;
@@ -138,7 +138,8 @@ refuses a path inside either): `%USERPROFILE%\Stoinkulator\bars` (`fetch-bars`),
 and the run database named by `run --db` (the owner's file; a first write migrates it).
 Bars are month files
 `DIR/SYMBOL/SYMBOL_YYYY-MM.csv` (naive New York times, regular hours) with
-`manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them; live files are
+`manifest.json`, `gaps.csv` and `gaps_summary.txt` beside them (`run` may also write these into
+its `--bars` folder when it fetches missing warm-up days); live files are
 `DIR/SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`. Agents write there only through a
 command's own defaults, in a session the owner asked for; tests never (the
 command test files enforce it with `tests/home_guard.py`).
@@ -181,7 +182,8 @@ Seen in real sessions (2026-11-23/24, owner's TWS):
   recording with account/path redaction; `cli.py` `fetch-bars` and `probe-data` (gate, paper mode,
   paths); `probe.py` the probe steps; `watch_bars.py` the live bar watcher; `live_run.py` the
   live paper session driver (watcher, aligner, engine and run writer; no orders); `run_cli.py` the
-  `run` command (paper only, refusals, gate); `contracts.py`, `events.py`.
+  `run` command (paper only, refusals, gate); `live_history.py` the warm-up coverage check and the
+  fetch of missing days before the open; `contracts.py`, `events.py`.
 - `OfflineData/` committed 1-minute bars (AAPL, MSFT, TSLA) used by tests. Data time is naive
   `America/New_York` wall-clock time (session 09:30 to 16:00); algos' hard-coded times use it too.
 - `tests/` pytest suite; `tests/harness.py` runs offline backtests headless.

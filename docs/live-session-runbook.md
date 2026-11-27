@@ -43,10 +43,16 @@ says VERIFIED; the dashboard showed the run while it ran; the next-morning compa
    the month files in `--bars`, and fetches what is missing or still provisional itself, after the
    paper check and before it subscribes to live bars (issue 287): you do not have to run
    `fetch-bars` first. It needs time: at least 10 s per missing symbol-day at IB's pacing limits,
-   all of it before 09:30 New York. So start early enough (about 09:00 for a few missing days; the
-   console prints the estimate), or fetch beforehand as below. A day fetched before 06:00 next day
-   is provisional and is fetched again by the first `run` after 06:00 of the session day; yesterday
-   is never taken as final before 06:00. To fetch by hand (use the symbols of the algos file, here
+   all of it before 09:30 New York, and that time comes off the `--minutes` window (which counts
+   from the start of the command, not from 09:30). A full session to 16:20 therefore needs the
+   history ALREADY on disk: fetch it beforehand (the evening before after 16:00 for all but the
+   last day, or in the morning after 06:00 New York) and start `run` at about 09:25, so that it
+   only tops up what is missing. Starting early to fetch costs the end of the day: `--minutes 415`
+   from 09:00 ends the run at 15:55 and even 420 ends it at 16:00, before the last bars at 16:20
+   (the console prints a WARNING with the time the run will stop). A day fetched before 06:00 next
+   day is provisional and is fetched again by the first `run` after 06:00 of the session day;
+   yesterday, present or missing, is never taken as final before 06:00 (a start before then is
+   refused). To fetch by hand (use the symbols of the algos file, here
    AAPL and MSFT, and a start a few trading days back):
 
        .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols AAPL,MSFT --start YYYY-MM-DD --end YYYY-MM-DD --paper --no-prompt

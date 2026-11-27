@@ -60,6 +60,7 @@ from MainStoinker.ib.history import (
     GAP_COMPLETE,
     GAP_PARTIAL,
     GAP_SHORT,
+    STATUS_NO_DATA,
     STATUS_OK,
     DayRecord,
     Manifest,
@@ -118,13 +119,18 @@ class SymbolHistory:
     symbol: str
     missing: tuple[date, ...] = ()
     provisional: tuple[date, ...] = ()  # present and complete, but fetched before the day is final
-    blocked: tuple[date, ...] = ()  # the provisional days that are not final yet: no fetch helps
+    blocked: tuple[date, ...] = ()  # missing or provisional days that are not final yet: no fetch helps
     partial: tuple[tuple[date, int], ...] = ()  # days kept with holes (IB's final answer): (day, bars)
+    # missing days the fetch driver would NOT request: its manifest records them `ok` or `no_data`
+    stuck: tuple[tuple[date, str], ...] = ()
+    unchecked: bool = False  # bars on disk but no manifest.json: finality could not be checked
 
     @property
     def todo(self) -> list[date]:
-        """The days to fetch: missing ones and provisional ones that are final by now."""
-        return sorted(set(self.missing) | (set(self.provisional) - set(self.blocked)))
+        """The days to fetch: missing ones the driver will request and provisional ones that are
+        final by now."""
+        skip = set(self.blocked) | {d for d, _ in self.stuck}
+        return sorted((set(self.missing) | set(self.provisional)) - skip)
 
 
 @dataclass(frozen=True)
@@ -142,36 +148,68 @@ class Coverage:
     def requests(self) -> int:
         return sum(len(days) for days in self.todo().values())
 
+    def stuck(self) -> dict[str, list[tuple[date, str]]]:
+        """Missing days the fetch would not request (its manifest says `ok` or `no_data`)."""
+        return {s.symbol: list(s.stuck) for s in self.symbols if s.stuck}
+
+    def unchecked(self) -> list[str]:
+        """Symbols with bars on disk and no manifest: their days could not be checked for finality."""
+        return [s.symbol for s in self.symbols if s.unchecked]
+
     @property
     def clean(self) -> bool:
-        return not self.todo() and not self.blocked()
+        return not self.todo() and not self.blocked() and not self.stuck()
 
     def describe_gaps(self) -> str:
         parts = []
         for s in self.symbols:
-            if s.missing:
-                parts.append(f"{s.symbol} missing {day_list_text(s.missing)}")
+            stuck_days = {d for d, _ in s.stuck}
+            fetchable = [d for d in s.missing if d not in stuck_days and d not in s.blocked]
+            if fetchable:
+                parts.append(f"{s.symbol} missing {day_list_text(fetchable)}")
+            for day, status in s.stuck:
+                parts.append(f"{s.symbol} {day.isoformat()} has no bars but its manifest says "
+                             f"'{status}', so a fetch would not ask IB for it again")
             late = [d for d in s.provisional if d not in s.blocked]
             if late:
                 parts.append(f"{s.symbol} provisional (to fetch again) {day_list_text(late)}")
-            if s.blocked:
+            young = [d for d in s.blocked if d in s.provisional]
+            if young:
                 parts.append(f"{s.symbol} provisional until 06:00 New York next day "
-                             f"{day_list_text(s.blocked)}")
+                             f"{day_list_text(young)}")
+            absent = [d for d in s.blocked if d not in s.provisional]
+            if absent:
+                parts.append(f"{s.symbol} missing and not final until 06:00 New York next day "
+                             f"{day_list_text(absent)}")
         return "; ".join(parts)
 
 
 def _manifest(bars_dir: Path, symbol: str) -> Manifest | None:
     """The records of `manifest.json`, read as they stand (no identity check, nothing moved or
-    written); None when there is no usable file. `fetch` is what judges the file's identity."""
+    written); None when there is no file. A file that exists but cannot be read or is not a
+    manifest is a `HistoryError` naming it: it must not hide provisional days. `fetch` is what
+    judges the file's identity."""
+    path = manifest_path(bars_dir, symbol)
     try:
-        raw = json.loads(manifest_path(bars_dir, symbol).read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HistoryError(f"{symbol}: {path} cannot be read ({type(exc).__name__}); repair or move "
+                           "it") from exc
+    try:
+        raw = json.loads(text)
         records = raw["days"]
         manifest = Manifest(symbol, int(raw.get("conId", 0)))
         for key, rec in records.items():
+            status = str(rec["status"])
+            if status not in ("ok", "no_data", "failed"):
+                raise ValueError(f"unknown status {status!r}")
             manifest.days[date.fromisoformat(key).isoformat()] = DayRecord(
-                str(rec["status"]), int(rec.get("bars", 0)), None, "", str(rec.get("fetched_utc", "")))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return None
+                status, int(rec.get("bars", 0)), None, "", str(rec.get("fetched_utc", "")))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise HistoryError(f"{symbol}: {path} is not a usable manifest ({type(exc).__name__}: {exc}); "
+                           "repair or move it") from exc
     return manifest
 
 
@@ -216,12 +254,15 @@ def check_coverage(bars_dir: Path, symbols: Sequence[str], days: Sequence[date],
         missing: list[date] = []
         provisional: list[date] = []
         partial: list[tuple[date, int]] = []
+        stuck: list[tuple[date, str]] = []
         for day in days:
             row = rows.get(day)
+            record = None if manifest is None else manifest.days.get(day.isoformat())
             if row is None or row.present == 0:
                 missing.append(day)
+                if record is not None and record.status in (STATUS_OK, STATUS_NO_DATA):
+                    stuck.append((day, record.status))
                 continue
-            record = None if manifest is None else manifest.days.get(day.isoformat())
             if manifest is not None and manifest.is_provisional(day):
                 provisional.append(day)
             elif row.status in (GAP_COMPLETE, GAP_SHORT):
@@ -230,9 +271,14 @@ def check_coverage(bars_dir: Path, symbols: Sequence[str], days: Sequence[date],
                 partial.append((day, row.present))  # IB's own final answer, kept as it came
             else:
                 missing.append(day)  # holes and no record of a complete answer: ask IB
-        blocked = [d for d in provisional if now.astimezone(UTC) < day_final_utc(d)]
+                if record is not None and record.status == STATUS_NO_DATA:
+                    stuck.append((day, record.status))
+        # a day that is not final yet cannot be fetched into a final state, whether it is provisional
+        # or missing altogether (a fetch now would only give a provisional day)
+        blocked = [d for d in (*provisional, *missing) if now.astimezone(UTC) < day_final_utc(d)]
         found.append(SymbolHistory(symbol, tuple(missing), tuple(provisional), tuple(blocked),
-                                   tuple(partial)))
+                                   tuple(partial), tuple(stuck),
+                                   unchecked=manifest is None and frame is not None and len(frame) > 0))
     return Coverage(tuple(days), tuple(found))
 
 

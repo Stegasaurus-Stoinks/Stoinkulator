@@ -232,7 +232,15 @@ before it subscribes to any live bar, in this order:
    data only`, the fetch's own progress lines under `History:`, and `History: complete: the month
    files hold the N session(s) ... for ...`. The warm-up is built from the files after the fetch.
 5. The time the fetch takes comes off `--minutes` (the session never runs longer than `--minutes`
-   from the start of the command; the window is not extended).
+   from the start of the command; the window is not extended). So a full session to 16:20 needs
+   the history already on disk (`fetch-bars` the evening before after 16:00 for all but the last
+   day, or in the morning after 06:00) and a start about 09:25: `run` then only tops up. Starting
+   early to fetch costs the end of the day (09:00 with `--minutes 415` ends at 15:55, 420 at
+   16:00); the console prints `live: WARNING: ... the run will stop at about HH:MM New York`.
+   Also refused before connecting: a missing or provisional day that is not final before 06:00 New
+   York (a start before then), a missing day the fetch would not ask for (its manifest says `ok` or
+   `no_data`), a `manifest.json` that exists but cannot be read; with no manifest at all the line
+   says finality could not be checked.
 6. What cannot be done in time is never traded cold. Refused before connecting (exit 2): `--no-fetch`
    with a gap (the line names the `fetch-bars` command), a start after 09:30, an estimate that does
    not fit before the open, a provisional day before 06:00. Stopped after connecting (exit 7, no run

@@ -1985,7 +1985,10 @@ def run_watch(
         else:
             verified = paper
             md = market_data_factory(conn)
-            early = seam.before_watch(conn, md, say) if seam.before_watch is not None else None
+            # defence in depth: the seam runs only in a verified paper session (`paper_session_ok`
+            # passed above); in any other mode it is never called
+            early = (seam.before_watch(conn, md, say)
+                     if seam.before_watch is not None and verified else None)
             if early is not None:
                 code = early  # nothing was subscribed: the finally block closes everything
             else:

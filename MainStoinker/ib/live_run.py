@@ -403,7 +403,10 @@ def _plan(args: argparse.Namespace, today: date, now: datetime | None = None) ->
         raise SessionRefused(f"the algo config cannot be used: {exc}") from exc
     when = now if now is not None else datetime(today.year, today.month, today.day, 9, 0,
                                                 tzinfo=_NY_ZONE)
-    needed = needed_days(today, sessions)
+    try:
+        needed = needed_days(today, sessions)
+    except (ValueError, OverflowError) as exc:
+        raise SessionRefused(f"the warm-up of {sessions} sessions cannot be counted: {exc}") from exc
     try:
         coverage = check_coverage(Path(bars), symbols, needed, when)
     except HistoryError as exc:
@@ -448,7 +451,9 @@ def _history_plan(coverage: Coverage, bars: Path, today: date, now: datetime, no
     kept = [f"{s.symbol} {d.isoformat()} ({n} bars)" for s in coverage.symbols for d, n in s.partial]
     if coverage.clean:
         notes.append(f"History: nothing missing: the month files hold the {span} for "
-                     f"{', '.join(names)}, complete and final; nothing is requested")
+                     f"{', '.join(names)}, complete and final; nothing is requested"
+                     + ("; finality could not be checked for " + ", ".join(coverage.unchecked())
+                        + " (no manifest.json)" if coverage.unchecked() else ""))
         if kept:
             notes.append("History: days kept with fewer bars than the session (IB's final answer): "
                          + ", ".join(kept))
@@ -459,8 +464,12 @@ def _history_plan(coverage: Coverage, bars: Path, today: date, now: datetime, no
     blockers: list[str] = []  # short and free of paths: stored with the run when the start is cold
     hint = f" (fetch it first with: {fetch_command(bars, todo)})" if todo else ""
     if blocked:
-        blockers.append("a day fetched before 06:00 New York of the day after it is not final before "
-                        "then")
+        blockers.append("a needed day is not final before 06:00 New York of the day after it (a fetch "
+                        "before then gives provisional bars)")
+    if coverage.stuck():
+        blockers.append("the fetch would not ask IB for a day that has no bars, because its manifest "
+                        "records it ok or no_data: repair the data (restore the month file, or delete "
+                        "that day's entry in manifest.json so it is requested again)")
     if todo and no_fetch:
         blockers.append("--no-fetch: the missing history is not fetched")
     elif todo and stamp >= opening:
@@ -482,7 +491,14 @@ def _history_plan(coverage: Coverage, bars: Path, today: date, now: datetime, no
     if kept:
         notes.append("History: days kept with fewer bars than the session (IB's final answer): "
                      + ", ".join(kept))
+    if coverage.unchecked():
+        notes.append(_unchecked_text(coverage))
     return will_fetch, not will_fetch, notes, blockers
+
+
+def _unchecked_text(coverage: Coverage) -> str:
+    return ("History: finality could not be checked for " + ", ".join(coverage.unchecked())
+            + " (bars on disk but no manifest.json): its days are taken as final")
 
 
 def check_algos_importable_quiet(entries: Sequence[Mapping[str, Any]]) -> None:
@@ -615,6 +631,13 @@ class _Session:
             # the history fetch ran inside the --minutes window: the watch gets what is left of it
             left = int((self.plan.minutes * 60 - self.history.elapsed) // 60)
             watcher.minutes = max(1, min(watcher.minutes, left))
+            stops = self.wall().timestamp() + watcher.minutes * 60
+            today = _ny(self.wall().timestamp()).date()
+            if stops < self._session_end(today) + SESSION_GRACE:
+                self.say(f"live: WARNING: the fetch took {int(self.history.elapsed // 60)} min of the "
+                         f"--minutes window: the run will stop at about {_ny(stops):%H:%M} New York, "
+                         f"before the end of the session ({_hm(self._session_end(today) + SESSION_GRACE)}"
+                         "); the bars after that are not run")
 
     def _extra(self) -> Mapping[date, int | None] | None:
         """The market calendar's table of this run (IB's close for today when it differs)."""
@@ -752,6 +775,16 @@ class _Session:
         if today == plan.preflight_day and self.warm is not None:
             frames, description, warnings = self.warm
         else:  # the clock of this computer and IB's disagree about the date, or nothing was built yet
+            if not plan.allow_cold:  # the history was checked for the other date: check this one too
+                found = check_coverage(plan.bars_dir, plan.symbols,
+                                       needed_days(today, plan.warmup_days), self.wall())
+                if not found.clean:
+                    self._set_fault(
+                        "data_fault", EXIT_FAULT,
+                        f"IB's date {today} is not this computer's {plan.preflight_day} and the "
+                        f"history for IB's date is incomplete ({found.describe_gaps()}); nothing was "
+                        "traded and no run was stored")
+                    return
             frames, description, warnings = live_warmup(plan.bars_dir, plan.symbols, today,
                                                         plan.warmup_days)
         frames = {s: f.copy() for s, f in frames.items()}

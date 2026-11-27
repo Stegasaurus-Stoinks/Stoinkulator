@@ -9,6 +9,8 @@ live under `tmp_path` and the rig points the environment at `tmp_path` (`real_ho
 
 from __future__ import annotations
 
+import argparse
+import json
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -21,7 +23,7 @@ from ibapi.contract import Contract
 
 from MainStoinker.engine.feed import COLUMNS, read_symbol_bars, write_month_file
 from MainStoinker.engine.store import SqliteStore
-from MainStoinker.ib import live_run
+from MainStoinker.ib import live_run, watch_bars
 from MainStoinker.ib.history import DAY_FINAL_AT, Manifest, manifest_path, save_manifest
 from MainStoinker.ib.live_history import (
     DEFAULT_WARMUP_DAYS,
@@ -623,3 +625,169 @@ def test_allow_cold_starts_with_what_is_stored_and_says_so_in_the_run(
 
 def test_the_open_epoch_is_half_past_nine_new_york() -> None:
     assert open_epoch(TODAY) == ep(9, 30)
+
+
+# -- fix round (PR 291 review) -----------------------------------------------------------------------
+
+
+def write_raw_manifest(bars: Path, records: dict[str, dict[str, Any]],
+                       symbols: tuple[str, ...] = SYMBOLS) -> None:
+    for symbol in symbols:
+        manifest = {"version": 1, "symbol": symbol, "conId": CON_IDS[symbol],
+                    "data_zone": "America/New_York", "use_rth": 1, "what_to_show": "TRADES",
+                    "bar_size": "1 min", "days": records}
+        path = manifest_path(bars, symbol)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["no_data", "ok"])
+def test_a_missing_day_the_fetch_would_not_request_is_refused_before_connecting(
+        tmp_path: Path, status: str) -> None:
+    bars = tmp_path / "bars"
+    write_days(bars, [(AUG_15, 390)])
+    stamp = "2024-08-18T12:00:00Z"
+    write_raw_manifest(bars, {
+        AUG_14.isoformat(): {"status": status, "bars": 0 if status == "no_data" else 390,
+                             "fetched_utc": stamp},
+        AUG_15.isoformat(): {"status": "ok", "bars": 390, "fetched_utc": stamp}})
+    coverage = check_coverage(bars, SYMBOLS, [AUG_14, AUG_15], NINE)
+    assert coverage.todo() == {} and set(coverage.stuck()) == set(SYMBOLS) and not coverage.clean
+    with pytest.raises(live_run.SessionRefused) as info:
+        live_run._plan(plan_args(tmp_path), TODAY, NINE)  # noqa: SLF001
+    text = str(info.value)
+    assert f"AAPL 2024-08-14 has no bars but its manifest says '{status}'" in text
+    assert "--allow-cold" in text and "manifest.json" in text
+    plan = live_run._plan(plan_args(tmp_path, allow_cold=True), TODAY, NINE)  # noqa: SLF001
+    assert not plan.will_fetch and plan.cold
+
+
+def test_an_unusable_manifest_is_a_refusal_and_no_manifest_is_said(tmp_path: Path) -> None:
+    bars = tmp_path / "bars"
+    write_warmup_files(bars)
+    plan = live_run._plan(plan_args(tmp_path), TODAY, NINE)  # noqa: SLF001
+    line = next(n for n in plan.notes if "nothing missing" in n)
+    assert "finality could not be checked for AAPL, MSFT, TSLA (no manifest.json)" in line
+    (bars / "AAPL" / "manifest.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(live_run.SessionRefused, match=r"AAPL.*manifest\.json is not a usable manifest"):
+        live_run._plan(plan_args(tmp_path), TODAY, NINE)  # noqa: SLF001
+    write_raw_manifest(bars, {AUG_15.isoformat(): {"status": "bogus"}}, ("AAPL",))  # partly invalid
+    with pytest.raises(live_run.SessionRefused, match="not a usable manifest"):
+        live_run._plan(plan_args(tmp_path), TODAY, NINE)  # noqa: SLF001
+
+
+def test_a_huge_warmup_is_a_refusal_not_a_traceback(tmp_path: Path) -> None:
+    write_warmup_files(tmp_path / "bars")
+    with pytest.raises(live_run.SessionRefused, match="cannot be counted"):
+        live_run._plan(plan_args(tmp_path, warmup_days=10**6), TODAY, NINE)  # noqa: SLF001
+
+
+def test_a_missing_yesterday_before_six_is_refused_before_connecting(tmp_path: Path) -> None:
+    write_days(tmp_path / "bars", [(AUG_14, 390)])  # the 15th is missing altogether
+    with pytest.raises(live_run.SessionRefused, match="missing and not final until 06:00"):
+        live_run._plan(plan_args(tmp_path), TODAY, at(TODAY, 5, 30))  # noqa: SLF001
+    assert live_run._plan(plan_args(tmp_path), TODAY, NINE).will_fetch  # noqa: SLF001
+
+
+def test_the_console_warns_when_the_fetch_cuts_the_window_short(
+        hrig: Any, tmp_path: Path, stores: list[SqliteStore]) -> None:  # noqa: F811
+    write_days(tmp_path / "bars", [(AUG_15, 390)])
+    finish_script(hrig, 6, 12)
+    result = session(hrig, tmp_path, stores, minutes=12, warmup_days=None)
+    assert result.code == 0, hrig.text
+    assert "live: WARNING: the fetch took" in hrig.text
+    assert "the run will stop at about 09:" in hrig.text
+    assert "before the end of the session (16:20)" in hrig.text
+
+
+def test_history_to_fetch_on_a_not_paper_account_sends_no_history_request(
+        hrig: Any, tmp_path: Path, stores: list[SqliteStore]) -> None:  # noqa: F811
+    write_days(tmp_path / "bars", [(AUG_15, 390)])
+    hrig.accounts = "U1234567"
+    result = session(hrig, tmp_path, stores, minutes=5, warmup_days=None)
+    assert result.code == 5, hrig.text
+    assert hrig.daily_requests() == [] and hrig.requests == []
+    assert result.store.list_runs() == ()
+
+
+def test_ctrl_c_during_the_fetch_exits_130_closes_the_connection_and_stores_no_run(
+        hrig: Any, tmp_path: Path, stores: list[SqliteStore]) -> None:  # noqa: F811
+    write_days(tmp_path / "bars", [(AUG_15, 390)])
+
+    def interrupt(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    hrig.sleep = interrupt  # the fetch's first pacing wait
+    result = session(hrig, tmp_path, stores, minutes=5, warmup_days=None)
+    assert result.code == 130, hrig.text
+    assert hrig.connections[0].state.name == "CLOSED"
+    assert result.store.list_runs() == ()
+    assert not any(keep for *_, keep in hrig.requests)
+
+
+def watch_args(tmp: Path, paper: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        paper=paper, host="127.0.0.1", port=7497, client_id=22, connect_timeout=30.0,
+        symbols=["AAPL"], minutes=5, backfill_minutes=10, quiet=True, out=tmp / "live", record=None,
+        private=())
+
+
+def run_watch_with(hrig: Any, tmp: Path, paper: bool, hook: Any) -> int:
+    return watch_bars.run_watch(
+        watch_args(tmp, paper), connection_factory=hrig.connection_factory,
+        market_data_factory=hrig.market_data_factory, recorder_factory=hrig.recorder_factory,
+        out=hrig.out, clock=hrig, sleep=hrig.sleep, wall=hrig.wall,
+        seams=watch_bars.WatchSeams(before_watch=hook))
+
+
+def test_a_nonzero_before_watch_ends_the_watch_with_that_code_and_builds_no_watcher(
+        hrig: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoWatcher:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            raise AssertionError("a Watcher was built")
+
+    monkeypatch.setattr(watch_bars, "Watcher", NoWatcher)
+    calls: list[int] = []
+
+    def hook(conn: Any, md: Any, say: Any) -> int:
+        calls.append(1)
+        return 7
+
+    assert run_watch_with(hrig, tmp_path, True, hook) == 7
+    assert calls == [1] and hrig.requests == [] and hrig.connections[0].state.name == "CLOSED"
+    assert "(exit 7)" in hrig.text
+
+
+def test_before_watch_is_not_called_outside_a_verified_paper_session(
+        hrig: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Stub:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def run(self) -> int:
+            return 0
+
+    monkeypatch.setattr(watch_bars, "Watcher", Stub)
+    calls: list[int] = []
+
+    def hook(conn: Any, md: Any, say: Any) -> int:
+        calls.append(1)
+        return 7
+
+    assert run_watch_with(hrig, tmp_path, False, hook) == 0
+    assert calls == []
+
+
+def test_a_server_date_other_than_the_machines_is_checked_for_history_and_stops_the_session(
+        hrig: Any, tmp_path: Path, stores: list[SqliteStore]) -> None:  # noqa: F811
+    """This computer says 2024-08-15 (its sessions 13 and 14 are on disk); IB says the 16th, whose
+    sessions 14 and 15 are not: exit 7, no run."""
+    write_days(tmp_path / "bars", [(date(2024, 8, 13), 390), (AUG_14, 390)])
+    hrig.server_epoch = ep(9, 30, 10)
+    hrig.wall_offset = -86400.0 - 0.4
+    finish_script(hrig, 2, 4)
+    result = session(hrig, tmp_path, stores, minutes=4, warmup_days=None)
+    assert result.code == 7, hrig.text
+    assert "is not this computer's 2024-08-15" in hrig.text
+    assert "history for IB's date is incomplete" in hrig.text
+    assert result.store.list_runs() == ()

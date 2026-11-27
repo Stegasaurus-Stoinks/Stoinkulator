@@ -110,8 +110,12 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
   ...` (issue 287: the history the algos need is fetched before the open, data only, into `--bars`).
   Then `live: run N begun (paper-live, realistic fills) ...`, one line per closed bar, and at the
   end `Live session: completed, end reason session_end (exit 0)` (or `minutes_elapsed`,
-  `stop_file`), with the check `live: verify: VERIFIED` above it. Start about 09:00 if days are
-  missing (at least 10 s per symbol-day, all before 09:30). `History: STOPPED: ...` ends the
+  `stop_file`), with the check `live: verify: VERIFIED` above it. The fetch (at least 10 s
+  per symbol-day, all before 09:30) comes off the `--minutes` window, which counts from the start of
+  the command: for a full session to 16:20 have the history on disk already (`fetch-bars` the
+  evening before after 16:00 for all but the last day, or in the morning after 06:00) and start
+  `run` at about 09:25 so it only tops up. Starting at 09:00 with `--minutes 415` ends the run at
+  15:55 (420: 16:00); the console says so in a WARNING line. `History: STOPPED: ...` ends the
   session with exit 7, nothing traded, no run stored; a start after 09:30 with a gap, `--no-fetch`
   with a gap or a day not final before 06:00 is refused (exit 2) and names the `fetch-bars`
   command. Your own options (not part of the command shape agents use): `--no-fetch`, `--allow-cold`,
