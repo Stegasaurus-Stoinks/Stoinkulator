@@ -36,8 +36,11 @@ The layers, bottom to top:
   minute. Bad prices, volumes or times are refused (`BadBar`), never repaired.
 - `history.py` pure planning: which days to fetch, the pacer (10 s between history requests, at
   most 60 per 10 minutes, fewer than 6 per contract per 2 s, no identical request within 15 s), the
-  resume manifest, the gap report. There is no holiday calendar: a holiday is requested like a
-  weekday and recorded as `no_data`.
+  resume manifest, the gap report. The market calendar (`engine/market_calendar.py`) decides the
+  days: weekends and holidays are not planned (and not requested), a half day (13:00 close) is
+  expected to hold 210 bars (`complete` with them). A day is still planned only once 16:00 New York
+  of that day has passed, also a half day (a request ends at 16:00, never in the future). Where the calendar and the
+  data disagree the data is kept and the gap report says so (see "Gap files").
 - `fetch.py` the driver behind `fetch-bars`; `probe.py` the steps of `probe-data`; `watch_bars.py`
   the live bar watcher; `cli.py` the argument parsing, path checks, console gate, paper mode,
   scrubbed printer and the shared session runner of `fetch-bars` and `probe-data`; `run_cli.py` the
@@ -71,8 +74,9 @@ of a day is final from 06:00 New York on the next calendar day (`history.DAY_FIN
 fetched earlier is stored as usual but is provisional; a later run whose server time is past that
 moment fetches it again and replaces its rows (reporting how many minutes changed; a refetch with
 fewer bars keeps the stored day, a failed refetch keeps it and tries again). A day with no bars
-counts as a holiday (`no_data`) only once that moment has passed; sooner it is `failed` ("no data
-yet") and asked again. The summary shows a provisional count and the days, and the gap files carry
+counts as `no_data` (a day IB has nothing for, such as one the calendar does not know is closed) only
+once that moment has passed; sooner it is `failed` ("no data yet") and asked again. Holidays and
+weekends are never asked for. The summary shows a provisional count and the days, and the gap files carry
 a `provisional` status for such days.
 
 Order of events: arguments, paths, dates, port guard, folder layout, the console gate; connect;
@@ -168,7 +172,7 @@ Options (the exact text is in `--help`):
 | `--client-id N` | 20 | 0 and 123 are refused |
 | `--paper` | off | required: without it the command is refused. Also makes it refuse the live opt-in variable in the environment and run the account check |
 | `--no-prompt` | off | only with `--paper`: skip the console gate. Without it you must type the port number |
-| `--minutes N` | required | how long the session may last, 1 to 420. 415 covers 09:25 to 16:20 |
+| `--minutes N` | required | how long the session may last, 1 to 420. 415 covers 09:25 to 16:20; on a half day (13:00 close) 235 covers 09:25 to 13:20 (the session ends on its own at the close plus 20 minutes) |
 | `--stop-file PATH` | none | when this file appears the run is ended cleanly (`completed`, `stop_file`). It must not exist at the start. Not in the repo or OneDrive |
 | `--record FILE` / `--no-record` | a new `run-<date>-<n>.jsonl` in `%USERPROFILE%\Stoinkulator\recordings` | the session recording is on by default; an existing file is never overwritten. The two options exclude each other |
 | `--connect-timeout S` | 30 | seconds per connection attempt, above 0 and at most 300 |
@@ -269,13 +273,65 @@ up to 2 s, is repeated 5 times with 0.6 s between, and then fails. A failed step
 that step and ends the run as `error` (exit 4). If the end of the run cannot be stored for the same
 reason, the last line says the run is still marked running.
 
+### Half days and holidays (the market calendar, issue 285)
+
+The watcher, `run` and `fetch-bars` follow `engine/market_calendar.py` (rule-based: NYSE holidays,
+13:00 closes on the day after Thanksgiving, 24 December and 3 July when 3 and 4 July are weekdays,
+one-off closures listed in `OVERRIDES`).
+
+- A weekend or a holiday. `run` and the watcher refuse (exit 2, before anything is built or
+  connected, no folder made) with `Refused: <date> is not a trading day: the market is closed on a
+  market holiday (Thanksgiving)`; the date is this computer's clock in New York. After connecting,
+  IB's server date is checked the same way (a clock that disagrees about the date) and IB's reported
+  hours (below): a closed day ends the session with exit 2 before any history request.
+  `fetch-bars` does not plan such days (no request, nothing in the manifest) and refuses a range
+  with no trading day at all.
+- A half day. Everything derived from 16:00 follows 13:00: the regular session of the watcher
+  (silent-symbol, delayed-data and no-data windows: nothing is judged after 13:00, and "market
+  closed: no new bars expected" is said then), the last-bars hold (the last two bars of the session
+  are held until the close plus 20 minutes, 13:20, as 16:20 on a full day), the end of a `run` session
+  (the last bar 12:59 decided, or 13:20 plus the 60 s margin) and the aligner's held clock. A half day
+  ends as `completed` (`session_end`, exit 0), not `failed`. Open positions follow the existing rule
+  (left open and listed) unless the algo closed them: `FVGZone` goes flat at 12:55 on a half day
+  (`docs/algos-fvgzone.md`). The start line says so (`Note: ... is a half day`), and `run` names the
+  `--minutes` that cover it: 235 from 09:25 to 13:20 (415 on a full day). A larger `--minutes` is
+  fine: the session ends on its own.
+- IB's hours as a cross-check. The contract details every symbol's lookup returns already carry
+  `liquidHours`; no new request and no new message id is involved. At the start, after the lookups
+  and before the first history request, today's close by the calendar is compared with IB's
+  regular hours for the day: one line `Trading hours: ...` says they agree, or that they could not be
+  read and the calendar is followed (no field, another time zone, a session that does not start at
+  09:30, a day the text does not mention, ...). The rule, in plain words:
+  - IB's close equals the calendar's: nothing changes.
+  - IB's close differs, and IB's close is exactly 13:00 or 16:00 (the only closes the exchange
+    uses): a `WARNING` line, and IB's close is used for today in every derived time. Example: the
+    calendar says half day, IB says 16:00: the session is judged as a full day; if the stream then
+    stops at 13:00, the silent-symbol check of `run` ends the run as a data fault (`data_fault`, exit
+    7) by design, and the watcher reports `no data` / a stopped stream the way it would on a full
+    day. The other way round (calendar full, IB says 13:00): the session ends at 13:00 and 13:20 as
+    on any half day.
+  - IB's close differs and is any other value (12:00, 15:00, a mis-parse that still looks valid): a
+    `WARNING` naming both values, and the calendar is followed. IB's value is not used.
+  - IB's hours cannot be read: one line, the calendar is followed.
+  - IB says closed for a symbol on a day the calendar calls open: nothing is requested and the
+    session ends with exit 2 (refused).
+  Symbols that differ among themselves: the earliest close, or closed, wins, then the rule above.
+- Gap reports. A half day is expected to hold 210 bars and is `complete` with them. A day the
+  calendar calls full that has exactly the bars 09:30 to 12:59 stays `short`; bars after 12:59 on a
+  calendar half day are kept (judged against 390) and bars on a calendar holiday are kept. Each such
+  disagreement gets a `calendar:` line in `gaps_summary.txt` and a line in the `fetch-bars` summary;
+  `gaps.csv` keeps its columns.
+- Not covered: a closure or early close the calendar does not list (announced at short notice). Add
+  it to `OVERRIDES` in a reviewed change. For a live session IB's hours (above) catch it on the day
+  if IB already reports it; otherwise the owner does not start the session.
+
 ### Exit codes
 
 | code | `fetch-bars` | `probe-data` | `watch_bars` | `run` |
 |------|--------------|--------------|--------------|-------|
-| 0 | complete: every day ok, no data (holiday) or already done | every step done (delayed data is a success) | watched to the end, every symbol streaming | the session ended as planned (`session_end`, `minutes_elapsed` or `stop_file`); stored as `completed` |
+| 0 | complete: every day ok, no data or already done | every step done (delayed data is a success) | watched to the end, every symbol streaming | the session ended as planned (`session_end` at 16:20, or 13:20 on a half day, `minutes_elapsed` or `stop_file`); stored as `completed` |
 | 1 | finished, but a day failed or a symbol was not fetched | connected, but a step failed (including NO data) | finished, but a symbol stopped, had no stream at the end or delivered no bars | a symbol stopped; stored as `failed` |
-| 2 | refused: gate, port guard, arguments, path, folder layout, `--paper` conditions | refused (same list) | refused (same list) | refused, nothing built or connected: usage, gate, port guard, `--paper` conditions, a mode other than `paper`, legacy fills, an unusable path or database, another `paper-live` run still running |
+| 2 | refused: gate, port guard, arguments, path, folder layout, `--paper` conditions | refused (same list) | refused (same list), and a weekend or a market holiday | refused, nothing built or connected: usage, gate, port guard, `--paper` conditions, a mode other than `paper`, legacy fills, an unusable path or database, another `paper-live` run still running, a weekend or a market holiday (also after connecting: IB says the day is closed) |
 | 3 | could not connect | could not connect | could not connect | could not connect |
 | 4 | stopped early: connection lost, pacing violation twice or a fatal fault; rerun resumes | not a paper account (`--paper` only) | stopped by a lost or closed connection, or an unexpected error | stopped by a lost or closed connection or by an error; stored as `failed`. Also: the run ended as planned but its end could not be stored |
 | 5 | not a paper account (`--paper` only) | not used | not a paper account (`--paper` only) | not a paper account (at the start nothing requested, nothing stored; later the run was ended) |
@@ -348,7 +404,7 @@ machine's idea of "home"); a command with neither set refuses to start.
   `engine.feed` reads, plus in each symbol folder `manifest.json` (per day: ok, no_data or failed
   with the IB text, the contract id), `gaps.csv` (`symbol,day,status,expected,present,missing,
   ranges`) and `gaps_summary.txt`. A gap status is complete, provisional (all 390 minutes, fetched before the day is
-  final), short (a half day), partial, no_data or not_fetched. Files are written atomically and merged day by day; the manifest is set aside, never
+  final), short (a day the calendar calls full that has exactly the bars 09:30 to 12:59: an early close it did not know), partial, no_data or not_fetched. A half day by the calendar is complete with 210 bars (390 expected on a full day). Where the data and the calendar disagree (bars after 12:59 on a calendar half day, a short day on a calendar full day, bars on a calendar holiday) the row is kept as the bars say, `gaps_summary.txt` carries a `calendar:` line for the day and a count, and `fetch-bars` prints it. Files are written atomically and merged day by day; the manifest is set aside, never
   deleted, if it cannot be used.
 - `%USERPROFILE%\Stoinkulator\live` (watcher `--out`): `SYMBOL/SYMBOL_live_YYYY-MM-DD.csv`, kept out
   of the bars folder so fetched history and live observation never mix.
@@ -427,8 +483,8 @@ never connect; none runs a connecting command in a subprocess (a subprocess test
   refuses an earlier start); the `--help` text of `run` still says "Only the owner runs it for
   now".
 - Issue 177: the exit code 4 clash of `probe-data`; console masking of the exact ids TWS reports;
-  data-farm breaks timed from when the notice is read; the lag bound is a running minimum; holidays
-  are unknown to the watcher; whether the last update of a minute equals the final bar is still to
+  data-farm breaks timed from when the notice is read; the lag bound is a running minimum; (holidays
+  and half days: issue 285, below); whether the last update of a minute equals the final bar is still to
   be checked against `fetch-bars`; the hook matches the interpreter by path only and accepts
   `--minutes` 0 and 421 to 999, which the watcher then refuses. Volumes differ by a few percent
   between the live and paper feeds for the same bar (owner: not a concern for current strategies).
@@ -442,7 +498,9 @@ never connect; none runs a connecting command in a subprocess (a subprocess test
   the reader refuses; no fsync before the atomic replace; lower-case tickers behave differently
   from upper-case on Windows.
 - Issue 161: two small follow-ups to the hook's legacy-script rule.
-- A day with fewer than 390 bars is kept and listed, never failed; there is no holiday calendar.
+- A day with fewer bars than the calendar expects is kept and listed, never failed. The calendar is
+  rule-based (`engine/market_calendar.py`); a closure it does not list (an announced one-off) is
+  not planned for, IB answers it with no data, and `fetch-bars` records `no_data`; add it there.
 - Python cannot stop code that replaces the client's guard by writing private attributes or talks
   to a socket of its own: callers are reviewed for that, and the import boundary test forbids
   socket modules in the package.

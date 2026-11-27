@@ -293,21 +293,21 @@ def test_gap_report_minute_ranges() -> None:
     assert (full.status, full.missing) == (GAP_COMPLETE, ())
 
 
-def test_gap_report_early_close_is_short() -> None:
-    day = date(2024, 11, 29)  # day after Thanksgiving, closes 13:00
+def test_gap_report_an_unscheduled_early_close_is_short() -> None:
+    day = date(2024, 11, 26)  # a full day by the calendar: 210 bars are an unscheduled early close
     minutes = expected_minutes(day)
     [row] = gap_report([day], bars_for(day, minutes[:210]))  # 09:30 to 12:59
     assert row.status == GAP_SHORT
-    assert row.missing == ((datetime(2024, 11, 29, 13, 0), datetime(2024, 11, 29, 15, 59)),)
+    assert row.missing == ((datetime(2024, 11, 26, 13, 0), datetime(2024, 11, 26, 15, 59)),)
     # A hole before the end is partial, not short.
     holed = minutes[:100] + minutes[150:210]
     assert gap_report([day], bars_for(day, holed))[0].status == GAP_PARTIAL
 
 
 def test_gap_report_short_means_exactly_a_13_00_close() -> None:
-    day = date(2024, 11, 29)
+    day = date(2024, 11, 26)  # a full day by the calendar
     minutes = expected_minutes(day)
-    assert minutes[210] == datetime(2024, 11, 29, 13, 0)  # the early close, first missing bar
+    assert minutes[210] == datetime(2024, 11, 26, 13, 0)  # the early close, first missing bar
     status = {name: gap_report([day], bars_for(day, mins))[0].status for name, mins in {
         "to_1259": minutes[:210],  # early close: short
         "to_1258": minutes[:209],  # tail missing but not from 13:00
@@ -320,6 +320,80 @@ def test_gap_report_short_means_exactly_a_13_00_close() -> None:
     assert status == {"to_1259": GAP_SHORT, "to_1258": GAP_PARTIAL, "to_1300": GAP_PARTIAL,
                       "only_1559_missing": GAP_PARTIAL, "one_bar": GAP_PARTIAL,
                       "one_bar_late": GAP_PARTIAL, "late_only": GAP_PARTIAL}
+
+
+HALF = date(2024, 11, 29)  # the day after Thanksgiving: the calendar closes it at 13:00
+
+
+def test_gap_report_a_half_day_expects_210_bars_and_is_complete_with_them() -> None:
+    """Issue 285: the calendar, not the bars that came back, says a half day is 09:30 to 12:59."""
+    minutes = expected_minutes(HALF)
+    [row] = gap_report([HALF], bars_for(HALF, minutes[:210]))
+    assert (row.status, row.expected, row.present, row.missing, row.note) == (GAP_COMPLETE, 210, 210, (), "")
+    holed = minutes[:100] + minutes[150:210]
+    [row] = gap_report([HALF], bars_for(HALF, holed))
+    assert (row.status, row.expected, row.present, row.note) == (GAP_PARTIAL, 210, 160, "")
+    assert row.missing == ((datetime(2024, 11, 29, 11, 10), datetime(2024, 11, 29, 11, 59)),)
+    [row] = gap_report([HALF], bars_for(HALF, minutes[:209]))  # the last minute missing
+    assert (row.status, row.missing_count) == (GAP_PARTIAL, 1)
+    assert gap_report([HALF], bars_for(HALF, []))[0].status == GAP_NO_DATA
+    assert gap_report([HALF], bars_for(HALF, minutes[:210]), provisional={HALF})[0].status == "provisional"
+
+
+def test_gap_report_keeps_the_tolerance_where_the_data_disagrees_with_the_calendar() -> None:
+    minutes = expected_minutes(HALF)
+    # a full day of bars on a half day: nothing is dropped, judged against 390, and the row says so
+    [row] = gap_report([HALF], bars_for(HALF, minutes))
+    assert (row.status, row.expected, row.present) == (GAP_COMPLETE, 390, 390)
+    assert "early close at 13:00 but the data has bars after it" in row.note
+    # a bar or two after the close: partial against the full day, with the note
+    [row] = gap_report([HALF], bars_for(HALF, minutes[:211]))
+    assert (row.status, row.expected, row.present) == (GAP_PARTIAL, 390, 211) and row.note
+    # an unscheduled early close on a full day: short, with the note
+    full = date(2024, 11, 26)
+    [row] = gap_report([full], bars_for(full, expected_minutes(full)[:210]))
+    assert row.status == GAP_SHORT and "expects a full day" in row.note
+    # bars on a day the calendar has no session (a holiday): kept, noted
+    holiday = date(2024, 11, 28)
+    [row] = gap_report([holiday], bars_for(holiday))
+    assert row.status == GAP_COMPLETE and "no session on this day" in row.note
+    assert gap_report([holiday], bars_for(holiday, []))[0].note == ""
+    # the caller's table can make a full day a half day
+    [row] = gap_report([full], bars_for(full, expected_minutes(full)[:210]), extra={full: 13 * 60})
+    assert row.status == GAP_COMPLETE and row.note == ""
+
+
+def test_gap_summary_lists_a_complete_day_only_when_the_calendar_disagrees() -> None:
+    clean = gap_report([HALF], bars_for(HALF, expected_minutes(HALF)[:210]))
+    quiet = history.gaps_summary_text(clean)
+    assert "disagree" not in quiet and "calendar" not in quiet
+    noted = gap_report([HALF], bars_for(HALF))
+    text = history.gaps_summary_text(noted)
+    assert "days where the data and the market calendar disagree: 1" in text
+    assert "2024-11-29 complete" in text and "  calendar: the market calendar has an early close" in text
+    assert history.gaps_csv_text(noted, "AAPL").splitlines()[1] == "AAPL,2024-11-29,complete,390,390,0,"
+
+
+def test_plan_range_skips_holidays_and_weekends_and_plans_a_half_day_only_after_16_00() -> None:
+    # Thanksgiving week 2024: Thursday is a holiday and Friday a half day
+    days = history.plan_days(date(2024, 11, 25), date(2024, 12, 2), LATE)
+    assert days == [date(2024, 11, 25), date(2024, 11, 26), date(2024, 11, 27), HALF, date(2024, 12, 2)]
+    assert history.plan_days(date(2024, 11, 28), date(2024, 11, 28), LATE) == []  # only a holiday
+    # a request ends at 16:00 and never in the future: at 14:00 New York the half day (closed at
+    # 13:00 by the calendar) is NOT planned, after 16:00 it is
+    two_pm = datetime(2024, 11, 29, 14, 0, tzinfo=NY)
+    with pytest.raises(ValueError, match="not closed"):
+        history.plan_range(HALF, HALF, two_pm)
+    plan = history.plan_range(date(2024, 11, 27), HALF, two_pm)
+    assert plan.days == [date(2024, 11, 27)] and plan.not_closed == [HALF]
+    for stamp in (datetime(2024, 11, 29, 16, 0, tzinfo=NY), datetime(2024, 11, 29, 16, 1, tzinfo=NY)):
+        assert history.plan_range(HALF, HALF, stamp).days == [HALF]
+    with pytest.raises(ValueError, match="not closed"):  # one minute before 16:00
+        history.plan_range(HALF, HALF, datetime(2024, 11, 29, 15, 59, tzinfo=NY))
+    # a caller's table moves a day
+    assert history.plan_days(HALF, HALF, LATE, {HALF: None}) == []
+    # the request itself ends at 16:00 whatever the day: IB returns the session's bars
+    assert history.day_request(HALF).end_date_time == "20241129-21:00:00"
 
 
 def test_gap_report_missing_day(tmp_path: Path) -> None:

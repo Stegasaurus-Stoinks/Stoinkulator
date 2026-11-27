@@ -305,6 +305,8 @@ class SymbolResult:
     # (day, bars on disk, gap status "short" or "partial") for every day of the range with
     # bars that is not a full session; the days stay `ok` (missing minutes are data)
     short_days: list[tuple[date, int, str]] = field(default_factory=list)
+    # (day, text) for every day where the data and the market calendar disagree (the data is kept)
+    calendar_notes: list[tuple[date, str]] = field(default_factory=list)
     # days of the range this run was to fetch and has not asked IB for (yet): the gap report
     # calls such a day without bars `not_fetched`, never `no_data`; a resumed run fetches them
     not_requested: set[date] = field(default_factory=set)
@@ -1000,6 +1002,7 @@ class _Run:
                 res.gaps = rows
                 res.short_days = [(r.day, r.present, r.status) for r in rows
                                   if r.status in (GAP_SHORT, GAP_PARTIAL)]
+                res.calendar_notes = [(r.day, r.note) for r in rows if r.note]
                 res.gap_files = write_gap_files(symbol_folder(self.out_dir, symbol), rows, symbol,
                                                 sleep=self.sleep, clock=self.clock)
                 counts: dict[str, int] = {}
@@ -1009,7 +1012,9 @@ class _Run:
                 self.emit("gaps", f"{symbol}: gap report " + ", ".join(
                     f"{n} {s}" for s, n in sorted(counts.items())), symbol, counts=counts,
                     short_days=[(d.isoformat(), n, s) for d, n, s in res.short_days],
-                    days_with_gaps=len(res.short_days))
+                    days_with_gaps=len(res.short_days),
+                    **({"calendar_notes": [(d.isoformat(), t) for d, t in res.calendar_notes]}
+                       if res.calendar_notes else {}))
             except Exception as exc:  # noqa: BLE001 - a broken report must not hide the run's result
                 res.gap_error = f"{type(exc).__name__}: {exc}"
                 self.emit("gaps", f"{symbol}: gap report failed: {res.gap_error}", symbol,

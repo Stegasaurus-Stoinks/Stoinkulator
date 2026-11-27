@@ -2527,8 +2527,8 @@ def test_data_that_starts_later_makes_the_symbol_streaming_and_the_result_follow
 
 @pytest.mark.parametrize("server,minutes", [
     (epd(16, 16, 30), 4),  # after the close
-    (epd(17, 10, 0), 4),   # a Saturday
-    (epd(18, 11, 0), 4),   # a Sunday
+    # a Saturday and a Sunday used to be watched ("market closed"); since issue 285 they are refused
+    # (tests/test_ib_calendar_live.py)
     (epd(16, 9, 0), 4),    # before the open, and the watch ends before 09:30
 ])
 def test_outside_the_session_nothing_changes(rig: Rig, server: int, minutes: int) -> None:

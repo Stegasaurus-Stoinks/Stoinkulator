@@ -60,7 +60,9 @@ from the repository root, with TWS on the paper login and Read-Only API ON:
 
     .venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS_FILE --bars "$env:USERPROFILE\Stoinkulator\bars" --db "$env:USERPROFILE\Stoinkulator\live-runs.db" --stop-file "$env:USERPROFILE\Stoinkulator\stop-run" --paper --no-prompt --minutes 415
 
-Every algo in the file needs `"mode": "paper"`. Back up the live runs database (`live-runs.db`, not `runs.db`, which holds backtest runs and is never written by a session) before the first start
+`--minutes 415` covers a full day (09:25 to 16:20). On a half day (13:00 close) the market calendar
+moves the end to about 13:20: use `--minutes 235` (more is fine); a weekend or a holiday is refused
+at the start (exit 2). Every algo in the file needs `"mode": "paper"`. Back up the live runs database (`live-runs.db`, not `runs.db`, which holds backtest runs and is never written by a session) before the first start
 (the new schema is a one-way migration). Without `--no-prompt` you type `7497` when asked. After the
 session: `report RUN --db ...` and `report RUN --verify --bars ... --db ...`. Never run it on a live
 port, and never turn Read-Only API off.
@@ -92,8 +94,9 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
   `NO data`; a first bar with hundreds of thousands to millions of shares for a large stock; the last
   line `Result: all steps completed`. Delayed data is a success (exit 0).
 - `fetch-bars`: a `Summary` with, per symbol, `N ok, N no data, 0 failed, ... [done]` (22 `ok`
-  days for 2024-08-01 to 2024-08-30; weekends are not requested); the first fetched day
-  of each symbol with 390 bars (09:30 to 15:59) or fewer on a half day; a gaps line per symbol that
+  days for 2024-08-01 to 2024-08-30; weekends and holidays are not requested); the first fetched day
+  of each symbol with 390 bars (09:30 to 15:59), or 210 on a half day (13:00 close; `complete` by the
+  market calendar); holidays are not requested; a gaps line per symbol that
   names no `partial` day; `Result: complete (exit 0)`. A day fetched before 06:00 New York next day
   is listed as provisional: run the command again after that time and it is fetched again. Running the same command again fetches
   nothing and also ends with exit 0.
@@ -115,7 +118,7 @@ at any time: about 10 s per symbol-day (the three symbols above for August 2024:
 | 3 | could not connect | TWS running and logged in, API enabled, the right port, 127.0.0.1 trusted, no dialog waiting in TWS |
 | 4 | `fetch-bars`: stopped early (connection lost, pacing violation twice, a fault). Watcher: connection lost or closed, or an unexpected error. `probe-data`: not a paper account (`--paper` only). `run`: connection lost or closed, or an error; the run is stored `failed` | `fetch-bars`: what was finished is on disk; check TWS is running and logged in, run the same command again to resume; after a pacing stop wait at least 10 minutes first. Watcher: check TWS, start a new watch (files of the day are appended, only later bars). `probe-data`: log TWS into the paper account, do not retry in a loop. `run`: a restart is a new run (an earlier run is never resumed) |
 | 5 | `--paper` only, `fetch-bars`, watcher and `run`: the account TWS is signed into is not a paper account; nothing was requested | log TWS into the paper account; do not retry in a loop |
-| 6 | watcher: a symbol received no data (`no data received`). `run`: no data received for a symbol; the run is stored `failed` | check the market data subscription of the paper account and code 10197; a weekday holiday gives the same (the code does not know holidays) |
+| 6 | watcher: a symbol received no data (`no data received`). `run`: no data received for a symbol; the run is stored `failed` | check the market data subscription of the paper account and code 10197; a closure the market calendar does not list (announced at short notice) gives the same. Weekends and the listed holidays are refused at the start (exit 2); a half day ends at 13:00 and is not a fault |
 | 7 | `run` only: the session stopped the run on a data fault (delayed data, refused or late bars, a silent symbol, a step over 60 s) | read the `live: FAULT` line; see `docs/live-session-runbook.md` |
 | 130 | Ctrl-C | the connection and the recording were closed. `fetch-bars`: run the same command to resume. `probe-data` and watcher: nothing to resume, start again if needed |
 

@@ -69,7 +69,14 @@ says VERIFIED; the dashboard showed the run while it ran; the next-morning compa
 
 `--paper` means port 7497 on 127.0.0.1, the live opt-in absent, and an account check. 415 minutes
 cover 09:25 to 16:20; the session ends on its own once the last bar is decided (about 16:20, at the
-latest 16:21). Without `--no-prompt` the command prints what it will do and asks you to type
+latest 16:21). On a half day (13:00 close: the day after Thanksgiving, 24 December, sometimes 3 July)
+the market calendar moves every one of those times by three hours: start at about 09:25 with
+`--minutes 235` (09:25 to 13:20; a larger number is fine, the session ends on its own at about
+13:20) and expect `completed`, `session_end`, exit 0. On a weekend or a market holiday `run` refuses
+to start (exit 2, `Refused: ... is not a trading day`). The `--minutes` deadline runs from the start of the
+watch: 415 (235 on a half day) leaves no room if the command is started at or before about 09:25:10, and the
+session then ends as `minutes_elapsed` just before the last two held bars (fed at the close + 20 minutes) are fed;
+the safe values are 420 on a full day and 240 on a half day (420 is the cap). Without `--no-prompt` the command prints what it will do and asks you to type
 `7497`.
 
 A start before 09:30 depends on a subscription opened before the open rolling into the session
@@ -187,7 +194,7 @@ resumed.
 | 3 | could not connect | TWS running and logged in on the paper login, API enabled, port 7497, 127.0.0.1 trusted, no dialog waiting in TWS, client id 20 not used by another program. Nothing was stored |
 | 4 | stopped by a lost or closed connection, or by an error (`connection_closed`, `error`) | check TWS (a restart, a lost internet connection, a login dialog). Read the last line: if it says `could not be closed`, see the last row. Start a new run if the session is still open (it only warms up on today's earlier bars; no catch-up trading) |
 | 5 | TWS is not on a paper account (`not_paper`) | STOP. Do not retry. Log TWS into the paper account yourself, and look at what happened before you try again |
-| 6 | no data received (`no_data`) | check the market data subscription of the paper account (shared with the live account's data), 10197 (another session uses the data), and whether it is a weekday holiday (the code does not know holidays) |
+| 6 | no data received (`no_data`) | check the market data subscription of the paper account (shared with the live account's data), 10197 (another session uses the data), and whether a closure the market calendar does not list was announced (weekends and the listed holidays are refused at the start, never run) |
 | 7 | the run was stopped on a data fault (`delayed_data`, `data_fault`, `step_too_slow`) | read the line `live: FAULT (...)`. Delayed data: market data again. A data fault or slow step is a finding: open an issue with the console text |
 | 130 | Ctrl-C | the run is stored `failed`, `interrupted` |
 | any | the last line says `still marked running in the database` | the database stayed busy or refused the end of the run. Wait 3 minutes: it shows as `stale`, and the next `run` closes it as `failed`, `abandoned`. Do not edit the database by hand. `report RUN --verify` still works on it |

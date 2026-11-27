@@ -1043,19 +1043,23 @@ def digest(text: str) -> str:
 
 # The digests (sha256, first 16 hex digits) of the output of `origin/revival` at 48e8d86, the watcher
 # before these seams, for the same scenarios; made by running `run_scenario` on that checkout.
+# Repinned for issue 285: the watcher now prints ONE new line after the contract lookups, "Trading
+# hours: ..." (the market calendar against IB's hours; here the scripted contract details carry no
+# hours, so it says they were not compared). Checked before repinning: with that one line removed
+# from the output every scenario still hashes to the digest of 48e8d86 (5f0731dc7ab22e7c, ...).
 PINNED: dict[str, str] = {
-    "delayed": "5f0731dc7ab22e7c",
-    "farm_break": "6f73a5b3e3eeb1bc",
-    "file_error": "4ad960a0afc7305a",
-    "no_data": "224dddd5f2ba0b79",
-    "outage": "3e50c1bb682ce112",
-    "rerequest": "4876df5b803f51bd",
-    "revised": "372506026f5f116d",
-    "second_run": "5358fa8c71ffa691",
-    "session_end": "98ec471e4a049090",
-    "stalled": "2727a6a9a11a1645",
-    "standard": "288b1bac057b7edc",
-    "standard_recorded": "5f21fabbbec8841e",
+    "delayed": "8b107354c4f9db24",
+    "farm_break": "b9915b1be09a2bf2",
+    "file_error": "f7e8075f0463f4c0",
+    "no_data": "b6b09b03e9c05709",
+    "outage": "54bdbf58a655353a",
+    "rerequest": "7008ee83513b4344",
+    "revised": "0df2eda7d0da7deb",
+    "second_run": "0f19f50f6a006a43",
+    "session_end": "46dd7fe5bff99022",
+    "stalled": "261f1cf9af283366",
+    "standard": "010206a2b046710c",
+    "standard_recorded": "2b0927a1fa889e82",
 }
 
 

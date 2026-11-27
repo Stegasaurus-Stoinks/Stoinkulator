@@ -24,6 +24,9 @@ Refused (exit 2, before anything is built or connected; one line each):
   `STOINK_DB` in the environment);
 * another `paper-live` run that is marked running and was written recently (a stale one is closed
   as `failed` / `abandoned` first, by the driver, and said);
+* a weekend or a market holiday today in New York (this computer's clock, the market calendar);
+  after connecting IB's server date and IB's reported hours are checked too (exit 2, nothing
+  requested);
 * the console gate, unless `--paper --no-prompt`: stdin must be a terminal and the port number typed.
 
 `--paper --no-prompt` is the unattended form: no prompt, the first line says so. Every printed line is
@@ -32,7 +35,8 @@ scrubbed. The session recording is ON by default (a new `run-<date>-<n>.jsonl` u
 environment mapping handed to `main` (`USERPROFILE`, else `HOME`), never from the machine's idea of home.
 
 A session that starts at about 09:25 New York (five minutes before the open) runs to the end of the
-session at about 16:20, 415 minutes. Ctrl-C does not interrupt the end of a session: the run is
+session at about 16:20, 415 minutes (on a half day, 13:00 close: 13:20, 235 minutes). Ctrl-C does not
+interrupt the end of a session: the run is
 ended in the store first (see `live_run._Shield`), then the command exits with 130.
 
 Exit codes: see `EXIT_CODES_TEXT` (shown by `--help`).
@@ -51,6 +55,7 @@ from pathlib import Path
 from typing import Any, TextIO
 from zoneinfo import ZoneInfo
 
+from MainStoinker.engine import market_calendar as calendar
 from MainStoinker.engine.cli import (
     CliError,
     config_symbols,
@@ -61,6 +66,7 @@ from MainStoinker.engine.live_counts import LIVE_KINDS
 from MainStoinker.engine.modes import DEFAULT_MODE
 from MainStoinker.engine.run_documents import liveness
 from MainStoinker.engine.store import Store, StoreError, open_store, open_store_readonly
+from MainStoinker.ib import trading_hours
 from MainStoinker.ib.cli import (
     EXIT_REFUSED,
     PAPER_MODE_LINE,
@@ -87,25 +93,27 @@ from MainStoinker.ib.history import DATA_ZONE
 from MainStoinker.ib.live_run import DEFAULT_CLIENT_ID, MODE, run_live_session
 from MainStoinker.ib.market_data import IbMarketData
 from MainStoinker.ib.recorder import SessionRecorder
-from MainStoinker.ib.watch_bars import MAX_SYMBOLS
+from MainStoinker.ib.watch_bars import MAX_SYMBOLS, SESSION_GRACE
 from MainStoinker.Util.broker_guard import BrokerPortRefused, check_broker_port
 
 RUN = "run"
 RUN_KIND = LIVE_KINDS[0]  # "paper-live"
 MIN_MINUTES = 1
-MAX_MINUTES = 420  # a session from 09:25 to 16:20 is 415 minutes; the driver itself would take 600
+# a session from 09:25 to 16:20 is 415 minutes (235 on a half day); the driver itself would take 600
+MAX_MINUTES = 420
 DEFAULT_WARMUP_DAYS = 2
 LIVE_BUSY_TIMEOUT = 2.0  # seconds one attempt of a store call waits for another writer
 NY = ZoneInfo(DATA_ZONE)
 
 EXIT_CODES_TEXT = """\
 exit codes:
-  0    the session ended as planned: the end of the session (16:20 New York), --minutes elapsed
-       or the stop file; the run is stored as completed
+  0    the session ended as planned: the end of the session (16:20 New York; 13:20 on a half day),
+       --minutes elapsed or the stop file; the run is stored as completed
   1    a symbol stopped (IB error, unusable live file): the run is stored as failed
   2    refused: usage error, console gate, port guard, --paper conditions (port, host,
        STOINK_ALLOW_LIVE_PORT set), a mode other than paper, legacy fills, an unusable path or
-       database, another paper-live run still running; nothing was built or connected
+       database, another paper-live run still running, a weekend or a market holiday; nothing
+       was built or connected (also, after connecting: IB says the market is closed today)
   3    could not connect to TWS or IB Gateway
   4    stopped by a lost or closed connection, or by an error (the run is stored as failed)
   5    the account TWS is signed into is not a paper account (at the start nothing was
@@ -132,7 +140,8 @@ def build_parser(paper: bool = False) -> argparse.ArgumentParser:
             "--verify --bars DIR`. Only the owner runs it for now (an unattended form for "
             "agents is a separate decision). "
             "Every algo needs \"mode\": \"paper\".\n\n"
-            "Start about 09:25 New York for a full session (it ends at about 16:20, 415 minutes). "
+            "Start about 09:25 New York for a full session (it ends at about 16:20, 415 minutes; on "
+            "a half day it ends at about 13:20, 235 minutes). "
             "Ctrl-C does not interrupt the end of the session: the run is ended in the database "
             "first.\n\n"
             "Example, unattended on a paper account:\n"
@@ -172,7 +181,7 @@ def build_parser(paper: bool = False) -> argparse.ArgumentParser:
     parser.set_defaults(client_id=DEFAULT_CLIENT_ID)
     parser.add_argument("--minutes", type=int, required=True, metavar="N",
                         help=f"how long the session may last, {MIN_MINUTES} to {MAX_MINUTES} "
-                             "(415 covers 09:25 to 16:20)")
+                             "(415 covers 09:25 to 16:20, 235 covers 09:25 to 13:20 on a half day)")
     parser.add_argument("--stop-file", default=None, metavar="PATH",
                         help="when this file appears the run is ended cleanly (completed, stop_file); "
                              "it must not exist at the start")
@@ -333,6 +342,15 @@ def main(
         say(PAPER_ONLY_LINE)
         return EXIT_REFUSED
     day = today or wall_clock().astimezone(NY).date()
+    if not calendar.is_trading_day(day):  # this computer's clock; IB's server date decides once connected
+        say(f"Refused: {trading_hours.not_a_trading_day_text(day)}. Nothing was started.")
+        return EXIT_REFUSED
+    if calendar.is_half_day(day):
+        close = calendar.close_minute(day)
+        end = close + SESSION_GRACE // 60
+        say(f"Note: {day.isoformat()} is a half day by the market calendar: the session closes at "
+            f"{close // 60:02d}:{close % 60:02d} New York and the run ends at "
+            f"{end // 60:02d}:{end % 60:02d} (from 09:25 that is {end - (9 * 60 + 25)} minutes).")
     try:
         _check_inputs(args, variables)
         resolve_paths(args, variables, day, Path.cwd(), RUN)  # the recording and the private words

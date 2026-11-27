@@ -376,7 +376,7 @@ def test_plan_close_boundary_in_other_zones(zone: str, hour: int, expected: bool
 
 def test_plan_year_boundary_and_leap_day() -> None:
     assert plan_days(date(2023, 12, 28), date(2024, 1, 3), LATE) == [
-        date(2023, 12, 28), date(2023, 12, 29), date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)]
+        date(2023, 12, 28), date(2023, 12, 29), date(2024, 1, 2), date(2024, 1, 3)]  # no New Year's Day
     assert plan_days(date(2024, 2, 28), date(2024, 3, 1), LATE) == [
         date(2024, 2, 28), date(2024, 2, 29), date(2024, 3, 1)]
     one = date(2024, 3, 11)

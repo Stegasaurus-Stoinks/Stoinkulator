@@ -104,7 +104,7 @@ uv pip install --python .venv\Scripts\python.exe -e .
 .venv\Scripts\python.exe -P -m MainStoinker fetch-bars --symbols "AAPL,MSFT" --start 2024-08-16 --end 2024-08-26 --paper --no-prompt   # DATA only, PAPER account only (TWS on 7497): bars to CSV; one session at a time, main session only
 .venv\Scripts\python.exe -P -m MainStoinker probe-data --symbols "AAPL" --paper --no-prompt   # DATA only, PAPER account only: what market data the account gets
 .venv\Scripts\python.exe -P -m MainStoinker.ib.watch_bars --symbols "AAPL,MSFT,TSLA" --minutes 30 --paper --no-prompt   # DATA only, PAPER account only: watch live 1-minute bars for N minutes (1-420); one session at a time, main session only
-.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20); one session at a time, main session only; DB path from the owner
+.venv\Scripts\python.exe -P -m MainStoinker run --algos ALGOS.json --bars BARS --db RUNS.db --minutes 415 --paper --no-prompt   # PAPER account only, NO orders: algos on live 1-minute bars with simulated fills, stored as a `paper-live` run; N 1-420 (415 = 09:25 to 16:20; on a half day, 13:00 close, 235 = 09:25 to 13:20); one session at a time, main session only; DB path from the owner
 ```
 
 Owner forms of the same four (the owner's terminal, prompted: you type the port;
@@ -120,9 +120,9 @@ watcher and `run` but 4 for `probe-data`, where 4 is otherwise unused: issue 177
 
 | code | `fetch-bars` | `probe-data` | `watch_bars` | `run` |
 |------|--------------|--------------|--------------|-------|
-| 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming | the session ended as planned (end of session at 16:20, `--minutes` elapsed or the stop file): stored `completed` |
+| 0 | every day ok, no data or done | every step done (delayed data counts) | watched to the end, every symbol streaming | the session ended as planned (end of session at 16:20, or 13:20 on a half day, `--minutes` elapsed or the stop file): stored `completed` |
 | 1 | a day failed or a symbol not fetched | a step failed (incl. NO data) | a symbol stopped or delivered no bars | a symbol stopped: stored `failed` |
-| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same | same, and a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running: nothing built or connected |
+| 2 | refused: gate, port guard, arguments, path, `--paper` conditions | same | same, and a weekend or market holiday | same, and a weekend or market holiday, a mode other than paper, legacy fills, an unusable database, another `paper-live` run still running: nothing built or connected |
 | 3 | could not connect | same | same | same |
 | 4 | stopped early (connection lost, pacing twice, fault): rerun resumes | not a paper account | connection lost or closed, or a fault | lost or closed connection, or an error: stored `failed` |
 | 5 | not a paper account | (unused) | not a paper account | not a paper account |

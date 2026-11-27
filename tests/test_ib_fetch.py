@@ -303,24 +303,26 @@ def test_fetch_resumes_after_lost_connection(out: Path, tmp_path: Path, how: str
     assert manifest_days(out) == manifest_days(reference)
 
 
-def test_fetch_holiday_is_no_data_not_failure(out: Path) -> None:
+def test_fetch_does_not_plan_a_holiday_by_the_market_calendar(out: Path) -> None:
+    """Issue 285. Labor Day is not a trading day: no request is sent for it, it is no `no_data`
+    day and not in the manifest (before, it was asked for and recorded `no_data`; IB answered with
+    the previous session, which `filter_day` dropped)."""
     labor_day = date(2024, 9, 2)
     with make_rig(server_now=datetime(2024, 9, 10, 12, 0, tzinfo=UTC)) as rig:
-        rig.script(labor_day, holiday_behaviour(date(2024, 8, 30)))
+        rig.script(labor_day, holiday_behaviour(date(2024, 8, 30)))  # never asked for
         result = rig.run(["AAPL"], date(2024, 8, 30), date(2024, 9, 3), out)
     sym = result.symbols["AAPL"]
-    assert (sym.ok, sym.no_data, sym.failed) == (2, 1, 0)
+    assert (sym.ok, sym.no_data, sym.failed) == (2, 0, 0)
     assert result.complete
-    assert manifest_days(out)["2024-09-02"] == "no_data"
-    raw = json.loads((out / "AAPL" / "manifest.json").read_text(encoding="utf-8"))
-    assert raw["days"]["2024-09-02"]["bars"] == 0
+    assert rig.days_requested() == [date(2024, 8, 30), date(2024, 9, 3)]
+    assert "2024-09-02" not in manifest_days(out)
     frame = read_symbol_bars(out, "AAPL")
     assert not (frame["date"].dt.date == date(2024, 9, 2)).any()
-    assert (frame["date"].dt.date == date(2024, 8, 30)).sum() == 390  # the previous session once only
-    # a rerun does not ask for it again
+    assert (frame["date"].dt.date == date(2024, 8, 30)).sum() == 390
+    # a rerun does not ask for anything
     with make_rig(server_now=datetime(2024, 9, 10, 12, 0, tzinfo=UTC)) as rig2:
         again = rig2.run(["AAPL"], date(2024, 8, 30), date(2024, 9, 3), out)
-    assert rig2.requests == [] and again.symbols["AAPL"].already_done == 3
+    assert rig2.requests == [] and again.symbols["AAPL"].already_done == 2
 
 
 def test_fetch_failed_day_recorded_and_retried_next_run(out: Path) -> None:

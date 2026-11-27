@@ -625,6 +625,21 @@ def test_closed_session_day() -> None:
     assert str(closed_session_day(at(2024, 11, 24, 15, 0))) == "2024-11-22"  # Sunday
 
 
+def test_closed_session_day_follows_the_market_calendar() -> None:
+    """Issue 285: a holiday is skipped, and a half day is probed from 16:00 New York."""
+
+    def at(*a: int) -> datetime:
+        return datetime(*a, tzinfo=UTC)
+
+    assert str(closed_session_day(at(2024, 11, 28, 20, 0))) == "2024-11-27"  # Thanksgiving, after 16:00
+    assert str(closed_session_day(at(2024, 11, 29, 15, 0))) == "2024-11-27"  # day after, 10:00 NY
+    # a half day is probed only after 16:00 too (the request ends at 16:00, never in the future)
+    assert str(closed_session_day(at(2024, 11, 29, 18, 30))) == "2024-11-27"  # 13:30 NY
+    assert str(closed_session_day(at(2024, 11, 29, 20, 59))) == "2024-11-27"  # 15:59 NY
+    assert str(closed_session_day(at(2024, 11, 29, 21, 0))) == "2024-11-29"  # 16:00 NY
+    assert str(closed_session_day(at(2024, 9, 3, 14, 0))) == "2024-08-30"  # the day after Labor Day, 10:00
+
+
 # -- the fixes in the shared fetch-bars code ---------------------------------------------------------
 
 

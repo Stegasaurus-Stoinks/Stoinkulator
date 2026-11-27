@@ -14,7 +14,10 @@ The sequence of a session
 
 1. Refuse (exit 2, nothing built, no connection) unless the options are usable: paper mode,
    realistic fills, every algo's `"mode"` is `paper`, a warm-up can be read from the month files,
-   `--minutes` is within the driver limits, no stop file is lying about.
+   `--minutes` is within the driver limits, no stop file is lying about, and today (New York, by this
+   computer's clock) is a trading day by the market calendar (a weekend or a holiday is refused). A
+   half day (13:00 close) follows the calendar:
+   every time below that is derived from 16:00 follows 13:00, the end of the session is 13:20.
 2. Close the runs an earlier session left behind (D2b): every `paper-live` run still marked
    running whose last write is stale (`live_counts.STALE_AFTER`) is ended `failed` with the reason
    `abandoned` and said so. A restart is a NEW run (D2); an earlier run is never resumed.
@@ -87,8 +90,9 @@ Faults (each ends the session through the exit path, never a silent continue)
       later: the run is ended)
     Ctrl-C                                        failed  interrupted      130
     the last session bar decided (or 16:20 plus   completed session_end    0
-      SESSION_END_MARGIN)
-    `--minutes` elapsed                           completed minutes_elapsed 0
+      SESSION_END_MARGIN; on a half day the
+      close is 13:00 and the 13:20 follows)
+    `--minutes` elapsed                          completed minutes_elapsed 0
     the stop file exists                          completed stop_file      0
 
 The late allowance (exact): a LATE bar (its minute was already released) is NOT a fault only when
@@ -134,6 +138,8 @@ from typing import Any, TextIO
 
 import pandas as pd
 
+import MainStoinker.engine.market_calendar as calendar
+import MainStoinker.ib.trading_hours as trading_hours
 from MainStoinker.engine.algos import close_algo_logs
 from MainStoinker.engine.cli import (
     CliError,
@@ -197,7 +203,7 @@ STEP_SLOW_SECONDS = 20.0  # a step slower than this is recorded (the run's warni
 STEP_HARD_SECONDS = 60.0  # a step slower than this ends the run (`step_too_slow`)
 STALE_BATCH_AGE = 300.0  # a batch released this long after its minute ended is history: not stepped
 HEARTBEAT_EVERY = 20.0  # wall seconds without a write before the run is touched (< HEARTBEAT_INTERVAL)
-SESSION_END_MARGIN = 60.0  # seconds after 16:20 server time at which a session ends anyway
+SESSION_END_MARGIN = 60.0  # seconds after the close plus 20 min (16:20; 13:20 on a half day): ends anyway
 LAST_BARS_MARGIN = 10.0  # seconds after 16:20 server time before the last two minutes may go by time
 LAST_BARS_HOLD = 30.0  # seconds past 16:00 to which the clock given to the aligner is held until then
 # (10 s short of the 40 s at which the aligner's 160 s deadline reaches the minute 15:58)
@@ -262,6 +268,8 @@ def _plan(args: argparse.Namespace, today: date) -> _Plan:
     """Check the options (module text, step 1); `SessionRefused` for the first problem."""
     if getattr(args, "paper", False) is not True:
         raise SessionRefused("a live session is paper only: `paper` must be True")
+    if not calendar.is_trading_day(today):  # this computer's clock in New York; IB's decides once connected
+        raise SessionRefused(f"{trading_hours.not_a_trading_day_text(today)}; nothing was started")
     fills = getattr(args, "fills", FILLS)
     if fills != FILLS:
         raise SessionRefused(f"a live session uses realistic fills only (got {fills!r})")
@@ -435,6 +443,14 @@ class _Session:
 
     def set_watcher(self, watcher: Watcher) -> None:
         self.watcher = watcher
+
+    def _extra(self) -> Mapping[date, int | None] | None:
+        """The market calendar's table of this run (IB's close for today when it differs)."""
+        return getattr(self.watcher, "calendar_extra", None)
+
+    def _session_end(self, day: date) -> int:
+        """Epoch of the close of `day`'s regular session: 16:00, 13:00 on a half day."""
+        return _session_end(day, self._extra())
 
     def decided(self, symbol: str, through_epoch: int) -> None:
         self.aligner.decided(symbol, through_epoch)
@@ -644,7 +660,7 @@ class _Session:
         time after that. Every other minute is polled as before."""
         if self.today is None:
             return stream_now
-        end = float(_session_end(self.today))
+        end = float(self._session_end(self.today))
         if server_now < end + SESSION_GRACE + LAST_BARS_MARGIN:
             return min(stream_now, end + LAST_BARS_HOLD)
         return stream_now
@@ -667,7 +683,7 @@ class _Session:
         assert self.engine is not None and self.writer is not None
         minute = int(next(iter(bars.values())).time)
         # the last two bars of a session arrive at about 16:20 by design (D7): they are not history
-        by_design = minute >= _session_end(_ny(minute).date()) - 120
+        by_design = minute >= self._session_end(_ny(minute).date()) - 120
         if not by_design and stream_now - (minute + 60) > STALE_BATCH_AGE:
             for symbol in bars:
                 self.counts.stale[symbol] += 1
@@ -756,7 +772,7 @@ class _Session:
         if watcher.is_down():
             self.quiet_floor = now
             self.unmeasured_since = None
-        if not _in_session(now):
+        if not _in_session(now, self._extra()):
             self.unmeasured_since = None
             return
         if clock.stream_now is None:
@@ -797,7 +813,7 @@ class _Session:
     def _check_session_end(self, clock: StreamClock, states: Mapping[str, Any]) -> None:
         if self.today is None:
             return
-        end = _session_end(self.today)
+        end = self._session_end(self.today)
         running = [name for name, state in states.items() if state.running]
         last_minute = end - 60
         if running and all(self.decided_at.get(s, -math.inf) >= last_minute for s in running):
@@ -856,6 +872,8 @@ def _outcome(session: _Session, watcher_code: int) -> tuple[str, str | None, int
         return "failed", "not_paper", EXIT_NOT_PAPER
     if watcher is None:  # never connected, or refused before the watcher: its code stands
         return "failed", "error", watcher_code
+    if cause == "not_trading_day":  # IB's date or hours say the market is closed: nothing was requested
+        return "failed", "error", EXIT_REFUSED
     if session.fault is not None:
         return "failed", session.fault.reason, session.fault.code
     if session.fatal is not None:

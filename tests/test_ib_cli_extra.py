@@ -415,6 +415,14 @@ def test_a_weekend_only_range_is_refused_before_connecting_and_says_so(sess: Ses
     untouched(sess)
 
 
+def test_a_holiday_only_range_is_refused_before_connecting_by_the_market_calendar(sess: Session) -> None:
+    """Issue 285: Thanksgiving is a weekday but not a trading day."""
+    code = sess.main("--symbols", "AAPL", "--start", "2024-11-28", "--end", "2024-11-28", "--port", "7497",
+                     "--out", str(sess.tmp / "bars"))
+    assert code == 2 and "no weekday that is a trading day" in sess.text and "pre-check" in sess.text
+    untouched(sess)
+
+
 def test_a_range_that_starts_in_the_future_by_server_time_is_still_stopped_after_connecting(
         sess: Session) -> None:
     """The authoritative check stays: the clock of the machine says a day has started, IB's says not."""

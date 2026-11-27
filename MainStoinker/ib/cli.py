@@ -17,8 +17,8 @@ Checks, in this sequence, before any client or connection is built
    is a file or lies under one, is refused; the default folders come from `USERPROFILE`, else
    `HOME`, in the environment mapping given to `main`, never from the machine's own idea of
    "home", and are refused when neither is set);
-3. the dates (a range with no weekday, or starting after today in New York by this computer's
-   clock, is refused as a pre-check; IB's server time decides after connecting);
+3. the dates (a range with no trading day by the market calendar, or starting after today in New
+   York by this computer's clock, is refused as a pre-check; IB's server time decides after connecting);
 4. the port guard (`check_broker_port`): paper ports always, a live port only if the
    OWNER has set `STOINK_ALLOW_LIVE_PORT=1` in their own terminal; this module never sets it;
 5. the folder layout, then the output and recording folders are created (the last refusal);
@@ -64,11 +64,12 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, TextIO
 from zoneinfo import ZoneInfo
 
+from MainStoinker.engine import market_calendar as calendar
 from MainStoinker.engine.feed import read_symbol_bars
 from MainStoinker.engine.store import is_cloud_synced
 from MainStoinker.ib.connection import (
@@ -538,12 +539,9 @@ def resolve_paths(args: argparse.Namespace, env: Mapping[str, str], today: date,
 
 
 def trading_days(start: date, end: date) -> int:
-    """Weekdays from `start` to `end` (holidays and days not closed yet are not known here)."""
-    count, day = 0, start
-    while day <= end:
-        count += day.weekday() < 5
-        day += timedelta(days=1)
-    return count
+    """Trading days (by the market calendar: no weekend, no holiday) from `start` to `end`; days not
+    closed yet are not known here."""
+    return sum(1 for _ in calendar.trading_days(start, end))
 
 
 def rough_estimate(args: argparse.Namespace) -> FetchEstimate:
@@ -807,6 +805,9 @@ def _summary(say: _Say, result: FetchResult, out_dir: Path) -> None:
         if res.short_days:
             say(f"  {name}: " + ", ".join(f"{day} {bars} bars ({status})"
                                           for day, bars, status in res.short_days))
+    for name, res in result.symbols.items():  # only where the data and the market calendar disagree
+        for day, text in res.calendar_notes:
+            say(f"  {name}: {day}: {text} (the data is kept as it came)")
     if result.not_closed:
         say(f"Not closed yet, not fetched: {', '.join(d.isoformat() for d in result.not_closed)}")
     if result.ib_errors_dropped:
@@ -1119,8 +1120,8 @@ def main(
         return EXIT_REFUSED
     if not probe:
         if trading_days(args.start, args.end) == 0:
-            say(f"Refused (pre-check from the dates alone): no weekday from {args.start} to {args.end}; "
-                "nothing to fetch.")
+            say("Refused (pre-check from the dates alone): no weekday that is a trading day (the market "
+                f"calendar) from {args.start} to {args.end}; nothing to fetch.")
             return EXIT_REFUSED
         new_york_today = today or datetime.now(ZoneInfo(DATA_ZONE)).date()
         if args.start > new_york_today:
